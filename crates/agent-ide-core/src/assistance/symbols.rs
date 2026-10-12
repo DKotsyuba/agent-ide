@@ -371,13 +371,86 @@ impl Worker<'_> {
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Read).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
+        self.remember_file_read(
+            job,
+            &observed,
+            source,
+            range.unwrap_or_else(|| LineRange::new(1, total)),
+            &reply,
+            None,
+        )
+        .await;
         Ok((reply, Some(authority), Some(observed)))
+    }
+
+    /// Records only fully delivered file rows for later symbol-window edits in the same context.
+    /// `observed` and `source` are the read's snapshot; `range` uses inclusive file-line numbers.
+    /// `reply` bounds the first page, excluding a cut row. A supplied batch `outline` is reused;
+    /// otherwise only the source outline is requested, without starting or parking on an LSP.
+    /// Unknown context, unsupported files or unavailable outlines leave memory unchanged.
+    /// File snapshots have their own bounded retention; stop/compaction invalidate all reads.
+    async fn remember_file_read(
+        &mut self,
+        job: &mut Job,
+        observed: &SourceObservation,
+        source: &str,
+        range: LineRange,
+        reply: &PeerReply,
+        outline: Option<&Outline>,
+    ) {
+        let binding = job.invocation.binding_ref().clone();
+        if self.context_epoch(&binding).is_none() || range.start > range.end {
+            return;
+        }
+        let last = target::delivered_last(reply, range.end).min(range.end);
+        if last < range.start {
+            return;
+        }
+        let computed;
+        let outline = match outline {
+            Some(outline) => outline,
+            None => {
+                let Some(language) = Lang::for_path(observed.path()) else {
+                    return;
+                };
+                computed = self
+                    .source_outline(
+                        job,
+                        language,
+                        observed.worktree().worktree_path(),
+                        observed.path(),
+                        source,
+                    )
+                    .await
+                    .ok()
+                    .flatten();
+                let Some(outline) = computed.as_ref() else {
+                    return;
+                };
+                outline
+            }
+        };
+        let map = lang::address::AddressMap::build(outline, source);
+        let epoch = self.context_epoch(&binding);
+        if let Ok(mut ledger) = self.shared.ledger.lock() {
+            ledger
+                .read_memory
+                .entry(binding)
+                .or_default()
+                .remember_file(
+                    epoch,
+                    observed.path(),
+                    source,
+                    map,
+                    LineRange::new(range.start, last),
+                );
+        }
     }
 
     /// Every batch read — `ide.read {items}` (batch-api-v1) and the older `{symbols}` and
     /// `{path, ranges}` lists, which `form` names: one summary line, then one block per distinct
-    /// item in request order, one `source_ref` valid for every file it included, so a batch
-    /// `ide.edit` on any of them needs no re-read.
+    /// item in request order. No file-version reference is printed; source observations remain
+    /// retained privately for continuation and callers supplying a deprecated strict edit base.
     ///
     /// The summary line comes first:
     /// `read: <n> items in <f> files — <d> delivered, <u> unchanged, <c> not included, <x> failed`.
@@ -397,7 +470,7 @@ impl Worker<'_> {
     /// ide.read {path, lines|ranges}`), in whichever order the two come. A binary or unreadable
     /// file is one `not a readable text file` item, a missing file one `no such file` item. When
     /// any delivered file is one no IDE language analyzes the reply carries [`NO_ANALYSIS_NOTE`]
-    /// once, ahead of `source_ref`. Failures that are not about one file (a malformed address, a
+    /// once. Failures that are not about one file (a malformed address, a
     /// deadline) still fail the call.
     async fn read_batch(
         &mut self,
@@ -700,17 +773,25 @@ impl Worker<'_> {
             let (reply, page) = ContextPageState::new(oversized, 0, false, ResultKind::Read)
                 .next(&job.reference)?;
             self.shared.set_context_page(&job.reference, page);
+            for (item_index, read) in unit_reads {
+                if item_index == index {
+                    let last = target::delivered_last(&reply, read.last);
+                    self.remember_unit_read(&binding, read, last);
+                }
+            }
+            if matches!(&items[index].2, ReadItem::Path(_) | ReadItem::Lines(_, _)) {
+                let (_, observed, source, outline) = &files[file];
+                let range = match &items[index].2 {
+                    ReadItem::Lines(_, lines) => crate::assistance::facade::parse_read_range(lines)
+                        .ok_or(FailureCode::Internal)?,
+                    _ => LineRange::new(1, lang::line_count(source)),
+                };
+                self.remember_file_read(job, observed, source, range, &reply, outline.as_ref())
+                    .await;
+            }
             return Ok((reply, authority, Some(files[file].1.clone())));
         }
         let (text, delivered) = compose(&prefix(included));
-        // The window-edit guard knows only the units whose blocks this reply carries in full;
-        // a cut block's lines were never delivered.
-        for (index, read) in unit_reads {
-            if index < included {
-                let last = read.last;
-                self.remember_unit_read(&binding, read, last);
-            }
-        }
         // Remember the blocks this reply carries in full, so their repeat can answer unchanged.
         if epoch.is_some()
             && let Ok(mut ledger) = self.shared.ledger.lock()
@@ -750,6 +831,41 @@ impl Worker<'_> {
             },
             other => other,
         };
+        // Preserve request order across address and file reads of the same unit. Cut blocks
+        // record nothing; only the blocks delivered whole reach this loop.
+        let mut unit_reads = unit_reads.into_iter().peekable();
+        for (index, (block, file, item)) in items.iter().take(included).enumerate() {
+            if unit_reads
+                .peek()
+                .is_some_and(|(unit_index, _)| *unit_index == index)
+            {
+                let (_, read) = unit_reads.next().expect("peeked unit read");
+                let last = read.last;
+                self.remember_unit_read(&binding, read, last);
+            }
+            if let Some(file) = file
+                && matches!(item, ReadItem::Path(_) | ReadItem::Lines(_, _))
+            {
+                let (_, observed, source, outline) = &files[*file];
+                let range = match item {
+                    ReadItem::Lines(_, lines) => crate::assistance::facade::parse_read_range(lines)
+                        .ok_or(FailureCode::Internal)?,
+                    _ => LineRange::new(1, lang::line_count(source)),
+                };
+                let (block_reply, _) =
+                    ContextPageState::new(block.clone(), 0, false, ResultKind::Read)
+                        .next(&job.reference)?;
+                self.remember_file_read(
+                    job,
+                    observed,
+                    source,
+                    range,
+                    &block_reply,
+                    outline.as_ref(),
+                )
+                .await;
+            }
+        }
         Ok((reply, authority, job_source))
     }
 
@@ -3528,12 +3644,8 @@ impl Worker<'_> {
             .map(|outline| lang::address::AddressMap::build(&outline, &candidate)),
             None => None,
         };
-        // This session's own write is part of what it knows: units it had read whole now read
-        // as the edited text, so a window copied from this reply is not "changed since your
-        // read" (symbol-read-edit-v1 §3.2 rule 3).
-        if let Some(map) = candidate_map.as_ref() {
-            self.refresh_unit_memory(job.invocation.binding_ref(), path, map, &candidate);
-        }
+        // Candidate preparation never changes read memory: a later file may still refuse the
+        // batch, or the physical write may fail. Only an exact post-write observation refreshes it.
         let mut note = changed_rows(
             path,
             &changes,

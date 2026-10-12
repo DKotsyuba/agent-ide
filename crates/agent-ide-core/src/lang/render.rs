@@ -1366,7 +1366,7 @@ mod tests {
         // Same successful source-fallback sample as the recorded E002 protocol measurement:
         // addresses and regions now fit below its 213-byte total, provenance included.
         let provenance =
-            "outline: from source, exact (rust-analyzer unavailable; no need to repeat)\n";
+            "outline: from source, exact (test-analyzer unavailable; no need to repeat)\n";
         assert!(text.len() + provenance.len() < 213);
         let filter = OutlineFilter {
             kinds: &[],

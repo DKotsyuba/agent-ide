@@ -27,16 +27,19 @@ not an Agent Tasks ratification of a new contract revision.
 The graph-only intermediate export completed before the context-removal amendment:
 `schemas/tools.json` then had eleven names/15,178 B compact JSON, and
 `schemas/tools-codex.json` ten names/14,191 B. Those exact exports remain in the
-working tree and are preserved as `graph-intermediate-tools*.json` under the designated
+historical evidence and are preserved as `graph-intermediate-tools*.json` under the designated
 `outline-fix/graph-return` evidence directory. They are historical intermediate artifacts,
-not exports of the final source. The latest owner order defers builds, final snapshot
-regeneration, tests and test migration; this candidate is source-complete/UNTESTED.
+not exports of the final source. The owner has now authorized schema regeneration and
+test migration followed by the complete project gate.
 
 Current literal source text, measured without building: Claude/Codex paragraphs 662/681 B;
 read/symbol/graph/inspect description comments 241/268/263/238 B; start signature 690 B;
-Claude/Codex skills 4,571/4,073 B; plugin manifests 287/1,032 B. Current served catalog
-totals and final exporter equality are **not measured**. Both snapshots must be regenerated
-through `cargo xtask contract update` when the owner resumes verification.
+Claude/Codex skills are 4,499/4,040 B, and plugin manifests are 256/1,007 B. The skill
+ceilings are enforced by the symbol-workflow hygiene test. The actual rebuilt exporter
+now produces ten tools for each host. With the shortened edit description, the sum of compact
+tool-object bytes used by the budget guard is 14,157 B for Claude and 14,312 B for Codex;
+the compact arrays including punctuation are 14,168/14,323 B. Both snapshots were generated
+by `cargo xtask contract update`, not hand-edited. Complete test/gate results remain pending.
 
 The new capability split is source reads/related links through `ide.read`, exact UTF-8
 semantic positions through `ide.symbol {path,byte_offset}`, file provider diagnostics

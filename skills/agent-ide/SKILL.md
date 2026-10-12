@@ -24,7 +24,7 @@ regions: `src/a.rs#@header` (leading comments) and `src/a.rs#@imports`.
    - change text inside it: `ide.edit {"symbol":"src/a.rs#Store/get","old":"x: 0,","new":"x: 1,"}`;
    - replace lines of it: `ide.edit {"symbol":"src/a.rs#Store/get:3-5","content":"…"}`;
    - `op` insert (with `where`), delete or rename; `add_import` and `remove_import` with a `path`;
-   - several files at once with `files`, or an `apply_patch` body with `patch`.
+   - several files at once with `files`.
 5. `ide.test {"targets":[{"symbol":"src/a.rs#parse"}]}` runs the tests that matter.
 6. `ide.diff` shows what changed since your last diff; give it a `mode` for the whole diff.
 
@@ -43,7 +43,7 @@ test nodes. Graph is unnecessary for every small edit.
 
 ## Former context capabilities
 
-Public `ide.context` is removed. Read source with `ide.read {"path":"a.rs"}`; skeletons
+Read source with `ide.read {"path":"a.rs"}`; skeletons
 with `ide.outline`. For a use-site or shadowed name:
 `ide.symbol {"path":"a.rs","byte_offset":42}`. Offsets are zero-based UTF-8 semantic
 positions, never page cursors; split/out-of-file positions refuse. Cards give

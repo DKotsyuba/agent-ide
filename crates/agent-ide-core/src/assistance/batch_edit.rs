@@ -685,8 +685,12 @@ impl Worker<'_> {
             .ok()
             .and_then(|ledger| ledger.native_epoch.get(binding).copied())
             .unwrap_or(0);
-        exact_post_read_observation(read, &observed, &bytes, job.native_epoch, current_epoch)
-            .then_some(observed)
+        if !exact_post_read_observation(read, &observed, &bytes, job.native_epoch, current_epoch) {
+            return None;
+        }
+        self.refresh_written_unit_memory(job, &observed, &bytes)
+            .await;
+        Some(observed)
     }
 
     /// Triggers the one project check of the written files — one check generation per affected

@@ -504,6 +504,213 @@ async fn window_edits_are_guarded_by_the_last_read() {
     finished(actor, daemon, &fixture).await;
 }
 
+/// Every plain and batch file read protects the unit lines it actually delivered, exactly as
+/// a symbol read does (symbol-read-edit-v1 section 3.2 rule 3). Each form owns fresh memory;
+/// reading only another line must still leave the target window unguarded and echo its old text.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn file_range_reads_guard_later_symbol_window_edits() {
+    for (form, arguments) in [
+        ("range", json!({"path":FILE,"lines":"6-10"})),
+        ("whole", json!({"path":FILE})),
+        (
+            "item-range",
+            json!({"items":[{"path":FILE,"lines":"6-10"}]}),
+        ),
+        ("item-whole", json!({"items":[{"path":FILE}]})),
+        ("ranges", json!({"path":FILE,"ranges":["6-10"]})),
+    ] {
+        let fixture = batch_edit_fixture(ORIGINAL);
+        let epoch = fixture.base.join("context-epoch");
+        std::fs::write(&epoch, "1").unwrap();
+        let home = enable_fake_rust_checks(&fixture, &fixture.base);
+        let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
+        let daemon = fixture
+            .spawn_configured_daemon_with_env(
+                Some(&home),
+                false,
+                Duration::from_secs(30),
+                None,
+                &env,
+            )
+            .await;
+        let mut actor = batch_started_actor(&fixture, "sre-file-range-guard", FILE).await;
+        let (_, read) = call(&mut actor, &fixture, "ide.read", arguments).await;
+        assert!(read.contains("let a = x;"), "{form}: {read}");
+        let external = ORIGINAL.replace("let a = x;", "let a = x * 9;");
+        std::fs::write(fixture.root.join(FILE), &external).unwrap();
+        let window = json!({"symbol":"src/batch.rs#utility:3-3","content":"    let a = x + 1;"});
+        let (_, text) = call(&mut actor, &fixture, "ide.edit", window.clone()).await;
+        assert!(
+            text.contains("lines 3-3 of src/batch.rs#utility changed since your read")
+                && text.contains("Current text:")
+                && text.contains("let a = x * 9;")
+                && text.contains("Repair:"),
+            "{form}: {text}"
+        );
+        assert_eq!(on_disk(&fixture), external, "{form}");
+        if form == "range" {
+            reset(&fixture);
+            let (_, read) = call(
+                &mut actor,
+                &fixture,
+                "ide.read",
+                json!({"path":FILE,"lines":"9"}),
+            )
+            .await;
+            assert!(
+                read.contains("a * 2") && !read.contains("let a = x;"),
+                "{read}"
+            );
+            std::fs::write(fixture.root.join(FILE), &external).unwrap();
+            let (_, text) = call(&mut actor, &fixture, "ide.edit", window).await;
+            assert!(
+                text.contains("src/batch.rs#utility:3 (L8)  replaced")
+                    && text.contains("; was:")
+                    && text.contains("let a = x * 9;")
+                    && !text.contains("changed since your read"),
+                "{text}"
+            );
+            assert!(on_disk(&fixture).contains("let a = x + 1;"));
+        }
+        finished(actor, daemon, &fixture).await;
+    }
+}
+
+/// Validation of a refused multi-file edit must not refresh read memory with an unwritten
+/// candidate. An external writer choosing those candidate bytes still differs from the last
+/// actual read, so a later window edit refuses and preserves the external write.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn refused_batch_candidates_do_not_refresh_window_read_memory() {
+    let fixture = batch_edit_fixture(ORIGINAL);
+    let epoch = fixture.base.join("context-epoch");
+    std::fs::write(&epoch, "1").unwrap();
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
+    let daemon = fixture
+        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .await;
+    let mut actor = batch_started_actor(&fixture, "sre-refused-batch-memory", FILE).await;
+    let (_, read) = call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbol":"src/batch.rs#utility"}),
+    )
+    .await;
+    assert!(read.contains("let a = x;"), "{read}");
+    let other_before = std::fs::read(fixture.root.join("src/lib.rs")).unwrap();
+    let (refused, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"files":[
+            {"path":FILE,"changes":[{"symbol":"src/batch.rs#utility:3","content":"    let a = x * 9;"}]},
+            {"path":"src/lib.rs","changes":[{"old":"absent-memory-regression-marker","new":"replacement"}]}
+        ]}),
+    )
+    .await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        text.contains("nothing written") && text.contains("src/lib.rs"),
+        "{text}"
+    );
+    assert_eq!(on_disk(&fixture), ORIGINAL);
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/lib.rs")).unwrap(),
+        other_before
+    );
+    let external = ORIGINAL.replace("let a = x;", "let a = x * 9;");
+    std::fs::write(fixture.root.join(FILE), &external).unwrap();
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#utility:3","content":"    let a = x + 1;"}),
+    )
+    .await;
+    assert!(
+        text.contains("lines 3-3 of src/batch.rs#utility changed since your read")
+            && text.contains("Current text:")
+            && text.contains("let a = x * 9;")
+            && text.contains("Repair:"),
+        "{text}"
+    );
+    assert_eq!(on_disk(&fixture), external);
+    finished(actor, daemon, &fixture).await;
+}
+
+/// A complete file read containing more than 128 units retains the first unit's guard, both
+/// immediately and after this session edits another unit. All source fits one reply so eviction
+/// cannot be justified by undelivered rows (symbol-read-edit-v1 section 3.2 rule 3).
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn full_file_reads_guard_all_units_after_own_edits() {
+    let source: String = (0..129)
+        .map(|index| format!("pub fn function_{index}() -> u32 {{\n    {index}\n}}\n"))
+        .collect();
+    let fixture = batch_edit_fixture(&source);
+    let epoch = fixture.base.join("context-epoch");
+    std::fs::write(&epoch, "1").unwrap();
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
+    let daemon = fixture
+        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .await;
+    let mut actor = batch_started_actor(&fixture, "sre-many-units-guard", FILE).await;
+    for own_edit in [false, true] {
+        std::fs::write(fixture.root.join(FILE), &source).unwrap();
+        let (reply, read) = call(&mut actor, &fixture, "ide.read", json!({"path":FILE})).await;
+        assert_eq!(reply["kind"], "read", "{reply}");
+        assert_eq!(
+            reply["truncated"], false,
+            "the whole fixture must be delivered: {reply}"
+        );
+        assert_eq!(reply["continuation"], false, "{reply}");
+        assert!(
+            read.contains("pub fn function_0()") && read.contains("pub fn function_128()"),
+            "{read}"
+        );
+        let current = if own_edit {
+            let (_, text) = call(
+                &mut actor,
+                &fixture,
+                "ide.edit",
+                json!({"symbol":"src/batch.rs#function_128:2","content":"    999"}),
+            )
+            .await;
+            assert!(
+                text.contains("#function_128:2") && text.contains("replaced"),
+                "{text}"
+            );
+            let expected = source.replace("    128\n", "    999\n");
+            assert_eq!(on_disk(&fixture), expected);
+            expected
+        } else {
+            source.clone()
+        };
+        let external = current.replacen("    0\n", "    777\n", 1);
+        std::fs::write(fixture.root.join(FILE), &external).unwrap();
+        let (_, text) = call(
+            &mut actor,
+            &fixture,
+            "ide.edit",
+            json!({"symbol":"src/batch.rs#function_0:2","content":"    888"}),
+        )
+        .await;
+        assert!(
+            text.contains("lines 2-2 of src/batch.rs#function_0 changed since your read")
+                && text.contains("Current text:")
+                && text.contains("777")
+                && text.contains("Repair:"),
+            "own_edit={own_edit}: {text}"
+        );
+        assert_eq!(on_disk(&fixture), external, "own_edit={own_edit}");
+    }
+    finished(actor, daemon, &fixture).await;
+}
+
 /// The guard covers only the lines the session read, and follows the session's own edits: a
 /// window outside a partial read is unguarded and echoes what it replaces (so lines the agent
 /// never saw are not overwritten silently), and a window copied from the session's own previous

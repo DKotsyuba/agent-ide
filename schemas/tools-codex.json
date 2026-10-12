@@ -46,7 +46,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Edit by address. Replace a symbol with its new doc and body:\n`{\"symbol\":\"src/a.rs#Type/method\",\"content\":\"…\"}`. Change inside it with `old`/`new`\nscoped to the symbol, or `content` for a window `…/method:3-5`. Also `op`\ninsert/delete/rename, `add_import`/`remove_import`, `files` for several files and `patch`\nfor apply_patch. All changes apply or none; the reply is immediate and the project check\n(cargo check, pyright or tsc) arrives by itself.",
+    "description": "Edit by address. Replace a symbol's doc and body:\n`{\"symbol\":\"src/a.rs#Type/method\",\"content\":\"…\"}`. Change inside it with `old`/`new`\nscoped to the symbol, or `content` for a window `…/method:3-5`. Also `op`\ninsert/delete/rename, `add_import`/`remove_import`, `files` for several files and `patch`\nfor apply_patch. All changes apply or none; the reply is immediate and the project check\n(cargo check, pyright or tsc) arrives by itself.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -203,7 +203,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Call chains for impact, architecture, indirect faults or cross-language connections. Use for\nsignature/public changes or shared refactors; tiny edits need ide.symbol. Start depth 2,\nexpand only as needed (1–3; 60 nodes). callers = impact; callees = execution/dependency path;\nboth = both sides. tests:true expands tests. `{\"symbol\":\"a.rs#f\",\"depth\":2}`.",
+    "description": "Call chains for impact/architecture/indirect faults: signature/public changes, shared\nrefactors, cross-language connections. Start depth 2 (1–3; 60 nodes), expand only as needed;\ntests:true expands tests. `{\"symbol\":\"a.rs#f\",\"depth\":2}`. Tiny edits: ide.symbol.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -250,7 +250,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read what Agent IDE holds for you. Results of long work (test runs, project checks,\npending answers) arrive by themselves in an `<agent-ide>` block, so never poll for them.\n`{}` hands over everything ready now; `detail_ref` or `detail_refs` read results or their\nnext pages. `{\"kind\":\"problems\"}` lists the project check problems.",
+    "description": "`{}`: facts; `detail_ref`/`detail_refs`: pages. `{\"kind\":\"problems\"}`: checks.\n`{\"kind\":\"diagnostics\",\"path\":\"a.rs\"}`: file reports with freshness, unknown never clean.\nNo build/check starts. Long results arrive by themselves; never poll.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -266,14 +266,15 @@
           "type": "array"
         },
         "kind": {
-          "description": "`problems`: the project check results instead of a file.",
+          "description": "problems: project checks; diagnostics: file provider reports.",
           "enum": [
-            "problems"
+            "problems",
+            "diagnostics"
           ],
           "type": "string"
         },
         "language": {
-          "description": "With `problems`: limit to one language.",
+          "description": "With problems: limit to one language.",
           "enum": [
             "rust",
             "python",
@@ -282,10 +283,14 @@
           "type": "string"
         },
         "offset": {
-          "description": "With `problems`: continue from this problem index (see `next_offset`).",
+          "description": "With problems: continue from this problem index.",
           "maximum": 4294967295,
           "minimum": 0,
           "type": "integer"
+        },
+        "path": {
+          "description": "With diagnostics: worktree-relative file.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -330,7 +335,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read code by address: `src/a.rs#Type/method` returns doc and body numbered from 1,\n`…/method:3-5` a window, `src/a.rs#@imports` or `#@header` a region, `path:line` (from\ngrep) the enclosing symbol. Read many at once with `items`. Use `path` and `lines` only\nfor non-code files.",
+    "description": "`{\"symbol\":\"a.rs#f\"}`: doc and body, numbered; `#f:1-3`: window; `#@imports`/`#@header`:\nregions. `{\"path\":\"a.rs\"}` reads source; `lines` bounds a range, `items` batches reads.\nPrefer symbol units for code. Semantic positions use ide.symbol.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -450,20 +455,26 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Symbol card: signature/doc/definition/usages/history and immediate neighbors (callers/callees\n1–3 all mean direct). Address or bare name; ambiguous names list matches.\n`{\"symbol\":\"a.rs#f\",\"callers\":1}`. For deeper call chains use ide.graph.",
+    "description": "Symbol card: signature/doc/definition/usages/history, immediate neighbors (positive\ncallers/callees). `{\"symbol\":\"a.rs#f\"}`; ide.graph for call chains. Or\n`{\"path\":\"a.rs\",\"byte_offset\":42}`: UTF-8 use-site definitions/references,\nexplicit lexical/unavailable evidence.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "byte_offset": {
+          "description": "Zero-based UTF-8 position; split/out-of-file offsets refuse. Pages use ide.inspect.",
+          "maximum": 1048576,
+          "minimum": 0,
+          "type": "integer"
+        },
         "callees": {
           "default": 0,
-          "description": "0 omits callees; 1–3 all return immediate neighbors. Use ide.graph for deeper call chains.",
+          "description": "0–3: 0 omits; positive values return immediate callees. Deeper chains: ide.graph.",
           "maximum": 3,
           "minimum": 0,
           "type": "integer"
         },
         "callers": {
           "default": 1,
-          "description": "0 omits callers; 1–3 all return immediate neighbors. Use ide.graph for deeper call chains.",
+          "description": "0–3: 0 omits; positive values return immediate callers. Deeper chains: ide.graph.",
           "maximum": 3,
           "minimum": 0,
           "type": "integer"
@@ -472,6 +483,10 @@
           "default": false,
           "description": "Include the last commits touching the definition (opt-in).",
           "type": "boolean"
+        },
+        "path": {
+          "description": "With byte_offset: semantic use-site; not symbol/symbols.",
+          "type": "string"
         },
         "symbol": {
           "description": "Address `src/a.rs#Type/method`, or a bare name to search the project.",

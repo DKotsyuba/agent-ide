@@ -1,7 +1,7 @@
 {
   "name": "agent-ide",
   "version": "0.10.8",
-  "description": "Agent IDE coding-companion skill: find a symbol address, read the symbol, replace it or edit lines inside it, with the ide.start/diff/inspect/stop/edit/outline/read/symbol/test tools.",
+  "description": "Agent IDE coding-companion skill: find a symbol address, read the symbol, replace it or edit lines inside it, with the ide.start/diff/inspect/stop/edit/outline/read/symbol/graph/test tools.",
   "author": {
     "name": "DKotsyuba"
   },
@@ -11,7 +11,7 @@
   "interface": {
     "displayName": "Agent IDE",
     "shortDescription": "Bounded ide.* workflow for active-session source edits",
-    "longDescription": "Ten ide.* tools (start, diff, inspect, stop, edit, outline, read, symbol, graph, test): symbol cards/positional lookup, graph call chains, inspect file diagnostics/check problems. Public ide.context is removed. Native fallback remains available.",
+    "longDescription": "Ten ide.* tools (start, diff, inspect, stop, edit, outline, read, symbol, graph, test): symbol cards/positional lookup, graph call chains, inspect file diagnostics/check problems. Native fallback remains available.",
     "developerName": "DKotsyuba",
     "category": "Development",
     "capabilities": ["Interactive"],

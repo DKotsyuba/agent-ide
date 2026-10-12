@@ -43,7 +43,7 @@ test nodes.
 
 ## Former context capabilities
 
-Public `ide.context` is removed. Read source with `ide.read {"path":"a.rs"}`; skeletons
+Read source with `ide.read {"path":"a.rs"}`; skeletons
 with `ide.outline`. For a use-site or shadowed name:
 `ide.symbol {"path":"a.rs","byte_offset":42}`. Offsets are zero-based UTF-8 semantic
 positions, never page cursors; split/out-of-file positions refuse. Cards give

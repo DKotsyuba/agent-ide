@@ -48,8 +48,10 @@ fn pre_hook() -> agent_ide::assistance::host_binding::HookEvent {
     .unwrap()
 }
 
+/// The private backend schema keeps stable eleven-slot indexes, including its internal Context
+/// operation; public ten-tool discovery is proved by the shipping MCP catalog tests.
 #[test]
-fn discovery_is_static_and_contains_exactly_eleven_current_methods() {
+fn backend_schemas_keep_the_eleven_stable_operation_slots() {
     agent_ide::languages::install();
     let schemas = tool_schemas();
     assert_eq!(schemas.len(), 11);

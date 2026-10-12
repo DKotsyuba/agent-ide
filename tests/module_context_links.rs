@@ -1,8 +1,9 @@
-//! The `related_links:` block of `ide.context`: the cross-language names of the file (or of the
+//! The related-links block of Read and positional Symbol: cross-language names of the file or
 //! requested position) with the same rows, uncertainty labels and notes as a symbol card, the
 //! same answer whether HTML and CSS compute in their modules or in process, and no block at all
 //! for a file without name facts.
 
+use parity::source_query_tool;
 #[path = "support/parity.rs"]
 mod parity;
 
@@ -46,7 +47,7 @@ fn page() -> String {
     )
 }
 
-/// `ide.context` of `arguments` on a fresh daemon with the mode `env` value.
+/// Source or positional queries on a fresh daemon with the selected module mode.
 async fn context(mode: &str, requests: &[Value]) -> Vec<String> {
     let fixture = fixture();
     let env: Vec<(&str, &str)> = if mode.is_empty() {
@@ -58,8 +59,19 @@ async fn context(mode: &str, requests: &[Value]) -> Vec<String> {
     let mut session = Session::start(&fixture).await;
     let mut replies = Vec::new();
     for request in requests {
-        let reply = session.call(&fixture, "ide.context", request.clone()).await;
-        replies.push(line_for(&fixture, "ide.context", request, &reply));
+        let reply = session
+            .call(
+                &fixture,
+                source_query_tool(&request.clone()),
+                request.clone(),
+            )
+            .await;
+        replies.push(line_for(
+            &fixture,
+            source_query_tool(request),
+            request,
+            &reply,
+        ));
     }
     session.close(&fixture).await;
     replies
@@ -165,8 +177,8 @@ async fn the_related_links_block_is_identical_in_every_mixed_setting() {
 }
 
 /// Every usage row stays in the block, past the card's ceiling of 30: the rows that do not fit the
-/// first reply page follow on the reply's own `detail_ref` pages, and the source stays the last
-/// part, byte for byte, with the `source_ref` of the exact core-read bytes.
+/// first reply page follow on the reply's own `detail_ref` pages. Read keeps its exact numbered
+/// source before the links, and the fully delivered reference still authorizes the same bytes.
 #[tokio::test]
 async fn long_usage_lists_continue_on_the_replys_own_pages() {
     const FILES: usize = 1200;
@@ -190,7 +202,11 @@ async fn long_usage_lists_continue_on_the_replys_own_pages() {
     let started = std::time::Instant::now();
     let first = loop {
         let reply = session
-            .call(&fixture, "ide.context", json!({"path":"wide.css"}))
+            .call(
+                &fixture,
+                source_query_tool(&json!({"path":"wide.css"})),
+                json!({"path":"wide.css"}),
+            )
             .await;
         let text = reply["text"].as_str().unwrap_or_default();
         if !text.contains("unavailable for:")
@@ -227,10 +243,12 @@ async fn long_usage_lists_continue_on_the_replys_own_pages() {
         FILES,
         "every row once"
     );
-    // The source follows the block untouched.
-    assert!(text.trim_end().ends_with(source.trim_end()), "{text}");
-    // The context's `source_ref` still binds the exact bytes the core read: an edit through it
-    // applies, whatever the block above them held.
+    // Read preserves its numbered source before the links, without losing any source byte.
+    let numbered = format!("wide.css  (lines 1)\n1\t{source}");
+    let source_at = text.find(&numbered).expect("complete numbered source");
+    let links_at = text.find("related_links:").expect("retained link rows");
+    assert!(source_at < links_at, "{text}");
+    // The actual delivered read reference still binds the file after all link pages are fetched.
     let reference = first["detail_ref"].as_str().unwrap();
     let edited = ".wide { margin: 1px; }\n";
     let edit = session
@@ -260,7 +278,13 @@ async fn a_downed_html_module_is_disclosed_and_the_block_recovers() {
     let usage = "index.html:";
     let started = std::time::Instant::now();
     let warm = loop {
-        let reply = session.call(&fixture, "ide.context", request.clone()).await;
+        let reply = session
+            .call(
+                &fixture,
+                source_query_tool(&request.clone()),
+                request.clone(),
+            )
+            .await;
         let text = reply["text"].as_str().unwrap_or_default().to_owned();
         if text.contains(usage) || started.elapsed() > std::time::Duration::from_secs(40) {
             break text;
@@ -282,9 +306,15 @@ async fn a_downed_html_module_is_disclosed_and_the_block_recovers() {
     .unwrap();
     let started = std::time::Instant::now();
     loop {
-        let reply = session.call(&fixture, "ide.context", request.clone()).await;
+        let reply = session
+            .call(
+                &fixture,
+                source_query_tool(&request.clone()),
+                request.clone(),
+            )
+            .await;
         let text = reply["text"].as_str().unwrap_or_default().to_owned();
-        assert_eq!(reply["kind"], "context", "{reply}");
+        assert_eq!(reply["kind"], "read", "{reply}");
         assert!(text.contains("defines: class name btn"), "{text}");
         if text.contains("unavailable for:") {
             assert!(text.contains("unavailable for: html"), "{text}");
@@ -325,7 +355,11 @@ async fn a_snippet_that_looks_like_the_cut_marker_stays_intact() {
     let started = std::time::Instant::now();
     let text = loop {
         let reply = session
-            .call(&fixture, "ide.context", json!({"path":"wide.css"}))
+            .call(
+                &fixture,
+                source_query_tool(&json!({"path":"wide.css"})),
+                json!({"path":"wide.css"}),
+            )
             .await;
         let text = reply["text"].as_str().unwrap_or_default().to_owned();
         if !text.contains("unavailable for:")

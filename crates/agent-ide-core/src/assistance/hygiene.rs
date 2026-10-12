@@ -515,6 +515,7 @@ fn reply_surfaces_never_invite_polling() {
 
 /// No model-facing text teaches an old form: every source of [`symbol_first_sources`] is free of
 /// [`STALE_FORMS`] (the audit of M-030 T-012; `docs/model-text-inventory.md` lists the sources).
+/// Both shipped skills must also fit their host's 6/4 KiB fixed-context budget.
 #[test]
 fn model_text_teaches_only_the_symbol_workflow() {
     let mut found = Vec::new();
@@ -522,6 +523,13 @@ fn model_text_teaches_only_the_symbol_workflow() {
         for form in stale_forms(&name, &text) {
             found.push(format!("{name}: teaches `{form}`"));
         }
+    }
+    for (skill, maximum) in [
+        ("skills/agent-ide/SKILL.md", 6 * 1024),
+        ("skills/codex/agent-ide/SKILL.md", 4 * 1024),
+    ] {
+        let bytes = file_surface(skill, Tier::Teaching).text.len();
+        assert!(bytes <= maximum, "{skill}: {bytes} bytes exceeds {maximum}");
     }
     assert!(found.is_empty(), "{found:#?}");
 }

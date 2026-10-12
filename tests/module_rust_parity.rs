@@ -7,6 +7,8 @@
 //! `AGENT_IDE_RUST_TOOLCHAIN`) and a binary built with `--features test-seams`.
 #![cfg(feature = "test-seams")]
 
+use parity::{source_query, source_query_tool};
+
 #[path = "support/parity.rs"]
 mod parity;
 
@@ -130,10 +132,7 @@ fn semantic() -> Vec<(&'static str, Value)> {
             "ide.graph",
             json!({"symbol":"src/lib.rs#user","direction":"both","depth":2}),
         ),
-        (
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":HELPER_CALL_OFFSET}),
-        ),
+        source_query(json!({"path":"src/lib.rs","byte_offset":HELPER_CALL_OFFSET})),
         edit(
             json!({"operation_id":"p-container","op":"insert","symbol":"src/lib.rs#tests",
             "where":"last","content":"#[test]\nfn added_test() {\n    assert!(user());\n}"}),
@@ -235,14 +234,14 @@ async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) ->
     }
 }
 
-/// Polls `ide.context` on `src/lib.rs` until rust-analyzer answers semantically (60 s).
+/// Polls the positional Symbol query until rust-analyzer answers semantically (60 s).
 async fn ready(session: &mut Session, fixture: &Fixture) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let reply = session
             .call(
                 fixture,
-                "ide.context",
+                source_query_tool(&json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET})),
                 json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET}),
             )
             .await;
@@ -279,7 +278,7 @@ async fn problems(
         let reply = session
             .call(
                 fixture,
-                "ide.context",
+                source_query_tool(&json!({"kind":"problems","language":"rust"})),
                 json!({"kind":"problems","language":"rust"}),
             )
             .await;
@@ -602,7 +601,7 @@ async fn a_stalled_cargo_check_times_out_and_leaves_no_orphan() {
     let checking = session
         .call(
             &fixture,
-            "ide.context",
+            source_query_tool(&json!({"kind":"problems","language":"rust"})),
             json!({"kind":"problems","language":"rust"}),
         )
         .await;
@@ -931,7 +930,7 @@ async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
     // Deaths are noticed through the backend's own path (context) and through the core's
     // semantic paths (symbol, graph); each counts once against the same budget.
     let demands = [
-        ("ide.context", context.clone()),
+        source_query(context.clone()),
         ("ide.symbol", json!({"symbol":"src/lib.rs#Service/work"})),
         ("ide.graph", json!({"symbol":"src/lib.rs#user"})),
         ("ide.symbol", json!({"symbol":"src/lib.rs#user"})),

@@ -351,8 +351,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"With byte_offset: semantic use-site; not symbol/symbols."},
                     "byte_offset": {"type":"integer", "minimum":0, "maximum":MAX_BYTE_OFFSET, "description":"Zero-based UTF-8 position; split/out-of-file offsets refuse. Pages use ide.inspect."},
                     "usages": {"type": "boolean", "default": true, "description": "Include usages (src/tests split, with source lines)."},
-                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "0 omits callers; 1–3 all return immediate neighbors. Use ide.graph for deeper call chains."},
-                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "0 omits callees; 1–3 all return immediate neighbors. Use ide.graph for deeper call chains."},
+                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "0–3: 0 omits; positive values return immediate callers. Deeper chains: ide.graph."},
+                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "0–3: 0 omits; positive values return immediate callees. Deeper chains: ide.graph."},
                     "history": {"type": "boolean", "default": false, "description": "Include the last commits touching the definition (opt-in)."}
                 }
             }),
@@ -5026,7 +5026,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Stop, parameters, context).await
     }
 
-    /// Edit by address. Replace a symbol with its new doc and body:
+    /// Edit by address. Replace a symbol's doc and body:
     /// `{"symbol":"src/a.rs#Type/method","content":"…"}`. Change inside it with `old`/`new`
     /// scoped to the symbol, or `content` for a window `…/method:3-5`. Also `op`
     /// insert/delete/rename, `add_import`/`remove_import`, `files` for several files and `patch`
@@ -5317,7 +5317,7 @@ fn per_host_catalogs_differ_only_by_the_declared_subset() {
         json!({"kind":"unknown","path":"a.rs"}),
         json!({"kind":"diagnostics"}),
         json!({"kind":"problems","path":"a.rs"}),
-        json!({"kind":"diagnostics","path":"a.rs","language":"rust"}),
+        json!({"kind":"diagnostics","path":"a.rs","language":"alpha"}),
         json!({"kind":"diagnostics","path":"a.rs","detail_ref":"x"}),
     ] {
         assert!(validate_call(AssistanceTool::Inspect, arguments).is_err());
@@ -5354,12 +5354,12 @@ fn per_host_catalogs_differ_only_by_the_declared_subset() {
                 .contains("{\"symbol\":\"a.rs#f\",\"depth\":2}")
         );
         for property in ["callers", "callees"] {
-            assert!(
-                symbol.input_schema["properties"][property]["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains("all return immediate neighbors")
-            );
+            let description = symbol.input_schema["properties"][property]["description"]
+                .as_str()
+                .unwrap();
+            assert!(description.contains("0–3"));
+            assert!(description.contains(&format!("immediate {property}")));
+            assert!(description.contains("Deeper chains: ide.graph"));
         }
         assert!(host.instructions().contains("immediate neighbors"));
         assert!(host.instructions().contains("traverses call chains"));
@@ -5606,7 +5606,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
         (
             validate_call(AssistanceTool::Context, json!({})).unwrap_err(),
             AssistanceTool::Context,
-            "ide.context needs either \"path\" or \"kind\":\"problems\"."
+            "ide.inspect diagnostics needs \"path\"."
                 .to_string(),
         ),
         (

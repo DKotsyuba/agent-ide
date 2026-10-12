@@ -779,6 +779,7 @@ pub async fn submit_hook_if_running(
 /// Connect and request write share the hook transport deadline; after the write, reply waiting gets
 /// the longer method budget. A short no-reply interval checks daemon health before keeping the
 /// request open, so a paused daemon fails fast while a live worker retains the full method budget.
+/// The original reply remains readable during that probe and takes priority over a health timeout.
 pub async fn dispatch_method_if_running(
     runtime_dir: &Path,
     request: MethodDispatch,
@@ -851,7 +852,15 @@ pub async fn dispatch_method_if_running(
         Ok(Ok(reply)) => reply,
         Ok(Err(_)) => MethodDispatchTransportResult::OutcomeUnknown,
         Err(_) => {
-            let responsive = tokio::time::timeout(limits.deadline, doctor(runtime_dir)).await;
+            let responsive = tokio::select! {
+                biased;
+                reply = tokio::time::timeout_at(reply_deadline, &mut result) => return match reply {
+                    Ok(Ok(reply)) => reply,
+                    Ok(Err(_)) => MethodDispatchTransportResult::OutcomeUnknown,
+                    Err(_) => MethodDispatchTransportResult::WrittenTimedOut,
+                },
+                responsive = tokio::time::timeout(limits.deadline, doctor(runtime_dir)) => responsive,
+            };
             if !matches!(responsive, Ok(Ok(DoctorStatus::Healthy { .. }))) {
                 return MethodDispatchTransportResult::WrittenTimedOut;
             }
@@ -2341,6 +2350,67 @@ mod tests {
         assert_eq!(
             method_dispatch_budget("inspect", &json!({})),
             METHOD_DISPATCH_BUDGET
+        );
+    }
+
+    /// A confirmed method reply arriving during the health probe wins even when that separate
+    /// probe stays silent. The fake peer waits for the actual health request before answering the
+    /// original dispatch, so no sleep or scheduler timing decides which phase this exercises.
+    #[tokio::test]
+    async fn method_reply_during_silent_health_probe_is_not_lost() {
+        let scratch = ScratchRuntime(std::env::temp_dir().join(format!(
+            "agent-ide-method-health-race-{}",
+            std::process::id()
+        )));
+        let runtime = RuntimeDir::prepare_for_daemon(&scratch.0).unwrap();
+        let listener = UnixListener::bind(runtime.socket_path()).unwrap();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let peer = async {
+            let (mut method, _) = listener.accept().await.unwrap();
+            let request: Value = read_frame(&mut method, MAX_V2_FRAME_BYTES).await.unwrap();
+            let (mut health, _) = listener.accept().await.unwrap();
+            let health_request: Value = read_frame(&mut health, MAX_V1_FRAME_BYTES).await.unwrap();
+            assert_eq!(health_request["method"], "health");
+            write_frame(
+                &mut method,
+                &json!({
+                    "version": request["version"],
+                    "request_id": request["request_id"],
+                    "opaque_result_json": {"confirmed": true}
+                }),
+                MAX_V2_FRAME_BYTES,
+            )
+            .await
+            .unwrap();
+            // Keep both connections open until the caller decides: health never answers.
+            held.await.unwrap();
+        };
+        let caller = async {
+            let request = MethodDispatch::new(
+                "health-race",
+                "health-race",
+                "attachment",
+                AssistanceMethod::Start,
+                OpaqueJson::new("{}", 64).unwrap(),
+            )
+            .unwrap();
+            let limits = HookTransportLimits::new(
+                MAX_V2_FRAME_BYTES,
+                MAX_ASSISTANCE_JSON_BYTES,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+            let outcome = dispatch_method_if_running(&scratch.0, request, limits).await;
+            release.send(()).unwrap();
+            outcome
+        };
+        let (_, outcome) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(peer, caller) })
+                .await
+                .expect("the finite transport and fake peer must settle");
+        assert!(
+            matches!(outcome, MethodDispatchTransportResult::Dispatched { .. }),
+            "a confirmed original reply must not become unknown: {outcome:?}"
         );
     }
 

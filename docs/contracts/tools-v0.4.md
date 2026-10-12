@@ -4,8 +4,8 @@
 
 The symbol-address/read-edit r2 and harness-reply r5 contracts govern model-facing behavior throughout this guide. Find an address, read its unit, edit that unit, and review the diff. Project checks and long results arrive by themselves; never poll. Refusals carry one bounded head and one Repair line; internal reason tags belong to operator diagnostics. Both hosts use ide.inspect {"kind":"problems"} for project problems. Native tools remain available when the IDE cannot answer.
 
-Both hosts advertise the same ten names including `ide.graph`. Public `ide.context`
-is removed (including `tools/call`), an owner-authorized breaking MCP change.
+Both hosts advertise the same ten names including `ide.graph`. The former combined
+context tool is removed, an owner-authorized breaking MCP change.
 `ide.symbol {"symbol":"src/a.rs#f","callers":1}` is a card with
 signature/doc/definition/usages/history and immediate neighbors. Use
 `ide.graph {"symbol":"src/a.rs#f","direction":"callers","depth":2}` for call chains:
@@ -37,6 +37,10 @@ without dropping the retained rows; provider truncation remains explicit. The pr
 Context engine/transport remains reusable, but is not a public compatibility route.
 
 ## Operator compatibility reference
+
+The removed public `ide.context` call, including direct `tools/call`, has no compatibility
+alias. Source reads migrate to `ide.read`, exact semantic positions to `ide.symbol`,
+and file/project diagnostics to `ide.inspect` as described in the active workflow.
 
 The implementation/reference sections below document retained compatibility APIs and historical wire forms; they do not override the current model workflow above.
 

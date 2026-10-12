@@ -4,7 +4,13 @@ Revision: batch-api-v1 r1 (proposed); tracked boundary id `batch-api-v1`, revisi
 
 Purpose: an agent names every file, symbol or range it needs in ONE call and gets everything back, and applies one logical change across several files in ONE `ide.edit` with ONE project check.
 
-Forms and caps at a glance (the canonical example of each is under its section):
+Current E-003 rules are defined by [symbol read/edit](symbol-read-edit-v1.md) and
+[harness replies](harness-reply-v1.md): edit operation ids are optional; reads and
+edits print no file-version reference; current text and delivered-row memory guard
+edits; checks arrive separately. The historical detailed examples below retain
+deprecated supplied-reference compatibility, not required fields or model workflow.
+
+Forms and caps at a glance:
 
 | Tool | Batch key | Entry forms | Caps | Other fields |
 |---|---|---|---|---|
@@ -13,7 +19,7 @@ Forms and caps at a glance (the canonical example of each is under its section):
 | `ide.symbol` | `symbols` | symbol strings | 1–8 | `usages`, `callers`, `callees`, `history` |
 | `ide.graph` | `symbols` | symbol strings | 1–8 roots | `direction`, `depth`, `tests` |
 | `ide.test` | `targets` | `{symbol}`, `{path}`, `{pattern}` | 1–8 | `budget_s` |
-| `ide.edit` | `files` | `{path, changes}`, `{path, create: true, content}`, `{path, content}`, each with an optional `source_ref` | 1–16 files, ≤32 changes per file, ≤128 changes, ≤128 KiB of `content` + `new` | `operation_id` (required), `source_ref` |
+| `ide.edit` | `files` | `{path, changes}`, `{path, create: true, content}`, `{path, content}` | 1–16 files, ≤32 changes per file, ≤128 changes, ≤128 KiB of `content` + `new` | optional `operation_id` |
 
 ## 1. Common rules
 

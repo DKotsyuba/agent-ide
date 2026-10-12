@@ -9,6 +9,7 @@
 //! are the real-provider test's, which needs the accepted `AGENT_IDE_NODE`,
 //! `AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER` and `AGENT_IDE_TSSERVER`.
 
+use parity::{source_query, source_query_tool};
 #[path = "support/parity.rs"]
 mod parity;
 
@@ -162,14 +163,14 @@ fn calls(fixture: &Fixture) -> Vec<(&'static str, Value)> {
         .map(|path| ("ide.outline", json!({"path": path})))
         .collect();
     for path in FILES {
-        calls.push(("ide.context", json!({"path": path})));
+        calls.push(source_query(json!({"path": path})));
     }
     // A position inside the first declaration: the bridge's semantic context where the
     // extension has one.
     for (path, marker) in FILES.iter().zip(MARKERS) {
         let text = std::fs::read_to_string(fixture.root.join(path)).unwrap();
         let at = text.find(marker).expect("the marker") + 2;
-        calls.push(("ide.context", json!({"path": path, "byte_offset": at})));
+        calls.push(source_query(json!({"path": path, "byte_offset": at})));
     }
     calls.extend([
         ("ide.read", json!({"symbol":"src/a.ts#greet_ts"})),
@@ -286,7 +287,7 @@ async fn typescript_module_matches_in_process_answers_with_the_bridge() {
         .unwrap();
     }
     for path in ["src/a.ts", "src/panel.tsx", "src/c.js", "src/card.jsx"] {
-        let context = "ide.context {\"byte_offset\":";
+        let context = "ide.symbol {\"byte_offset\":";
         let reply = moduled.iter().find(|reply| {
             reply.starts_with(context) && reply.lines().next().is_some_and(|l| l.contains(path))
         });
@@ -296,7 +297,7 @@ async fn typescript_module_matches_in_process_answers_with_the_bridge() {
         );
     }
     for path in ["src/e.mts", "src/f.cts", "src/g.mjs", "src/h.cjs"] {
-        let context = "ide.context {\"byte_offset\":";
+        let context = "ide.symbol {\"byte_offset\":";
         let reply = moduled.iter().find(|reply| {
             reply.starts_with(context) && reply.lines().next().is_some_and(|l| l.contains(path))
         });
@@ -535,14 +536,8 @@ async fn node_transcript(env: &[(&str, &str)]) -> (Vec<String>, String) {
             json!({"symbol":"src/index.js#hello","callees":1}),
         ),
         ("ide.symbol", json!({"symbol":"src/index.js#PORT"})),
-        (
-            "ide.context",
-            json!({"path":"src/index.js","byte_offset":hello}),
-        ),
-        (
-            "ide.context",
-            json!({"path":"src/index.js","byte_offset":shout}),
-        ),
+        source_query(json!({"path":"src/index.js","byte_offset":hello})),
+        source_query(json!({"path":"src/index.js","byte_offset":shout})),
     ];
     for (tool, arguments) in reads {
         let reply = session.call(&fixture, tool, arguments.clone()).await;
@@ -581,7 +576,7 @@ async fn node_transcript(env: &[(&str, &str)]) -> (Vec<String>, String) {
         let page = session
             .call(
                 &fixture,
-                "ide.context",
+                source_query_tool(&json!({"kind":"problems","language":"typescript"})),
                 json!({"kind":"problems","language":"typescript"}),
             )
             .await;
@@ -662,7 +657,7 @@ async fn resolution_transcript(
     let mut replies = Vec::new();
     for (tool, arguments) in [
         ("ide.outline", json!({"path": path})),
-        ("ide.context", json!({"path": path, "byte_offset": at})),
+        source_query(json!({"path": path, "byte_offset": at})),
     ] {
         let reply = session.call(&fixture, tool, arguments.clone()).await;
         replies.push(line_for(&fixture, tool, &arguments, &reply));
@@ -800,7 +795,13 @@ async fn a_killed_typescript_module_is_replaced_and_leaves_nothing() {
     let text = std::fs::read_to_string(fixture.root.join("src/a.ts")).unwrap();
     let at = text.find("greet_ts").unwrap() + 2;
     let request = json!({"path":"src/a.ts","byte_offset":at});
-    let warm = session.call(&fixture, "ide.context", request.clone()).await;
+    let warm = session
+        .call(
+            &fixture,
+            source_query_tool(&request.clone()),
+            request.clone(),
+        )
+        .await;
     assert!(
         warm["text"]
             .as_str()
@@ -815,7 +816,13 @@ async fn a_killed_typescript_module_is_replaced_and_leaves_nothing() {
     let started = std::time::Instant::now();
     let mut after;
     loop {
-        after = session.call(&fixture, "ide.context", request.clone()).await;
+        after = session
+            .call(
+                &fixture,
+                source_query_tool(&request.clone()),
+                request.clone(),
+            )
+            .await;
         if after["text"]
             .as_str()
             .unwrap_or_default()
@@ -917,7 +924,13 @@ mod faults {
             let restarted = std::time::Instant::now();
             let mut recovered;
             loop {
-                recovered = session.call(&fixture, "ide.context", request.clone()).await;
+                recovered = session
+                    .call(
+                        &fixture,
+                        source_query_tool(&request.clone()),
+                        request.clone(),
+                    )
+                    .await;
                 if recovered["text"]
                     .as_str()
                     .unwrap_or_default()
@@ -1035,7 +1048,7 @@ mod faults {
             let reply = session
                 .call(
                     fixture,
-                    "ide.context",
+                    source_query_tool(&json!({"kind":"problems","language":"typescript"})),
                     json!({"kind":"problems","language":"typescript"}),
                 )
                 .await;

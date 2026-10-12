@@ -2,7 +2,7 @@
 
 An explicitly activated coding companion for Codex and Claude Code on macOS arm64. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback. Linux remains explicitly `not_tested` and no Linux release artifact is published.
 
-Status (0.8.1): eleven MCP tools — `ide.start`, `ide.context`, `ide.outline`, `ide.read`,
+Current development surface: ten MCP tools — `ide.start`, `ide.outline`, `ide.read`,
 `ide.symbol`, `ide.graph`, `ide.edit`, `ide.test`, `ide.diff`, `ide.inspect`, `ide.stop` — over
 Rust, Python and TypeScript/JavaScript language servers, a language-free core with one crate per
 language, a cross-language name bridge (CSS selectors ↔ HTML/TSX class names), and plain
@@ -97,7 +97,7 @@ configuration, toolchains, install layout, plugin link, host hooks, daemons, rec
 and exits 2 when it reports errors. `agent-ide doctor --runtime-dir PATH` keeps querying a
 running repository daemon.
 
-The accepted language-server versions for 0.8.1 are rust-analyzer 1.98.1 (from the pinned
+The pinned language-server versions are rust-analyzer 1.98.1 (from the pinned
 Rust toolchain), pyright 1.1.413, typescript-language-server 6.0.0, TypeScript 5.9.3, and
 Node 24.4.0; the release workflow installs exactly these, and [docs/release.md](docs/release.md)
 lists them for the publication gate.
@@ -134,7 +134,7 @@ args = ["mcp", "--launcher-template", "/absolute/path/to/launcher.json"]
 The launcher file uses the existing schema and must contain exactly one target. Managed MCP captures
 the host-selected current directory, replaces only that target's candidate and a fresh internal
 attachment, validates the result, and owns its private daemon until stdio closes. Startup failure
-still exposes the same eleven tools with disconnected native-fallback results. A repository plugin
+still exposes the same ten tools with disconnected native-fallback results. A repository plugin
 manifest cannot safely supply the machine-specific template path, so it remains normal host config.
 Legacy `agent-ide mcp --runtime-dir PATH` remains connect-only and compatible with separately
 started `agent-ide daemon --runtime-dir PATH` instances.
@@ -182,7 +182,7 @@ Placeholder-only host examples are shipped for
 The v0.3 project problem feed adds confined background checks for Rust (`cargo check --offline
 --locked`) and Python (pyright) on macOS, a compact `<agent-ide>` error/warning block on Claude
 `PostToolUse` hooks (on managed Codex it rides native hooks and terminal replies at once,
-T29B), and `ide.context` with `{"kind":"problems"}`. Enable it only through the
+T29B), and `ide.inspect` with `{"kind":"problems"}`. Enable it only through the
 trusted launcher configuration (`AGENT_IDE_LAUNCHER_CONFIG`): declare normalized absolute
 `allowed_roots` plus a `project_checks` section naming the Rust toolchain and the Node/Pyright
 pair, as in the shipped fragment
@@ -221,8 +221,8 @@ or captured. The IDE also supports directories without Git; Git-only diff and hi
 no Git data is available.
 The offline installation helpers are `agent-ide evidence executable` and `agent-ide launcher check`.
 The bundled
-`skills/agent-ide` workflow directs coding agents through start, context, the
-supported `ide.edit` path when offered, refreshed context, diff, and stop.
+`skills/agent-ide` workflow directs coding agents through start, outline or a symbol card,
+reads and edits by address, graph call chains when needed, diff, and stop.
 Native host editing remains available when `ide.edit` is inactive, unavailable,
 unsupported, declined, or uncertain.
 

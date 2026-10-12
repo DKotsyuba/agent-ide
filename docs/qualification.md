@@ -6,7 +6,17 @@ This file lists the evidence behind the current record and the deliberate
 exceptions to the family standard. A passing unit test alone is never
 qualification evidence.
 
-## Current record
+## Current development candidate
+
+E-003 changes the public catalog to ten tools per host and one text block without
+`structuredContent`; the optional typed test oracle is limited to test-seams builds.
+Symbol-addressed reads/edits, positional lookup, file diagnostic inspection and
+the restored Codex graph have focused product/provider checks. The complete gate,
+final artifact verification and experiment acceptance remain separate obligations.
+The release evidence and exceptions below are scoped to their recorded revisions;
+they do not qualify the uncommitted integration candidate or Bridge migration.
+
+## Inherited release record
 
 - Target: `aarch64-apple-darwin` (macOS 27.0, arm64). Linux is explicitly
   `not_tested` and has no release artifact.

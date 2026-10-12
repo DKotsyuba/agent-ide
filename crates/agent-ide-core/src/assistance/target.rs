@@ -154,10 +154,10 @@ pub(super) fn numbered_rows(text: &str, first: u32, last: u32, limit: usize) -> 
     out
 }
 
-/// The last unit line a paged reply to a unit read actually delivered: `read.last` when the
+/// The last numbered line a paged read actually delivered: `last` when the
 /// reply is complete, else the number of the last numbered row in its text (`0` when the first
-/// page held no row).
-pub(super) fn delivered_last(reply: &PeerReply, read: &UnitRead) -> u32 {
+/// page held no row). `last` is the requested, clamped final line in the reply's numbering.
+pub(super) fn delivered_last(reply: &PeerReply, last: u32) -> u32 {
     match reply {
         PeerReply::Complete {
             text,
@@ -176,7 +176,7 @@ pub(super) fn delivered_last(reply: &PeerReply, read: &UnitRead) -> u32 {
                 last_row.saturating_sub(1)
             }
         }
-        _ => read.last,
+        _ => last,
     }
 }
 
@@ -283,7 +283,7 @@ impl Worker<'_> {
         let authority = self.finish_symbol_job(job, binding, &observed).await?;
         let reply = self.unit_reply(job, body, authority, observed)?;
         // Only the lines the reply's first page actually delivered are remembered as read.
-        let delivered = delivered_last(&reply.0, &read);
+        let delivered = delivered_last(&reply.0, read.last);
         self.remember_unit_read(binding, read, delivered);
         Ok(Some(reply))
     }
@@ -333,6 +333,40 @@ impl Worker<'_> {
             && let Some(memory) = ledger.read_memory.get_mut(binding)
         {
             memory.refresh_file_units(epoch, path, &current);
+            memory.refresh_file_reads(epoch, path, map, text);
+        }
+    }
+
+    /// Refreshes read guards from an already verified post-write observation and its bytes.
+    /// The caller must first match the exact Workspace write receipt and native epoch.
+    /// Candidate validation/refusals never call this. Unknown context or an unavailable source
+    /// outline preserves the old guard; only fully read units take the successful write's text.
+    pub(super) async fn refresh_written_unit_memory(
+        &mut self,
+        job: &Job,
+        observed: &SourceObservation,
+        bytes: &[u8],
+    ) {
+        let binding = job.invocation.binding_ref();
+        if self.context_epoch(binding).is_none() {
+            return;
+        }
+        let Some(language) = crate::lang::Language::for_path(observed.path()) else {
+            return;
+        };
+        let Ok(source) = observed_text(observed, bytes) else {
+            return;
+        };
+        if let Ok(Some(outline)) = crate::modules::calls::outline_from_source(
+            language,
+            observed.worktree().worktree_path(),
+            observed.path(),
+            source,
+        )
+        .await
+        {
+            let map = AddressMap::build(&outline, source);
+            self.refresh_unit_memory(binding, &observed.path().to_string_lossy(), &map, source);
         }
     }
 
@@ -346,12 +380,10 @@ impl Worker<'_> {
     ) -> Option<crate::assistance::batch::RememberedUnit> {
         let epoch = self.context_epoch(binding);
         let ledger = self.shared.ledger.lock().ok()?;
-        let found = ledger.read_memory.get(binding)?.unit_text(epoch, address)?;
-        Some(crate::assistance::batch::RememberedUnit {
-            text: found.text.clone(),
-            first: found.first,
-            last: found.last,
-        })
+        ledger
+            .read_memory
+            .get(binding)?
+            .latest_unit_text(epoch, address)
     }
 
     /// Wraps a rendered unit read as the paged `read` reply of the job.
@@ -440,10 +472,13 @@ mod tests {
             truncated,
             continuation: truncated,
         };
-        assert_eq!(delivered_last(&page("h\n1\ta\n2\tb\n", false), &read), 10);
-        assert_eq!(delivered_last(&page("h\n1\ta\n2\tb\n", true), &read), 2);
-        assert_eq!(delivered_last(&page("h\n1\ta\n2\tb", true), &read), 1);
-        assert_eq!(delivered_last(&page("h\n", true), &read), 0);
+        assert_eq!(
+            delivered_last(&page("h\n1\ta\n2\tb\n", false), read.last),
+            10
+        );
+        assert_eq!(delivered_last(&page("h\n1\ta\n2\tb\n", true), read.last), 2);
+        assert_eq!(delivered_last(&page("h\n1\ta\n2\tb", true), read.last), 1);
+        assert_eq!(delivered_last(&page("h\n", true), read.last), 0);
     }
 
     /// A unit reads whole with its extent, numbered from 1 inside the unit.

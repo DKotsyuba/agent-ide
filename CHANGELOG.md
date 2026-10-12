@@ -9,6 +9,11 @@
 
 ### Changed
 
+- Both hosts advertise the same ten tools: `ide.graph` is available to Codex, and public `ide.context` is removed. Source reads and related links use `ide.read`, exact UTF-8 use-site lookup uses `ide.symbol {path, byte_offset}`, and provider diagnostics and project problems use `ide.inspect`. Symbol cards show immediate callers/callees; graph traverses deeper call chains. Codex alone advertises the patch edit form.
+- Window-edit guards also remember lines delivered by file and range reads, including batch reads, while excluding undisplayed and cut rows.
+- Refused edit candidates never refresh read guards; only verified post-write bytes update remembered units. File reads retain one source snapshot instead of spending one remembered-unit slot per symbol.
+- A response arriving while the client probes daemon health is read immediately instead of being lost to a separate health timeout; the original dispatch deadline remains unchanged.
+
 - A plain line range past the end of a file is clamped (`N`, `N-M` and `N-` are accepted) and a start past the end answers `file has <n> lines; nothing at a-b` as a success instead of a refusal.
 - Read and edit replies no longer print a `source_ref`; the current text is the freshness check. A supplied `source_ref` is still validated and deprecated.
 

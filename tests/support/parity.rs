@@ -26,6 +26,25 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 
+/// Selects the current public tool for one source/position/problem query without rewriting it.
+/// A `kind` query uses Inspect, `byte_offset` uses positional Symbol, and a file query uses Read.
+/// This is only construction of test inputs: Session dispatch never aliases a removed tool.
+pub fn source_query_tool(arguments: &Value) -> &'static str {
+    if arguments.get("kind").is_some() {
+        "ide.inspect"
+    } else if arguments.get("byte_offset").is_some() {
+        "ide.symbol"
+    } else {
+        "ide.read"
+    }
+}
+
+/// Pairs an owned query with its actual current public tool for a parity request vector.
+/// The JSON bytes stay unchanged and are consumed once; no runtime call or legacy alias occurs.
+pub fn source_query(arguments: Value) -> (&'static str, Value) {
+    (source_query_tool(&arguments), arguments)
+}
+
 /// The fallback switch the harness flips.
 pub const LANGUAGE_MODE: &str = "AGENT_IDE_LANGUAGE_MODE";
 /// Trusted fixture channel attachment.

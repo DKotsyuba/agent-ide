@@ -411,6 +411,206 @@ impl Mcp {
     }
 }
 
+/// Builds the independent expected complete numbered Read body for nonempty UTF-8 `source`.
+/// `path` is the worktree-relative heading; every source line must end with a newline. The
+/// returned body preserves those bytes after a right-aligned 1-based gutter and performs no I/O.
+fn numbered_source(path: &str, source: &str) -> String {
+    assert!(!source.is_empty() && source.ends_with('\n'));
+    let count = source.lines().count();
+    let range = if count == 1 {
+        "1".to_owned()
+    } else {
+        format!("1–{count}")
+    };
+    let mut expected = format!("{path}  (lines {range})\n");
+    let width = count.to_string().len();
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+        expected.push_str(&format!("{:>width$}\t{line}", index + 1));
+    }
+    expected
+}
+
+/// Verifies positive provider locations are compact source addresses, never JSON URI arrays.
+/// `text` is a settled positional Symbol body and `group` is definitions or references. Every
+/// advertised row must be present and contain a relative path/line; unsupported or empty groups
+/// fail because these callers specifically expect real semantic resolution. No I/O occurs.
+fn assert_addressed_locations(text: &str, group: &str) {
+    let mut lines = text
+        .lines()
+        .skip_while(|line| !line.starts_with(&format!("{group}: ")));
+    let header = lines
+        .next()
+        .unwrap_or_else(|| panic!("missing {group}: {text}"));
+    let count: usize = header
+        .strip_prefix(&format!("{group}: "))
+        .unwrap()
+        .parse()
+        .expect("semantic location count");
+    assert!(count > 0, "{text}");
+    for _ in 0..count {
+        let row = lines.next().expect("advertised location row");
+        assert!(
+            row.starts_with("  ")
+                && row.contains(':')
+                && !row.contains("file://")
+                && !row.contains("\"uri\""),
+            "{row}"
+        );
+    }
+    assert!(
+        !text.contains("authority_epoch:") && !text.contains("source_sequence:"),
+        "{text}"
+    );
+}
+
+/// Both shipping host catalogs expose ten tools including Graph, and refuse removed Context
+/// before dispatch. Uses fresh unbound raw MCP processes so neither discovery nor refusal may
+/// create runtime state; closes both subprocesses and checks their exit statuses.
+#[tokio::test]
+async fn both_hosts_publish_ten_tools_and_refuse_removed_context_before_dispatch() {
+    for host in ["claude", "codex"] {
+        let runtime = runtime();
+        let mut command = Command::new(product_binary());
+        command
+            .env("TOKIO_WORKER_THREADS", "1")
+            .args(["mcp", "--runtime-dir"])
+            .arg(&runtime)
+            .args(["--host", host])
+            .env_remove("AGENT_IDE_HOST_ATTACHMENT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let mut mcp = Mcp {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        };
+        let initialized = mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-03-26","capabilities":{},
+                    "clientInfo":{"name":"removed-context-contract","version":"1"}
+                }}),
+            )
+            .await;
+        assert!(initialized["result"].is_object(), "{initialized}");
+        mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await;
+        let discovery = mcp
+            .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+            .await;
+        let tools = discovery["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 10, "{host}: {discovery}");
+        assert!(
+            tools.iter().any(|tool| tool["name"] == "ide.graph"),
+            "{host}: {discovery}"
+        );
+        assert!(
+            !tools.iter().any(|tool| tool["name"] == "ide.context"),
+            "{host}: {discovery}"
+        );
+        let refused = mcp.exchange(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"src/lib.rs"}}})).await;
+        assert!(
+            refused["error"].is_object() && refused.get("result").is_none(),
+            "{host}: {refused}"
+        );
+        assert!(
+            !runtime.exists(),
+            "{host}: removed tool must never dispatch"
+        );
+        mcp.close().await;
+        assert!(!runtime.exists());
+    }
+}
+
+/// A positional lookup refuses split UTF-8 and past-end positions without writing, identifies
+/// lexical evidence honestly, and file diagnostics remain unknown when no provider has reported.
+/// The same source symlink escape is refused by Read, Symbol and Inspect on a live binding.
+#[tokio::test]
+async fn positional_symbol_and_file_diagnostics_preserve_source_safety() {
+    let fixture = ProductFixture::new(json!([]));
+    let source = "pub fn café() {}\npub fn caller() { café(); }\n";
+    std::fs::write(fixture.root.join("utf8.rs"), source).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", fixture.root.join("escape.rs")).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "positional-source-safety").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"positions"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for offset in [source.find('é').unwrap() + 1, source.len() + 1] {
+        let refused = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"path":"utf8.rs","byte_offset":offset}),
+            )
+            .await;
+        let refused = actor.settle(&fixture, refused).await;
+        assert_eq!(refused["code"], "source_unavailable", "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("utf8.rs")).unwrap(),
+            source
+        );
+    }
+    let symbol = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"path":"utf8.rs","byte_offset":source.rfind("café").unwrap()}),
+        )
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+    let text = symbol["text"].as_str().unwrap();
+    assert!(
+        text.contains("mode: lexical")
+            && text.contains("definitions: unavailable")
+            && text.contains("references: unavailable"),
+        "{symbol}"
+    );
+    assert!(
+        !text.contains(source) && !text.contains("source_sequence:"),
+        "{symbol}"
+    );
+    for (tool, arguments) in [
+        ("ide.read", json!({"path":"escape.rs"})),
+        ("ide.symbol", json!({"path":"escape.rs","byte_offset":0})),
+        (
+            "ide.inspect",
+            json!({"kind":"diagnostics","path":"escape.rs"}),
+        ),
+    ] {
+        let refused = actor.call(&fixture, tool, arguments).await;
+        let refused = actor.settle(&fixture, refused).await;
+        assert_eq!(refused["code"], "source_unavailable", "{tool}: {refused}");
+    }
+    let diagnostics = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"kind":"diagnostics","path":"utf8.rs"}),
+        )
+        .await;
+    let diagnostics = actor.settle(&fixture, diagnostics).await;
+    assert_eq!(diagnostics["kind"], "inspect", "{diagnostics}");
+    let text = diagnostics["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("diagnostics: utf8.rs\n") && text.contains("diagnostics: unknown"),
+        "{diagnostics}"
+    );
+    assert!(
+        !text.contains("diagnostics: 0") && !text.contains(source),
+        "{diagnostics}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Verifies one successful MCP tool carrier has a single non-JSON block matching its typed state.
 ///
 /// `reply` must be a JSON-RPC tools/call response with `structuredContent`. The assertion performs
@@ -532,7 +732,7 @@ fn assert_compact_envelope(reply: &Value) {
             }
         }
         // Unlabelled replies (harness-reply-v1 R2): the text is the delivery itself.
-        ("complete", Some("activation" | "context" | "diff" | "stop")) => {
+        ("complete", Some("activation" | "diff" | "stop")) => {
             assert!(!body.is_empty(), "{reply}")
         }
         ("unavailable", _) => assert!(text.contains("\nRepair: "), "{reply}"),
@@ -756,13 +956,23 @@ fn claude_fields(tool: &str, text: &str) -> Value {
     // kind, and a cut ends with one `Cut; …` trailer line.
     let kind = match tool {
         "ide.start" => Some("activation"),
-        "ide.context" => Some("context"),
+        "ide.read" => Some("read"),
+        "ide.symbol" => Some("symbol"),
         "ide.diff" => Some("diff"),
         "ide.stop" => Some("stop"),
         // A continuation or a settled pending answer: its text says what it continues.
         "ide.inspect" if text.contains("call forms (") => Some("activation"),
         "ide.inspect" if text.starts_with("mode: ") || text.starts_with("diff (") => Some("diff"),
-        "ide.inspect" if !text.starts_with("tests #") => Some("context"),
+        "ide.inspect" if text.contains("symbol: ") => Some("symbol"),
+        "ide.inspect"
+            if text.starts_with("page ")
+                || text.lines().next().is_some_and(|line| {
+                    line.contains("  (lines ") || line.ends_with("  (empty file)")
+                }) =>
+        {
+            Some("read")
+        }
+        "ide.inspect" if !text.starts_with("tests #") => Some("inspect"),
         _ => None,
     };
     if let Some(kind) = kind {
@@ -871,7 +1081,6 @@ async fn server_identity_and_tool_annotations_are_pinned() {
     let tools = discovery["result"]["tools"].as_array().unwrap();
     let read_only = json!({"readOnlyHint": true, "openWorldHint": false});
     let mut expected = std::collections::BTreeMap::from([
-        ("ide.context", read_only.clone()),
         ("ide.diff", read_only.clone()),
         ("ide.inspect", read_only.clone()),
         ("ide.outline", read_only.clone()),
@@ -934,7 +1143,6 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
     assert_eq!(
         names,
         [
-            "ide.context",
             "ide.diff",
             "ide.edit",
             "ide.graph",
@@ -980,19 +1188,17 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
             .unwrap()
             .contains("These arguments do not match the tool schema.")
     );
-    // The plain `ide.context` schema cannot express "path or problems", so the handler explains it.
-    let no_target = mcp
+    // Removed public methods fail at dispatch rather than reaching the workspace handler.
+    let removed = mcp
         .exchange(
             json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
-                "name":"ide.context","arguments":{}
+                "name":"ide.context","arguments":{"path":"tracked.txt"}
             }}),
         )
         .await;
-    assert_eq!(no_target["result"]["isError"], true);
-    assert_eq!(
-        no_target["result"]["content"][0]["text"],
-        "These arguments do not match the tool schema.\nRepair: Correct the named arguments and repeat this call.\n  ide.context needs either \"path\" or \"kind\":\"problems\".\n"
-    );
+    assert!(removed["error"].is_object(), "{removed}");
+    assert!(removed.get("result").is_none(), "{removed}");
+    assert!(!runtime.exists(), "removed method must never dispatch");
     mcp.close().await;
     assert!(!runtime.exists());
 }
@@ -1230,7 +1436,7 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
     );
     for (index, (name, arguments)) in [
         ("ide.start", json!({"activation_id":"activate"})),
-        ("ide.context", json!({"path":"src/main.rs","byte_offset":0})),
+        ("ide.read", json!({"path":"src/main.rs"})),
         ("ide.diff", json!({})),
         ("ide.inspect", json!({"detail_ref":"detail"})),
         ("ide.stop", json!({})),
@@ -1559,8 +1765,8 @@ async fn managed_root_call(
 fn host_call(actor: &str, call: &str, name: &str) -> Value {
     let arguments = if name == "ide.start" {
         json!({"activation_id":"same-activation"})
-    } else if name == "ide.context" {
-        json!({"path":"src/main.rs","byte_offset":0})
+    } else if name == "ide.read" {
+        json!({"path":"src/main.rs"})
     } else {
         json!({})
     };
@@ -1673,8 +1879,8 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         hook(&runtime, "PreToolUse", "agent_id", "child", "after-stop")
     );
     let (root_reply, child_reply) = tokio::join!(
-        root.exchange(host_call("root", "after-stop", "ide.context")),
-        child.exchange(host_call("child", "after-stop", "ide.context"))
+        root.exchange(host_call("root", "after-stop", "ide.read")),
+        child.exchange(host_call("child", "after-stop", "ide.read"))
     );
     boundary(&root_reply, "host_binding");
     assert_compact_envelope(&child_reply);
@@ -1775,6 +1981,68 @@ async fn binary_codex_hook_fail_open_inactive_invalid_and_stdin_deadline() {
         drop(input);
     }
     assert!(!runtime.exists());
+}
+
+/// A valid pre-hook whose stdin never reaches EOF fails open without admitting its MCP call.
+///
+/// The next call with that exact identity must report the missing pre-event in its public text;
+/// a fresh hook-paired inspection succeeds on the same activation without restarting it.
+#[tokio::test]
+async fn binary_codex_pre_hook_stdin_deadline_refuses_only_its_call() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "stdin-deadline").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"stdin-deadline"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    let mut child = hook_process(&fixture.runtime, Some(actor.attachment));
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(
+            json!({"hook_event_name":"PreToolUse","session_id":actor.actor,"tool_use_id":call})
+                .to_string()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    // Keep valid input open: the real hook's bounded read cannot finish or submit this pre.
+    let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_managed_hook_silent(&output);
+    drop(input);
+
+    let refused = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":"ide.inspect","arguments":{"kind":"problems"},
+            "_meta":{"threadId":actor.actor,"callId":call,"x-codex-turn-metadata":{},
+                "codex/sandbox-state-meta":actor.state}}}),
+        )
+        .await;
+    assert_eq!(
+        refused["result"]["content"][0]["text"],
+        "The host's before-tool event did not reach the IDE.\nRepair: Repeat the call.",
+        "{refused}"
+    );
+    let fresh = actor
+        .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
+        .await;
+    assert_eq!(fresh["kind"], "inspect", "{fresh}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
 }
 
 /// Claude ingress is silent on malformed identity and daemon loss, without creating runtime state.
@@ -2979,7 +3247,7 @@ impl ProductFixture {
     }
     /// Runs fixed local fixture setup with all user/system Git configuration excluded.
     fn git(&self, args: &[&str]) {
-        let output = std::process::Command::new("/usr/bin/git")
+        let output = std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
             .env_clear()
             .env("TMPDIR", std::env::temp_dir())
             .env("TMP", std::env::temp_dir())
@@ -3001,18 +3269,19 @@ impl ProductFixture {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("tracked.txt"), "other\n").unwrap();
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("/usr/bin/git")
-                .env_clear()
-                .env("TMPDIR", std::env::temp_dir())
-                .env("TMP", std::env::temp_dir())
-                .env("TEMP", std::env::temp_dir())
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .args(["-C"])
-                .arg(&root)
-                .args(args)
-                .output()
-                .unwrap();
+            let output =
+                std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
+                    .env_clear()
+                    .env("TMPDIR", std::env::temp_dir())
+                    .env("TMP", std::env::temp_dir())
+                    .env("TEMP", std::env::temp_dir())
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .args(["-C"])
+                    .arg(&root)
+                    .args(args)
+                    .output()
+                    .unwrap();
             assert!(output.status.success(), "second repository Git failed");
         };
         git(&["init", "--quiet"]);
@@ -3031,7 +3300,7 @@ impl ProductFixture {
     /// [`Self::write_config`] with a caller-selected child capture budget; the shipped
     /// `agent-ide init` default is 65 536.
     fn write_config_with_output_bytes(&self, providers: Value, output_bytes: usize) {
-        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":output_bytes},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"providers":providers}]});
+        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":output_bytes},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/Library/Developer/CommandLineTools/usr/bin/git","fixture-git"),"providers":providers}]});
         std::fs::write(&self.config, config.to_string()).unwrap();
     }
     /// Returns the current fixture's complete measured-state-shaped payload outside model arguments.
@@ -3161,10 +3430,11 @@ impl ProductFixture {
     }
 }
 impl Drop for ProductFixture {
-    /// Releases every registered gate, then removes only the test-owned private tree.
+    /// Releases every registered gate, then removes the test's private tree.
     ///
     /// Runs on success, on panic unwinding and when a timeout drops the test future. The daemon
     /// handle ([`OwnedDaemon`]), declared after the fixture, has already stopped its providers.
+    /// Cleanup also runs during panic unwinding, so failed tests never retain their fixture.
     fn drop(&mut self) {
         for gate in self
             .gates
@@ -3613,7 +3883,7 @@ fn managed_claude_candidate_attachment(project: &Path) -> String {
 /// this stays a black-box reproduction of the product formula instead of a peek at its internals.
 fn managed_claude_runtime_path(project: &Path) -> PathBuf {
     let project = std::fs::canonicalize(project).unwrap();
-    let output = std::process::Command::new("/usr/bin/git")
+    let output = std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
         .arg("-C")
         .arg(&project)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -3634,7 +3904,7 @@ fn managed_claude_runtime_path(project: &Path) -> PathBuf {
 /// reproduces.
 fn hook_journal_dir(project: &Path) -> PathBuf {
     let project = std::fs::canonicalize(project).unwrap();
-    let output = std::process::Command::new("/usr/bin/git")
+    let output = std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
         .arg("-C")
         .arg(&project)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -4039,8 +4309,8 @@ async fn managed_codex_smoke_and_eof_cleanup() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4052,8 +4322,8 @@ async fn managed_codex_smoke_and_eof_cleanup() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","detail_ref":original_ref,"byte_offset":0}),
+        "ide.inspect",
+        json!({"detail_ref":original_ref}),
         &state,
     )
     .await;
@@ -4089,8 +4359,8 @@ async fn managed_codex_smoke_and_eof_cleanup() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4126,11 +4396,11 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     assert_eq!(retrieved, diff, "{retrieved}");
 
     next += 1;
-    let forged = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt","actor_id":"forged","sandbox":state},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
+    let forged = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"tracked.txt","actor_id":"forged","sandbox":state},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
     assert_eq!(forged["result"]["isError"], true, "{forged}");
 
     next += 1;
-    let isolated = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":"managed-stranger","callId":format!("managed-stranger-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
+    let isolated = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"tracked.txt"},"_meta":{"threadId":"managed-stranger","callId":format!("managed-stranger-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
     assert_compact_envelope(&isolated);
     assert_eq!(
         isolated["result"]["structuredContent"],
@@ -4145,7 +4415,7 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     assert_eq!(managed_runtime_paths(&fixture), before);
 }
 
-/// A problems lookup and unchanged re-observation keep an older Context edit ref usable;
+/// A problems lookup and unchanged re-observation keep an older Read edit ref usable;
 /// an actual byte change refuses the same operation without touching the target.
 #[tokio::test]
 async fn managed_context_problems_then_edit_tracks_content() {
@@ -4172,24 +4442,24 @@ async fn managed_context_problems_then_edit_tracks_content() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
     let context = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     next += 1;
     let problems = managed_call(
         &mut mcp,
         next,
         actor,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
         &state,
     )
     .await;
-    assert_eq!(problems["kind"], "context", "{problems}");
+    assert_eq!(problems["kind"], "inspect", "{problems}");
     assert_eq!(problems["detail_ref"], Value::Null, "{problems}");
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
@@ -4216,8 +4486,8 @@ async fn managed_context_problems_then_edit_tracks_content() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4227,8 +4497,8 @@ async fn managed_context_problems_then_edit_tracks_content() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4255,8 +4525,8 @@ async fn managed_context_problems_then_edit_tracks_content() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4337,8 +4607,8 @@ async fn managed_codex_publishes_distinct_actor_routes_and_retires_them_on_shutd
         next,
         actor,
         "root-session-b",
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4418,8 +4688,8 @@ async fn managed_codex_context_after_crash_requires_start_and_republishes_route(
         next,
         actor,
         session,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4439,8 +4709,8 @@ async fn managed_codex_context_after_crash_requires_start_and_republishes_route(
         next,
         actor,
         session,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4464,13 +4734,13 @@ async fn managed_codex_context_after_crash_requires_start_and_republishes_route(
         next,
         actor,
         session,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
     let context = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     mcp.close().await;
     std::fs::remove_dir_all(base).unwrap();
 }
@@ -4508,7 +4778,7 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
     next += 1;
     let timed_out = tokio::time::timeout(
         Duration::from_secs(4),
-        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
+        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
     ).await;
     drop(paused);
     let timed_out =
@@ -4524,13 +4794,13 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
     let context = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     assert_eq!(managed_daemon_pid(&runtime).await, pid);
     mcp.close().await;
 }
@@ -4600,7 +4870,7 @@ async fn managed_codex_wedged_daemon_is_replaced_in_place_without_agent_action()
     next += 1;
     let lost = tokio::time::timeout(
         Duration::from_secs(20),
-        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
+        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
     )
     .await
     .expect("the call that met the wedge returns its own failure");
@@ -4838,8 +5108,8 @@ async fn managed_codex_publication_failure_leaves_replies_working() {
         next,
         actor,
         "root-session-a",
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4975,8 +5245,8 @@ async fn parallel_managed_daemons_do_not_fence_each_others_workspace() {
         &mut first,
         first_id,
         "parallel-first",
-        "ide.context",
-        json!({"path":"src/lib.rs","byte_offset":0}),
+        "ide.read",
+        json!({"path":"src/lib.rs"}),
         &state,
     )
     .await;
@@ -4988,7 +5258,7 @@ async fn parallel_managed_daemons_do_not_fence_each_others_workspace() {
         still_live,
     )
     .await;
-    assert_eq!(still_live["kind"], "context", "{still_live}");
+    assert_eq!(still_live["kind"], "read", "{still_live}");
 
     first.close().await;
     second.close().await;
@@ -5171,7 +5441,7 @@ async fn modern_managed_claude_keeps_hook_pairing_and_text_only_envelope() {
         .await;
     assert_eq!(
         catalog["result"]["tools"].as_array().map(Vec::len),
-        Some(11),
+        Some(10),
         "{catalog}"
     );
     let mut next = 30;
@@ -5929,7 +6199,7 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
         next,
         "restart-session",
         None,
-        "ide.context",
+        "ide.read",
         json!({"path":"restart-pages.txt"}),
     )
     .await;
@@ -6158,7 +6428,7 @@ async fn a_pre_hook_on_a_dead_generations_attachment_fails_open_until_the_cache_
     mcp.close().await;
 }
 
-/// A paged Context survives native tool activity between its pages: a non-inert post (Bash) no
+/// A paged Read survives native tool activity between its pages: a non-inert post (Bash) no
 /// longer discards a page whose bytes are unchanged, while a real edit between pages still
 /// refuses with the explicit changed-source recovery.
 #[tokio::test]
@@ -6181,14 +6451,10 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     assert_eq!(started["kind"], "activation", "{started}");
 
     let first_call = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"claude-pages.py","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"claude-pages.py"}))
         .await;
     let (page1, _) = actor.settle_claude(&fixture, first_call).await;
-    assert_eq!(page1["kind"], "context", "{page1}");
+    assert_eq!(page1["kind"], "read", "{page1}");
     assert_eq!(page1["continuation"], true, "{page1}");
     let reference = page1["detail_ref"].as_str().unwrap().to_owned();
     let (_, _, _, end, total) = page_marker(page1["text"].as_str().unwrap());
@@ -6201,7 +6467,7 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     let next = actor
         .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
         .await;
-    assert_eq!(next["kind"], "context", "{next}");
+    assert_eq!(next["kind"], "read", "{next}");
     let text = next["text"].as_str().unwrap();
     let (number, _, from, to, _) = page_marker(text);
     assert_eq!(number, 2, "page two is served after a Bash post: {text}");
@@ -6510,18 +6776,15 @@ async fn an_edit_to_an_undeclared_rust_module_is_not_analysed() {
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let mut edit = async |path: &str, operation: &str, content: &str| {
-        let context = actor
-            .call(&fixture, "ide.context", json!({"path":path}))
-            .await;
+        let context = actor.call(&fixture, "ide.read", json!({"path":path})).await;
         let context = actor.settle(&fixture, context).await;
-        let edit = actor
-            .call(
-                &fixture,
-                "ide.edit",
-                json!({"operation_id":operation,"path":path,
-                       "source_ref":context["detail_ref"],"content":content}),
-            )
-            .await;
+        let mut arguments = json!({"operation_id":operation,"path":path,"content":content});
+        // An absent file has no read reference; creation observes it directly. Existing reads
+        // retain their actual delivered reference, preserving the legacy freshness check.
+        if let Some(reference) = context["detail_ref"].as_str() {
+            arguments["source_ref"] = json!(reference);
+        }
+        let edit = actor.call(&fixture, "ide.edit", arguments).await;
         let edit = actor.settle(&fixture, edit).await;
         settle_edit_check(&mut actor, &fixture, edit).await
     };
@@ -6601,7 +6864,7 @@ printf '{"reason":"build-finished","success":true}\n'
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let problems = actor
-            .call(&fixture, "ide.context", json!({"kind":"problems"}))
+            .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
             .await;
         let problems = actor.settle(&fixture, problems).await;
         if problems["text"]
@@ -7899,7 +8162,7 @@ async fn managed_claude_hook_pairs_through_project_dir_when_the_shell_cwd_left_t
             &outside,
             next,
             "cwd-session",
-            "ide.context",
+            "ide.inspect",
             json!({"kind":"problems"}),
         )
         .await;
@@ -7940,7 +8203,7 @@ async fn managed_claude_hook_pairs_through_project_dir_when_the_shell_cwd_left_t
     let refused = mcp
         .exchange(
             json!({"jsonrpc":"2.0","id":90,"method":"tools/call","params":{
-                "name":"ide.context","arguments":{"kind":"problems"},
+                "name":"ide.inspect","arguments":{"kind":"problems"},
                 "_meta":{"claudecode/toolUseId":"stranger-call"}
             }}),
         )
@@ -8011,7 +8274,7 @@ async fn managed_claude_hook_never_routes_a_wandering_cwd_to_another_registered_
     let refused = other
         .exchange(
             json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
-                "name":"ide.context","arguments":{"kind":"problems"},
+                "name":"ide.inspect","arguments":{"kind":"problems"},
                 "_meta":{"claudecode/toolUseId":"managed-claude-1"}
             }}),
         )
@@ -8080,7 +8343,7 @@ async fn managed_claude_hook_with_a_vanished_project_dir_never_routes_to_another
         let refused = other
             .exchange(
                 json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{
-                    "name":"ide.context","arguments":{"kind":"problems"},
+                    "name":"ide.inspect","arguments":{"kind":"problems"},
                     "_meta":{"claudecode/toolUseId":call}
                 }}),
             )
@@ -8136,7 +8399,7 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
         next,
         "context-session",
         None,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
     )
     .await;
@@ -8175,7 +8438,7 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
         next,
         "context-session",
         None,
-        "ide.context",
+        "ide.read",
         json!({"path":"context-pages.txt"}),
     )
     .await;
@@ -8221,7 +8484,11 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     assert_eq!(start.form.as_deref(), Some("activation_id"));
     let context = events
         .iter()
-        .find(|event| event.method == "context" && event.request.is_some())
+        .find(|event| {
+            event.method == "inspect"
+                && event.form.as_deref() == Some("kind")
+                && event.request.is_some()
+        })
         .unwrap_or_else(|| panic!("a context dispatch line: {raw}"));
     assert_eq!(context.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
     assert_eq!(context.host.as_deref(), Some("claude"));
@@ -8240,17 +8507,17 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     let lexical_context = events
         .iter()
         .find(|event| {
-            event.method == "context" && event.correlation.as_deref() == Some(detail_ref.as_str())
+            event.method == "read" && event.correlation.as_deref() == Some(detail_ref.as_str())
         })
         .unwrap_or_else(|| panic!("the lexical context line: {raw}"));
-    assert_eq!(lexical_context.outcome, "degraded", "{lexical_context:?}");
+    assert_eq!(lexical_context.outcome, "completed", "{lexical_context:?}");
     let inspection = events
         .iter()
         .find(|event| {
             event.method == "inspect" && event.correlation.as_deref() == Some(detail_ref.as_str())
         })
         .unwrap_or_else(|| panic!("the inspection line: {raw}"));
-    assert_eq!(inspection.outcome, "degraded", "{inspection:?}");
+    assert_eq!(inspection.outcome, "completed", "{inspection:?}");
     assert_eq!(inspection.delivered, Some(true));
     assert_eq!(
         inspection.origin.as_deref(),
@@ -8403,20 +8670,25 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
         "{retried}"
     );
     let context = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let context = actor.settle(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
-    assert!(context["text"].as_str().unwrap().contains("mode: lexical"));
+    assert_eq!(context["kind"], "read", "{context}");
+    let diagnostics = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"kind":"diagnostics","path":"src/lib.rs"}),
+        )
+        .await;
+    let diagnostics = actor.settle(&fixture, diagnostics).await;
+    assert_eq!(diagnostics["kind"], "inspect", "{diagnostics}");
     assert!(
-        context["text"]
+        diagnostics["text"]
             .as_str()
             .unwrap()
-            .contains("diagnostics_freshness: unknown")
+            .contains("diagnostics: unknown"),
+        "{diagnostics}"
     );
     assert!(context["text"].as_str().unwrap().contains("pub fn value"));
     let old_context = context["detail_ref"].as_str().unwrap().to_owned();
@@ -8425,14 +8697,10 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     // confirm it from the durable store during the diff capture that follows, not merely accept
     // the trait's default `None`.
     let tracked_context = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"tracked.txt","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let tracked_context = actor.settle(&fixture, tracked_context).await;
-    assert_eq!(tracked_context["kind"], "context", "{tracked_context}");
+    assert_eq!(tracked_context["kind"], "read", "{tracked_context}");
 
     let mut diff_ref = String::new();
     for mode in ["head", "staged", "unstaged"] {
@@ -8513,11 +8781,7 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
         .await;
     assert_eq!(stale_diff["kind"], "diff", "{stale_diff}");
     let latest = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let latest = actor.settle(&fixture, latest).await;
     assert!(latest["text"].as_str().unwrap().contains("changed"));
@@ -8924,7 +9188,7 @@ async fn configured_product_task_diff_refuses_unknown_activation_commit() {
 
 /// A later Codex binding's `ide.diff` covers a path an earlier grant's `ide.edit` observed.
 ///
-/// Session A registers a durable observation for `tracked.txt` (`ide.context` + `ide.edit`) and
+/// Session A registers a durable observation for `tracked.txt` (`ide.read` + `ide.edit`) and
 /// stops. Session B is a new binding on the same daemon and store, so its authority epoch is
 /// later; the store still holds A's row for the path. The diff capture must not compare that
 /// row's epoch with B's grant and answer `source_unavailable` (`diff:unstable`): the row belongs
@@ -8945,14 +9209,10 @@ async fn configured_product_later_binding_diffs_path_edited_under_earlier_grant(
     assert_eq!(started["kind"], "activation", "{started}");
     let first_epoch = activation_epoch(&started);
     let context = first
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"tracked.txt","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let context = first.settle(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     let edited = first
         .call(
             &fixture,
@@ -9040,7 +9300,7 @@ async fn configured_product_clean_tree_diff_completes_over_large_metadata_and_ig
     fixture.git(&["add", "--", "."]);
     fixture.git(&["commit", "--quiet", "-m", "large clean fixture"]);
     assert_eq!(
-        std::process::Command::new("/usr/bin/git")
+        std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
             .env_clear()
             .env("TMPDIR", std::env::temp_dir())
             .env("TMP", std::env::temp_dir())
@@ -9261,13 +9521,9 @@ async fn diff_plain_fallback_refuses_a_path_the_exact_capture_refuses() {
     // A recorded observation edited out of band makes every exact capture unstable, so each
     // `ide.diff` below goes through the plain fallback.
     let observed = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"a-observed.txt","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"a-observed.txt"}))
         .await;
-    assert_eq!(actor.settle(&fixture, observed).await["kind"], "context");
+    assert_eq!(actor.settle(&fixture, observed).await["kind"], "read");
     std::fs::write(fixture.root.join("a-observed.txt"), "unreconciled\n").unwrap();
     let degraded = actor
         .call(&fixture, "ide.diff", json!({"mode":"head"}))
@@ -9738,7 +9994,7 @@ async fn a_branch_switched_outside_the_ide_is_noticed_once_on_the_plate() {
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     fixture.git(&["checkout", "--quiet", "-b", "moved-elsewhere"]);
     let early = actor
-        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let early = actor.settle(&fixture, early).await;
     assert!(
@@ -9747,7 +10003,7 @@ async fn a_branch_switched_outside_the_ide_is_noticed_once_on_the_plate() {
     );
     tokio::time::sleep(Duration::from_secs(31)).await;
     let context = actor
-        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let context = actor.settle(&fixture, context).await;
     let plate = carried_status(&context).unwrap_or_else(|| panic!("{context}"));
@@ -9759,7 +10015,7 @@ async fn a_branch_switched_outside_the_ide_is_noticed_once_on_the_plate() {
         "{plate}"
     );
     let again = actor
-        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let again = actor.settle(&fixture, again).await;
     assert!(
@@ -9827,7 +10083,7 @@ async fn configured_product_test_handle_answers_after_stop() {
         .await;
     assert_eq!(detail["state"], "unavailable", "{detail}");
     let context = actor
-        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     assert_eq!(context["state"], "unavailable", "{context}");
     actor.mcp.close().await;
@@ -10671,7 +10927,7 @@ printf '{"reason":"build-finished","success":true}\n'
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let text = loop {
         let problems = actor
-            .call(&fixture, "ide.context", json!({"kind":"problems"}))
+            .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
             .await;
         let problems = actor.settle(&fixture, problems).await;
         let text = problems["text"].as_str().unwrap_or_default().to_owned();
@@ -10938,7 +11194,9 @@ async fn batch_call_with_text(
     (reply["result"]["structuredContent"].clone(), text)
 }
 
-/// [`ProductActor::settle`] for calls whose compact text must be asserted too.
+/// [`ProductActor::settle`] for calls whose compact text must be asserted too. A pending
+/// diagnostic lookup re-enters the same pending loop instead of escaping as a terminal edit;
+/// the existing deadline and poll ceiling apply to the whole settlement.
 async fn batch_settle_with_text(
     actor: &mut ProductActor,
     fixture: &ProductFixture,
@@ -10947,13 +11205,22 @@ async fn batch_settle_with_text(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
     let mut polls = 0;
     let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
-    while reply.0["state"] == "pending" {
+    loop {
+        let reference = if reply.0["state"] == "pending" {
+            reply.0["detail_ref"].as_str().unwrap().to_owned()
+        } else if reply.0["state"] == "edit" && reply.0["diagnostics"]["state"] == "pending" {
+            reply.0["diagnostics"]["detail_ref"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        } else {
+            return reply;
+        };
         assert!(
             tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
             "product operation did not settle: {}",
             reply.0
         );
-        let reference = reply.0["detail_ref"].as_str().unwrap().to_owned();
         tokio::time::sleep(delay).await;
         polls += 1;
         reply = batch_call_with_text(
@@ -10965,33 +11232,6 @@ async fn batch_settle_with_text(
         .await;
         delay = delay.saturating_mul(2).min(PRODUCT_SETTLE_MAX_DELAY);
     }
-    // An edit answers at once with `diagnostics: pending` (symbol-read-edit-v1 §3.3); its own
-    // reference returns the settled reply once the project check has finished.
-    let mut polls = 0;
-    while reply.0["state"] == "edit" && reply.0["diagnostics"]["state"] == "pending" {
-        assert!(
-            tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
-            "edit check did not settle: {}",
-            reply.0
-        );
-        let reference = reply.0["diagnostics"]["detail_ref"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        tokio::time::sleep(PRODUCT_SETTLE_INITIAL_DELAY).await;
-        polls += 1;
-        let next = batch_call_with_text(
-            actor,
-            fixture,
-            "ide.inspect",
-            json!({"detail_ref":reference}),
-        )
-        .await;
-        if next.0["state"] == "edit" || next.0["state"] == "pending" {
-            reply = next;
-        }
-    }
-    reply
 }
 
 /// An edit reply whose diagnostics are still `pending` settled through its own reference
@@ -11784,14 +12024,10 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let read = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"svc/app.py","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"svc/app.py"}))
         .await;
     let read = actor.settle(&fixture, read).await;
-    assert_eq!(read["kind"], "context", "{read}");
+    assert_eq!(read["kind"], "read", "{read}");
     let source_ref = read["detail_ref"].as_str().unwrap();
     let original =
         String::from_utf8(std::fs::read(fixture.root.join("svc/app.py")).unwrap()).unwrap();
@@ -11867,11 +12103,7 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let read = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"svc/app.py","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"svc/app.py"}))
         .await;
     let read = actor.settle(&fixture, read).await;
     let source_ref = read["detail_ref"].as_str().unwrap();
@@ -11951,17 +12183,13 @@ async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     // No TypeScript server launch is accepted, so symbol reads wait for a server that cannot
-    // start; the edit's `old`-text addresses need no outline, and `ide.context` mints the
+    // start; the edit's `old`-text addresses need no outline, and `ide.read` mints the
     // edit-admissible source the same way.
     let read = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"app.ts","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"app.ts"}))
         .await;
     let read = actor.settle(&fixture, read).await;
-    assert_eq!(read["kind"], "context", "{read}");
+    assert_eq!(read["kind"], "read", "{read}");
     let source_ref = read["detail_ref"].as_str().unwrap();
 
     let refused = batch_call_with_text(
@@ -12065,14 +12293,10 @@ async fn configured_product_batch_typescript_gate_uses_the_configured_package() 
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let read = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"app.ts","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"app.ts"}))
         .await;
     let read = actor.settle(&fixture, read).await;
-    assert_eq!(read["kind"], "context", "{read}");
+    assert_eq!(read["kind"], "read", "{read}");
     let source_ref = read["detail_ref"].as_str().unwrap();
 
     let refused = batch_call_with_text(
@@ -12768,14 +12992,10 @@ async fn product_outline_and_read_report_no_such_file() {
     daemon.wait().await.unwrap();
 }
 
-/// `ide.context {path}` with no `byte_offset` keeps serving the whole file exactly as before
-/// (real hosts and the acceptance scripts rely on its `source_ref`), now leading with a one-line
-/// hint toward the bounded `ide.outline`/`ide.read` alternative instead of retiring the mode
-/// (T163, W5, revised). `ide.context {kind:"problems"}` and the semantic `byte_offset` query are
-/// unaffected — covered by `managed_context_problems_then_edit_tracks_content` and the
-/// `mode: semantic` product assertions elsewhere in this file.
+/// Reads complete numbered source through the public path form and checks that model prose
+/// omits version references while the typed test-seam detail retains deprecated edit compatibility.
 #[tokio::test]
-async fn product_path_only_context_keeps_serving_with_a_hint() {
+async fn product_path_only_read_serves_numbered_source() {
     let fixture = ProductFixture::new(json!([]));
     std::fs::write(fixture.root.join("tracked.txt"), "hello\n").unwrap();
     let mut daemon = fixture.daemon().await;
@@ -12789,14 +13009,21 @@ async fn product_path_only_context_keeps_serving_with_a_hint() {
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let reply = actor
-        .call(&fixture, "ide.context", json!({"path":"tracked.txt"}))
+        .call(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let reply = actor.settle(&fixture, reply).await;
-    assert_eq!(reply["kind"], "context", "{reply}");
+    assert_eq!(reply["kind"], "read", "{reply}");
     let text = reply["text"].as_str().unwrap_or_default();
+    assert_eq!(
+        text,
+        "tracked.txt  (lines 1)
+1	hello
+note: no code analysis for this format; showing its text only
+"
+    );
     assert!(
-        text.starts_with("hint: ide.outline {\"path\"} gives the skeleton and ide.read {\"path\",\"lines\"} a bounded region; this whole-file view stays for compatibility\n"),
-        "the first line must hint at the bounded alternative: {text}"
+        !text.contains("source_ref") && !text.contains("authority_epoch"),
+        "{text}"
     );
     assert!(
         text.contains("hello"),
@@ -15060,10 +15287,10 @@ async fn plain_directory_activates_and_answers_without_git_data() {
     assert_eq!(read["kind"], "read", "{read}");
     assert!(read["text"].as_str().unwrap().contains(".sim"), "{read}");
     let source = actor
-        .call(&fixture, "ide.context", json!({"path":"sim.css"}))
+        .call(&fixture, "ide.read", json!({"path":"sim.css"}))
         .await;
     let source = actor.settle(&fixture, source).await;
-    assert_eq!(source["kind"], "context", "{source}");
+    assert_eq!(source["kind"], "read", "{source}");
     let edit = actor
         .call(
             &fixture,
@@ -15287,7 +15514,7 @@ async fn configured_product_resolves_a_new_linked_worktree_after_daemon_start() 
 
     let linked = fixture.base.join("different-parent").join("linked");
     std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
-    let output = std::process::Command::new("/usr/bin/git")
+    let output = std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
         .env_clear()
         .env("TMPDIR", std::env::temp_dir())
         .env("TMP", std::env::temp_dir())
@@ -15342,7 +15569,7 @@ async fn configured_product_same_actor_start_on_another_root_hands_the_activatio
     let linked = |name: &str| {
         let path = fixture.base.join("different-parent").join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let output = std::process::Command::new("/usr/bin/git")
+        let output = std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
             .env_clear()
             .env("TMPDIR", std::env::temp_dir())
             .env("TMP", std::env::temp_dir())
@@ -15700,25 +15927,17 @@ async fn configured_product_stop_reclaims_only_its_binding_details() {
     let start = second.settle(&fixture, start).await;
     assert_eq!(start["kind"], "activation", "{start}");
     let context = first
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let first_context = first.settle(&fixture, context).await;
-    assert_eq!(first_context["kind"], "context");
+    assert_eq!(first_context["kind"], "read");
     // The store holds 3 results (first: start + context, second: start). The second actor's
     // next call is admitted by evicting its own oldest result, its start.
     let admitted = second
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let admitted = second.settle(&fixture, admitted).await;
-    assert_eq!(admitted["kind"], "context", "{admitted}");
+    assert_eq!(admitted["kind"], "read", "{admitted}");
     let evicted = second
         .call(
             &fixture,
@@ -15734,7 +15953,7 @@ async fn configured_product_stop_reclaims_only_its_binding_details() {
             json!({"detail_ref":first_context["detail_ref"]}),
         )
         .await;
-    assert_eq!(peer_kept["kind"], "context", "{peer_kept}");
+    assert_eq!(peer_kept["kind"], "read", "{peer_kept}");
     let stopped = first.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     let retained = second
@@ -15744,16 +15963,12 @@ async fn configured_product_stop_reclaims_only_its_binding_details() {
             json!({"detail_ref":admitted["detail_ref"]}),
         )
         .await;
-    assert_eq!(retained["kind"], "context", "{retained}");
+    assert_eq!(retained["kind"], "read", "{retained}");
     let context = second
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let context = second.settle(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     first.mcp.close().await;
     second.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -15798,12 +16013,12 @@ async fn configured_product_returns_real_rust_semantic_context() {
             let response = actor
                 .call(
                     &fixture,
-                    "ide.context",
+                    "ide.symbol",
                     json!({"path":path,"byte_offset":offset}),
                 )
                 .await;
             let response = actor.settle(&fixture, response).await;
-            if response["kind"] != "context" {
+            if response["kind"] != "symbol" {
                 actor.mcp.close().await;
                 daemon.kill().await.unwrap();
                 let output = daemon.wait_with_output().await.unwrap();
@@ -15839,7 +16054,7 @@ async fn configured_product_returns_real_rust_semantic_context() {
                 response["text"]
                     .as_str()
                     .unwrap()
-                    .contains("definitions: [{"),
+                    .contains("definitions: 1\n  "),
                 "{response}"
             );
         }
@@ -15884,12 +16099,12 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     let response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
         )
         .await;
     let response = actor.settle(&fixture, response).await;
-    assert_eq!(response["kind"], "context", "{response}");
+    assert_eq!(response["kind"], "symbol", "{response}");
     assert!(
         response["text"]
             .as_str()
@@ -15898,14 +16113,17 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
         "{response}"
     );
     let text = response["text"].as_str().unwrap();
-    assert!(text.contains("definitions: [{"), "{response}");
-    assert!(text.contains("references: [{"), "{response}");
-    assert!(text.contains("diagnostic_count: 1"), "{response}");
+    assert_addressed_locations(text, "definitions");
+    assert_addressed_locations(text, "references");
+    assert!(text.contains("diagnostics: 1"), "{response}");
     assert!(
-        text.contains("Type \\\"Literal['bad']\\\" is not assignable to return type \\\"int\\\""),
+        text.contains(r#"Type "Literal['bad']" is not assignable to return type "int""#),
         "{response}"
     );
-    assert!(text.contains("return \"bad\""), "{response}");
+    assert!(
+        text.contains("main.py#value") && !text.contains("return \"bad\""),
+        "{response}"
+    );
     std::fs::write(
         &path,
         "def value() -> int:\n    return 8\n\ndef caller() -> int:\n    return value()\n",
@@ -15915,17 +16133,17 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     let fixed_response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"main.py","byte_offset":fixed.rfind("value()").unwrap()}),
         )
         .await;
     let fixed_response = actor.settle(&fixture, fixed_response).await;
-    assert_eq!(fixed_response["kind"], "context", "{fixed_response}");
+    assert_eq!(fixed_response["kind"], "symbol", "{fixed_response}");
     let fixed_text = fixed_response["text"].as_str().unwrap();
     assert!(fixed_text.contains("mode: semantic"), "{fixed_response}");
-    assert!(fixed_text.contains("return 8"), "{fixed_response}");
+    assert!(fixed_text.contains("main.py#value"), "{fixed_response}");
     assert!(
-        fixed_text.contains("source_sequence: 2"),
+        !fixed_text.contains("source_sequence") && !fixed_text.contains("authority_epoch"),
         "{fixed_response}"
     );
     assert!(
@@ -15991,15 +16209,15 @@ async fn configured_product_pyright_resolves_root_venv_for_nested_python_file() 
     let response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"tools/x.py","byte_offset":6}),
         )
         .await;
     let response = actor.settle(&fixture, response).await;
-    assert_eq!(response["kind"], "context", "{response}");
+    assert_eq!(response["kind"], "symbol", "{response}");
     let text = response["text"].as_str().unwrap();
     assert!(text.contains("mode: semantic"), "{response}");
-    assert!(text.contains("diagnostic_count: 0"), "{response}");
+    assert!(text.contains("diagnostics: 0 (provisional)"), "{response}");
     assert!(!text.contains("reportMissingImports"), "{response}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
@@ -16105,12 +16323,12 @@ async fn configured_product_pyright_reader_borrows_writer_session() {
             let context = actor
                 .call(
                     &fixture,
-                    "ide.context",
+                    "ide.symbol",
                     json!({"path":path,"byte_offset":source.rfind("value()").unwrap()}),
                 )
                 .await;
             let context = actor.settle(&fixture, context).await;
-            assert_eq!(context["kind"], "context", "{context}");
+            assert_eq!(context["kind"], "symbol", "{context}");
             assert!(
                 context["text"].as_str().unwrap().contains("mode: semantic"),
                 "{context}"
@@ -16356,7 +16574,7 @@ async fn configured_product_pyright_semantics_and_checks() {
     let context = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"main.py","byte_offset":source.find("value").unwrap()}),
         )
         .await;
@@ -16396,7 +16614,7 @@ fn python_venv_at(dir: &Path, name: &str) {
 
 /// Adds the real confined-Pyright project check to a fixture's launcher configuration, using the
 /// accepted `AGENT_IDE_NODE` executable and the `dist/pyright.js` CLI module of the
-/// `AGENT_IDE_PYRIGHT` installation, so `ide.context {kind:"problems"}` exercises Python checks.
+/// `AGENT_IDE_PYRIGHT` installation, so `ide.inspect {kind:"problems"}` exercises Python checks.
 fn enable_real_pyright_checks(fixture: &ProductFixture) {
     let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
     let pyright_cli = std::path::Path::new(&pyright)
@@ -16480,12 +16698,12 @@ async fn configured_product_nested_python_packages_are_listed_checked_and_edited
         let problems = actor
             .call(
                 &fixture,
-                "ide.context",
+                "ide.inspect",
                 json!({"kind":"problems","language":"python"}),
             )
             .await;
         let problems = actor.settle(&fixture, problems).await;
-        assert_eq!(problems["kind"], "context", "{problems}");
+        assert_eq!(problems["kind"], "inspect", "{problems}");
         problems_text = problems["text"].as_str().unwrap().to_owned();
         if problems_text.contains("python: ready") || problems_text.contains("python: partial") {
             break;
@@ -16536,7 +16754,7 @@ async fn configured_product_nested_python_packages_are_listed_checked_and_edited
 
 /// A nested package with no environment: the project check cannot run for it, so a `.py` edit
 /// that introduces a type error answers the language server's diagnostics for the exact
-/// post-edit source (located, labelled), never `unknown`; `ide.context` locates them too.
+/// post-edit source (located, labelled), never `unknown`; `ide.read` locates them too.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_edit_in_a_package_without_environment_reports_server_diagnostics() {
@@ -16620,8 +16838,8 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
     let context = actor
         .call(
             &fixture,
-            "ide.context",
-            json!({"path":"libs/contracts/mod.py"}),
+            "ide.inspect",
+            json!({"kind":"diagnostics","path":"libs/contracts/mod.py"}),
         )
         .await;
     let context = actor.settle(&fixture, context).await;
@@ -16685,15 +16903,15 @@ async fn configured_product_suffixed_venv_is_discovered_and_used() {
     let response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/svc.py","byte_offset":6}),
         )
         .await;
     let response = actor.settle(&fixture, response).await;
-    assert_eq!(response["kind"], "context", "{response}");
+    assert_eq!(response["kind"], "symbol", "{response}");
     let text = response["text"].as_str().unwrap();
     assert!(text.contains("mode: semantic"), "{response}");
-    assert!(text.contains("diagnostic_count: 0"), "{response}");
+    assert!(text.contains("diagnostics: 0 (provisional)"), "{response}");
     assert!(!text.contains("reportMissingImports"), "{response}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
@@ -16967,20 +17185,25 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
     assert_eq!(started["kind"], "activation", "{started}");
 
     let context = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.py","byte_offset":initial.rfind("value()").unwrap()}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"main.py"}))
         .await;
     let context = actor.settle(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
+    let diagnostics = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"kind":"diagnostics","path":"main.py"}),
+        )
+        .await;
+    let diagnostics = actor.settle(&fixture, diagnostics).await;
+    assert_eq!(diagnostics["kind"], "inspect", "{diagnostics}");
     assert!(
-        context["text"]
+        diagnostics["text"]
             .as_str()
             .unwrap()
-            .contains("diagnostic_count: 1"),
-        "{context}"
+            .contains("diagnostics: 1"),
+        "{diagnostics}"
     );
     let stale_ref = context["detail_ref"].as_str().unwrap().to_owned();
 
@@ -17003,11 +17226,7 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
     assert_eq!(std::fs::read_to_string(&path).unwrap(), intervening);
 
     let current = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.py","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"main.py"}))
         .await;
     let current = actor.settle(&fixture, current).await;
     let reported_source = "def value() -> int:\n    return \"reported-private-bad\"\n\ndef caller() -> int:\n    return value()\n";
@@ -17073,11 +17292,7 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
         .lifecycle(&fixture, "PostToolUse", "acceptance-native-edit")
         .await;
     let refreshed = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.py","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"main.py"}))
         .await;
     let refreshed = actor.settle(&fixture, refreshed).await;
     assert!(
@@ -17248,34 +17463,28 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
         let response = actor
             .call(
                 &fixture,
-                "ide.context",
+                "ide.symbol",
                 json!({"path":path,"byte_offset":source.rfind(occurrence).unwrap()}),
             )
             .await;
         let response = actor.settle(&fixture, response).await;
-        assert_eq!(response["kind"], "context", "{path}: {response}");
+        assert_eq!(response["kind"], "symbol", "{path}: {response}");
         let text = response["text"].as_str().unwrap();
         assert!(text.contains("mode: semantic"), "{path}: {response}");
-        assert!(text.contains("definitions: [{"), "{path}: {response}");
-        assert!(text.contains("references: [{"), "{path}: {response}");
+        assert_addressed_locations(text, "definitions");
+        assert_addressed_locations(text, "references");
         if matches!(path, "fixture.js" | "fixture.ts") {
+            assert!(text.contains("(provisional"), "{path}: {response}");
             assert!(
-                text.contains("diagnostics_freshness: Provisional"),
+                text.contains("diagnostics: at least "),
                 "{path}: {response}"
             );
             assert!(
-                text.contains("diagnostic_readiness: Reported"),
-                "{path}: {response}"
-            );
-            assert!(
-                text.contains("diagnostic_count: at_least_"),
+                text.contains("diagnostics: at least "),
                 "{path}: {response}"
             );
         } else if path == "fixture_clean.ts" {
-            assert!(
-                text.contains("diagnostic_count: unknown"),
-                "{path}: {response}"
-            );
+            assert!(text.contains("diagnostics: unknown"), "{path}: {response}");
         }
     }
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -17403,7 +17612,7 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     )
     .unwrap();
     let child_git = |args: &[&str]| {
-        let output = std::process::Command::new("/usr/bin/git")
+        let output = std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
             .env_clear()
             .env("TMPDIR", std::env::temp_dir())
             .env("TMP", std::env::temp_dir())
@@ -17461,12 +17670,12 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     let (root_context, child_context) = tokio::join!(
         root.call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"fixture.ts","byte_offset":root_offset})
         ),
         child.call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"fixture.ts","byte_offset":child_offset})
         )
     );
@@ -17474,24 +17683,26 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
         root.settle(&fixture, root_context),
         child.settle(&fixture, child_context)
     );
-    assert_eq!(root_context["kind"], "context", "{root_context}");
-    assert_eq!(child_context["kind"], "context", "{child_context}");
+    assert_eq!(root_context["kind"], "symbol", "{root_context}");
+    assert_eq!(child_context["kind"], "symbol", "{child_context}");
     let root_text = root_context["text"].as_str().unwrap();
     let child_text = child_context["text"].as_str().unwrap();
     assert!(root_text.contains("mode: semantic"), "{root_context}");
     assert!(child_text.contains("mode: semantic"), "{child_context}");
-    assert!(root_text.contains("definitions: [{") && root_text.contains("references: [{"));
-    assert!(child_text.contains("definitions: [{") && child_text.contains("references: [{"));
+    assert_addressed_locations(root_text, "definitions");
+    assert_addressed_locations(root_text, "references");
+    assert_addressed_locations(child_text, "definitions");
+    assert_addressed_locations(child_text, "references");
     assert!(root_text.contains("rootValue") && root_text.contains("root diagnostic marker"));
     assert!(!root_text.contains("child-only"));
     assert!(
-        root_text.contains("diagnostic_count: at_least_"),
+        root_text.contains("diagnostics: at least "),
         "{root_context}"
     );
     assert!(child_text.contains("childValue") && child_text.contains("child-only"));
     assert!(!child_text.contains("root diagnostic marker"));
     assert!(
-        child_text.contains("diagnostic_count: unknown"),
+        child_text.contains("diagnostics: unknown"),
         "{child_context}"
     );
 
@@ -17500,7 +17711,7 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     let child_live = child
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"fixture.ts","byte_offset":child_offset}),
         )
         .await;
@@ -17509,7 +17720,7 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     assert!(child_live_text.contains("mode: semantic"), "{child_live}");
     assert!(child_live_text.contains("child-only"), "{child_live}");
     assert!(
-        child_live_text.contains("diagnostic_count: unknown"),
+        child_live_text.contains("diagnostics: unknown"),
         "{child_live}"
     );
     let stopped = child.call(&fixture, "ide.stop", json!({})).await;
@@ -17556,28 +17767,19 @@ async fn configured_product_claude_returns_real_typescript_semantic_context_and_
         let context = actor
             .call_claude(
                 &fixture,
-                "ide.context",
+                "ide.symbol",
                 json!({"path":path,"byte_offset":source.rfind("value;").unwrap()}),
             )
             .await;
         let (context, _) = actor.settle_claude(&fixture, context).await;
-        assert_eq!(context["kind"], "context", "{path}: {context}");
+        assert_eq!(context["kind"], "symbol", "{path}: {context}");
         let text = context["text"].as_str().unwrap();
         assert!(text.contains("mode: semantic"), "{path}: {context}");
-        assert!(text.contains("definitions: [{"), "{path}: {context}");
-        assert!(text.contains("references: [{"), "{path}: {context}");
-        assert!(
-            text.contains("diagnostics_freshness: Provisional"),
-            "{path}: {context}"
-        );
-        assert!(
-            text.contains("diagnostic_readiness: Reported"),
-            "{path}: {context}"
-        );
-        assert!(
-            text.contains("diagnostic_count: at_least_"),
-            "{path}: {context}"
-        );
+        assert_addressed_locations(text, "definitions");
+        assert_addressed_locations(text, "references");
+        assert!(text.contains("(provisional"), "{path}: {context}");
+        assert!(text.contains("diagnostics: at least "), "{path}: {context}");
+        assert!(text.contains("diagnostics: at least "), "{path}: {context}");
     }
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
@@ -17624,15 +17826,18 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
-    let context = actor.call(&fixture, "ide.context", json!({"path":"source/utils/normalize.ts","byte_offset":source.rfind("value;").unwrap()})).await;
+    let context = actor.call(&fixture, "ide.symbol", json!({"path":"source/utils/normalize.ts","byte_offset":source.rfind("value;").unwrap()})).await;
     let context = actor.settle(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "symbol", "{context}");
     assert!(
         context["text"].as_str().unwrap().contains("mode: semantic"),
         "{context}"
     );
     assert!(
-        context["text"].as_str().unwrap().contains(source),
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("source/utils/normalize.ts#value"),
         "{context}"
     );
     assert!(context["detail_ref"].as_str().is_some(), "{context}");
@@ -17642,12 +17847,12 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
     let membership = actor
         .call(
             &fixture,
-            "ide.context",
-            json!({"path":"source/utils/normalize.ts","byte_offset":0}),
+            "ide.symbol",
+            json!({"path":"source/utils/normalize.ts","byte_offset":source.rfind("value;").unwrap()}),
         )
         .await;
     let membership = actor.settle(&fixture, membership).await;
-    assert_eq!(membership["kind"], "context", "{membership}");
+    assert_eq!(membership["kind"], "symbol", "{membership}");
     // An empty `node_modules` changes no observed project file, and the tsconfig still lists
     // the document, so the re-observed resolution stays verified and semantic.
     assert!(
@@ -17658,11 +17863,23 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
         "{membership}"
     );
     assert!(
-        membership["text"].as_str().unwrap().contains(source),
+        membership["text"]
+            .as_str()
+            .unwrap()
+            .contains("source/utils/normalize.ts#value"),
         "{membership}"
     );
     assert!(membership["detail_ref"].as_str().is_some(), "{membership}");
 
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"source/utils/normalize.ts"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert!(read["text"].as_str().unwrap().contains("42"), "{read}");
     let edit = actor
         .call(
             &fixture,
@@ -17670,7 +17887,7 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
             json!({
                 "operation_id":"typescript-edit",
                 "path":"source/utils/normalize.ts",
-                "source_ref":context["detail_ref"],
+                "source_ref":read["detail_ref"],
                 "content":source.replace("42", "43")
             }),
         )
@@ -17778,7 +17995,7 @@ async fn configured_product_typescript_vite_directory_include_membership() {
     let outside = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"outside.ts","byte_offset":0}),
         )
         .await;
@@ -17836,12 +18053,12 @@ async fn configured_product_claude_typescript_unverified_membership_falls_back_t
     let context = actor
         .call_claude(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"fixture.ts","byte_offset":source.rfind("value;").unwrap()}),
         )
         .await;
     let (context, _) = actor.settle_claude(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "symbol", "{context}");
     // The compact line names the actual rejection (b2155cc renders the reason), not the
     // generic default.
     assert!(
@@ -17854,11 +18071,15 @@ async fn configured_product_claude_typescript_unverified_membership_falls_back_t
         context["text"]
             .as_str()
             .unwrap()
-            .contains("lexical_matches: [{"),
+            .contains("lexical matches: "),
         "{context}"
     );
     assert!(
-        context["text"].as_str().unwrap().contains(source),
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("fixture.ts#value")
+            && !context["text"].as_str().unwrap().contains(source),
         "{context}"
     );
 
@@ -17917,19 +18138,19 @@ async fn configured_product_claude_returns_real_pyright_semantic_context_diff_an
     let pending = actor
         .call_claude(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
         )
         .await;
     let (context, _) = actor.settle_claude(&fixture, pending).await;
     let text = context["text"].as_str().unwrap();
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "symbol", "{context}");
     assert!(text.contains("mode: semantic"), "{context}");
-    assert!(text.contains("definitions: [{"), "{context}");
-    assert!(text.contains("references: [{"), "{context}");
-    assert!(text.contains("diagnostic_count: 1"), "{context}");
+    assert_addressed_locations(text, "definitions");
+    assert_addressed_locations(text, "references");
+    assert!(text.contains("diagnostics: 1"), "{context}");
     assert!(
-        text.contains("Type \\\"Literal['bad']\\\" is not assignable to return type \\\"int\\\""),
+        text.contains(r#"Type "Literal['bad']" is not assignable to return type "int""#),
         "{context}"
     );
 
@@ -17948,13 +18169,13 @@ async fn configured_product_claude_returns_real_pyright_semantic_context_diff_an
     let pending = actor
         .call_claude(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"main.py","byte_offset":fixed.rfind("value()").unwrap()}),
         )
         .await;
     let (refreshed, _) = actor.settle_claude(&fixture, pending).await;
     let refreshed_text = refreshed["text"].as_str().unwrap();
-    assert!(refreshed_text.contains("return 8"), "{refreshed}");
+    assert!(refreshed_text.contains("main.py#value"), "{refreshed}");
     assert!(
         !refreshed_text.contains("return \\\"bad\\\"")
             && !refreshed_text.contains("Literal['bad']"),
@@ -18054,17 +18275,20 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    // The positional query legitimately returns lexical evidence while indexing. This test
+    // proves real cross-crate semantics, so wait for the same existing live-outline barrier.
+    batch_wait_semantic_outline(&mut actor, &fixture, "src/lib.rs").await;
     let bytes = std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap();
     let offset = bytes.rfind("shared_value()").unwrap();
     let response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/lib.rs","byte_offset":offset}),
         )
         .await;
     let response = actor.settle(&fixture, response).await;
-    assert_eq!(response["kind"], "context", "{response}");
+    assert_eq!(response["kind"], "symbol", "{response}");
     let text = response["text"].as_str().unwrap();
     assert!(text.contains("mode: semantic"), "{response}");
     assert!(
@@ -18338,14 +18562,10 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
 
     // The reader must not have disturbed the writer: its context still resolves.
     let live = first
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let live = first.settle(&fixture, live).await;
-    assert_eq!(live["kind"], "context", "{live}");
+    assert_eq!(live["kind"], "read", "{live}");
 
     // A reader requesting writer mode is refused with the holder facts and the read-only next step.
     let refused_writer = second.call_raw(&fixture, "ide.start", json!({})).await;
@@ -18469,7 +18689,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     let pending = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
@@ -18530,7 +18750,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     daemon.wait().await.unwrap();
 }
 
-/// A provider that exits before it ever answers must fall back to a lexical `ide.context` result
+/// A provider that exits before it ever answers must fall back to a lexical `ide.read` result
 /// almost immediately, never by exhausting the 120s operation budget polling a provider that is
 /// already dead. `context` treats `FailureCode::ProviderUnavailable` as a deliberate lexical fallback rather
 /// than a fatal error, so the settled reply is `state: "complete"` carrying the fallback reason, not
@@ -18569,7 +18789,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
     let pending = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
@@ -18617,7 +18837,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
     let refreshed = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
@@ -18677,7 +18897,7 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     let pending = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
@@ -18755,7 +18975,7 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     fixture.git(&["add", "--", "app.py"]);
     fixture.git(&["commit", "--quiet", "-m", "python fixture"]);
     // The Node host of Pyright cannot start until this test releases the gate, so the very first
-    // `ide.context` must observe the job still queued (`Pending`) rather than racing a fast real
+    // `ide.read` must observe the job still queued (`Pending`) rather than racing a fast real
     // provider.
     let gate = fixture.base.join("release-provider");
     let wrapper = fixture.base.join("node-gated-provider");
@@ -18808,7 +19028,7 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     let response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"app.py","byte_offset":offset}),
         )
         .await;
@@ -18841,12 +19061,12 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     // is source text, so the hook names the result and its reference only. The native edit
     // lifecycle that carries it ran after the job started, so the fact says files changed since.
     assert_eq!(
-        additional.matches("job-ready ide.context app.py: ").count(),
+        additional.matches("job-ready ide.symbol app.py: ").count(),
         1,
         "{additional}"
     );
     assert!(
-        additional.contains("job-ready ide.context app.py: ready (files changed since)"),
+        additional.contains("job-ready ide.symbol app.py: ready (files changed since)"),
         "{additional}"
     );
     assert!(
@@ -18878,10 +19098,10 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
         .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
         .await;
     assert_eq!(full["state"], "complete", "{full}");
-    assert_eq!(full["kind"], "context", "{full}");
+    assert_eq!(full["kind"], "symbol", "{full}");
     let text = full["text"].as_str().unwrap();
     assert!(
-        text.contains("1 diagnostics reported for this file") && text.contains("reportReturnType"),
+        text.contains("diagnostics: 1 (provisional)") && text.contains("reportReturnType"),
         "{full}"
     );
 
@@ -18991,7 +19211,7 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     std::fs::write(
         &proxy,
         format!(
-            "#!/bin/sh\nwhile [ -e {} ]; do sleep 0.05; done\nexec /usr/bin/git \"$@\"\n",
+            "#!/bin/sh\nwhile [ -e {} ]; do sleep 0.05; done\nexec /Library/Developer/CommandLineTools/usr/bin/git \"$@\"\n",
             gate.display()
         ),
     )
@@ -19141,14 +19361,10 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     // exactness — so it is never silently captured as if the stale recorded revision still
     // described it.
     let observed = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"tracked.txt","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let observed = actor.settle(&fixture, observed).await;
-    assert_eq!(observed["kind"], "context", "{observed}");
+    assert_eq!(observed["kind"], "read", "{observed}");
     std::fs::write(fixture.root.join("tracked.txt"), "unreconciled\n").unwrap();
     let mismatched = actor
         .call(&fixture, "ide.diff", json!({"mode":"head"}))
@@ -19572,7 +19788,7 @@ async fn diff_oversized_single_hunk_pages_to_completion() {
     fixture.git(&["commit", "--quiet", "-m", "huge"]);
     let body = escape_heavy("hunkmark-huge", 3000);
     std::fs::write(fixture.root.join("huge.txt"), &body).unwrap();
-    let output = std::process::Command::new("/usr/bin/git")
+    let output = std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
         .args(["diff", "--no-color", "--", "huge.txt"])
         .current_dir(&fixture.root)
         .output()
@@ -19638,7 +19854,7 @@ async fn diff_fallback_pages_large_hunks_and_untracked_text() {
         fixture.root.join("node_modules"),
     )
     .unwrap();
-    let previous = std::process::Command::new("/usr/bin/git")
+    let previous = std::process::Command::new("/Library/Developer/CommandLineTools/usr/bin/git")
         .args(["rev-parse", "HEAD~1"])
         .current_dir(&fixture.root)
         .output()
@@ -19647,7 +19863,7 @@ async fn diff_fallback_pages_large_hunks_and_untracked_text() {
     let previous = String::from_utf8(previous.stdout).unwrap();
     let counter = fixture.base.join("head-counter");
     let proxy = fixture.base.join("unstable-git.sh");
-    std::fs::write(&proxy, format!("#!/bin/sh\ncase \" $* \" in\n *\" rev-parse --verify --quiet HEAD \"*)\n n=$(cat \"{}\" 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > \"{}\"\n if [ $((n%2)) -eq 0 ]; then echo '{}'; exit 0; fi;;\nesac\nexec /usr/bin/git \"$@\"\n", counter.display(), counter.display(), previous.trim())).unwrap();
+    std::fs::write(&proxy, format!("#!/bin/sh\ncase \" $* \" in\n *\" rev-parse --verify --quiet HEAD \"*)\n n=$(cat \"{}\" 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > \"{}\"\n if [ $((n%2)) -eq 0 ]; then echo '{}'; exit 0; fi;;\nesac\nexec /Library/Developer/CommandLineTools/usr/bin/git \"$@\"\n", counter.display(), counter.display(), previous.trim())).unwrap();
     std::fs::set_permissions(&proxy, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
@@ -19889,7 +20105,7 @@ fn page_marker(text: &str) -> (usize, bool, usize, usize, usize) {
     )
 }
 
-/// A Claude Context reads a source file far over the former 64 KiB render cap in one daemon
+/// A Claude Read reads a source file far over the former 64 KiB render cap in one daemon
 /// capture, and the daemon pages the whole composed text across repeated `ide.inspect` calls:
 /// the first continuation call serves page two (not page one again), every page starts with a
 /// contiguous position marker, the pages join to the exact file bytes, the last page states
@@ -19917,14 +20133,10 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
     assert_eq!(started["kind"], "activation", "{started}");
 
     let first_call = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"claude-large.py","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"claude-large.py"}))
         .await;
     let (page1, _) = actor.settle_claude(&fixture, first_call).await;
-    assert_eq!(page1["kind"], "context", "{page1}");
+    assert_eq!(page1["kind"], "read", "{page1}");
     assert_eq!(page1["truncated"], true, "{page1}");
     assert_eq!(page1["continuation"], true, "{page1}");
     let reference = page1["detail_ref"]
@@ -19932,15 +20144,16 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
         .expect("a multi-page Context result must carry a detail_ref")
         .to_owned();
     let page1_text = page1["text"].as_str().unwrap().to_owned();
+    let expected = numbered_source("claude-large.py", &content);
     assert!(
-        page1_text.contains("coverage: complete registered path"),
+        page1_text.contains("claude-large.py  (lines 1–3300)"),
         "{page1_text}"
     );
     let (number, last, from, mut end, total) = page_marker(&page1_text);
-    assert_eq!((number, last, from, total), (1, false, 0, content.len()));
+    assert_eq!((number, last, from, total), (1, false, 0, expected.len()));
     let mut collected = page1_text
-        .split_once("\n\n")
-        .expect("header ends at the first blank line")
+        .split_once('\n')
+        .expect("page marker precedes body")
         .1
         .to_owned();
 
@@ -19953,14 +20166,14 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
         let next = actor
             .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
             .await;
-        assert_eq!(next["kind"], "context", "{next}");
+        assert_eq!(next["kind"], "read", "{next}");
         let text = next["text"].as_str().unwrap();
         let (number, last, from, to, total) = page_marker(text);
         assert_eq!(
             number, expected_page,
             "the first continuation call must serve page two, never page one again: {text}"
         );
-        assert_eq!((from, total), (end, content.len()), "{text}");
+        assert_eq!((from, total), (end, expected.len()), "{text}");
         end = to;
         continuation = next["continuation"].as_bool().unwrap();
         assert_eq!(last, !continuation, "{text}");
@@ -19990,10 +20203,10 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
         }
     }
     assert!(expected_page >= 3, "the fixture must force several pages");
-    assert_eq!(end, content.len(), "the last page must reach the end");
+    assert_eq!(end, expected.len(), "the last page must reach the end");
     assert_eq!(
-        collected, content,
-        "pages must join to the exact file bytes"
+        collected, expected,
+        "pages must join to every numbered source byte, including UTF-8"
     );
 
     // Terminal behaviour: a further inspect re-serves the same last page, byte-identical.
@@ -20010,7 +20223,7 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
     daemon.wait().await.unwrap();
 }
 
-/// Keeps a Claude Context ref across a problems lookup, native Read hint, and unchanged
+/// Keeps a Claude Read ref across a problems lookup, native Read hint, and unchanged
 /// re-observation; a later byte change refuses the edit before it touches the target.
 /// The Python fixture is near the reported fastapi file size.
 #[tokio::test]
@@ -20029,19 +20242,15 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
     assert_eq!(start["kind"], "activation", "{start}");
 
     let context = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"fastapi/utils.py","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"fastapi/utils.py"}))
         .await;
     let (context, _) = actor.settle_claude(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     assert_eq!(context["continuation"], false, "{context}");
     let problems = actor
-        .call_claude(&fixture, "ide.context", json!({"kind":"problems"}))
+        .call_claude(&fixture, "ide.inspect", json!({"kind":"problems"}))
         .await;
-    assert_eq!(problems["kind"], "context", "{problems}");
+    assert_eq!(problems["kind"], "inspect", "{problems}");
     assert_eq!(problems["detail_ref"], Value::Null, "{problems}");
     assert_eq!(problems["text"], "checks disabled");
     actor.claude_native_post(&fixture, "Read").await;
@@ -20060,14 +20269,10 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
     assert_eq!(std::fs::read(&path).unwrap(), b"edited\n");
 
     let older = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"fastapi/utils.py","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"fastapi/utils.py"}))
         .await;
     let (older, _) = actor.settle_claude(&fixture, older).await;
-    assert_eq!(older["kind"], "context", "{older}");
+    assert_eq!(older["kind"], "read", "{older}");
     let edit = actor
         .call_claude(
             &fixture,
@@ -20357,11 +20562,11 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
     let context = claude_operation(
         &mut first,
         &fixture,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
     )
     .await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     let edited = claude_operation(
         &mut first,
         &fixture,
@@ -20410,11 +20615,11 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
     let stop_context = claude_operation(
         &mut first,
         &fixture,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
     )
     .await;
-    assert_eq!(stop_context["kind"], "context", "{stop_context}");
+    assert_eq!(stop_context["kind"], "read", "{stop_context}");
     let ready = first
         .call_claude(
             &fixture,
@@ -20602,14 +20807,10 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
     }
 
     let context = first
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"tracked.txt","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let (context, _) = first.settle_claude(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     first.mcp.close().await;
@@ -20637,14 +20838,10 @@ async fn claude_later_binding_diffs_path_edited_under_earlier_grant() {
     assert_eq!(started["kind"], "activation", "{started}");
     let first_epoch = activation_epoch(&started);
     let pending = first
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"tracked.txt","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let (context, _) = first.settle_claude(&fixture, pending).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     let pending = first
         .call_claude(
             &fixture,
@@ -20697,9 +20894,9 @@ async fn claude_later_binding_diffs_path_edited_under_earlier_grant() {
     daemon.wait().await.unwrap();
 }
 
-/// Proves Claude Context and Diff retrieved through their own tools with a `detail_ref`
+/// Proves Claude Read and Diff retrieved through their own tools with a `detail_ref`
 /// execute on the daemon route, and that a diagnostic already delivered inline inside a retrieved
-/// Context reply is never echoed a second time on the next ordinary native-edit hook.
+/// Symbol reply is never echoed a second time on the next ordinary native-edit hook.
 /// Cross-production identity replacement is covered by the worker's bounded ledger regression;
 /// this test owns the real Claude host surfaces.
 #[tokio::test]
@@ -20746,21 +20943,21 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
         .unwrap();
     let arguments = json!({"path":"app.py","byte_offset":offset});
     let pending = actor
-        .call_claude(&fixture, "ide.context", arguments.clone())
+        .call_claude(&fixture, "ide.symbol", arguments.clone())
         .await;
     let (context, _) = actor
-        .settle_claude_via(&fixture, pending, "ide.context", arguments)
+        .settle_claude_via(&fixture, pending, "ide.symbol", arguments)
         .await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "symbol", "{context}");
     let context_text = context["text"].as_str().unwrap();
     assert!(context_text.contains("mode: semantic"), "{context_text}");
-    assert!(context_text.contains("return \"bad\""), "{context_text}");
     assert!(
-        context_text.contains("diagnostic_count: 1"),
+        context_text.contains("app.py#value") && !context_text.contains("return \"bad\""),
         "{context_text}"
     );
+    assert!(context_text.contains("diagnostics: 1"), "{context_text}");
     // The diagnostic delta above was already handed to this same caller inline, inside the
-    // retrieved `ide.context` reply. An ordinary native-edit post hook that follows must not echo
+    // retrieved `ide.read` reply. An ordinary native-edit post hook that follows must not echo
     // that already-submitted fact on the second channel: `claude_lifecycle` asserts empty stdout,
     // the same bar every other no-feedback hook in this file is held to.
     actor
@@ -20999,18 +21196,18 @@ async fn await_eyes_result(actor: &mut ProductActor, fixture: &ProductFixture) -
     }
 }
 
-/// Reads the `ide.context` problems page for an active Claude actor.
+/// Reads the `ide.inspect` problems page for an active Claude actor.
 async fn eyes_problems(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
     let reply = actor
-        .call_claude(fixture, "ide.context", json!({"kind":"problems"}))
+        .call_claude(fixture, "ide.inspect", json!({"kind":"problems"}))
         .await;
-    assert_eq!(reply["kind"], "context", "{reply}");
+    assert_eq!(reply["kind"], "inspect", "{reply}");
     reply["text"].as_str().unwrap().to_owned()
 }
 
 /// Start schedules a confined check whose first result reaches the next native post-hook once;
 /// unchanged state stays silent, a native edit reruns the check and the block carries the delta,
-/// and `ide.context kind=problems` reports the same counts (EYES-r1 §5–§7).
+/// and `ide.inspect kind=problems` reports the same counts (EYES-r1 §5–§7).
 #[tokio::test]
 async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     let fixture = ProductFixture::new(json!([]));
@@ -21186,22 +21383,24 @@ async fn eyes_codex_legacy_sandbox_metadata_keeps_project_checks_available() {
     daemon.wait().await.unwrap();
 }
 
-/// Reads the `ide.context` problems page for an active Codex actor, with its carried status plate.
+/// Reads the `ide.inspect` problems page for an active Codex actor, with its carried status plate.
+/// A refusal prints the raw envelope, retaining its cause-specific repair text for diagnosis.
 async fn eyes_codex_problems(
     actor: &mut ProductActor,
     fixture: &ProductFixture,
 ) -> (String, Option<String>) {
-    let reply = actor
-        .call(fixture, "ide.context", json!({"kind":"problems"}))
+    let raw = actor
+        .call_raw(fixture, "ide.inspect", json!({"kind":"problems"}))
         .await;
-    assert_eq!(reply["kind"], "context", "{reply}");
+    let reply = &raw["result"]["structuredContent"];
+    assert_eq!(reply["kind"], "inspect", "{raw}");
     (
         reply["text"].as_str().unwrap().to_owned(),
-        carried_status(&reply).map(str::to_owned),
+        carried_status(reply).map(str::to_owned),
     )
 }
 
-/// Polls Codex `ide.context` problems replies until one carries exactly `expected` (T28B).
+/// Polls Codex `ide.inspect` problems replies until one carries exactly `expected` (T28B).
 ///
 /// Intermediate `checking (…)` plates are legitimately delivered once each; only the exact
 /// expected plate satisfies the wait.
@@ -21285,11 +21484,7 @@ async fn eyes_codex_reply_carries_due_plate_and_delta() {
 
     // An `ide.edit` that changes the check inputs is followed by a reply carrying the delta.
     let original = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"problems.count","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"problems.count"}))
         .await;
     let original = actor.settle(&fixture, original).await;
     let edited = actor
@@ -21371,7 +21566,7 @@ async fn eyes_codex_managed_reply_carries_due_plate_after_native_edit() {
                 &mut mcp,
                 next,
                 actor,
-                "ide.context",
+                "ide.inspect",
                 json!({"kind":"problems"}),
                 &state,
             )
@@ -21402,7 +21597,7 @@ async fn eyes_codex_managed_reply_carries_due_plate_after_native_edit() {
             &mut mcp,
             next,
             actor,
-            "ide.context",
+            "ide.inspect",
             json!({"kind":"problems"}),
             &state,
         )
@@ -21538,7 +21733,7 @@ async fn await_eyes_codex_hook_plate(
     }
 }
 
-/// Polls managed `ide.context` problems replies (explicit root session) until one carries exactly
+/// Polls managed `ide.inspect` problems replies (explicit root session) until one carries exactly
 /// `expected` on its reply carrier (T28B), returning the plate.
 async fn await_eyes_codex_managed_root_plate(
     mcp: &mut Mcp,
@@ -21556,7 +21751,7 @@ async fn await_eyes_codex_managed_root_plate(
             *next,
             actor,
             session,
-            "ide.context",
+            "ide.inspect",
             json!({"kind":"problems"}),
             state,
         )
@@ -21645,7 +21840,7 @@ async fn eyes_codex_managed_native_post_delivers_plate_and_delta_without_ide_cal
         next,
         actor,
         session,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
         &state,
     )
@@ -21726,7 +21921,7 @@ async fn eyes_codex_reply_carrier_consumes_the_plate_before_the_native_hook() {
         next,
         actor,
         session,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
         &state,
     )
@@ -21786,7 +21981,7 @@ async fn eyes_codex_concurrent_hook_and_reply_deliver_exactly_one_plate() {
         let hook_run = managed_native_post(&root, session, actor, &race_call, "Bash");
         let state_for_race = state.clone();
         let reply_run = mcp.exchange(
-            json!({"jsonrpc":"2.0","id":next_for_reply,"method":"tools/call","params":{"name":"ide.context",
+            json!({"jsonrpc":"2.0","id":next_for_reply,"method":"tools/call","params":{"name":"ide.inspect",
                 "arguments":{"kind":"problems"},
                 "_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next_for_reply}"),
                 "x-codex-turn-metadata":{"session_id":session},"codex/sandbox-state-meta":state_for_race}}}),
@@ -21827,7 +22022,7 @@ async fn eyes_codex_concurrent_hook_and_reply_deliver_exactly_one_plate() {
         next,
         actor,
         session,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
         &state,
     )
@@ -22021,7 +22216,7 @@ async fn eyes_codex_two_sessions_on_one_repository_deliver_once_across_routes() 
         next,
         actor,
         session_b,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
         &state,
     )
@@ -22212,7 +22407,7 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     next += 1;
     let invalid = mcp
         .exchange(
-            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context",
+            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read",
             "arguments":{},
             "_meta":{"threadId":actor,"callId":rejected_call,
             "x-codex-turn-metadata":{"session_id":session},"codex/sandbox-state-meta":state}}}),
@@ -22271,8 +22466,8 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
         next,
         actor,
         session,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -22297,8 +22492,8 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
         next,
         actor,
         session,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -22905,7 +23100,7 @@ async fn outbox_claude_reply_carries_a_finished_run_fact_once() {
             .mcp
             .exchange(
                 json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
-                "name":"ide.context","arguments":{"kind":"problems"},
+                "name":"ide.inspect","arguments":{"kind":"problems"},
                 "_meta":{"claudecode/toolUseId":call}}}),
             )
             .await;
@@ -22958,7 +23153,7 @@ async fn a_running_test_adds_no_plate_line_and_one_terminal_fact_follows() {
     for _ in 0..3 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let reply = actor
-            .call(&fixture, "ide.context", json!({"kind":"problems"}))
+            .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
             .await;
         let carried = carried_status(&reply).unwrap_or_default();
         for seen in [carried.to_owned(), text(&reply)] {
@@ -22982,7 +23177,7 @@ async fn a_running_test_adds_no_plate_line_and_one_terminal_fact_follows() {
     );
     assert!(!fact.contains("poll"), "{fact}");
     let after = actor
-        .call(&fixture, "ide.context", json!({"kind":"problems"}))
+        .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
         .await;
     assert!(
         !text(&after).contains("tests #1")
@@ -23023,7 +23218,7 @@ async fn eyes_claude_method_replies_never_carry_the_plate() {
             .mcp
             .exchange(
                 json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
-                "name":"ide.context","arguments":{"kind":"problems"},
+                "name":"ide.inspect","arguments":{"kind":"problems"},
                 "_meta":{"claudecode/toolUseId":call}}}),
             )
             .await;
@@ -23298,14 +23493,10 @@ async fn configured_product_batch_typescript_tsx_gate_parses_jsx_in_the_real_lau
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let read = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/details.tsx","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/details.tsx"}))
         .await;
     let read = actor.settle(&fixture, read).await;
-    assert_eq!(read["kind"], "context", "{read}");
+    assert_eq!(read["kind"], "read", "{read}");
     let source_ref = read["detail_ref"].as_str().unwrap();
 
     // A clean edit to the JSX file must not be told the base already fails to parse: that false
@@ -23469,11 +23660,11 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
         let context = actor
             .call(
                 &fixture,
-                "ide.context",
+                "ide.inspect",
                 json!({"kind":"problems","language":"python"}),
             )
             .await;
-        assert_eq!(context["kind"], "context", "{context}");
+        assert_eq!(context["kind"], "inspect", "{context}");
         let run = actor
             .call(
                 &fixture,
@@ -23894,7 +24085,7 @@ async fn managed_claude_restart_recovers_each_actor_and_admits_a_new_subagent() 
         &mut next,
         session,
         Some("agent-busy"),
-        "ide.context",
+        "ide.read",
         json!({"path":"busy.txt"}),
     )
     .await;

@@ -5855,7 +5855,7 @@ impl<'a> Worker<'a> {
                         .ok()
                         .and_then(|ledger| ledger.native_epoch.get(&binding).copied())
                         .unwrap_or(0);
-                    if !post_read.is_some_and(|read| {
+                    let exact = post_read.is_some_and(|read| {
                         exact_post_read_observation(
                             read,
                             &observed,
@@ -5863,7 +5863,12 @@ impl<'a> Worker<'a> {
                             job.native_epoch,
                             current_epoch,
                         )
-                    }) {
+                    });
+                    if exact {
+                        self.refresh_written_unit_memory(job, &observed, &bytes)
+                            .await;
+                    }
+                    if !exact {
                         (None, EditDiagnostics::Unknown {})
                     } else if let Some(deadline) = edit_diagnostic_deadline(job.deadline) {
                         let original = std::mem::replace(&mut job.deadline, deadline);
@@ -12651,7 +12656,7 @@ mod stop_retry_tests {
         assert!(matches!(
             reply,
             PeerReply::Complete {
-                kind: ResultKind::Context,
+                kind: ResultKind::Inspect,
                 detail_ref: None,
                 ..
             }
@@ -14820,7 +14825,7 @@ mod stop_retry_tests {
         );
         assert_eq!(
             run(AssistanceTool::Read, serde_json::json!({"symbol":"##top"})).await,
-            Ok("b.alpha:1  (lines 1)\n1\t#top @btn\n".into())
+            Ok("b.alpha:1  (lines 1)\n1\t#top @btn\n\nrelated_links:\n  defines: class name btn\n  defines: element id top\n  usages: 1 indexed in 1 files (src 1, tests 0)\n    a.gamma:3  [gamma ##top] #top\n  unavailable for: gamma, delta\n".into())
         );
         assert_eq!(
             run(

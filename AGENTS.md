@@ -113,8 +113,8 @@ unchanged unless a change is the point of the task.
 `schemas/tools.json` exports the real binary's `tools/list` array for Claude;
 `schemas/tools-codex.json` exports Codex (`mcp --runtime-dir <dir> --host codex`).
 The current production source defines ten tools per host, including `ide.graph`.
-The owner deferred final regeneration: working exports are the historical graph-only
-intermediate (Claude eleven/Codex ten), not the final source catalog.
+Both snapshots are generated from the rebuilt binary and contain the final ten names.
+The complete project gate remains required before claiming this candidate is done.
 Both source catalogs have the same ten public names. Public `ide.context` is
 removed, including `tools/call`; only its private engine/transport remains. Source
 reads move to `ide.read {"path":"src/a.rs"}` and skeletons to `ide.outline`.

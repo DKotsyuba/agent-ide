@@ -6,6 +6,7 @@
 //! (`AGENT_IDE_PYRIGHT`, `AGENT_IDE_NODE`, `AGENT_IDE_PYTHON`) and, for the fault cases, a
 //! `test-seams` build.
 
+use parity::{source_query, source_query_tool};
 #[path = "support/parity.rs"]
 mod parity;
 
@@ -127,7 +128,7 @@ fn calls() -> Vec<(&'static str, Value)> {
         ("ide.symbol", json!({"symbol":"double"})),
         ("ide.read", json!({"symbol":"main.py#Greeter/greet"})),
         ("ide.graph", json!({"symbol":"helper.py#double"})),
-        ("ide.context", json!({"path":"main.py","byte_offset":141})),
+        source_query(json!({"path":"main.py","byte_offset":141})),
     ]
 }
 
@@ -139,7 +140,7 @@ async fn problems(session: &mut Session, fixture: &Fixture, done: impl Fn(&str) 
         let reply = session
             .call(
                 fixture,
-                "ide.context",
+                source_query_tool(&json!({"kind":"problems","language":"python"})),
                 json!({"kind":"problems","language":"python"}),
             )
             .await;
@@ -481,7 +482,11 @@ async fn python_analyzer_faults_are_typed_and_restart() {
         let daemon_pid = daemon.pid();
         let mut session = Session::start(&fixture).await;
         let warm = session
-            .call(&fixture, "ide.context", json!({"path":"main.py"}))
+            .call(
+                &fixture,
+                source_query_tool(&json!({"path":"main.py"})),
+                json!({"path":"main.py"}),
+            )
             .await;
         assert_eq!(warm["state"], "complete", "{fault}: {warm}");
         let first = provider_module(&mut daemon).expect("the Pyright module runs");

@@ -479,10 +479,34 @@ pub(crate) struct ReadMemory {
     /// Per `file#unit` address: the unit's whole text as the session last read it, the base of
     /// the window-edit guard (symbol-read-edit-v1 §3.2). Dropped with the epoch like `blocks`.
     units: std::collections::BTreeMap<String, RememberedUnit>,
+    /// Ordering of explicit unit reads, including partial reads forgotten after an own write.
+    unit_order: std::collections::BTreeMap<String, u64>,
+    /// Bounded file snapshots; unit texts are sliced only when an edit asks for their guard.
+    files: std::collections::VecDeque<RememberedFile>,
+    /// Monotonic read order within this memory, independent of native call identity.
+    sequence: u64,
 }
 
 /// Most unit texts the memory keeps; a full memory starts over rather than growing.
 const MAX_REMEMBERED_UNITS: usize = 128;
+
+/// At most thirty-two 1 MiB source snapshots, covering every item of one maximum batch.
+const MAX_REMEMBERED_FILES: usize = 32;
+
+/// One delivered file snapshot with per-unit coverage and a single shared source allocation.
+#[derive(Debug)]
+struct RememberedFile {
+    /// Worktree-relative file, identical to the file in canonical guard addresses.
+    file: std::path::PathBuf,
+    /// The exact read bytes, shared with other snapshots of unchanged source.
+    source: std::sync::Arc<str>,
+    /// Address geometry for those bytes, never reconstructed from a later file version.
+    map: crate::lang::address::AddressMap,
+    /// Unit-relative delivered intervals; `None` fences a partial read forgotten after a write.
+    coverage: std::collections::BTreeMap<String, Option<crate::lang::LineRange>>,
+    /// Order of this read relative to explicit address reads.
+    sequence: u64,
+}
 
 impl ReadMemory {
     /// Returns the `detail_ref` of the earlier read that delivered exactly `block` for `item` in
@@ -498,6 +522,8 @@ impl ReadMemory {
         if self.epoch != Some(epoch) {
             self.blocks.clear();
             self.units.clear();
+            self.unit_order.clear();
+            self.files.clear();
             self.epoch = Some(epoch);
             return None;
         }
@@ -523,6 +549,8 @@ impl ReadMemory {
         if self.epoch != Some(epoch) || self.blocks.len() >= MAX_REMEMBERED_BLOCKS {
             self.blocks.clear();
             self.units.clear();
+            self.unit_order.clear();
+            self.files.clear();
             self.epoch = Some(epoch);
         }
         self.blocks.insert(
@@ -551,11 +579,17 @@ impl ReadMemory {
         if self.epoch != Some(epoch) {
             self.blocks.clear();
             self.units.clear();
+            self.unit_order.clear();
+            self.files.clear();
             self.epoch = Some(epoch);
         }
-        if self.units.len() >= MAX_REMEMBERED_UNITS && !self.units.contains_key(address) {
+        if self.unit_order.len() >= MAX_REMEMBERED_UNITS && !self.unit_order.contains_key(address) {
             self.units.clear();
+            self.unit_order.clear();
+            self.files.clear();
         }
+        self.sequence = self.sequence.saturating_add(1);
+        self.unit_order.insert(address.to_owned(), self.sequence);
         self.units
             .insert(address.to_owned(), RememberedUnit { text, first, last });
     }
@@ -567,6 +601,146 @@ impl ReadMemory {
             return None;
         }
         self.units.get(address)
+    }
+
+    /// Remembers delivered inclusive file `range` in `source` and its exact `map` for `file`.
+    /// Unknown epochs record nothing; a new epoch resets all reads. Only intersecting units
+    /// gain coverage, without copying their text or spending the explicit 128-unit quota.
+    /// Thirty-two source snapshots are retained in read order, sharing identical file bytes.
+    pub(crate) fn remember_file(
+        &mut self,
+        epoch: Option<u64>,
+        file: &std::path::Path,
+        source: &str,
+        map: crate::lang::address::AddressMap,
+        range: crate::lang::LineRange,
+    ) {
+        let Some(epoch) = epoch else { return };
+        if self.epoch != Some(epoch) {
+            self.blocks.clear();
+            self.units.clear();
+            self.unit_order.clear();
+            self.files.clear();
+            self.epoch = Some(epoch);
+        }
+        let coverage = map
+            .units()
+            .iter()
+            .filter(|unit| range.start.max(unit.span.start) <= range.end.min(unit.span.end))
+            .map(|unit| {
+                let first = range.start.max(unit.span.start);
+                let last = range.end.min(unit.span.end);
+                (
+                    crate::lang::address::Address::new(
+                        Some(file.to_owned()),
+                        unit.address.segments().to_vec(),
+                        None,
+                    )
+                    .to_string(),
+                    Some(crate::lang::LineRange::new(
+                        first - unit.span.start + 1,
+                        last - unit.span.start + 1,
+                    )),
+                )
+            })
+            .collect();
+        let source = self
+            .files
+            .iter()
+            .rev()
+            .find(|read| read.file == file && read.source.as_ref() == source)
+            .map(|read| std::sync::Arc::clone(&read.source))
+            .unwrap_or_else(|| std::sync::Arc::from(source));
+        self.sequence = self.sequence.saturating_add(1);
+        if self.files.len() == MAX_REMEMBERED_FILES {
+            self.files.pop_front();
+        }
+        self.files.push_back(RememberedFile {
+            file: file.to_owned(),
+            source,
+            map,
+            coverage,
+            sequence: self.sequence,
+        });
+    }
+
+    /// Returns the latest delivered unit text from explicit address reads or file snapshots.
+    /// Only the requested unit is copied. Unknown epochs and forgotten partial reads return
+    /// `None`; overlapping file ranges use the last read of that unit, not the last file read.
+    pub(crate) fn latest_unit_text(
+        &self,
+        epoch: Option<u64>,
+        address: &str,
+    ) -> Option<RememberedUnit> {
+        if epoch.is_none() || self.epoch != epoch {
+            return None;
+        }
+        let explicit = self.unit_order.get(address).copied().unwrap_or(0);
+        for read in self.files.iter().rev() {
+            if read.sequence <= explicit {
+                break;
+            }
+            let Some(coverage) = read.coverage.get(address) else {
+                continue;
+            };
+            let coverage = (*coverage)?;
+            let crate::lang::address::Parsed::Address(parsed) =
+                crate::lang::address::Address::parse(address).ok()?
+            else {
+                return None;
+            };
+            let resolved = read.map.resolve(&parsed).ok()?;
+            return Some(RememberedUnit {
+                text: read.source.get(resolved.bytes)?.to_owned(),
+                first: coverage.start,
+                last: coverage.end,
+            });
+        }
+        self.unit_text(epoch, address).map(|read| RememberedUnit {
+            text: read.text.clone(),
+            first: read.first,
+            last: read.last,
+        })
+    }
+
+    /// Refreshes fully delivered units in file snapshots after this session's own write.
+    /// `map` and `source` describe the durable post-write bytes of `file`. Partial or removed
+    /// units become explicit forgotten coverage, so an older snapshot cannot resurrect them.
+    pub(crate) fn refresh_file_reads(
+        &mut self,
+        epoch: Option<u64>,
+        file: &str,
+        map: &crate::lang::address::AddressMap,
+        source: &str,
+    ) {
+        if epoch.is_none() || self.epoch != epoch {
+            return;
+        }
+        let source: std::sync::Arc<str> = std::sync::Arc::from(source);
+        for read in self
+            .files
+            .iter_mut()
+            .filter(|read| read.file == std::path::Path::new(file))
+        {
+            for (address, coverage) in &mut read.coverage {
+                let full = coverage.as_ref().and_then(|old| {
+                    let crate::lang::address::Parsed::Address(parsed) =
+                        crate::lang::address::Address::parse(address).ok()?
+                    else {
+                        return None;
+                    };
+                    let prior = read.map.resolve(&parsed).ok()?;
+                    if old.start != 1 || old.end < prior.span.len() {
+                        return None;
+                    }
+                    let next = map.resolve(&parsed).ok()?;
+                    Some(crate::lang::LineRange::new(1, next.span.len()))
+                });
+                *coverage = full;
+            }
+            read.source = std::sync::Arc::clone(&source);
+            read.map = map.clone();
+        }
     }
 
     /// Refreshes the remembered units of file `file` after this session's own write: a unit

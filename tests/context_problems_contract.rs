@@ -71,18 +71,21 @@ fn ready(language: Language, problems: Vec<Problem>) -> ProblemSnapshot {
     ProblemSnapshot::from_problems(language, CheckState::Ready, problems, 1, 5)
 }
 
-/// Advertises the closed problems fields alongside the unchanged v0.2 context properties.
+/// Advertises closed project/file diagnostic modes on Inspect, including bounded problem paging.
 #[test]
 fn context_schema_advertises_bounded_problems_fields() {
     agent_ide::languages::install();
     let schema = tool_schemas()
         .into_iter()
-        .find(|schema| schema.name == "ide.context")
-        .expect("context schema stays present")
+        .find(|schema| schema.name == "ide.inspect")
+        .expect("inspect diagnostic schema")
         .input_schema;
     assert_eq!(schema["additionalProperties"], false);
     assert_eq!(schema["properties"]["kind"]["type"], "string");
-    assert_eq!(schema["properties"]["kind"]["enum"], json!(["problems"]));
+    assert_eq!(
+        schema["properties"]["kind"]["enum"],
+        json!(["problems", "diagnostics"])
+    );
     assert_eq!(schema["properties"]["language"]["type"], "string");
     assert_eq!(
         schema["properties"]["language"]["enum"],
@@ -99,17 +102,17 @@ fn context_schema_advertises_bounded_problems_fields() {
 #[test]
 fn validation_accepts_problems_without_path_and_keeps_bounds_closed() {
     agent_ide::languages::install();
-    assert!(validate_call(AssistanceTool::Context, json!({"kind":"problems"})).is_ok());
+    assert!(validate_call(AssistanceTool::Inspect, json!({"kind":"problems"})).is_ok());
     assert!(
         validate_call(
-            AssistanceTool::Context,
+            AssistanceTool::Inspect,
             json!({"kind":"problems","language":"python","offset":40})
         )
         .is_ok()
     );
     assert!(
         validate_call(
-            AssistanceTool::Context,
+            AssistanceTool::Inspect,
             json!({"kind":"problems","language":"typescript"})
         )
         .is_ok()
@@ -121,13 +124,14 @@ fn validation_accepts_problems_without_path_and_keeps_bounds_closed() {
         json!({"kind":"problems","unknown":"field"}),
     ] {
         assert!(
-            validate_call(AssistanceTool::Context, invalid.clone()).is_err(),
+            validate_call(AssistanceTool::Inspect, invalid.clone()).is_err(),
             "{invalid}"
         );
     }
 }
 
-/// A context request naming neither `path` nor `kind: "problems"` gets the dedicated typed error.
+/// The private legacy Context validator retains its dedicated missing-target error; this is
+/// internal compatibility, not a registered public MCP call.
 #[test]
 fn context_without_path_or_problems_kind_is_a_context_target_error() {
     agent_ide::languages::install();
