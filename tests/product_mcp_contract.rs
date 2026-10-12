@@ -14699,7 +14699,7 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
     assert_eq!(missing["code"], "provider_unavailable", "{missing}");
     assert_ne!(missing["state"], "pending", "{missing}");
 
-    // Read of a symbol: numbered source, marked unavailable, with its source_ref.
+    // Read of a symbol: numbered source, marked unavailable.
     let read = actor
         .call(&fixture, "ide.read", json!({"symbol":"src/lib.rs#value"}))
         .await;
@@ -14729,9 +14729,10 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
     let refused_text = raw["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_default();
-    assert!(
-        refused_text.contains("the source outline refused this file; use native reads")
-            && !refused_text.contains("still answer from source"),
+    assert_eq!(raw["result"]["isError"], true, "{raw}");
+    assert_eq!(
+        refused_text,
+        "The server cannot answer this request and no source outline is available.\nRepair: Read the source with native tools.",
         "{raw}"
     );
 
