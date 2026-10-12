@@ -542,6 +542,11 @@ enum ActorElsewhere {
     },
 }
 
+/// One retained diff page's delivery candidate: BLAKE3 fitted-body digest, previously delivered
+/// fingerprints still in the capture, then complete current-page hunk fingerprints. This tuple
+/// owns bounded in-memory sets; it changes seen state only after a successful matching send.
+type DiffDeliveryCandidate = ([u8; 32], BTreeSet<u64>, BTreeSet<u64>);
+
 /// Shared bounded transport-side bookkeeping; no lock survives an I/O await.
 struct Ledger {
     /// Jobs popped for execution and not yet settled; maintained in the same locked section that
@@ -582,7 +587,7 @@ struct Ledger {
     /// Per retained diff reference: exact fitted body digest, prior delivered hunks still in
     /// this capture, and complete hunks on its current page. Capture prepares these candidates;
     /// only a successful matching body send consumes them into diff_seen.
-    diff_delivery: BTreeMap<String, ([u8; 32], BTreeSet<u64>, BTreeSet<u64>)>,
+    diff_delivery: BTreeMap<String, DiffDeliveryCandidate>,
     /// Pending `job-ready` registrations (OUTBOX §3.2) by result reference, with the epoch the
     /// fact is fenced at; taken by the job's settlement or by a read through its own reference.
     deferred: BTreeMap<String, (super::outbox::DeferSpec, super::outbox::JobEpoch)>,

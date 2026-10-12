@@ -4261,18 +4261,19 @@ pub(crate) fn staged_detail(
 /// action or extending its Repair line. Only the known refusal head changes; carried status
 /// and the existing bounded repair remain intact.
 fn note_replaced_references(mut rendered: CallToolResult, note: bool) -> CallToolResult {
-    if note && let Some(ContentBlock::Text(text)) = rendered.content.first_mut() {
-        if let Some((head, tail)) = text.text.split_once("\nRepair: ") {
-            let status = head.rsplit_once('\n').map_or("", |(status, _)| status);
-            text.text = format!(
-                "{}This result reference was issued before the IDE restarted.\nRepair: {tail}",
-                if status.is_empty() {
-                    String::new()
-                } else {
-                    format!("{status}\n")
-                }
-            );
-        }
+    if note
+        && let Some(ContentBlock::Text(text)) = rendered.content.first_mut()
+        && let Some((head, tail)) = text.text.split_once("\nRepair: ")
+    {
+        let status = head.rsplit_once('\n').map_or("", |(status, _)| status);
+        text.text = format!(
+            "{}This result reference was issued before the IDE restarted.\nRepair: {tail}",
+            if status.is_empty() {
+                String::new()
+            } else {
+                format!("{status}\n")
+            }
+        );
     }
     rendered
 }
