@@ -90,6 +90,8 @@ fn add_worktree(repo: &Path, branch: &str) -> PathBuf {
 /// The key is `candidate`'s canonical git common directory, independently rediscovered through the
 /// real `git` binary; a `candidate` outside any repository falls back to itself, exactly like the
 /// product code. This never inspects product internals, only its documented external contract.
+/// The parent is the inherited operator-selected Claude rendezvous root; an absent or empty
+/// setting retains the legacy parent. Canonicalization failures fail this fixture explicitly.
 fn expected_runtime_path(candidate: &Path) -> PathBuf {
     let candidate = std::fs::canonicalize(candidate).unwrap();
     let output = std::process::Command::new("/usr/bin/git")
@@ -105,7 +107,10 @@ fn expected_runtime_path(candidate: &Path) -> PathBuf {
         candidate
     };
     let hash = blake3::hash(key.as_os_str().as_bytes());
-    std::fs::canonicalize("/private/tmp")
+    let parent = std::env::var_os("AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from("/private/tmp"), PathBuf::from);
+    std::fs::canonicalize(parent)
         .unwrap()
         .join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
 }
