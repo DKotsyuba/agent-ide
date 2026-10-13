@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-ide"
-version = "0.10.8"
+version = "0.10.9"
 dependencies = [
  "agent-ide-core",
  "agent-ide-lang-css",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-core"
-version = "0.10.8"
+version = "0.10.9"
 dependencies = [
  "async-lsp",
  "blake3",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-lang-css"
-version = "0.10.8"
+version = "0.10.9"
 dependencies = [
  "agent-ide-core",
  "async-lsp",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-lang-html"
-version = "0.10.8"
+version = "0.10.9"
 dependencies = [
  "agent-ide-core",
  "async-lsp",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-lang-python"
-version = "0.10.8"
+version = "0.10.9"
 dependencies = [
  "agent-ide-core",
  "async-lsp",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-lang-rust"
-version = "0.10.8"
+version = "0.10.9"
 dependencies = [
  "agent-ide-core",
  "async-lsp",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-lang-typescript"
-version = "0.10.8"
+version = "0.10.9"
 dependencies = [
  "agent-ide-core",
  "async-lsp",

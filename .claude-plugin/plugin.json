@@ -1,6 +1,6 @@
 {
   "name": "agent-ide",
-  "version": "0.10.8",
+  "version": "0.10.9",
   "description": "Ten ide.* tools: source reads/edits, symbol cards or positional lookup, call chains and diagnostic inspection.",
   "author": {
     "name": "DKotsyuba"

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.9 — 2026-10-13
+
 ### Added
 
 - Optional protected Bridge SDK 0.2.0 routing for managed Codex direct-MCP test and edit-check completion notices. Local Workspace/source authority stays in IDE; durable publication intent and scoped retirement prevent replay through a second carrier after uncertain custody. Unsupported hosts and paths retain their existing delivery.

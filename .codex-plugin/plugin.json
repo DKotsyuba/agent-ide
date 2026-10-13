@@ -1,6 +1,6 @@
 {
   "name": "agent-ide",
-  "version": "0.10.8",
+  "version": "0.10.9",
   "description": "Agent IDE coding-companion skill: find a symbol address, read the symbol, replace it or edit lines inside it, with the ide.start/diff/inspect/stop/edit/outline/read/symbol/graph/test tools.",
   "author": {
     "name": "DKotsyuba"

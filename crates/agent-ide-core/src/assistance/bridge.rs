@@ -255,6 +255,7 @@ impl BridgeDelivery {
     /// Reserves the sole delivery owner synchronously before any legacy push. Returns
     /// `None` when no eligible route/capacity exists; otherwise the caller must await the
     /// owned attempt and fall back only for a positive no-publication result.
+    /// Failed and source-bearing drafts always stay on their existing guarded carriers.
     pub(crate) fn reserve(
         &self,
         binding: &BindingRef,
@@ -499,6 +500,9 @@ impl BridgeClient {
     /// Registers original Codex direct-call metadata once before local dispatch. Exact
     /// native-call-derived ids survive reconnect without new operations; historical replay
     /// never attaches a route. Unavailable/unsupported Bridge leaves legacy delivery intact.
+    /// The inline wait is at most 250 ms; eight blocking registrations may continue
+    /// behind it. Late tickets are discarded. Capability support is cached for 60 seconds
+    /// and failure for five; original native evidence is never cached or reused.
     pub(crate) async fn register(
         self: &Arc<Self>,
         meta: &Map<String, Value>,
