@@ -1303,6 +1303,20 @@ impl ProductDispatcher {
                     && !stopped
                     && matches!(
                         method.method(),
+                        AssistanceMethod::Edit | AssistanceMethod::Test
+                    )
+                    && let Some(ticket) = meta.get(super::bridge::ROUTE_META)
+                {
+                    worker.note_bridge_route(
+                        invocation.binding_ref(),
+                        method.correlation_id(),
+                        ticket,
+                    );
+                }
+                if self.managed_codex
+                    && !stopped
+                    && matches!(
+                        method.method(),
                         AssistanceMethod::Context
                             | AssistanceMethod::Diff
                             | AssistanceMethod::Inspect

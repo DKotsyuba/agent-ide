@@ -661,6 +661,8 @@ tokio::task_local! {
 
 /// Cloneable state shared by ingress and the single worker task, never by independent worker loops.
 struct Shared {
+    /// Optional qualified Bridge completion owner; local authority remains unchanged.
+    bridge: Mutex<Option<Arc<super::bridge::BridgeDelivery>>>,
     /// Exact revocable host binding owner.
     bindings: Arc<Mutex<HostBindingGuard>>,
     /// Bounded queue, cancellation and detail ledger.
@@ -1452,6 +1454,7 @@ impl WorkerHandle {
         let (inspect, receiver) = mpsc::channel(launcher.limits.queued);
         Self {
             shared: Arc::new(Shared {
+                bridge: Mutex::new(None),
                 bindings,
                 ledger: Mutex::new(Ledger::default()),
                 notify: Notify::new(),
@@ -1753,6 +1756,17 @@ impl WorkerHandle {
             // ponytail: one process-lifetime Store Arc leak per daemon boot; replace with explicit
             // task-owned shutdown once in-process daemon restart becomes a supported lifecycle.
             let store: &'static Arc<Store> = Box::leak(Box::new(Arc::new(store)));
+            // Bridge orphan recovery is safe only for this owned runtime's database.
+            // A separately shared state database cannot prove another daemon's scopes dead.
+            if database == runtime.join("state.sqlite")
+                && let Some(config) = shared.launcher.bridge()
+                && let Some(delivery) =
+                    super::bridge::BridgeDelivery::open(config, Arc::clone(store), shared.nonce)
+                        .await
+                && let Ok(mut bridge) = shared.bridge.lock()
+            {
+                *bridge = Some(delivery);
+            }
             let telemetry_database = std::env::var_os("AGENT_IDE_TELEMETRY_DATABASE")
                 .map(std::path::PathBuf::from)
                 .filter(|path| path.is_absolute())
@@ -1857,6 +1871,15 @@ impl WorkerHandle {
     }
     /// Fences admission, cancels every binding, and waits for the sole worker to reap providers.
     pub async fn shutdown(&self) -> Result<(), FailureCode> {
+        if let Some(bridge) = self
+            .shared
+            .bridge
+            .lock()
+            .ok()
+            .and_then(|bridge| bridge.clone())
+        {
+            bridge.end_all();
+        }
         self.startup_cancel
             .store(true, std::sync::atomic::Ordering::Release);
         self.shared
@@ -2029,6 +2052,15 @@ impl WorkerHandle {
         }
         // OUTBOX §11: the stop reply carries what was never handed over; then nothing is pushed.
         let undelivered = self.shared.outbox.flush_for_stop(&binding);
+        if let Some(bridge) = self
+            .shared
+            .bridge
+            .lock()
+            .ok()
+            .and_then(|bridge| bridge.clone())
+        {
+            bridge.end_scope(&binding);
+        }
         self.shared.notify.notify_one();
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
@@ -5776,6 +5808,7 @@ impl<'a> Worker<'a> {
             }
         };
         let preexisting = self.pre_edit_problem_keys(&authority, &request.path);
+        let guard_base = self.read_guard_write_base(job, &source).await;
         let active = match self.shared.active(&binding) {
             Ok(active) => active,
             Err(_) => {
@@ -5864,8 +5897,11 @@ impl<'a> Worker<'a> {
                             current_epoch,
                         )
                     });
-                    if exact {
-                        self.refresh_written_unit_memory(job, &observed, &bytes)
+                    if exact
+                        && !matches!(outcome, crate::workspace::edit::EditOutcome::Unchanged(_))
+                        && let Some(before) = guard_base.as_deref()
+                    {
+                        self.refresh_written_unit_memory(job, &observed, &bytes, before)
                             .await;
                     }
                     if !exact {
@@ -6340,6 +6376,15 @@ impl<'a> Worker<'a> {
     /// Releases binding-owned state only after a committed revoke, including environment notice
     /// baselines, so stopped bindings cannot retain roots or suppress a future binding's notices.
     fn release_binding_state(&mut self, binding: &BindingRef) {
+        if let Some(bridge) = self
+            .shared
+            .bridge
+            .lock()
+            .ok()
+            .and_then(|bridge| bridge.clone())
+        {
+            bridge.end_scope(binding);
+        }
         // A displaced or revoked session's undelivered facts reach nobody (OUTBOX §11).
         super::outbox::SessionOutbox::forget(&*self.shared, binding);
         self.unsettled_edits.remove(binding);
@@ -10578,6 +10623,7 @@ mod stop_retry_tests {
         .unwrap();
         Worker {
             shared: Arc::new(Shared {
+                bridge: Mutex::new(None),
                 bindings: Arc::new(Mutex::new(HostBindingGuard::default())),
                 ledger: Mutex::new(Ledger::default()),
                 notify: Notify::new(),

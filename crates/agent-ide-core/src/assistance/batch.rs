@@ -458,8 +458,8 @@ pub(crate) fn read_follow_up(form: ReadForm, cut: &[&ReadItem]) -> String {
     footer
 }
 
-/// Most delivered blocks one session's [`ReadMemory`] keeps; past it the memory starts over,
-/// which only ever means a block is sent again.
+/// Most delivered blocks one session's [`ReadMemory`] keeps; past it all read history resets.
+/// Repeated blocks are delivered again, and windows without remembered rows echo what they replace.
 const MAX_REMEMBERED_BLOCKS: usize = 512;
 
 /// One session's memory of the blocks `ide.read {items}` delivered (batch-api-v1 §2), so a
@@ -504,6 +504,9 @@ struct RememberedFile {
     map: crate::lang::address::AddressMap,
     /// Unit-relative delivered intervals; `None` fences a partial read forgotten after a write.
     coverage: std::collections::BTreeMap<String, Option<crate::lang::LineRange>>,
+    /// Own-write text for changed, fully known units; untouched external changes stay in source.
+    /// Bounded by the explicit-unit ceiling, without retaining one whole file per own edit.
+    overrides: std::collections::BTreeMap<String, String>,
     /// Order of this read relative to explicit address reads.
     sequence: u64,
 }
@@ -594,8 +597,9 @@ impl ReadMemory {
             .insert(address.to_owned(), RememberedUnit { text, first, last });
     }
 
-    /// What this session last read of unit `address` in the same `epoch`, or `None` (unknown
-    /// epoch, a different epoch, never read).
+    /// Explicit address-read entry for `address` in the same `epoch`, without file overlays.
+    /// Unknown/different epochs or absent explicit entries return `None`. Full last-read
+    /// semantics are implemented by [`Self::latest_unit_text`].
     pub(crate) fn unit_text(&self, epoch: Option<u64>, address: &str) -> Option<&RememberedUnit> {
         if epoch.is_none() || self.epoch != epoch {
             return None;
@@ -660,6 +664,7 @@ impl ReadMemory {
             source,
             map,
             coverage,
+            overrides: std::collections::BTreeMap::new(),
             sequence: self.sequence,
         });
     }
@@ -691,7 +696,11 @@ impl ReadMemory {
             };
             let resolved = read.map.resolve(&parsed).ok()?;
             return Some(RememberedUnit {
-                text: read.source.get(resolved.bytes)?.to_owned(),
+                text: read
+                    .overrides
+                    .get(address)
+                    .cloned()
+                    .or_else(|| read.source.get(resolved.bytes).map(str::to_owned))?,
                 first: coverage.start,
                 last: coverage.end,
             });
@@ -703,55 +712,92 @@ impl ReadMemory {
         })
     }
 
-    /// Refreshes fully delivered units in file snapshots after this session's own write.
-    /// `map` and `source` describe the durable post-write bytes of `file`. Partial or removed
-    /// units become explicit forgotten coverage, so an older snapshot cannot resurrect them.
+    /// Refreshes fully delivered file units only when their remembered text matches the write base.
+    /// `map`/`source` are the post-write bytes, `before_map`/`before` the verified pre-write base.
+    /// Externally changed units retain their old baseline. Known partial or removed units are
+    /// forgotten explicitly; own-write overlays retain only unit text and have a bounded quota.
     pub(crate) fn refresh_file_reads(
         &mut self,
         epoch: Option<u64>,
         file: &str,
         map: &crate::lang::address::AddressMap,
         source: &str,
+        before_map: &crate::lang::address::AddressMap,
+        before: &str,
     ) {
         if epoch.is_none() || self.epoch != epoch {
             return;
         }
-        let source: std::sync::Arc<str> = std::sync::Arc::from(source);
         for read in self
             .files
             .iter_mut()
             .filter(|read| read.file == std::path::Path::new(file))
         {
             for (address, coverage) in &mut read.coverage {
-                let full = coverage.as_ref().and_then(|old| {
-                    let crate::lang::address::Parsed::Address(parsed) =
-                        crate::lang::address::Address::parse(address).ok()?
-                    else {
-                        return None;
-                    };
-                    let prior = read.map.resolve(&parsed).ok()?;
-                    if old.start != 1 || old.end < prior.span.len() {
-                        return None;
-                    }
-                    let next = map.resolve(&parsed).ok()?;
-                    Some(crate::lang::LineRange::new(1, next.span.len()))
-                });
-                *coverage = full;
+                let Some(old) = *coverage else { continue };
+                let Ok(crate::lang::address::Parsed::Address(parsed)) =
+                    crate::lang::address::Address::parse(address)
+                else {
+                    continue;
+                };
+                let Ok(prior) = read.map.resolve(&parsed) else {
+                    continue;
+                };
+                let Some(remembered) = read
+                    .overrides
+                    .get(address)
+                    .map(String::as_str)
+                    .or_else(|| read.source.get(prior.bytes))
+                else {
+                    continue;
+                };
+                let matches_base = before_map
+                    .resolve(&parsed)
+                    .ok()
+                    .and_then(|base| before.get(base.bytes))
+                    == Some(remembered);
+                if !matches_base {
+                    continue;
+                }
+                if old.start != 1 || old.end < crate::lang::line_count(remembered) {
+                    *coverage = None;
+                    read.overrides.remove(address);
+                    continue;
+                }
+                let Some((new_text, length)) = map
+                    .resolve(&parsed)
+                    .ok()
+                    .and_then(|next| source.get(next.bytes).map(|text| (text, next.span.len())))
+                else {
+                    *coverage = None;
+                    read.overrides.remove(address);
+                    continue;
+                };
+                if new_text == remembered {
+                    continue;
+                }
+                // ponytail: bounded unit overlays; reread if a write changes over 128 known units.
+                if read.overrides.len() >= MAX_REMEMBERED_UNITS
+                    && !read.overrides.contains_key(address)
+                {
+                    continue;
+                }
+                read.overrides.insert(address.clone(), new_text.to_owned());
+                *coverage = Some(crate::lang::LineRange::new(1, length));
             }
-            read.source = std::sync::Arc::clone(&source);
-            read.map = map.clone();
         }
     }
 
     /// Refreshes the remembered units of file `file` after this session's own write: a unit
-    /// whose whole text was remembered takes the text `current` gives for its address (or is
-    /// forgotten when `current` knows no such unit); a unit read only in part is forgotten, since
-    /// the lines the agent never saw are no longer known to it.
+    /// whose remembered text equals the verified `before` base takes the text `current` gives
+    /// (or is forgotten when removed). Foreign changes preserve the old guard; known partial
+    /// units are forgotten. These callbacks return whole unit text and its line count.
     pub(crate) fn refresh_file_units(
         &mut self,
         epoch: Option<u64>,
         file: &str,
         current: &dyn Fn(&str) -> Option<(String, u32)>,
+        before: &dyn Fn(&str) -> Option<(String, u32)>,
     ) {
         if epoch.is_none() || self.epoch != epoch {
             return;
@@ -767,6 +813,9 @@ impl ReadMemory {
             let Some(old) = self.units.get(&key) else {
                 continue;
             };
+            if !before(&key).is_some_and(|(base, _)| base == old.text) {
+                continue;
+            }
             let whole = old.first == 1 && old.last >= old.text.lines().count() as u32;
             match (whole, current(&key)) {
                 (true, Some((text, length))) => {
@@ -1823,6 +1872,30 @@ mod tests {
         );
     }
 
+    /// Unknown/new context cannot use guards, and an existing unit at the quota must not evict
+    /// other entries. Crossing the distinct-unit or block quota explicitly resets read history.
+    #[test]
+    fn read_guard_epochs_and_quota_boundaries_are_explicit() {
+        let mut memory = ReadMemory::default();
+        for index in 0..MAX_REMEMBERED_UNITS {
+            memory.remember_unit(Some(1), &format!("a.rs#unit{index}"), "old\n".into(), 1, 1);
+        }
+        assert!(memory.latest_unit_text(None, "a.rs#unit0").is_none());
+        assert!(memory.latest_unit_text(Some(2), "a.rs#unit0").is_none());
+        memory.remember_unit(Some(1), "a.rs#unit0", "new\n".into(), 1, 1);
+        assert_eq!(
+            memory.latest_unit_text(Some(1), "a.rs#unit0").unwrap().text,
+            "new\n"
+        );
+        assert!(memory.unit_text(Some(1), "a.rs#unit1").is_some());
+        memory.remember_unit(Some(1), "a.rs#overflow", "x\n".into(), 1, 1);
+        assert!(memory.latest_unit_text(Some(1), "a.rs#unit0").is_none());
+        for index in 0..=MAX_REMEMBERED_BLOCKS {
+            memory.remember(Some(1), &format!("block{index}"), "body", "ref");
+        }
+        assert!(memory.latest_unit_text(Some(1), "a.rs#overflow").is_none());
+    }
+
     /// After the session's own write, a unit it had read whole takes the new text, a unit it had
     /// read in part is forgotten, and another epoch's memory is never touched.
     #[test]
@@ -1835,9 +1908,14 @@ mod tests {
             "a.rs#whole" => Some(("x\nY\nz\n".to_owned(), 3)),
             _ => None,
         };
-        memory.refresh_file_units(Some(2), "a.rs", &current);
+        let before = |address: &str| match address {
+            "a.rs#whole" => Some(("x\ny\n".to_owned(), 2)),
+            "a.rs#part" => Some(("p\nq\nr\n".to_owned(), 3)),
+            _ => None,
+        };
+        memory.refresh_file_units(Some(2), "a.rs", &current, &before);
         assert!(memory.unit_text(Some(1), "a.rs#whole").unwrap().text == "x\ny\n");
-        memory.refresh_file_units(Some(1), "a.rs", &current);
+        memory.refresh_file_units(Some(1), "a.rs", &current, &before);
         let whole = memory.unit_text(Some(1), "a.rs#whole").unwrap();
         assert_eq!(
             (whole.text.as_str(), whole.first, whole.last),

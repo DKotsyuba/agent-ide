@@ -2296,6 +2296,7 @@ async fn run_managed_codex_mcp(
     launcher_template: PathBuf,
     candidate: std::io::Result<PathBuf>,
 ) -> ExitCode {
+    let bridge_launcher = LauncherConfig::read(&launcher_template).ok();
     let Ok(candidate) = candidate else {
         return serve_managed_stdio(
             StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
@@ -2387,6 +2388,9 @@ async fn run_managed_codex_mcp(
             let facade = facade.map(|facade| {
                 facade
                     .with_catalog_host(CatalogHost::Codex)
+                    .with_bridge_configuration(
+                        bridge_launcher.as_ref().and_then(LauncherConfig::bridge),
+                    )
                     .with_wedge_eviction(evict)
             });
             let Some(facade) = facade else {

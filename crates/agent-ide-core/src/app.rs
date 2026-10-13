@@ -2408,9 +2408,12 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(peer, caller) })
                 .await
                 .expect("the finite transport and fake peer must settle");
-        assert!(
-            matches!(outcome, MethodDispatchTransportResult::Dispatched { .. }),
-            "a confirmed original reply must not become unknown: {outcome:?}"
+        let MethodDispatchTransportResult::Dispatched { opaque_result_json } = outcome else {
+            panic!("a confirmed original reply must not become unknown: {outcome:?}");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(opaque_result_json.as_str()).unwrap(),
+            json!({"confirmed":true})
         );
     }
 

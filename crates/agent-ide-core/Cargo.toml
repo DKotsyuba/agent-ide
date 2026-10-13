@@ -11,6 +11,7 @@ description = "Language-independent core of Agent IDE: sessions, providers, chec
 path = "src/lib.rs"
 
 [dependencies]
+bridge-sdk.workspace = true
 async-lsp.workspace = true
 blake3.workspace = true
 libc.workspace = true

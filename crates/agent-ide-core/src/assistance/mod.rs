@@ -34,6 +34,9 @@ pub mod problems;
 /// Loads bounded restart-only trusted target and executable/profile configuration.
 pub mod launcher;
 
+/// Connects optional protected Bridge routing without changing local authority.
+pub mod bridge;
+
 /// Defines closed byte-budgeted pending/detail/error and owner-result envelopes.
 pub mod reply;
 

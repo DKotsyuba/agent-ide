@@ -4,6 +4,8 @@
 
 ### Added
 
+- Optional protected Bridge SDK 0.2.0 routing for managed Codex direct-MCP test and edit-check completion notices. Local Workspace/source authority stays in IDE; durable publication intent and scoped retirement prevent replay through a second carrier after uncertain custody. Unsupported hosts and paths retain their existing delivery.
+
 - `ide.read` and `ide.edit` work on symbol addresses. A read takes `file#Type/method`, a `:N`, `:N-M` or `:N-` window counted from the symbol's first line, an `@header`/`@imports` region or the `path:line` that grep prints, and answers `<address>  (<n> lines; file lines a-b)` with lines numbered from 1 inside the unit. An edit replaces a whole symbol or region, lines inside a symbol (refused with the symbol's current text when those lines changed since the session's last read of it, otherwise applied with the replaced lines echoed), exact old text with new text scoped to a symbol or the file, inserts next to a symbol or region, adds or removes one import, replaces a whole file, and accepts a Codex `apply_patch` body (`patch`, Add File and Update File). No form needs a file-version reference or an `operation_id`.
 - Every edit reply lists the changed lines by address valid for `ide.read`, with absolute lines and counts (`src/a.rs#Store/transcript:12-16 (L131-135)  replaced (3 lines → 5)`), and leaves right after the write: the project check arrives as an `edit-checked` fact instead of being waited for.
 
@@ -12,6 +14,7 @@
 - Both hosts advertise the same ten tools: `ide.graph` is available to Codex, and public `ide.context` is removed. Source reads and related links use `ide.read`, exact UTF-8 use-site lookup uses `ide.symbol {path, byte_offset}`, and provider diagnostics and project problems use `ide.inspect`. Symbol cards show immediate callers/callees; graph traverses deeper call chains. Codex alone advertises the patch edit form.
 - Window-edit guards also remember lines delivered by file and range reads, including batch reads, while excluding undisplayed and cut rows.
 - Refused edit candidates never refresh read guards; only verified post-write bytes update remembered units. File reads retain one source snapshot instead of spending one remembered-unit slot per symbol.
+- An own edit of one unit never adopts unread external changes in another unit as its read baseline; no-op edits leave that baseline unchanged.
 - A response arriving while the client probes daemon health is read immediately instead of being lost to a separate health timeout; the original dispatch deadline remains unchanged.
 
 - A plain line range past the end of a file is clamped (`N`, `N-M` and `N-` are accepted) and a start past the end answers `file has <n> lines; nothing at a-b` as a success instead of a refusal.

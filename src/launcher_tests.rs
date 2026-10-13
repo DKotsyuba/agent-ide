@@ -21,6 +21,23 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     let target = json!({"attachment":"private-attachment","candidate":"/private/tmp/worktree","git":executable,"codex":executable,"providers":[],"profiles":[],"allow_disabled_host":true});
     let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target.clone()]});
     let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
+    assert!(loaded.bridge().is_none());
+    let mut bridged = config.clone();
+    bridged["bridge"] = json!({"registration_socket":"/private/service/adapter.sock", "core_socket":"/private/service/core.sock", "credential_file":"/private/service/producer.token"});
+    assert!(
+        LauncherConfig::parse(bridged.to_string().as_bytes())
+            .unwrap()
+            .bridge()
+            .is_some()
+    );
+    bridged["bridge"]["inline_secret"] = json!("refused");
+    assert!(LauncherConfig::parse(bridged.to_string().as_bytes()).is_err());
+    bridged["bridge"]
+        .as_object_mut()
+        .unwrap()
+        .remove("inline_secret");
+    bridged["bridge"]["core_socket"] = json!("relative.sock");
+    assert!(LauncherConfig::parse(bridged.to_string().as_bytes()).is_err());
     assert_eq!(
         loaded.target("private-attachment").unwrap().candidate,
         PathBuf::from("/private/tmp/worktree")

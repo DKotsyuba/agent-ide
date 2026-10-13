@@ -711,6 +711,68 @@ async fn full_file_reads_guard_all_units_after_own_edits() {
     finished(actor, daemon, &fixture).await;
 }
 
+/// An own edit or no-op in another unit never adopts an external writer's unread changes.
+/// Both file and explicit-unit reads must preserve the original guard until a fresh read.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn own_edits_do_not_adopt_external_changes_in_other_units() {
+    for read in [
+        json!({"path":FILE}),
+        json!({"symbol":"src/batch.rs#utility"}),
+    ] {
+        for own_value in [5, 3] {
+            let fixture = batch_edit_fixture(ORIGINAL);
+            let epoch = fixture.base.join("context-epoch");
+            std::fs::write(&epoch, "1").unwrap();
+            let home = enable_fake_rust_checks(&fixture, &fixture.base);
+            let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
+            let daemon = fixture
+                .spawn_configured_daemon_with_env(
+                    Some(&home),
+                    false,
+                    Duration::from_secs(30),
+                    None,
+                    &env,
+                )
+                .await;
+            let mut actor = batch_started_actor(&fixture, "sre-other-writer", FILE).await;
+            call(&mut actor, &fixture, "ide.read", read.clone()).await;
+            let external = ORIGINAL.replace("let a = x;", "let a = x * 9;");
+            std::fs::write(fixture.root.join(FILE), &external).unwrap();
+            let (_, own) = call(
+                &mut actor,
+                &fixture,
+                "ide.edit",
+                json!({
+                    "symbol":"src/batch.rs#second:2", "content":format!("    {own_value}"),
+                }),
+            )
+            .await;
+            let expected = external.replace("    3\n", &format!("    {own_value}\n"));
+            assert_eq!(on_disk(&fixture), expected, "{own}");
+            let (_, attempted) = call(
+                &mut actor,
+                &fixture,
+                "ide.edit",
+                json!({
+                    "symbol":"src/batch.rs#utility:3", "content":"    let a = x + 1;",
+                }),
+            )
+            .await;
+            assert!(
+                attempted.contains("changed since your read"),
+                "read={read}, own={own_value}: {attempted}"
+            );
+            assert_eq!(
+                on_disk(&fixture),
+                expected,
+                "external bytes were overwritten"
+            );
+            finished(actor, daemon, &fixture).await;
+        }
+    }
+}
+
 /// The guard covers only the lines the session read, and follows the session's own edits: a
 /// window outside a partial read is unguarded and echoes what it replaces (so lines the agent
 /// never saw are not overwritten silently), and a window copied from the session's own previous

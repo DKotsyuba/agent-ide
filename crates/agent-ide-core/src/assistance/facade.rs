@@ -2915,6 +2915,8 @@ pub struct StdioFacade {
     /// Only the managed Codex constructor sets this. Publication never activates anything and is
     /// skipped entirely when the trusted request metadata lacks a root session or actor.
     publisher: Option<SharedCodexPublisher>,
+    /// Optional protected Bridge registration client; no workspace authority is delegated.
+    bridge: Option<Arc<super::bridge::BridgeClient>>,
     /// Which per-host catalog and paragraph answer discovery. Both have ten public tools; only
     /// patch advertisement differs. Private Context validation remains outside the rmcp router.
     catalog_host: CatalogHost,
@@ -2930,6 +2932,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: None,
             publisher: None,
+            bridge: None,
             catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         }
@@ -2946,6 +2949,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: None,
             publisher: None,
+            bridge: None,
             catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         }
@@ -2962,6 +2966,7 @@ impl StdioFacade {
             attachment: Some(attachment),
             reconnect: None,
             publisher: None,
+            bridge: None,
             catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         })
@@ -2983,6 +2988,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
             publisher: Some(publisher),
+            bridge: None,
             catalog_host: CatalogHost::Codex,
             router: Self::described_tool_router(),
         })
@@ -3003,6 +3009,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
             publisher: None,
+            bridge: None,
             catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         })
@@ -3034,6 +3041,7 @@ impl StdioFacade {
                 note,
             )),
             publisher: None,
+            bridge: None,
             catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         })
@@ -3043,6 +3051,16 @@ impl StdioFacade {
     /// constructor already selects [`CatalogHost::Codex`]).
     pub fn with_catalog_host(mut self, host: CatalogHost) -> Self {
         self.catalog_host = host;
+        self
+    }
+
+    /// Reads an optional protected Bridge deployment once at trusted managed startup.
+    /// Invalid/unavailable credentials disable only Bridge; no socket is probed here.
+    pub fn with_bridge_configuration(
+        mut self,
+        config: Option<&super::bridge::BridgeConfig>,
+    ) -> Self {
+        self.bridge = config.and_then(super::bridge::BridgeConfig::open);
         self
     }
 
@@ -3119,6 +3137,12 @@ impl StdioFacade {
             return None;
         }
         host.host_meta = Some(selected);
+        if self.catalog_host == CatalogHost::Codex
+            && let Some(route) = context.meta.get(super::bridge::ROUTE_META)
+            && let Some(Value::Object(meta)) = host.host_meta.as_mut()
+        {
+            meta.insert(super::bridge::ROUTE_META.into(), route.clone());
+        }
         Some(host)
     }
 
@@ -3765,7 +3789,7 @@ impl StdioFacade {
         &self,
         tool: AssistanceTool,
         parameters: Value,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let stage_parameters = parameters.clone();
         let call_started = std::time::Instant::now();
@@ -3797,6 +3821,22 @@ impl StdioFacade {
                     message: error.message(tool),
                 },
                 content::Envelope::TextOnly,
+            );
+        }
+        // Always discard any incoming similarly named extension. Only this trusted front
+        // can add a current same-call registration after model argument validation.
+        context.meta.remove(super::bridge::ROUTE_META);
+        if self.catalog_host == CatalogHost::Codex
+            && host_kind == Some(HostKind::Codex)
+            && matches!(tool, AssistanceTool::Test | AssistanceTool::Edit)
+            && let Some(client) = &self.bridge
+            && let Some(route) = client.register(&context.meta).await
+        {
+            context.meta.insert(
+                super::bridge::ROUTE_META.into(),
+                json!({
+                    "route_key": route.route_key, "actor": route.actor, "call": route.call,
+                }),
             );
         }
         // harness-reply-v1 R1: every host, recognized or not, receives the compact text block

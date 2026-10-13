@@ -1,0 +1,340 @@
+{
+  "requests": [
+    {
+      "api_version": 1,
+      "request_id": "caps-1",
+      "credential": "fixture-secret",
+      "op": "capabilities",
+      "params": {}
+    },
+    {
+      "api_version": 1,
+      "request_id": "register-1",
+      "credential": "fixture-secret",
+      "op": "register_call",
+      "params": {
+        "operation_key": "opaque-op",
+        "evidence": {
+          "type": "native",
+          "host": "codex",
+          "metadata": {
+            "threadId": "native-thread",
+            "callId": "native-call",
+            "x-codex-turn-metadata": {}
+          }
+        }
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "publish-1",
+      "credential": "fixture-secret",
+      "op": "publish",
+      "params": {
+        "destination": {
+          "type": "address",
+          "address": "local/codex/store/session"
+        },
+        "event_id": "opaque-event",
+        "kind": "opaque.kind",
+        "payload": "opaque content"
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "status-1",
+      "credential": "fixture-secret",
+      "op": "status",
+      "params": {
+        "selector": {
+          "type": "event",
+          "event_id": "opaque-event"
+        }
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "close-1",
+      "credential": "fixture-secret",
+      "op": "close_route",
+      "params": {
+        "route_key": "opaque-route"
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "consume-1",
+      "credential": "fixture-secret",
+      "op": "consume_assertion",
+      "params": {
+        "assertion_key": "fixture-assertion",
+        "invocation_key": "opaque-forwarded-rpc"
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "retire-1",
+      "credential": "fixture-secret",
+      "op": "retire_delivery_scope",
+      "params": {
+        "scope_key": "opaque-lifetime",
+        "action": "retire_unhanded"
+      }
+    }
+  ],
+  "responses": [
+    {
+      "api_version": 1,
+      "request_id": "caps-1",
+      "success": true,
+      "result": {
+        "op": "capabilities",
+        "value": {
+          "api_version": 1,
+          "supported_versions": [
+            1
+          ],
+          "operations": [
+            "capabilities",
+            "register_call",
+            "publish",
+            "status",
+            "close_route",
+            "consume_assertion",
+            "retire_delivery_scope"
+          ],
+          "evidence_variants": [
+            "native",
+            "sealed"
+          ],
+          "native_contracts": [],
+          "modes": [
+            "message",
+            "inject",
+            "auto"
+          ],
+          "policies": [
+            "keep_all",
+            "latest",
+            "batch"
+          ],
+          "reply_policies": [
+            "self",
+            "shared_session"
+          ],
+          "limits": {
+            "registration_request_bytes": 131072,
+            "core_request_bytes": 524288,
+            "response_bytes": 4194304,
+            "payload_bytes": 65536,
+            "metadata_entries": 16,
+            "rendered_manifest_bytes": 98304,
+            "open_routes": 16,
+            "assertions": 16
+          },
+          "grant": {
+            "allowed_modes": [
+              "message",
+              "inject",
+              "auto"
+            ],
+            "allowed_policies": [
+              "keep_all",
+              "latest",
+              "batch"
+            ],
+            "allowed_kinds": [
+              "*"
+            ],
+            "reply_policies": [
+              "self",
+              "shared_session"
+            ],
+            "direct_address": true,
+            "native_scopes": []
+          },
+          "features": {
+            "consume_assertion": true,
+            "delivery_scopes": true,
+            "host_observations": false
+          },
+          "retention": {
+            "durable_keys": true,
+            "closed_tombstones": true,
+            "credential_independent_identity": true
+          }
+        }
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "register-1",
+      "success": true,
+      "result": {
+        "op": "register_call",
+        "value": {
+          "receipt": {
+            "producer": "synthetic-producer",
+            "request_id": "register-1",
+            "operation_key": "opaque-op",
+            "route_key": "opaque-route",
+            "caller_scope": "opaque-caller",
+            "destination_scope": "opaque-destination",
+            "reply_policy": "self",
+            "constraints": {
+              "allowed_modes": [
+                "message"
+              ],
+              "allowed_kinds": [
+                "*"
+              ],
+              "max_payload_bytes": 65536,
+              "reply_policy": "self"
+            },
+            "state": "open",
+            "created_at_ms": 10,
+            "route_expires_at_ms": null
+          },
+          "evidence_state": "historical",
+          "assertion": null
+        }
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "publish-1",
+      "success": true,
+      "result": {
+        "op": "publish",
+        "value": {
+          "receipt": {
+            "producer": "synthetic-producer",
+            "event_id": "opaque-event",
+            "intent_hash": "17fed1b6c5b9af966dbfe0d299c9d40a90c37ee93954bd792e5180c0d822af96",
+            "envelope_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "accepted_at_ms": 10,
+            "acceptance_seq": 1,
+            "destination": {
+              "address": "local/codex/store/session",
+              "route_key": null,
+              "caller_scope": null,
+              "destination_scope": null
+            }
+          },
+          "replayed": false
+        }
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "status-1",
+      "success": true,
+      "result": {
+        "op": "status",
+        "value": {
+          "type": "event",
+          "event": {
+            "receipt": {
+              "producer": "synthetic-producer",
+              "event_id": "opaque-event",
+              "intent_hash": "17fed1b6c5b9af966dbfe0d299c9d40a90c37ee93954bd792e5180c0d822af96",
+              "envelope_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "accepted_at_ms": 10,
+              "acceptance_seq": 1,
+              "destination": {
+                "address": "local/codex/store/session",
+                "route_key": null,
+                "caller_scope": null,
+                "destination_scope": null
+              }
+            },
+            "custody_state": "pending",
+            "delivery": {
+              "delivery": "unhanded",
+              "attempt_state": null,
+              "effective_mode": null,
+              "note": null,
+              "attempts_made": 0,
+              "attempt": null,
+              "tiers": [],
+              "incident": null,
+              "hold_reason": null,
+              "blocked_by": null
+            }
+          }
+        }
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "close-1",
+      "success": true,
+      "result": {
+        "op": "close_route",
+        "value": {
+          "receipt": {
+            "producer": "synthetic-producer",
+            "request_id": "close-1",
+            "route_key": "opaque-route",
+            "state": "closed",
+            "closed_at_ms": 11
+          },
+          "replayed": false
+        }
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "consume-1",
+      "success": true,
+      "result": {
+        "op": "consume_assertion",
+        "value": {
+          "receipt": {
+            "producer": "synthetic-producer",
+            "request_id": "consume-1",
+            "context": {
+              "audience": "opaque-audience",
+              "caller_scope": "opaque-caller",
+              "destination_scope": "opaque-destination",
+              "caller_address": "local/codex/store/session",
+              "destination_address": "local/codex/store/session",
+              "role": "root",
+              "native_actor_id": "native-thread",
+              "native_call_id": "native-call",
+              "invocation_key": "opaque-forwarded-rpc",
+              "observed_at_ms": 10,
+              "expires_at_ms": 30,
+              "issuer_boot": "opaque-boot",
+              "endpoint_incarnation": "opaque-endpoint"
+            },
+            "consumed_at_ms": 11
+          },
+          "state": "historical"
+        }
+      }
+    },
+    {
+      "api_version": 1,
+      "request_id": "retire-1",
+      "success": true,
+      "result": {
+        "op": "retire_delivery_scope",
+        "value": {
+          "receipt": {
+            "producer": "synthetic-producer",
+            "request_id": "retire-1",
+            "scope_key": "opaque-lifetime",
+            "action": "retire_unhanded",
+            "retired_at_ms": 12,
+            "disposed": 0,
+            "already_terminal": 0,
+            "preserved_possible_effect": 0,
+            "preserved_unhanded": 0
+          },
+          "replayed": false
+        }
+      }
+    }
+  ]
+}

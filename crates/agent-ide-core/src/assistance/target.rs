@@ -313,14 +313,17 @@ impl Worker<'_> {
     }
 
     /// Refreshes the units this session remembers of `path` after its own write: `map` is the
-    /// address map of the written text and `text` that text. Units read whole take the new text;
-    /// units read in part are forgotten (see `ReadMemory::refresh_file_units`).
+    /// address map of the written text and `text` that text. `before_map`/`before_text` are the
+    /// verified write base. Explicit reads and file snapshots preserve foreign changes;
+    /// only matching known units refresh, and known partial units are forgotten.
     pub(super) fn refresh_unit_memory(
         &self,
         binding: &BindingRef,
         path: &str,
         map: &AddressMap,
         text: &str,
+        before_map: &AddressMap,
+        before_text: &str,
     ) {
         let epoch = self.context_epoch(binding);
         let current = |address: &str| -> Option<(String, u32)> {
@@ -329,23 +332,31 @@ impl Worker<'_> {
             let span = map.units()[index].span;
             Some((crate::lang::slice_lines(text, span), span.len()))
         };
+        let before = |address: &str| -> Option<(String, u32)> {
+            let index = (0..before_map.units().len())
+                .find(|&index| canonical(Path::new(path), before_map, index) == address)?;
+            let span = before_map.units()[index].span;
+            Some((crate::lang::slice_lines(before_text, span), span.len()))
+        };
         if let Ok(mut ledger) = self.shared.ledger.lock()
             && let Some(memory) = ledger.read_memory.get_mut(binding)
         {
-            memory.refresh_file_units(epoch, path, &current);
-            memory.refresh_file_reads(epoch, path, map, text);
+            memory.refresh_file_units(epoch, path, &current, &before);
+            memory.refresh_file_reads(epoch, path, map, text, before_map, before_text);
         }
     }
 
     /// Refreshes read guards from an already verified post-write observation and its bytes.
     /// The caller must first match the exact Workspace write receipt and native epoch.
     /// Candidate validation/refusals never call this. Unknown context or an unavailable source
-    /// outline preserves the old guard; only fully read units take the successful write's text.
+    /// outline preserves the old guard. `before` contains exact bytes of the successful write's
+    /// base; fully read units refresh only if those bytes match their remembered baseline.
     pub(super) async fn refresh_written_unit_memory(
         &mut self,
         job: &Job,
         observed: &SourceObservation,
         bytes: &[u8],
+        before: &[u8],
     ) {
         let binding = job.invocation.binding_ref();
         if self.context_epoch(binding).is_none() {
@@ -357,6 +368,9 @@ impl Worker<'_> {
         let Ok(source) = observed_text(observed, bytes) else {
             return;
         };
+        let Ok(before) = std::str::from_utf8(before) else {
+            return;
+        };
         if let Ok(Some(outline)) = crate::modules::calls::outline_from_source(
             language,
             observed.worktree().worktree_path(),
@@ -366,8 +380,46 @@ impl Worker<'_> {
         .await
         {
             let map = AddressMap::build(&outline, source);
-            self.refresh_unit_memory(binding, &observed.path().to_string_lossy(), &map, source);
+            if let Ok(Some(prior)) = crate::modules::calls::outline_from_source(
+                language,
+                observed.worktree().worktree_path(),
+                observed.path(),
+                before,
+            )
+            .await
+            {
+                let prior_map = AddressMap::build(&prior, before);
+                self.refresh_unit_memory(
+                    binding,
+                    &observed.path().to_string_lossy(),
+                    &map,
+                    source,
+                    &prior_map,
+                    before,
+                );
+            }
         }
+    }
+
+    /// Captures exact source bytes for guard refresh without replacing a physical write's base.
+    /// A known context and observation matching `base`'s worktree/path/state/bytes are required.
+    /// Failure returns `None`; the ordinary write remains stale-safe and old guards are preserved.
+    pub(super) async fn read_guard_write_base(
+        &mut self,
+        job: &Job,
+        base: &SourceObservation,
+    ) -> Option<Vec<u8>> {
+        let binding = job.invocation.binding_ref();
+        self.context_epoch(binding)?;
+        let (observed, bytes) = self
+            .observe(binding, base.path().to_path_buf())
+            .await
+            .ok()?;
+        (observed.worktree() == base.worktree()
+            && observed.path() == base.path()
+            && observed.state() == base.state()
+            && observed.bytes() == base.bytes())
+        .then_some(bytes)
     }
 
     /// What this session last read of unit `address` (`file#unit`) in the current context epoch:

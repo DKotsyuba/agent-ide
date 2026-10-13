@@ -543,6 +543,7 @@ impl Worker<'_> {
                     .open(target)
                     .and_then(|mut file| std::io::Write::write_all(&mut file, b"native\n"));
             }
+            let guard_base = self.read_guard_write_base(job, &plan.base).await;
             let outcome = self
                 .write_batch_file(job, binding, operation_id, &plan)
                 .await;
@@ -567,7 +568,17 @@ impl Worker<'_> {
             if let Some(read) = read {
                 let _ = receipts.mark_written(operation_id, index).await;
                 if let Some(observed) = self
-                    .post_write_source(job, binding, &plan.path, &read)
+                    .post_write_source(
+                        job,
+                        binding,
+                        &plan.path,
+                        &read,
+                        if state == FileState::Unchanged {
+                            None
+                        } else {
+                            guard_base.as_deref()
+                        },
+                    )
                     .await
                 {
                     sources.push(observed);
@@ -670,12 +681,15 @@ impl Worker<'_> {
 
     /// Observes a just-written file and returns the observation as an edit base only when it is
     /// exactly the Workspace post-read and no native write intervened (the one-file rule).
+    /// A verified non-no-op `before` base also refreshes eligible read guards. Missing base
+    /// bytes leave their prior state intact.
     async fn post_write_source(
         &mut self,
         job: &Job,
         binding: &BindingRef,
         path: &str,
         read: &crate::workspace::edit::EditPostRead,
+        before: Option<&[u8]>,
     ) -> Option<SourceObservation> {
         let (observed, bytes) = self.observe(binding, path.into()).await.ok()?;
         let current_epoch = self
@@ -688,8 +702,10 @@ impl Worker<'_> {
         if !exact_post_read_observation(read, &observed, &bytes, job.native_epoch, current_epoch) {
             return None;
         }
-        self.refresh_written_unit_memory(job, &observed, &bytes)
-            .await;
+        if let Some(before) = before {
+            self.refresh_written_unit_memory(job, &observed, &bytes, before)
+                .await;
+        }
         Some(observed)
     }
 

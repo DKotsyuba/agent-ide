@@ -588,6 +588,57 @@ async fn wake_session(
 }
 
 impl Shared {
+    /// Transfers eligible content-free completions to exactly one delivery owner.
+    /// Legacy receives only unreserved or positively unsent events. Source-bearing facts
+    /// keep existing currency checks and carriers. A retired binding emits nothing.
+    fn push_or_transfer(&self, recipients: &[BindingRef], draft: FactDraft, epoch: JobEpoch) {
+        let bridge = self.bridge.lock().ok().and_then(|bridge| bridge.clone());
+        for binding in recipients {
+            let reserved = bridge
+                .as_ref()
+                .and_then(|bridge| bridge.reserve(binding, &draft));
+            let Some((route, permit)) = reserved else {
+                self.outbox
+                    .push_draft(std::slice::from_ref(binding), draft.clone(), epoch);
+                self.schedule_wake(std::slice::from_ref(binding));
+                continue;
+            };
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                self.outbox
+                    .push_draft(std::slice::from_ref(binding), draft.clone(), epoch);
+                self.schedule_wake(std::slice::from_ref(binding));
+                continue;
+            };
+            let bridge = Arc::clone(bridge.as_ref().expect("reserved owner"));
+            let bindings = Arc::clone(&self.bindings);
+            let binding = binding.clone();
+            let draft = draft.clone();
+            let outbox = Arc::clone(&self.outbox);
+            let waker = Arc::clone(&self.waker);
+            let tests = self.test_runs.clone();
+            runtime.spawn(async move {
+                let _permit = permit;
+                if !bindings
+                    .lock()
+                    .ok()
+                    .is_some_and(|guard| guard.check_active(&binding).is_ok())
+                {
+                    bridge.end_scope(&binding);
+                    return;
+                }
+                if !bridge.publish(binding.clone(), &draft, route).await
+                    && bindings
+                        .lock()
+                        .ok()
+                        .is_some_and(|guard| guard.check_active(&binding).is_ok())
+                {
+                    outbox.push_draft(std::slice::from_ref(&binding), draft, epoch);
+                    tokio::time::sleep(WAKE_GRACE).await;
+                    let _ = wake_session(&outbox, &tests, waker.as_ref(), &binding).await;
+                }
+            });
+        }
+    }
     /// Records the session state the job behind `reference` started from, once: the epoch its
     /// `job-ready` fact is fenced at (OUTBOX §3.1). Records of results no longer retained go.
     pub(super) fn note_job_started(&self, reference: &str, binding: &BindingRef) {
@@ -675,12 +726,11 @@ impl Shared {
             },
         ) = (held, reply)
         {
-            self.outbox.push_draft(
+            self.push_or_transfer(
                 std::slice::from_ref(&work.owner),
                 edit_checked_fact(reference, result, diagnostics),
                 work.epoch,
             );
-            self.schedule_wake(std::slice::from_ref(&work.owner));
         }
     }
 
@@ -726,17 +776,14 @@ impl Shared {
         let Some(work) = self.outbox.take_holding(&test_subject(id)) else {
             return;
         };
-        self.outbox.push_draft(
+        self.push_or_transfer(
             std::slice::from_ref(&work.owner),
             test_fact(id, &result, true),
             work.epoch,
         );
         if !work.subscribers.is_empty() {
-            self.outbox
-                .push_draft(&work.subscribers, test_fact(id, &result, false), work.epoch);
+            self.push_or_transfer(&work.subscribers, test_fact(id, &result, false), work.epoch);
         }
-        self.schedule_wake(std::slice::from_ref(&work.owner));
-        self.schedule_wake(&work.subscribers);
     }
 
     /// Installs the test-run settle hook that produces `test-finished` facts; it holds only a weak
@@ -752,6 +799,31 @@ impl Shared {
 }
 
 impl super::WorkerHandle {
+    /// Associates a same-call Bridge route only after local managed Codex admission.
+    /// Cross-actor/call/malformed tickets are ignored and leave legacy delivery intact.
+    pub(crate) fn note_bridge_route(&self, binding: &BindingRef, call: &str, value: &Value) {
+        let Some(ticket) = super::super::bridge::RouteTicket::from_private(value, binding, call)
+        else {
+            return;
+        };
+        // A concurrent stop may have fenced this call after assembly admission. Keep its
+        // guard until the synchronous association ends so a stopped route cannot reappear.
+        let Ok(bindings) = self.shared.bindings.lock() else {
+            return;
+        };
+        if bindings.check_active(binding).is_err() {
+            return;
+        }
+        if let Some(bridge) = self
+            .shared
+            .bridge
+            .lock()
+            .ok()
+            .and_then(|bridge| bridge.clone())
+        {
+            bridge.note_route(binding, ticket);
+        }
+    }
     /// Queues the one `lost-after-restart` fact of `binding`, just re-activated after a daemon
     /// replacement, for the `subjects` its front relayed unresolved (OUTBOX §10). A later
     /// re-activation with the same list replaces it (coalescing on the fixed subject).

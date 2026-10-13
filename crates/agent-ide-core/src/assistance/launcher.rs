@@ -548,6 +548,9 @@ struct RawConfig {
     /// Confined background project-check declarations; absent disables project checks.
     #[serde(default)]
     project_checks: Option<ProjectChecksConfig>,
+    /// Optional explicit protected Bridge deployment; absence preserves legacy delivery.
+    #[serde(default)]
+    bridge: Option<super::bridge::BridgeConfig>,
 }
 
 /// One validated trusted target; metadata alone never creates one of these values.
@@ -572,6 +575,8 @@ pub struct LauncherConfig {
     allowed_roots: Vec<PathBuf>,
     /// Validated project-check declarations; `None` disables project checks.
     project_checks: Option<ProjectChecksConfig>,
+    /// Optional protected Bridge deployment shared by the managed front and daemon.
+    bridge: Option<super::bridge::BridgeConfig>,
     /// Retired settings identifiers whose provider entries were dropped, each once.
     retired: Vec<&'static RetiredSettings>,
 }
@@ -661,6 +666,9 @@ impl LauncherConfig {
         if let Some(checks) = &raw.project_checks {
             checks.validate()?;
         }
+        if raw.bridge.as_ref().is_some_and(|bridge| !bridge.validate()) {
+            return Err(LauncherError::Rejected);
+        }
         if raw.version != 1 || raw.targets.len() > 64 {
             return Err(LauncherError::Rejected);
         }
@@ -714,12 +722,17 @@ impl LauncherConfig {
             limits: raw.limits,
             allowed_roots: raw.allowed_roots,
             project_checks: raw.project_checks,
+            bridge: raw.bridge,
             retired,
         })
     }
     /// The retired settings identifiers this file still declares; their entries were ignored.
     pub fn retired_settings(&self) -> &[&'static RetiredSettings] {
         &self.retired
+    }
+    /// Returns explicit restart-only Bridge configuration; no runtime discovery or I/O.
+    pub fn bridge(&self) -> Option<&super::bridge::BridgeConfig> {
+        self.bridge.as_ref()
     }
     /// Verifies each immutable configured executable once before the worker becomes visible.
     /// Duplicate paths share verification; conflicting fingerprints and cancellation fail closed.
