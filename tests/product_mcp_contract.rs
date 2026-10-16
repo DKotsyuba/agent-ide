@@ -611,6 +611,20 @@ async fn positional_symbol_and_file_diagnostics_preserve_source_safety() {
     daemon.wait().await.unwrap();
 }
 
+/// Returns whether `text` has the harness-reply-v1 R5 refusal shape: a head of at most 160 bytes,
+/// exactly one `Repair: ` line of at most 120 bytes directly after it, and any further line
+/// quoted as indented data. A refusal that echoes a long identifier or path in its head, or
+/// puts a second repair step on the line, fails here.
+fn refusal_shape_holds(text: &str) -> bool {
+    let lines = text.lines().collect::<Vec<_>>();
+    lines.len() >= 2
+        && lines[0].len() <= 160
+        && !lines[0].starts_with("Repair: ")
+        && lines[1].starts_with("Repair: ")
+        && lines[1].len() <= 120
+        && lines[2..].iter().all(|line| line.starts_with("  "))
+}
+
 /// Verifies one successful MCP tool carrier has a single non-JSON block matching its typed state.
 ///
 /// `reply` must be a JSON-RPC tools/call response with `structuredContent`. The assertion performs
@@ -692,7 +706,7 @@ fn assert_compact_envelope(reply: &Value) {
         // A multi-file edit (batch-api-v1 §7) opens with its outcome line, or is a bounded
         // refusal (head sentence, one Repair line), and carries its closed structured result.
         ("edit_batch", _) => assert!(
-            (body.starts_with("edit: ") || body.contains("\nRepair: "))
+            (body.starts_with("edit: ") || refusal_shape_holds(body))
                 && structured["operation_id"].is_string()
                 && structured["outcome"].is_string()
                 && structured["files"].is_array(),
@@ -753,9 +767,7 @@ fn assert_compact_envelope(reply: &Value) {
         // A durable edit refusal is a head sentence and one Repair line; an applied edit leads
         // with its outcome word.
         ("edit", _) if text.contains("\nRepair: ") => assert!(
-            text.lines().next().unwrap().len() <= 160
-                && text.lines().nth(1).unwrap().len() <= 120
-                && !text.starts_with("edit: "),
+            refusal_shape_holds(text) && !text.starts_with("edit: "),
             "{reply}"
         ),
         _ => assert!(text.starts_with(state), "{reply}"),
@@ -842,21 +854,23 @@ fn claude_fields(tool: &str, text: &str) -> Value {
         let head = text.lines().next().unwrap();
         // A durable edit refusal keeps the settled-write state its internal outcome names; the
         // head states the effect, so the outcome is recovered from that sentence.
-        let durable = if head.starts_with("This operation_id already names a different edit") {
+        let durable = if head.starts_with("Nothing was written; this operation_id already names") {
             Some("conflicting_duplicate")
-        } else if head.contains(" is a symlink or special file the IDE may not write") {
+        } else if head.contains("is a symlink or special file the IDE may not write") {
             Some("unsafe_target")
-        } else if head.starts_with("The edit of ") && head.contains(" was cancelled;") {
+        } else if head.starts_with("Nothing was written; the edit was cancelled") {
             Some("cancelled_no_effect")
-        } else if head.starts_with("The edit of ") && head.contains(" ran out of time;") {
+        } else if head.starts_with("Nothing was written; the edit ran out of time") {
             Some("deadline_no_effect")
-        } else if head.starts_with("The IDE was too busy to edit ") {
+        } else if head.starts_with("Nothing was written; the IDE was too busy to edit") {
             Some("capacity_no_effect")
-        } else if head.contains(" may or may not have been written.") {
+        } else if head.starts_with("The edit may or may not have been written") {
             Some("outcome_unknown")
-        } else if head.starts_with("The IDE session is not active; the edit of ") {
+        } else if head.starts_with("Nothing was written; the IDE session is not active") {
             Some("unavailable_before_dispatch")
-        } else if head.ends_with("; nothing was written.") && !head.starts_with("Edit refused;") {
+        } else if head.starts_with("Nothing was written; the file changed")
+            || (head.ends_with("; nothing was written.") && !head.starts_with("Edit refused;"))
+        {
             Some("stale_source")
         } else {
             None

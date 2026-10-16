@@ -7,6 +7,11 @@
 //! text-only envelope; the assertion is the contract of R5: a head of at most 160 bytes, exactly
 //! one `Repair:` line of at most 120 bytes that names one step (no `or`, no retry count), no
 //! internal reason code, and an excerpt only after the Repair line.
+//!
+//! The same contract covers the refusals that are not template branches: the transport refusals of
+//! `facade::transport_refusal`, the unidentified-stop and reply-limit texts, and the multi-file
+//! conflicting-duplicate text of `batch::conflicting_duplicate_reply` rendered with the longest
+//! valid (128-byte) `operation_id`. [`static_rows`] lists them with their E-002 sizes.
 
 use super::*;
 use crate::assistance::reply::EditDiagnostics;
@@ -296,7 +301,7 @@ fn rows() -> Vec<Row> {
         error(
             "outside_allowed_roots: environment",
             F::OutsideAllowedRoots,
-            Some("environment \"rust\" ../venv"),
+            Some("environment \"lang\" ../venv"),
         ),
         error(
             "outside_allowed_roots: root absent",
@@ -637,6 +642,145 @@ const INTERNAL_WORDS: [&str; 14] = [
 
 /// Renders every row through the production projection and asserts the R5 shape; with
 /// `AGENT_IDE_PRINT_REFUSAL_TABLE` set it prints `label | old | new` for the inventory table.
+/// Asserts the harness-reply-v1 R5 shape of one rendered refusal `text` named `label`: a head of
+/// at most 160 bytes, exactly one `Repair:` line of at most 120 bytes naming one step, no
+/// internal reason code, and every later line quoted as data.
+fn assert_refusal_shape(label: &str, text: &str) {
+    let lines = text.lines().collect::<Vec<_>>();
+    let repairs = lines
+        .iter()
+        .filter(|line| line.starts_with("Repair: "))
+        .count();
+    assert_eq!(repairs, 1, "{label}: {text}");
+    assert!(lines[0].len() <= 160, "{label} head: {text}");
+    assert!(
+        lines[1].starts_with("Repair: ") && lines[1].len() <= 120,
+        "{label} repair: {text}"
+    );
+    let repair = &lines[1]["Repair: ".len()..];
+    assert!(
+        !repair.contains(" or ") && !repair.contains("once") && !repair.contains("otherwise"),
+        "{label} names more than one step: {text}"
+    );
+    for word in INTERNAL_WORDS {
+        assert!(
+            !lines[0].contains(word) && !repair.contains(word),
+            "{label} shows {word}: {text}"
+        );
+    }
+    assert!(
+        lines[2..].iter().all(|line| line.starts_with("  ")),
+        "{label} excerpt must be quoted data after the Repair line: {text}"
+    );
+}
+
+/// Returns the refusals that bypass the reply template, as `(label, text, E-002 bytes)`.
+///
+/// Every `FacadeOutcome` transport refusal (the lost-reply one for each tool), the
+/// unidentified-stop and reply-limit texts, and the batch conflicting duplicate with a 128-byte
+/// `operation_id`. The E-002 sizes are the old texts measured at `eaeba10`.
+fn static_rows() -> Vec<(String, String, usize)> {
+    use crate::assistance::facade::AssistanceTool as T;
+    use crate::assistance::facade::{
+        FacadeOutcome as O, REPLY_LIMIT_REFUSAL, STOP_UNIDENTIFIED, transport_refusal,
+    };
+    let mut rows = Vec::new();
+    for (label, outcome, tool, old) in [
+        (
+            "transport: invalid_parameters",
+            O::InvalidParameters,
+            T::Read,
+            51,
+        ),
+        (
+            "transport: host attachment",
+            O::MissingHostMetadata,
+            T::Read,
+            81,
+        ),
+        (
+            "transport: connection unavailable",
+            O::Unavailable,
+            T::Read,
+            70,
+        ),
+        ("transport: timed out", O::TimedOut, T::Read, 65),
+        ("transport: busy", O::Busy, T::Read, 133),
+        ("transport: restarting", O::Restarting, T::Read, 128),
+        (
+            "transport: lost reply (ide.edit)",
+            O::OutcomeUnknown,
+            T::Edit,
+            111,
+        ),
+        (
+            "transport: lost reply (ide.test)",
+            O::OutcomeUnknown,
+            T::Test,
+            126,
+        ),
+        (
+            "transport: lost reply (ide.start)",
+            O::OutcomeUnknown,
+            T::Start,
+            131,
+        ),
+        (
+            "transport: lost reply (other)",
+            O::OutcomeUnknown,
+            T::Read,
+            99,
+        ),
+        (
+            "transport: reconnect failed",
+            O::ReestablishFailed,
+            T::Read,
+            73,
+        ),
+        ("transport: incomplete", O::Incomplete, T::Read, 71),
+    ] {
+        rows.push((
+            label.to_owned(),
+            transport_refusal(&outcome, tool).to_owned(),
+            old,
+        ));
+    }
+    rows.push((
+        "transport: reply limit".to_owned(),
+        REPLY_LIMIT_REFUSAL.to_owned(),
+        74,
+    ));
+    rows.push((
+        "transport: stop unidentified".to_owned(),
+        STOP_UNIDENTIFIED.to_owned(),
+        148,
+    ));
+    let PeerReply::EditBatch { text, .. } =
+        crate::assistance::batch::conflicting_duplicate_reply(&"i".repeat(128))
+    else {
+        unreachable!("conflicting_duplicate_reply builds an edit batch");
+    };
+    rows.push((
+        "batch: conflicting_duplicate (128-byte operation_id)".to_owned(),
+        text,
+        230,
+    ));
+    rows
+}
+
+/// Asserts the R5 shape of every refusal that does not pass through the reply template, and with
+/// `AGENT_IDE_PRINT_REFUSAL_TABLE` set prints `label | old | new` rows for the inventory table.
+#[test]
+fn template_free_refusals_have_a_bounded_head_and_one_repair() {
+    let print = std::env::var_os("AGENT_IDE_PRINT_REFUSAL_TABLE").is_some();
+    for (label, text, old) in static_rows() {
+        assert_refusal_shape(&label, &text);
+        if print {
+            println!("ROW | {label} | {old} | {}", text.len());
+        }
+    }
+}
+
 #[test]
 fn every_rewritten_refusal_has_a_bounded_head_and_one_repair() {
     let print = std::env::var_os("AGENT_IDE_PRINT_REFUSAL_TABLE").is_some();
@@ -654,36 +798,7 @@ fn every_rewritten_refusal_has_a_bounded_head_and_one_repair() {
         )
         .unwrap_or_else(|| panic!("{} did not render", row.label));
         let text = rendered.content[0].as_text().unwrap().text.clone();
-        let lines = text.lines().collect::<Vec<_>>();
-        let repairs = lines
-            .iter()
-            .filter(|line| line.starts_with("Repair: "))
-            .count();
-        assert_eq!(repairs, 1, "{}: {text}", row.label);
-        assert!(lines[0].len() <= 160, "{} head: {text}", row.label);
-        assert!(
-            lines[1].starts_with("Repair: ") && lines[1].len() <= 120,
-            "{} repair: {text}",
-            row.label
-        );
-        let repair = &lines[1]["Repair: ".len()..];
-        assert!(
-            !repair.contains(" or ") && !repair.contains("once") && !repair.contains("otherwise"),
-            "{} names more than one step: {text}",
-            row.label
-        );
-        for word in INTERNAL_WORDS {
-            assert!(
-                !lines[0].contains(word) && !repair.contains(word),
-                "{} shows {word}: {text}",
-                row.label
-            );
-        }
-        assert!(
-            lines[2..].iter().all(|line| line.starts_with("  ")),
-            "{} excerpt must be quoted data after the Repair line: {text}",
-            row.label
-        );
+        assert_refusal_shape(row.label, &text);
         if print {
             println!(
                 "ROW | {} | {} | {}",

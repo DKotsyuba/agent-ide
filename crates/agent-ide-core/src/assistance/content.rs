@@ -423,6 +423,27 @@ fn refusal_note(head: String, repair: String, note: Option<String>) -> String {
     refusal_text(format!("{sentence}; nothing was written."), step, None)
 }
 
+/// Longest path label, in bytes, that a refusal head carries after its effect sentence.
+const PATH_LABEL_BYTES: usize = 60;
+
+/// Shortens a worktree-relative path for a refusal head, keeping its tail.
+///
+/// A path of at most [`PATH_LABEL_BYTES`] bytes is returned unchanged; a longer one becomes `…`
+/// plus the longest suffix that fits, cut at a UTF-8 boundary, because the file name and its
+/// nearest directories identify the target best. The head formatter places the label after the
+/// reason and effect sentence, so a long label can never push those facts past the 160-byte cut.
+/// Performs no I/O.
+fn path_label(path: String) -> String {
+    if path.len() <= PATH_LABEL_BYTES {
+        return path;
+    }
+    let mut start = path.len() - (PATH_LABEL_BYTES - '…'.len_utf8());
+    while !path.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &path[start..])
+}
+
 /// VM-instruction budget for one reply render; a render that exceeds it fails into the
 /// presentation-degraded fallback instead of looping. Keeps tenfold headroom over the costliest
 /// real render (the final error fallbacks walk every `elif` of `reply.jinja`, so each added error
@@ -435,7 +456,8 @@ const RENDER_RECURSION_LIMIT: usize = 16;
 /// the helpers `reply.jinja` actually uses are registered, so an added template construct fails
 /// loudly here instead of silently widening the engine (JINJA-02).
 ///
-/// Registered set: filter `join`; bounded refusal formatters (`refusal`, `refusal_note`); tests `defined`, `mapping`,
+/// Registered set: filter `join`; bounded refusal formatters (`refusal`, `refusal_note`) and the
+/// `path_label` shortener; tests `defined`, `mapping`,
 /// `startingwith`, `endingwith`. The formatter receives data, never template source.
 fn reply_environment(fuel: Option<u64>) -> Environment<'static> {
     let mut environment = Environment::empty();
@@ -444,6 +466,7 @@ fn reply_environment(fuel: Option<u64>) -> Environment<'static> {
     environment.add_filter("join", minijinja::filters::join);
     environment.add_function("refusal", refusal_text);
     environment.add_function("refusal_note", refusal_note);
+    environment.add_function("path_label", path_label);
     environment.add_test("defined", minijinja::tests::is_defined);
     environment.add_test("mapping", minijinja::tests::is_mapping);
     environment.add_test("startingwith", minijinja::tests::is_startingwith);
@@ -1946,9 +1969,54 @@ mod tests {
                 assert!(text.contains("do not repeat this edit") && text.contains("native tools"));
             }
             if refused && outcome != EditOutcome::OutcomeUnknown {
-                assert!(text.contains("nothing was written"), "{text}");
+                assert!(text.starts_with("Nothing was written; "), "{text}");
             }
         }
+    }
+
+    /// A valid 203-byte path never costs a durable edit refusal its effect sentence: the effect
+    /// leads the head, the path label is shortened to its tail and the head stays within 160 B.
+    #[test]
+    fn long_paths_keep_the_effect_of_every_durable_edit_refusal() {
+        let path = format!("{}/{}.rs", "a".repeat(100), "b".repeat(99));
+        assert_eq!(path.len(), 203);
+        for outcome in [
+            EditOutcome::StaleSource,
+            EditOutcome::ConflictingDuplicate,
+            EditOutcome::UnsafeTarget,
+            EditOutcome::CancelledNoEffect,
+            EditOutcome::DeadlineNoEffect,
+            EditOutcome::CapacityNoEffect,
+            EditOutcome::OutcomeUnknown,
+            EditOutcome::UnavailableBeforeDispatch,
+        ] {
+            let reply = PeerReply::Edit {
+                result: EditResult::new("op".into(), path.clone(), outcome, None).unwrap(),
+                diagnostics: EditDiagnostics::Unknown {},
+                note: None,
+                operation: None,
+            };
+            let rendered = render(reply, Envelope::TextOnly).unwrap();
+            let text = text_of(&rendered);
+            let lines = text.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 2, "{text}");
+            assert!(lines[0].len() <= 160, "{text}");
+            assert!(
+                lines[1].starts_with("Repair: ") && lines[1].len() <= 120,
+                "{text}"
+            );
+            let effect = if outcome == EditOutcome::OutcomeUnknown {
+                "may or may not have been written"
+            } else {
+                "Nothing was written; "
+            };
+            assert!(text.contains(effect), "{text}");
+            assert!(lines[0].ends_with(&path[path.len() - 50..]), "{text}");
+            assert!(!lines[0].contains(&path), "{text}");
+        }
+        assert_eq!(path_label("src/lib.rs".into()), "src/lib.rs");
+        assert_eq!(path_label(path).len(), PATH_LABEL_BYTES);
+        assert_eq!(path_label("é".repeat(40)).chars().count(), 29);
     }
 
     /// Renders same-response diagnostics into one non-JSON block with the matching typed result.
@@ -2048,7 +2116,7 @@ mod tests {
         // contract sentence and a repeat-the-call repair, and mentions no file-version reference.
         assert_eq!(
             text,
-            "src/lib.rs changed while the edit was applied; nothing was written.\nRepair: Repeat the call."
+            "Nothing was written; the file changed while the edit was applied: src/lib.rs\nRepair: Repeat the call."
         );
         assert!(!text.contains("source_ref"), "{text}");
     }

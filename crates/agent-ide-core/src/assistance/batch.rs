@@ -1320,17 +1320,18 @@ pub(crate) fn edit_batch_reply(
 }
 
 /// The reply to a reused `operation_id` whose recorded request differs: outcome
-/// `conflicting_duplicate`, no file touched, nothing written.
+/// `conflicting_duplicate`, no file touched, nothing written. The text is a head and one Repair
+/// line (harness-reply-v1 R5) and does not echo the id, which can be 128 bytes long and which the
+/// caller already holds; the structured copy still carries it.
 pub(crate) fn conflicting_duplicate_reply(operation_id: &str) -> PeerReply {
     PeerReply::EditBatch {
         operation_id: operation_id.to_owned(),
         outcome: EditBatchOutcome::ConflictingDuplicate,
         source_ref: None,
         files: Vec::new(),
-        text: format!(
-            "operation_id {operation_id} already names a different multi-file edit; nothing was \
-             written.\nRepair: Read the targets with ide.read, then edit with a new operation_id.\n"
-        ),
+        text: "This operation_id already names a different multi-file edit; nothing was \
+               written.\nRepair: Read the targets with ide.read, then edit with a new operation_id.\n"
+            .to_owned(),
         truncated: false,
     }
 }
@@ -2572,16 +2573,23 @@ mod tests {
             nothing["source_ref"].is_null(),
             "no written file, no source_ref"
         );
-        let duplicate = structured(conflicting_duplicate_reply("op-4"));
+        // A 128-byte operation_id (the longest valid one) must not stretch the refusal head.
+        let long_id = "i".repeat(128);
+        let duplicate = structured(conflicting_duplicate_reply(&long_id));
         assert_eq!(duplicate["outcome"], "conflicting_duplicate");
+        assert_eq!(duplicate["operation_id"], json!(long_id));
         assert_eq!(duplicate["files"], json!([]));
         assert!(duplicate["source_ref"].is_null());
+        let text = duplicate["text"].as_str().unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
         assert!(
-            duplicate["text"]
-                .as_str()
-                .unwrap()
-                .starts_with("operation_id")
+            text.starts_with("This operation_id already names"),
+            "{text}"
         );
+        assert!(!text.contains(&long_id), "{text}");
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].len() <= 160 && lines[1].len() <= 120, "{text}");
+        assert!(lines[1].starts_with("Repair: "), "{text}");
         let lost = structured(edit_batch_reply(
             "op-5",
             &[

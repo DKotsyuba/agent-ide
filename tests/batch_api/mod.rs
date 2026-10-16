@@ -1015,7 +1015,11 @@ async fn multi_file_edit_stops_at_a_native_write_and_resumes_only_unchanged_base
         other["files"][0]["changes"][0]["content"] = json!("different");
         let (duplicate, text) = settled_edit(&mut actor, &fixture, other).await;
         assert!(
-            text.starts_with("operation_id") && text.contains("Repair: "),
+            text.starts_with("This operation_id already names a different multi-file edit")
+                && text.lines().count() == 2
+                && text.lines().next().unwrap().len() <= 160
+                && text.lines().nth(1).unwrap().len() <= 120
+                && text.lines().nth(1).unwrap().starts_with("Repair: "),
             "{text}"
         );
         assert_eq!(duplicate["outcome"], "conflicting_duplicate", "{duplicate}");
@@ -1296,7 +1300,11 @@ async fn rename_stopped_midway_reports_each_file_and_the_same_operation_id_finis
     other["new_name"] = json!("different");
     let (_, text) = settled_edit(&mut actor, &fixture, other).await;
     assert!(
-        text.starts_with("operation_id") && text.contains("Repair: "),
+        text.starts_with("This operation_id already names a different multi-file edit")
+            && text.lines().count() == 2
+            && text.lines().next().unwrap().len() <= 160
+            && text.lines().nth(1).unwrap().len() <= 120
+            && text.lines().nth(1).unwrap().starts_with("Repair: "),
         "{text}"
     );
     assert_eq!(

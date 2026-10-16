@@ -264,26 +264,26 @@ edit: {{ outcome }}; path {{ result.path }}; diagnostics: pending; result retain
 {%- endif -%}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "stale_source" -%}
-{{ refusal_note(result.path ~ " changed while the edit was applied; nothing was written.", "Repeat the call.", note) }}
+{{ refusal_note("Nothing was written; the file changed while the edit was applied: " ~ path_label(result.path), "Repeat the call.", note) }}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "conflicting_duplicate" -%}
-{{ refusal("This operation_id already names a different edit of " ~ result.path ~ "; nothing was written.", "Read the target with ide.read, then edit with a new operation_id.") }}
+{{ refusal("Nothing was written; this operation_id already names a different edit of " ~ path_label(result.path), "Read the target with ide.read, then edit with a new operation_id.") }}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "unsafe_target" -%}
-{{ refusal(result.path ~ " is a symlink or special file the IDE may not write; nothing was written.", "Edit it with native tools.") }}
+{{ refusal("Nothing was written; the target is a symlink or special file the IDE may not write: " ~ path_label(result.path), "Edit it with native tools.") }}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "cancelled_no_effect" -%}
-{{ refusal("The edit of " ~ result.path ~ " was cancelled; nothing was written.", "Repeat the call with the same operation_id.") }}
+{{ refusal("Nothing was written; the edit was cancelled: " ~ path_label(result.path), "Repeat the call with the same operation_id.") }}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "deadline_no_effect" -%}
-{{ refusal("The edit of " ~ result.path ~ " ran out of time; nothing was written.", "Repeat the call with the same operation_id.") }}
+{{ refusal("Nothing was written; the edit ran out of time: " ~ path_label(result.path), "Repeat the call with the same operation_id.") }}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "capacity_no_effect" -%}
-{{ refusal("The IDE was too busy to edit " ~ result.path ~ "; nothing was written.", "Repeat the call with the same operation_id.") }}
+{{ refusal("Nothing was written; the IDE was too busy to edit " ~ path_label(result.path), "Repeat the call with the same operation_id.") }}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "outcome_unknown" -%}
-{{ refusal("The edit of " ~ result.path ~ " may or may not have been written.", "Inspect the file with native tools; do not repeat this edit.") }}
+{{ refusal("The edit may or may not have been written: " ~ path_label(result.path), "Inspect the file with native tools; do not repeat this edit.") }}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "unavailable_before_dispatch" -%}
-{{ refusal("The IDE session is not active; the edit of " ~ result.path ~ " was not sent and nothing was written.", "Call ide.start, then repeat the call.") }}
+{{ refusal("Nothing was written; the IDE session is not active, so the edit was not sent: " ~ path_label(result.path), "Call ide.start, then repeat the call.") }}
 {%- endif -%}

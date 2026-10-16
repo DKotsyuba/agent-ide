@@ -2239,7 +2239,12 @@ fn journal_transport_timeout(tool: AssistanceTool, phase: &str) {
 }
 
 /// The answer to an `ide.stop` that was not sent because its actor could not be identified.
-const STOP_UNIDENTIFIED: &str = "The IDE could not identify this stop's session; nothing was stopped.\nRepair: Repeat ide.stop.";
+pub(crate) const STOP_UNIDENTIFIED: &str = "The IDE could not identify this stop's session; nothing was stopped.\nRepair: Repeat ide.stop.";
+
+/// The refusal for a reply whose final carrier cannot fit the response ceiling and has no
+/// receipt to degrade to; a head and one Repair line like every other refusal.
+pub(crate) const REPLY_LIMIT_REFUSAL: &str =
+    "The IDE result exceeds the reply limit.\nRepair: Continue with native tools.";
 
 /// What one stop's identity query established (see `StdioFacade::identify_actor`).
 enum StopIdentity {
@@ -4305,7 +4310,7 @@ impl StdioFacade {
 /// text names the check to make for `tool` instead of a replay), a failed reconnect and an
 /// incomplete reply. [`FacadeOutcome::Reply`] carries a typed reply rendered elsewhere; it maps to
 /// the incomplete-result refusal so the function stays total. The returned text is static.
-fn transport_refusal(outcome: &FacadeOutcome, tool: AssistanceTool) -> &'static str {
+pub(crate) fn transport_refusal(outcome: &FacadeOutcome, tool: AssistanceTool) -> &'static str {
     match outcome {
         FacadeOutcome::InvalidParameters => {
             "These arguments do not match the tool schema.\nRepair: Correct the arguments and repeat this call."
@@ -4389,11 +4394,7 @@ pub(super) fn render_reply_with_status(
             },
         );
         receipt.map_or_else(
-            || {
-                CallToolResult::error(vec![ContentBlock::text(
-                    "The IDE result exceeds the reply limit.\nRepair: Continue with native tools.",
-                )])
-            },
+            || CallToolResult::error(vec![ContentBlock::text(REPLY_LIMIT_REFUSAL)]),
             content::PresentationReceipt::degraded,
         )
     })
