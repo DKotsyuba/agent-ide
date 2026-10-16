@@ -562,10 +562,10 @@ pub enum ParameterError {
     /// `ide.read` needs exactly one of: `items`, `symbol`, `path` alone (the whole file), `path`
     /// with `lines`, `path` with `ranges`, or `symbols`.
     ReadTarget,
-    /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` and `source_ref` for a range
-    /// replace, or the full-file form `path` + `content` (with `source_ref` to replace an existing
-    /// file, without it only to create a missing one); the forms are exclusive, except a redundant
-    /// `path` naming the symbol's own file.
+    /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` for a range replace, or the
+    /// full-file form `path` + `content` (which creates a missing file or replaces the current
+    /// bytes of an existing one); the optional, deprecated `source_ref` is never required. The
+    /// forms are exclusive, except a redundant `path` naming the symbol's own file.
     EditTarget,
     /// `ide.edit` with `changes` needs `path` (one file) and no single-change form beside it.
     ChangesTarget,
@@ -1750,10 +1750,10 @@ pub(crate) fn validate_normalized_call(
                     FieldRule::TooLong(MAX_EDIT_ARGUMENT_CONTENT_BYTES),
                 ));
             }
-            // Without `source_ref` the call may only create a file that does not exist yet: the
-            // worker observes the path itself and refuses an existing file. The placeholder only
-            // runs the request's own validation here (the worker supplies the real reference) and
-            // is dropped from the forwarded parameters below.
+            // Without `source_ref` the call writes the whole file: the worker observes the path
+            // itself, creating a missing file or replacing the current bytes of an existing one.
+            // The placeholder only runs the request's own validation here (the worker supplies the
+            // real reference) and is dropped from the forwarded parameters below.
             let source_ref = object
                 .contains_key("source_ref")
                 .then(|| required_string(object, "source_ref", MAX_DETAIL_REF_BYTES))
@@ -4301,12 +4301,12 @@ impl StdioFacade {
             }
             // The daemon refused the call before running it, so even a mutation applied nothing.
             FacadeOutcome::Busy => {
-                "The IDE is serving too many calls; this call did not run and nothing was applied.\nRepair: Retry once; otherwise use native tools."
+                "The IDE is serving too many calls; this call did not run and nothing was applied.\nRepair: Repeat this call."
             }
             // The daemon refused the call before running it (and a managed client already tried
             // the replacement once), so even a mutation applied nothing.
             FacadeOutcome::Restarting => {
-                "The IDE restarted after an internal fault; this call did not run and nothing was applied.\nRepair: Retry once; otherwise use native tools."
+                "The IDE restarted after an internal fault; this call did not run and nothing was applied.\nRepair: Repeat this call."
             }
             // Never resent: the daemon may have executed the call, and a resend could only repeat
             // a change or be refused for its already consumed pre-hook.
@@ -4320,9 +4320,7 @@ impl StdioFacade {
                 AssistanceTool::Start | AssistanceTool::Stop => {
                     "This activation change may have applied; its outcome is unknown.\nRepair: Call ide.start to see the current binding."
                 }
-                _ => {
-                    "This call may have run, but its reply was lost.\nRepair: Retry once; otherwise use native tools."
-                }
+                _ => "This call may have run, but its reply was lost.\nRepair: Repeat this call.",
             },
             FacadeOutcome::ReestablishFailed => {
                 "The IDE exited and could not reconnect.\nRepair: Continue with native tools."

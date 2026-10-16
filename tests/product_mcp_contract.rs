@@ -663,7 +663,9 @@ fn assert_compact_envelope(reply: &Value) {
                 "{reply}"
             );
             assert!(
-                !lines[0].starts_with("error:") && !lines[1].contains(" or "),
+                !lines[0].starts_with("error:")
+                    && !lines[1].contains(" or ")
+                    && !lines[1].contains("; otherwise"),
                 "{reply}"
             );
         }

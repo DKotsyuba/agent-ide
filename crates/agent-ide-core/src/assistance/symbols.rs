@@ -1,9 +1,10 @@
 //! Symbol-addressed worker jobs: `ide.outline`, `ide.read`, `ide.symbol` and `ide.graph` (v0.4).
 //!
-//! Every job observes the source through Workspace exactly like `ide.context`, asks the binding's
-//! live language server for document symbols, normalizes them through the language module and
-//! renders the compact text the contract specifies. Results are retained with the source
-//! observation so a later `ide.edit` may name them as `source_ref`.
+//! Every job observes the source through Workspace, asks the binding's live language server for
+//! document symbols, normalizes them through the language module and renders the compact text the
+//! contract specifies. Results are retained with the source observation; a later `ide.edit` is
+//! checked against the file's current bytes and needs no file-version reference (the deprecated,
+//! unadvertised `source_ref` is still honoured when a caller supplies one).
 
 use super::navigation::{classify_constructions, collapse_named, constructs};
 use super::*;
@@ -241,7 +242,7 @@ impl Worker<'_> {
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         // Batch reads: `items` (batch-api-v1), or the older `symbols` and `path`+`ranges` lists —
-        // one reply in request order, one `source_ref` valid for every file it included.
+        // one reply in request order whose retained observation covers every file it included.
         if let Some((form, requested)) = batch::read_request(&job.parameters) {
             return self.read_batch(job, requested, form).await;
         }
@@ -3133,7 +3134,7 @@ impl Worker<'_> {
         };
         let source = observed_text(&observed, &bytes)?.to_owned();
         let path = file.display().to_string();
-        // An explicit `source_ref` (mandatory for the line-range form) must name a retained
+        // An explicit deprecated `source_ref` (optional, even for the line-range form) must name a retained
         // same-path observation whose bytes are still the file's current ones: the splice's line
         // numbers and the symbol's range are only meaningful for the content the caller read.
         // Anything else is refused before any write, exactly as a changed full-file base is.
@@ -3286,9 +3287,9 @@ impl Worker<'_> {
             .await
     }
 
-    /// `ide.edit {operation_id, path, source_ref?, changes}`: many changes to one file in one
-    /// call. Every address resolves against the bytes `source_ref` names (or, for a symbol-only
-    /// batch, the fresh observation) before anything is applied; application is bottom-up so
+    /// `ide.edit {operation_id, path, changes}`: many changes to one file in one call. Every
+    /// address resolves against the bytes current at processing time (or the retained observation
+    /// a supplied deprecated `source_ref` names) before anything is applied; application is bottom-up so
     /// each change's final range is exact; the formatted candidate must parse; then one atomic
     /// stale-safe write carries the whole batch. A refused batch writes nothing and consumes
     /// neither the `operation_id` nor a receipt, so the same id retries. Line-addressed entries
@@ -3313,10 +3314,9 @@ impl Worker<'_> {
             return Err(code);
         }
         observed_text(&observed, &bytes)?;
-        // Exactly the single form's rule: an explicit `source_ref` must name a retained
+        // Exactly the single form's rule: an explicit deprecated `source_ref` must name a retained
         // same-path observation whose bytes are still the file's current ones; without one the
-        // fresh observation is the base (only a symbol-only batch may omit it — the facade
-        // refused the rest).
+        // fresh observation is the base.
         let base = match job.parameters.get("source_ref").and_then(Value::as_str) {
             Some(reference) => {
                 let retained = self.shared.ledger.lock().ok().and_then(|ledger| {
@@ -3725,16 +3725,16 @@ impl Worker<'_> {
         Ok(Ok((candidate, note)))
     }
 
-    /// `ide.edit {path, content}` without `source_ref`: creates a file that does not exist yet.
+    /// `ide.edit {path, content}` without `source_ref`: writes a whole file, creating it when
+    /// missing or replacing it against its current bytes.
     ///
-    /// The worker observes `path` itself (the same confined reader as every other observation);
-    /// only an observed absence is a valid base, since `ide.read` and `ide.outline` answer
-    /// `no_such_file` there and so cannot mint a `source_ref`. The candidate is formatted with the
-    /// project formatter and written through the ordinary stale-safe edit path with that missing
-    /// observation as the base, so the reply is `edit: created` with the project check, and a file
-    /// that appears between the observation and the write is refused `stale_source`, never
-    /// overwritten. An existing path is refused as invalid parameters naming `source_ref`, before
-    /// any receipt or write, so a retry with a real `source_ref` may reuse the `operation_id`.
+    /// The worker observes `path` itself (the same confined reader as every other observation), so
+    /// no file-version reference is needed. The candidate is formatted with the project formatter,
+    /// must pass the pre-write structural gate, and is written through the ordinary stale-safe
+    /// edit path with that observation (an observed absence, or the current text) as the base, so
+    /// the reply carries the project check and a file that changes between the observation and
+    /// the write is refused `stale_source`, never overwritten blindly. A refusal before the
+    /// receipt leaves the `operation_id` unused.
     pub(super) async fn create_file(
         &mut self,
         job: &mut Job,

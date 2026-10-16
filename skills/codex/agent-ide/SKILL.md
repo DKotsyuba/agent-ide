@@ -7,13 +7,14 @@ description: Batch source discovery, reads, atomic edits and tests. In Bridge mo
 
 Call `ide.start` once per agent/worktree. Paths are relative. An address is
 `src/a.rs#Type/method`; `:3-5` selects a symbol window; `src/a.rs#@imports` is a region.
+Ten tools: start, stop, outline, symbol, graph, read, edit, test, diff, inspect.
 
 ## Batch workflow
 
 Collect the related set first. Use one bounded batch per phase, rather than one call per
 file/symbol/hunk. Batch outline paths/glob, symbol/graph symbols, read items, edits and test
 targets. Review changed paths in one diff; fetch known detail_refs together only when needed.
-Start/stop are lifecycle calls, once per task; no extra calls are needed to make a batch.
+Start/stop are once-per-task lifecycle calls.
 
 1. Discover related changes together. `ide.symbol` gives a card and **direct** neighbors.
    Positive callers/callees values never request deeper traversal. For a precise UTF-8
@@ -25,10 +26,11 @@ Start/stop are lifecycle calls, once per task; no extra calls are needed to make
    including a warm cache; acceptance is not the graph. Approximate/lexical edges and
    unavailable coverage remain explicit, never exact negative evidence.
 3. Read related code together:
-   `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"src/b.rs","lines":"1-80"}]}`.
+   `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"docs/b.md","lines":"1-80"}]}`
+   (path ranges only for non-code text).
    In an observed context epoch, unchanged delivered items return an acknowledgement.
    Reuse prior code; `force:true` handles lost context or an intentional reread. Unknown
-   context keeps suppression off. Do not reread your successful patch as a ritual.
+   context keeps suppression off.
 4. Apply related production/tests edits in one atomic call:
    `ide.edit {"patch":"*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** Update File: src/b.rs\n@@\n-before\n+after\n*** End Patch"}`.
    Add File/Update File work; deletion/moves are unsupported.
@@ -57,5 +59,6 @@ Ending a turn does not cancel work. Extra pages use `ide.graph {"detail_ref":"â€
 Unknown never means clean. `ide.diff` is optional for incremental/paged changes; Git diff is
 valid. Call `ide.stop` at task end, after collecting required outcomes.
 
-Discover missing tools once. On refusal/unavailability, try the repair once, then native
-tools. Preserve freshness; never invent graph coverage, test counts or delivery success.
+Discover missing tools once. Try a refusal's Repair once; if the tool is unavailable, still refused
+or gives no Repair, continue with native tools. Verify uncertain writes before another mutation.
+Preserve freshness; never invent graph coverage, test counts or delivery success.

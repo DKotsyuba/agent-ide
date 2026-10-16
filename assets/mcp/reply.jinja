@@ -191,13 +191,13 @@ Result retained under {{ detail_ref }}. Bridge delivers it automatically when co
 {%- elif code == "capacity" and resolution_detail is startingwith("diff:") -%}
 {{ refusal("This diff exceeds a bounded capture or reply envelope limit.", "Call ide.diff with narrower paths.") }}
 {%- elif code == "capacity" and resolution_detail is endingwith(":queue_full") -%}
-{{ refusal("The IDE's bounded request queue is full.", "Retry once; otherwise use native tools.") }}
+{{ refusal("The IDE's bounded request queue is full.", "Repeat this call.") }}
 {%- elif code == "capacity" and resolution_detail == "worker:result_store_full" -%}
-{{ refusal("The IDE's bounded result store is full.", "Retry once; otherwise use native tools.") }}
+{{ refusal("The IDE's bounded result store is full.", "Continue this operation with native tools.") }}
 {%- elif code == "capacity" and resolution_detail == "worker:actor_share_full" -%}
 {{ refusal("This call would consume capacity reserved for other active actors.", "Continue this operation with native tools.") }}
 {%- elif code == "capacity" -%}
-{{ refusal("The IDE's bounded queue or result store is full.", "Retry once; otherwise use native tools.") }}
+{{ refusal("The IDE's bounded queue or result store is full.", "Continue this operation with native tools.") }}
 {%- elif code == "cancelled" -%}
 {{ refusal("This call was cancelled when its activation stopped.", "Call ide.start before continuing.") }}
 {%- elif code == "deadline" -%}

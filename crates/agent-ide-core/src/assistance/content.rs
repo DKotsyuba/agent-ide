@@ -1596,7 +1596,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&staged),
-            "The IDE's bounded queue or result store is full.\nRepair: Retry once; otherwise use native tools."
+            "The IDE's bounded queue or result store is full.\nRepair: Continue this operation with native tools."
         );
         for (stage, recovery) in [
             ("worker:queue_full", "request queue"),
@@ -1616,7 +1616,17 @@ mod tests {
                 Envelope::WithStructured,
             )
             .unwrap();
-            assert!(text_of(&reply).contains(recovery), "{}", text_of(&reply));
+            let text = text_of(&reply);
+            assert!(text.contains(recovery), "{text}");
+            // One concrete Repair action: exactly one line, within budget, never a two-step.
+            let lines = text.lines().collect::<Vec<_>>();
+            assert!(lines[0].len() <= 160 && lines[1].len() <= 120, "{text}");
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with("Repair: ")).count(),
+                1,
+                "{text}"
+            );
+            assert!(!text.contains("; otherwise"), "{text}");
         }
         let bare = render(
             PeerReply::Error {
@@ -1628,7 +1638,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "The IDE's bounded queue or result store is full.\nRepair: Retry once; otherwise use native tools."
+            "The IDE's bounded queue or result store is full.\nRepair: Continue this operation with native tools."
         );
     }
 

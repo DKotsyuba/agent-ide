@@ -11,7 +11,7 @@ Purpose: an IDE reply costs the model about what the same fact costs from a nati
 - **R3 Framing only on exceptions.** A summary line, count or trailer appears only when something is not simply delivered: a cut (one trailer line per cut, naming how to continue), a partial result, an approximate answer, a clamp. Never a line that restates the request or the count the text already shows.
 - **R4 Locations as the address grammar says.** Wherever a reply names a place it prints the symbol address plus the absolute line exactly as symbol-address-v1 defines, for example `src/x.rs#Type/method:7 (L123)`; regions print as `src/x.rs#@imports`. No reply invents another location form.
 - **R5 Refusals.** A refusal is a head sentence of at most 160 bytes, then one `Repair:` line of at most 120 bytes naming the single next call or edit, then optionally an excerpt of the current text (at most 60 lines or 4 KiB). It names no internal reason code, retry count or alternative list.
-- **R6 Nothing teaches waiting.** No server paragraph, tool description, schema text, start reply, pending or started wording, skill or doc tells the agent to wait, poll or call `ide.inspect` with `wait_ms`. Results of long work arrive by themselves in an `<agent-ide>` block after the next tool call or at the end of the turn. `wait_ms` stays accepted by the validator but is not advertised. Codex idle cover: results arrive on the next `ide.*` reply or hook; it is a blocker only if a deferred result can be lost.
+- **R6 Nothing teaches waiting.** No server paragraph, tool description, schema text, start reply, pending or started wording, skill or doc tells the agent to wait, poll or call `ide.inspect` with `wait_ms`. A deferred graph, test or edit-check result stays retained under its reference (`ide.test {"result":N}`, `detail_ref`); when Bridge is configured it delivers the result automatically, and Bridge owns the carrier and timing. IDE has no `Stop` hold, hook or reply-piggyback deferred carrier, so without a Bridge route the result is read explicitly. `wait_ms` stays accepted by the validator but is not advertised.
 - **R7 Budgets.** The sizes in section 3 bound descriptions, catalogs, skills and the replies that carry the most framing. M-030 may trim framing lines (R3) later without a revision of this contract; raising a budget needs one.
 
 ## 2. Catalog per host
@@ -44,8 +44,8 @@ continuation cursors. `ide.inspect {"kind":"diagnostics","path":"a.rs"}` reads p
 reports using the existing source/generation/version fences; unknown stays unknown,
 unversioned nonempty counts stay provisional lower bounds. `kind:"problems"` remains the
 project check feed. Neither query starts a build/check, and bounded continuation uses
-`ide.inspect {"detail_ref":"…"}`. Deferred Inspect queries retain their public tool name;
-their source-derived reports remain suppressed on hook carriers and require reauthorization.
+`ide.inspect {"detail_ref":"…"}`. Deferred Inspect queries retain their public tool name and,
+like other deferred results, are retained and delivered only through Bridge.
 
 ## 3. Byte budgets
 
@@ -69,7 +69,7 @@ their source-derived reports remain suppressed on hook carriers and require reau
 
 ## 4. Baseline
 
-Sizes of the E-002 build (`eaeba10`), the numbers the E-003 changes are measured against:
+Historical sizes of the E-002 build (`eaeba10`, eleven tools including `ide.context`), the numbers the E-003 changes were measured against; the current catalog has ten tools:
 
 | Item | Bytes at `eaeba10` |
 |---|---|

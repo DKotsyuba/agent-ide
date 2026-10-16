@@ -137,7 +137,7 @@ Request:
   - `changes`: 1–32 change objects, exactly as the one-file `changes` form (`lines` | `symbol` + `op`/`where` | `old`/`new`/`within`);
   - `content` with `create: true`: a new file; the path must not exist;
   - `content` without `create`: the whole new content of an existing file.
-- An entry's own `source_ref` overrides the batch one. A base is required for `lines` or `old` changes and for whole-content replacement; a symbol-only entry without one uses the fresh observation, as the one-file form does.
+- An entry's own deprecated, unadvertised `source_ref` overrides the batch one. No base is required: an entry without one (including `lines`, `old` and whole-content entries) resolves against the fresh observation of the file's current bytes, as the one-file form does.
 - Totals: at most 128 changes and at most 128 KiB in all `content` and `new` strings together; the serialized arguments stay within 136 KiB.
 
 Phase 1 — validate everything, write nothing:

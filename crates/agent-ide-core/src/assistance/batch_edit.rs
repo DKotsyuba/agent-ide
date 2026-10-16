@@ -25,9 +25,9 @@ const MAX_BATCH_REFUSAL_BYTES: usize = 2048;
 pub(super) struct Planned {
     /// Worktree-relative path as requested.
     path: String,
-    /// The observation the write is checked against: the admitted `source_ref` observation, the
-    /// fresh observation for a symbol-only change or a resume, or the observed absence for a
-    /// file to create.
+    /// The observation the write is checked against: the retained observation a supplied
+    /// deprecated `source_ref` names, otherwise the fresh observation (also used by a resume), or
+    /// the observed absence for a file to create.
     base: SourceObservation,
     /// The exact bytes the commit writes.
     candidate: String,
@@ -165,7 +165,7 @@ fn settled_reply(
 }
 
 impl Worker<'_> {
-    /// `ide.edit {operation_id, source_ref?, files}`: one logical change across several files.
+    /// `ide.edit {operation_id, files}`: one logical change across several files.
     ///
     /// A new operation validates every file first and writes nothing on any refusal
     /// (`edit_refused`, every failed file and change named, the `operation_id` left unused). It
@@ -380,8 +380,8 @@ impl Worker<'_> {
                 }
             }
             // A resume's base is the fresh observation the caller matched to the recorded base;
-            // a symbol-only change without `source_ref` uses the fresh observation as the
-            // one-file form does (the facade refused the rest).
+            // a change without the deprecated `source_ref` uses the fresh observation as the
+            // one-file form does.
             _ => observed.clone(),
         };
         match &file.body {

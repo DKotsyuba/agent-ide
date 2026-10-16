@@ -128,7 +128,7 @@ ambiguous_symbol: new matches 3 symbols; repeat ide.symbol with one exact path:
 
 ### `<agent-ide>` status block
 
-A native hook or the top of a response may include the check status plate (at most 256 bytes) in one block:
+The top of a response may include the check status plate (at most 256 bytes) in one block:
 
 ```text
 <agent-ide>
@@ -381,7 +381,7 @@ src/assistance/host_binding.rs#HostBindingGuard/establish_start  (lines 906–93
 source_ref: sym-14
 ```
 
-`source_ref` is the reference currently called `detail_ref` by edit: it binds to the read content. A stale or incomplete read is refused as `stale_source` with no write; retry with the newest `source_ref` in the reply, or re-read every page before retrying.
+A supplied (deprecated, unadvertised) `source_ref` binds an edit to the read content and a stale one is refused as `stale_source` with no write. Omit it: the edit resolves against the file's current bytes, and a file that changed since it was read is refused the same way; re-read the affected symbol with `ide.read` and repeat the edit.
 
 Batch reads fetch everything one edit needs in one call ([batch API v1](batch-api-v1.md) §2):
 
@@ -410,16 +410,16 @@ Input operations:
 {op: "insert",  symbol: "src/index.ts#ClassImpl",   where: "first"|"last",   content: "…"}
 {op: "delete",  symbol: "src/index.ts#ClassImpl/old"}
 {op: "rename",  symbol: "src/index.ts#ClassImpl/method", new_name: "run"}
-{op: "replace", path: "src/index.ts", lines: "1-12", source_ref: "sym-14", content: "…"}   // fallback mode
-{path: "src/index.ts", source_ref: "sym-14", content: "…"}                                // whole-file replace
+{op: "replace", path: "src/index.ts", lines: "1-12", content: "…"}   // fallback mode (non-code text)
+{path: "src/index.ts", content: "…"}                                                       // whole-file replace of the current bytes
 {path: "src/new.ts", content: "…"}                                                        // create a missing file
 ```
 
-The whole-file form without `source_ref` only creates a file that does not exist yet: `ide.read` and `ide.outline` answer `no_such_file` on a missing path, so there is no read to name. The worker observes the path itself; an absence is the base, the candidate is formatted and written through the same confined, stale-safe path as every edit (reply `edit: created` with the project check), and a file that appears between that observation and the write is refused `stale_source`, never overwritten. On an existing file the call is refused with no write: `invalid bounded parameters: "source_ref" is required to replace an existing file: read it first (ide.read)`.
+The whole-file form without `source_ref` creates a missing file or replaces an existing one against its current bytes; no file-version reference is needed. The worker observes the path itself; an absence or the current text is the base, the candidate is formatted and written through the same confined, stale-safe path as every edit (reply `edit: created` with the project check), and a file that changes between that observation and the write is refused `stale_source`, never overwritten.
 
 For a symbol, `content` is the complete symbol including its header. The IDE derives indentation and blank lines from neighboring code. After writing, the project's formatter runs over the candidate (before the write), then the project check (cargo check / pyright / tsc) is scheduled at once and the reply carries the edited file's problems from it. `rename` is performed by the language server across the project.
 
-The line-range form **requires** `source_ref`, and it must name a retained read of the same file (an `ide.read` reply's `source_ref`, a completed paged read, or a prior edit's `source_ref`). The edit applies only while that observation's bytes are still the file's current bytes; a stale or incomplete reference is refused as `stale_source` with no write. The reply names the newest `source_ref` for that path known to this session, from its last successful edit or read, when available; retry with that reference. If none is given, re-read with `ide.read` and inspect every page before retrying. The symbol form resolves the symbol again, so its `source_ref` is optional — but when one is given it is validated the same way. When an edit changes the file's line count, its successful reply states the net movement and first changed line (for example `lines after 12 moved +3`). A later line-addressed edit using that edit result is refused as `stale_source (edit:lines_moved)`; re-read current lines with `ide.read {path, lines}`. `old` and symbol edits can continue from the edit reply. A line-count-preserving edit and reads from `ide.read` or `ide.context` remain valid bases for line ranges.
+The line-range form resolves against the file's current bytes; a supplied (deprecated, unadvertised) `source_ref` must name a retained read of the same file (an `ide.read` reply's `source_ref`, a completed paged read, or a prior edit's `source_ref`). The edit applies only while that observation's bytes are still the file's current bytes; a stale or incomplete reference is refused as `stale_source` with no write. Recover by omitting `source_ref` (the edit then uses the current bytes) or by re-reading the affected symbol with `ide.read` and repeating the edit. The symbol form resolves the symbol again, so its `source_ref` is optional — but when one is given it is validated the same way. When an edit changes the file's line count, its successful reply states the net movement and first changed line (for example `lines after 12 moved +3`). A later line-addressed edit using that edit result is refused as `stale_source (edit:lines_moved)`; re-read current lines with `ide.read {path, lines}`. `old` and symbol edits can continue from the edit reply. A line-count-preserving edit and reads from `ide.read` remain valid bases for line ranges.
 
 ```text
 lines after 12 moved +3
@@ -428,22 +428,21 @@ lines after 12 moved +3
 Output (implemented wire form):
 
 ```text
-edit: replaced; path src/lang/path.rs; source_ref …-3; diagnostics: current_reported (project check 1.8s: 1 errors, 0 warnings in this file)
+edit: replaced; path src/lang/path.rs; diagnostics: current_reported (project check 1.8s: 1 errors, 0 warnings in this file)
 src/lang/path.rs:132:9 error [E0308] mismatched types
-Next: use ide.edit with source_ref …-3
 lines after 12 moved +3
 ```
 
 ```text
-edit: replaced; path src/lang/path.rs; source_ref …-4; diagnostics: current_clean. Next: use ide.diff
+edit: replaced; path src/lang/path.rs; diagnostics: current_clean
 ```
 
-`current_clean` is only ever derived from a completed project check that named no problem in the file; a language server's empty publish is not taken as proof. A clean file in a project whose completed check reports errors in other files answers `diagnostics: current_clean for this file; the project check reports N errors in other files. Next: use ide.context with kind problems` (structured `project_errors: N`), so a clean edit never reads as a passing build. When the check could not have analysed the file, the reply says `diagnostics: not_analysed (<reason>)`, and the reason carries its own next step. For Rust, a file no unconditional `mod` declaration reaches from a build target answers ``rust check may not have compiled this file — no unconditional `mod` declaration reaches it; declare it, then edit again``; a file reached only behind a gate — an inner `#![cfg]` (an integration test behind `feature = "…"`), a `cfg`/`cfg_attr`-gated `mod` on its chain, or a `#[path]` declaration the walk cannot follow — answers that it is built only under that condition and should be checked by a build or `ide.test` command that enables it. A `#[path = "…"]` declaration whose literal names a file beside the declaring file reaches it. A file no IDE language checks (a template, a manifest) answers `not_analysed (no IDE language checks this file type)`. The closed diagnostics vocabulary is `current_reported`, `current_clean`, `not_analysed`, `unknown`, `pending`, and `not_analysed` is never clean. Python files outside every project root, or under a root without an environment, are `not_analysed` with that reason (`the Python project root beside this file has no environment; create one or pick it with ide.start environment`); TypeScript files are always treated as analysed (an unimported file can still read `current_clean`). A provider report for the exact post-edit version (an error rust-analyzer or tsserver found on its own) is kept as it arrives instantly. When the project check cannot analyse the file (it could not run — for example no Python environment — or it skipped the file), a language server's report for the exact post-edit version still answers `current_reported`, one `path:line:col severity [code] message` line per diagnostic, with the delta `language server reported N diagnostics for the exact post-edit source generation; project check did not analyse this file: <reason>` (or `; project check unavailable`): imports may be unchecked, and with no completed check there is no new/pre-existing split. Without such a report the reply is `not_analysed (<reason>)`, never `unknown`. `ide.inspect {"kind":"diagnostics","path":"…"}` lists provider diagnostic rows in the same located form. The reply waits at most 90 s for the check, then says `diagnostics: unknown`; the result stays retained under its reference, Bridge delivers it when configured, and `ide.inspect {"kind":"diagnostics","path":"…"}` reads current diagnostics explicitly. The `rerun tests:` hint arrives with `ide.test` (§2.6).
+`current_clean` is only ever derived from a completed project check that named no problem in the file; a language server's empty publish is not taken as proof. A clean file in a project whose completed check reports errors in other files answers `diagnostics: current_clean for this file; the project check reports N errors in other files (ide.inspect {"kind":"problems"})` (structured `project_errors: N`), so a clean edit never reads as a passing build. Diagnostics not yet known read `diagnostics: unknown (ide.inspect {"kind":"problems"} shows the project check)`. When the check could not have analysed the file, the reply says `diagnostics: not_analysed (<reason>)`, and the reason carries its own next step. For Rust, a file no unconditional `mod` declaration reaches from a build target answers ``rust check may not have compiled this file — no unconditional `mod` declaration reaches it; declare it, then edit again``; a file reached only behind a gate — an inner `#![cfg]` (an integration test behind `feature = "…"`), a `cfg`/`cfg_attr`-gated `mod` on its chain, or a `#[path]` declaration the walk cannot follow — answers that it is built only under that condition and should be checked by a build or `ide.test` command that enables it. A `#[path = "…"]` declaration whose literal names a file beside the declaring file reaches it. A file no IDE language checks (a template, a manifest) answers `not_analysed (no IDE language checks this file type)`. The closed diagnostics vocabulary is `current_reported`, `current_clean`, `not_analysed`, `unknown`, `pending`, and `not_analysed` is never clean. Python files outside every project root, or under a root without an environment, are `not_analysed` with that reason (`the Python project root beside this file has no environment; create one or pick it with ide.start environment`); TypeScript files are always treated as analysed (an unimported file can still read `current_clean`). A provider report for the exact post-edit version (an error rust-analyzer or tsserver found on its own) is kept as it arrives instantly. When the project check cannot analyse the file (it could not run — for example no Python environment — or it skipped the file), a language server's report for the exact post-edit version still answers `current_reported`, one `path:line:col severity [code] message` line per diagnostic, with the delta `language server reported N diagnostics for the exact post-edit source generation; project check did not analyse this file: <reason>` (or `; project check unavailable`): imports may be unchecked, and with no completed check there is no new/pre-existing split. Without such a report the reply is `not_analysed (<reason>)`, never `unknown`. `ide.inspect {"kind":"diagnostics","path":"…"}` lists provider diagnostic rows in the same located form. The reply waits at most 90 s for the check, then says `diagnostics: unknown`; the result stays retained under its reference, Bridge delivers it when configured, and `ide.inspect {"kind":"diagnostics","path":"…"}` reads current diagnostics explicitly. The `rerun tests:` hint arrives with `ide.test` (§2.6).
 
 For `rename`:
 
 ```text
-edit: renamed; path src/index.ts; source_ref …-5; diagnostics: current_clean. Next: use ide.diff
+edit: renamed; path src/index.ts; diagnostics: current_clean
 renamed method → run; 7 sites in 4 files: src/index.ts (3), src/api.ts (2), test/index.test.ts (2), … (+1 more)
 ```
 
@@ -454,7 +453,7 @@ Errors: `stale_source` (including `edit:lines_moved`, which requires re-reading 
 A batch edit changes many places in ONE file in one call:
 
 ```text
-{operation_id, path, source_ref, changes: [
+{operation_id, path, changes: [
   {lines: "12-20", content: "…"},
   {symbol: "src/index.ts#ClassImpl/method", op: "replace", content: "…"},
   {symbol: "src/index.ts#ClassImpl", op: "insert", where: "after", content: "…"},
@@ -462,14 +461,14 @@ A batch edit changes many places in ONE file in one call:
   {old: "exact text", new: "…", within?: "src/index.ts#ClassImpl/method"}]}
 ```
 
-`changes` holds 1–32 entries, each addressed by exactly one of `lines` (numbers of the version `source_ref` read — never shifted by other changes in the same call; empty `content` deletes the range), `symbol` (with the same `op`/`where` vocabulary as the single form), or `old` (exact text that must match once, optionally scoped to `within`'s symbol; exactly the matched bytes are replaced, so `old` may start or end mid-line and may include line terminators — `new: ""` deletes the match). Every address resolves against the base bytes before anything is applied; two `old` changes overlap only when their matched bytes intersect (separate substrings of one line, such as two parts of one string literal, apply together), other addresses overlap by line; overlapping ranges, zero-or-multi matches, unknown symbols and ranges past the end are refused together in one reply (`error: edit_refused (edit:refused); change N: …`) naming each failed change and the exact fix — nothing is written and the `operation_id` is unconsumed, so the same id retries. Application is all-or-nothing: one atomic write, one project check.
+`changes` holds 1–32 entries, each addressed by exactly one of `lines` (numbers of the file's current bytes — never shifted by other changes in the same call; empty `content` deletes the range), `symbol` (with the same `op`/`where` vocabulary as the single form), or `old` (exact text that must match once, optionally scoped to `within`'s symbol; exactly the matched bytes are replaced, so `old` may start or end mid-line and may include line terminators — `new: ""` deletes the match). Every address resolves against the base bytes before anything is applied; two `old` changes overlap only when their matched bytes intersect (separate substrings of one line, such as two parts of one string literal, apply together), other addresses overlap by line; overlapping ranges, zero-or-multi matches, unknown symbols and ranges past the end are refused together in one reply (`error: edit_refused (edit:refused); change N: …`) naming each failed change and the exact fix — nothing is written and the `operation_id` is unconsumed, so the same id retries. Application is all-or-nothing: one atomic write, one project check.
 
 Before the write the formatted candidate must parse: a structural check runs per language (Rust: syn; Python: its interpreter's `ast.parse`; TypeScript/JavaScript: the accepted typescript package the launcher configured, else the project's own). A candidate that does not parse is NOT written; the reply names the change that produced the error — the change whose range contains the error line, else the nearest change before it, since a parser reports an unterminated construct a line or two after the edit that opened it — its line and a few lines around it. A file that already failed the same check before the edit is still edited (the reply notes the pre-existing error). Languages and files without a checker proceed and report through the project check as before.
 
 The success reply lists where every change landed in the final file, so no re-read is needed to learn the new numbers:
 
 ```text
-edit: replaced; path src/x.rs; source_ref …-7; diagnostics: current_clean. Next: use ide.diff
+edit: replaced; path src/x.rs; diagnostics: current_clean
 3 changes applied: change 1: lines 12–20 replaced (now 12–24); change 2: src/x.rs#Foo/bar inserted after #Foo (now 26–33); change 3: old text at line 88 replaced (now 90–91)
 lines after 12 moved +3
 ```
@@ -477,11 +476,11 @@ lines after 12 moved +3
 A multi-file edit applies one logical change across up to 16 files in ONE call ([batch API v1](batch-api-v1.md) §7):
 
 ```text
-{operation_id, source_ref?, files: [
+{operation_id, files: [
   {path: "src/a.rs", changes: […]},                   // exactly the one-file `changes` entries
-  {path: "src/b.rs", source_ref: "…-61", changes: […]},
+  {path: "src/b.rs", changes: […]},
   {path: "src/new.rs", create: true, content: "…"},   // a file that must not exist yet
-  {path: "docs/x.md", content: "…"}]}                 // whole new content; needs a source_ref
+  {path: "docs/x.md", content: "…"}]}                 // whole new content of the current bytes
 ```
 
 At most 32 changes per file, 128 changes and 128 KiB of `content`/`new` text in all. Every file is observed and validated first (base admitted exactly as the one-file form admits it, every change resolved, formatted once and syntax-gated); any refusal answers `edit_refused` naming each failed `file k <path>` and nothing is written. Otherwise a durable receipt records the request digest and each file's base and candidate digests, the files are written in order through the stale-safe write, and one project check (one per affected checked language) runs after the last write. The reply is an `edit_batch` result: structured `operation_id`, `outcome` (`applied` | `partial` | `conflicting_duplicate` | `outcome_unknown`), `source_ref` and per file `path`, `state` (`created` | `replaced` | `unchanged` | `not_written` | `unknown`) and, for `not_written`, `reason` (`changed_after_validation` | `io_error` | `not_reached`), with a text that opens with `edit: applied N of N files; source_ref …` or `edit: partial — written w of N; not written: k <path> (changed after validation | write failed | not reached), …; the same operation_id resumes the rest`, then one line per file with its landing and diagnostics. Its `source_ref` is an edit base for every written file. The same `operation_id` with the same request resumes from the receipt (written files stay, an unwritten file is written only while its bytes still equal its validated base), even after a daemon restart, and a settled operation answers its settled diagnostics again; a written file no project check covers reports `not_analysed` with the reason; a different request answers `edit: conflicting_duplicate` and writes nothing. A crash after a write answers `outcome_unknown` for the operation.

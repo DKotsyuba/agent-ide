@@ -8,13 +8,16 @@ qualification evidence.
 
 ## Current development candidate
 
-E-003 changes the public catalog to ten tools per host and one text block without
-`structuredContent`; the optional typed test oracle is limited to test-seams builds.
+E-003 changes the public catalog to ten tools per host (public `ide.context` is removed) and
+every production reply to one text block without `structuredContent`; the optional typed test
+oracle is limited to test-seams builds. Deferred graph, test and edit-check results stay retained
+and Bridge delivers them automatically when configured (carrier and timing owned by Bridge);
+there is no polling advice and IDE keeps no legacy `Stop`, reply or hook deferred carrier.
 Symbol-addressed reads/edits, positional lookup, file diagnostic inspection and
 the restored Codex graph have focused product/provider checks. The complete gate,
 final artifact verification and experiment acceptance remain separate obligations.
 The release evidence and exceptions below are scoped to their recorded revisions;
-they do not qualify the uncommitted integration candidate or Bridge migration.
+they do not qualify the current E-003 integration candidate or the Bridge migration.
 
 ## Inherited release record
 
@@ -49,8 +52,10 @@ they do not qualify the uncommitted integration candidate or Bridge migration.
 - `unavailable` and `outcome_unknown` results carry `isError=false`: the tool
   answered honestly within its contract; this differs from a business refusal
   and is pinned by product tests.
-- Codex receives full `structuredContent` in addition to text; Claude gets the
-  compact text projection.
+- Every host receives one compact text block and no `structuredContent` in
+  production (a `test-seams` build may keep the typed copy as a test oracle).
+  The inherited release rows above predate this change and recorded Codex
+  receiving `structuredContent` too.
 - Tests share one cargo-configured `AGENT_IDE_HOME=target/test-home` and run
   with `--test-threads=1` (CFG-03 exception): the resident daemon's shared
   resources are serialized globally instead of per-test-home. Documented
