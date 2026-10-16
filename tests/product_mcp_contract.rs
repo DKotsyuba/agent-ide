@@ -689,10 +689,10 @@ fn assert_compact_envelope(reply: &Value) {
             "{reply}"
         ),
         ("complete", Some("graph")) => assert!(body.starts_with("graph: "), "{reply}"),
-        // A multi-file edit (batch-api-v1 §7) opens with its outcome line and carries its closed
-        // structured result.
+        // A multi-file edit (batch-api-v1 §7) opens with its outcome line, or is a bounded
+        // refusal (head sentence, one Repair line), and carries its closed structured result.
         ("edit_batch", _) => assert!(
-            body.starts_with("edit: ")
+            (body.starts_with("edit: ") || body.contains("\nRepair: "))
                 && structured["operation_id"].is_string()
                 && structured["outcome"].is_string()
                 && structured["files"].is_array(),
@@ -748,6 +748,14 @@ fn assert_compact_envelope(reply: &Value) {
         ("pending", _) => assert!(
             text.contains("Result retained under")
                 && text.contains("Bridge delivers it automatically when configured."),
+            "{reply}"
+        ),
+        // A durable edit refusal is a head sentence and one Repair line; an applied edit leads
+        // with its outcome word.
+        ("edit", _) if text.contains("\nRepair: ") => assert!(
+            text.lines().next().unwrap().len() <= 160
+                && text.lines().nth(1).unwrap().len() <= 120
+                && !text.starts_with("edit: "),
             "{reply}"
         ),
         _ => assert!(text.starts_with(state), "{reply}"),
@@ -832,6 +840,34 @@ fn claude_fields(tool: &str, text: &str) -> Value {
         && !text.starts_with("edit: ")
     {
         let head = text.lines().next().unwrap();
+        // A durable edit refusal keeps the settled-write state its internal outcome names; the
+        // head states the effect, so the outcome is recovered from that sentence.
+        let durable = if head.starts_with("This operation_id already names a different edit") {
+            Some("conflicting_duplicate")
+        } else if head.contains(" is a symlink or special file the IDE may not write") {
+            Some("unsafe_target")
+        } else if head.starts_with("The edit of ") && head.contains(" was cancelled;") {
+            Some("cancelled_no_effect")
+        } else if head.starts_with("The edit of ") && head.contains(" ran out of time;") {
+            Some("deadline_no_effect")
+        } else if head.starts_with("The IDE was too busy to edit ") {
+            Some("capacity_no_effect")
+        } else if head.contains(" may or may not have been written.") {
+            Some("outcome_unknown")
+        } else if head.starts_with("The IDE session is not active; the edit of ") {
+            Some("unavailable_before_dispatch")
+        } else if head.ends_with("; nothing was written.") && !head.starts_with("Edit refused;") {
+            Some("stale_source")
+        } else {
+            None
+        };
+        if let Some(outcome) = durable {
+            return json!({
+                "state":"edit",
+                "result":{"outcome":outcome,"source_ref":null},
+                "text":original,
+            });
+        }
         let code = if head.starts_with("This activation started with read_only:")
             || head.starts_with("Another agent session owns")
             || head.starts_with("Another session for this actor")
@@ -16032,39 +16068,45 @@ async fn configured_product_returns_real_rust_semantic_context() {
         for (path, symbol) in [("src/lib.rs", "value()")] {
             let bytes = std::fs::read_to_string(fixture.root.join(path)).unwrap();
             let offset = bytes.rfind(symbol).unwrap();
-            let response = actor
-                .call(
-                    &fixture,
-                    "ide.symbol",
-                    json!({"path":path,"byte_offset":offset}),
-                )
-                .await;
-            let response = actor.settle(&fixture, response).await;
-            if response["kind"] != "symbol" {
-                actor.mcp.close().await;
-                daemon.kill().await.unwrap();
-                let output = daemon.wait_with_output().await.unwrap();
-                panic!(
-                    "{path}: calls={}: {response}; daemon stderr={}",
-                    actor.next,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            if !response["text"]
-                .as_str()
-                .unwrap()
-                .contains("mode: semantic")
-            {
-                let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
-                let stopped = actor.settle(&fixture, stopped).await;
-                actor.mcp.close().await;
-                daemon.kill().await.unwrap();
-                let output = daemon.wait_with_output().await.unwrap();
-                panic!(
-                    "{response}; cleanup={stopped}; daemon stderr={}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            // A positional card answers at once and terminally: while the server loads it is
+            // lexical (the E-003 cold path), so repeat the call until the server is ready.
+            let deadline = std::time::Instant::now() + Duration::from_secs(150);
+            let response = loop {
+                let response = actor
+                    .call(
+                        &fixture,
+                        "ide.symbol",
+                        json!({"path":path,"byte_offset":offset}),
+                    )
+                    .await;
+                let response = actor.settle(&fixture, response).await;
+                let loading = response["kind"] == "symbol"
+                    && response["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("mode: lexical (semantic provider is still loading");
+                if loading && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                if response["kind"] != "symbol"
+                    || !response["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("mode: semantic")
+                {
+                    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+                    let stopped = actor.settle(&fixture, stopped).await;
+                    actor.mcp.close().await;
+                    daemon.kill().await.unwrap();
+                    let output = daemon.wait_with_output().await.unwrap();
+                    panic!(
+                        "{path}: {response}; cleanup={stopped}; daemon stderr={}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                break response;
+            };
             assert!(
                 response["text"]
                     .as_str()
@@ -17715,14 +17757,24 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     assert_addressed_locations(root_text, "references");
     assert_addressed_locations(child_text, "definitions");
     assert_addressed_locations(child_text, "references");
-    assert!(root_text.contains("rootValue") && root_text.contains("root diagnostic marker"));
-    assert!(!root_text.contains("child-only"));
+    // The card names the diagnostic by its address and compiler text; it prints no source lines.
+    assert!(
+        root_text.contains("rootValue") && root_text.contains("fixture.ts#rootBroken"),
+        "{root_context}"
+    );
+    assert!(!root_text.contains("childValue"), "{root_context}");
     assert!(
         root_text.contains("diagnostics: at least "),
         "{root_context}"
     );
-    assert!(child_text.contains("childValue") && child_text.contains("child-only"));
-    assert!(!child_text.contains("root diagnostic marker"));
+    assert!(
+        child_text.contains("childValue") && child_text.contains("fixture.ts#childUse"),
+        "{child_context}"
+    );
+    assert!(
+        !child_text.contains("rootValue") && !child_text.contains("rootBroken"),
+        "{child_context}"
+    );
     assert!(
         child_text.contains("diagnostics: unknown"),
         "{child_context}"
@@ -17740,7 +17792,10 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     let child_live = child.settle(&fixture, child_live).await;
     let child_live_text = child_live["text"].as_str().unwrap();
     assert!(child_live_text.contains("mode: semantic"), "{child_live}");
-    assert!(child_live_text.contains("child-only"), "{child_live}");
+    assert!(
+        child_live_text.contains("fixture.ts#childUse") && !child_live_text.contains("rootValue"),
+        "{child_live}"
+    );
     assert!(
         child_live_text.contains("diagnostics: unknown"),
         "{child_live}"

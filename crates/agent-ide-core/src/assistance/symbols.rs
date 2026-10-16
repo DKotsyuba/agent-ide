@@ -3161,7 +3161,7 @@ impl Worker<'_> {
                                 },
                                 diagnostics: EditDiagnostics::Unknown {},
                                 note: Some(format!(
-                                    "the edit that produced {reference} moved lines after line {line} by {delta:+}; line numbers must come from a read of the current file. Repair: read the current lines again with ide.read"
+                                    "an earlier edit moved lines after line {line} by {delta:+}; line numbers must come from a read of the current file. Repair: read the current lines again with ide.read"
                                 )),
                                 operation: None,
                             },
@@ -3344,7 +3344,7 @@ impl Worker<'_> {
                                 },
                                 diagnostics: EditDiagnostics::Unknown {},
                                 note: Some(format!(
-                                    "the edit that produced {reference} moved lines after line {line} by {delta:+}; line numbers must come from a read of the current file. Repair: read the current lines again with ide.read"
+                                    "an earlier edit moved lines after line {line} by {delta:+}; line numbers must come from a read of the current file. Repair: read the current lines again with ide.read"
                                 )),
                                 operation: None,
                             },
