@@ -273,7 +273,7 @@ fn tool_result(id: &str, text: &str) -> Value {
         {"type":"tool_result","tool_use_id":id,"content":[{"type":"text","text":text}]}]}})
 }
 
-/// The L2 oracle keeps the literal `stale_source` but takes it only from the result of a real
+/// The L2 oracle matches the stale refusal sentence but takes it only from the result of a real
 /// `ide.edit` call: a skipped step 7 fails even when the model narrates the literal, and another
 /// tool's result carrying it does not stand in for the skipped call.
 ///
@@ -286,9 +286,9 @@ fn l2_stale_oracle_requires_the_stale_edit_result_not_narration() {
     );
     std::fs::create_dir_all(&scratch.0).unwrap();
     let edit = "mcp__agent-ide__ide_edit";
-    let stale = "edit: stale_source; path acceptance-fixture/fixture.py. No write occurred";
+    let stale = "The supplied source_ref does not match this file's current text; nothing was written.\nRepair: Send the edit without source_ref";
     let narration = assistant(serde_json::json!([
-        {"type":"text","text":"Step 7 skipped; a stale_source refusal would have followed. LEFT_FALLBACK_OK"}]));
+        {"type":"text","text":"Step 7 skipped; a refusal that the source_ref does not match this file's current text would have followed. LEFT_FALLBACK_OK"}]));
     let call = |id: &str, name: &str| {
         assistant(serde_json::json!([{"type":"tool_use","id":id,"name":name,"input":{}}]))
     };
@@ -335,5 +335,5 @@ fn l2_stale_oracle_requires_the_stale_edit_result_not_narration() {
 
     let claude = include_str!("../scripts/acceptance-drivers/claude.sh");
     assert!(claude.contains("require_stale_edit_result \"$t\""));
-    assert!(!claude.contains("require_transcript_text \"$t\" \"stale_source\""));
+    assert!(!claude.contains("require_transcript_text \"$t\" \"does not match this file"));
 }

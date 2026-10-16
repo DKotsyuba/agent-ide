@@ -934,6 +934,9 @@ fn bounded_names_line(label: &str, paths: &[crate::workspace::git::PathStatus]) 
 
 /// Separates capture inventory from delivered hunks and bounds names and omission notes.
 /// Quoted names preserve arbitrary Unix path labels without embedding control characters.
+///
+/// Only called for a coverage exception (a `name only` entry); a capture whose every changed file
+/// is simply delivered as hunks prints no inventory, so no path appears before its file rows.
 fn render_inventory(result: &crate::changes::DiffResult) -> String {
     let mut text = format!(
         "inventory: {} tracked, {} untracked, {} conflicted; hunks delivered: {}\n",
@@ -972,7 +975,7 @@ fn render_inventory(result: &crate::changes::DiffResult) -> String {
 }
 
 /// Renders the compact §2.7 default reply: one summary line, the untracked/conflicted names Git
-/// itself never diffs, per-file hunk text, and a bounded continuation marker — no hash-bearing or
+/// itself never diffs, the inventory only when some entry is name-only, per-file hunk text, and a bounded continuation marker — no hash-bearing or
 /// bookkeeping fields. `degraded`, when set, is appended in parentheses on the summary line, for
 /// the single-pass plain `git diff` fallback that never claims the two-pass capture's exactness.
 fn render_diff_compact(
@@ -1000,7 +1003,9 @@ fn render_diff_compact(
     }
     text.push_str(&bounded_names_line("untracked", result.untracked()));
     text.push_str(&bounded_names_line("conflicted", result.conflicts()));
-    text.push_str(&render_inventory(result));
+    if !result.name_only().is_empty() {
+        text.push_str(&render_inventory(result));
+    }
     let mut current: Option<&std::path::PathBuf> = None;
     for hunk in result.selected_hunks() {
         if current != Some(hunk.path()) {

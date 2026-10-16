@@ -9385,7 +9385,7 @@ async fn diff_default_reply_is_compact_and_hash_free() {
     let text = diff["text"].as_str().unwrap();
     assert_eq!(
         text,
-        "diff (head): 1 files, +1 \u{2212}0\ninventory: 1 tracked, 0 untracked, 0 conflicted; hunks delivered: 1\npaths: \"a.txt\"\nfile: \"a.txt\"\n@@ -1 +1,2 @@\n line1\n+line2\n",
+        "diff (head): 1 files, +1 \u{2212}0\nfile: \"a.txt\"\n@@ -1 +1,2 @@\n line1\n+line2\n",
         "{text}"
     );
     for field in [
@@ -11632,7 +11632,10 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
     .await;
     let (moved, moved_text) = batch_settle_with_text(&mut actor, &fixture, moved).await;
     assert_eq!(moved["result"]["outcome"], "stale_source", "{moved}");
-    assert!(moved_text.contains("lines_moved"), "{moved_text}");
+    assert!(
+        moved_text.contains("moved lines after line"),
+        "{moved_text}"
+    );
     let reread = actor
         .call(
             &fixture,

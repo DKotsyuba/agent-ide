@@ -1,6 +1,6 @@
 # Harness reply v1 contract
 
-Revision: harness-reply-v1 r5; tracked boundary id `harness-reply-v1`, revision 5. Historically r5 raised catalog ceilings from 10/7 KiB to 15/13 KiB (then 15.1 KB Claude, 12.9 KB Codex). The owner-directed amendment restores Codex `ide.graph`, authorizes 14 KiB for Codex, and removes public `ide.context` from both hosts (ten names each). This is not an Agent Tasks ratification of a new revision. Export history and current measurements live in [model text inventory](../model-text-inventory.md). Both final schemas have been exported; focused checks have run, while acceptance still requires the complete project gate. Other r5 rules remain. Provider: M-030 (`assistance/facade.rs`, `content.rs`, `assets/mcp/reply.jinja`, `signature_card.rs`, `hygiene.rs`, `snapshots.rs`, the skills). Consumers: M-028 (addresses) and M-029 (read/edit). Consumes: [symbol-address-v1](symbol-address-v1.md) r2 and [symbol-read-edit-v1](symbol-read-edit-v1.md) r2. Vocabulary: [common](common.md); reply states: [reply-hygiene-v1](reply-hygiene-v1.md) and [agent-content-v0.2](agent-content-v0.2.md).
+Revision: harness-reply-v1 r5; tracked boundary id `harness-reply-v1`, revision 5. Historically r5 raised catalog ceilings from 10/7 KiB to 15/13 KiB (then 15.1 KB Claude, 12.9 KB Codex). The owner-directed amendment restores Codex `ide.graph` and removes public `ide.context` from both hosts (ten names each); the agreed Codex budget stays 13 KiB (the compact catalog is 12,782 B). The tracked contract entries already carry r5 as agreed. Export history and current measurements live in [model text inventory](../model-text-inventory.md). Both final schemas have been exported; focused checks have run, while acceptance still requires the complete project gate. Other r5 rules remain. Provider: M-030 (`assistance/facade.rs`, `content.rs`, `assets/mcp/reply.jinja`, `signature_card.rs`, `hygiene.rs`, `snapshots.rs`, the skills). Consumers: M-028 (addresses) and M-029 (read/edit). Consumes: [symbol-address-v1](symbol-address-v1.md) r2 and [symbol-read-edit-v1](symbol-read-edit-v1.md) r2. Vocabulary: [common](common.md); reply states: [reply-hygiene-v1](reply-hygiene-v1.md) and [agent-content-v0.2](agent-content-v0.2.md).
 
 Purpose: an IDE reply costs the model about what the same fact costs from a native tool. It is one block of plain text, says only what the agent does not already know, and names the single next step when something went wrong.
 
@@ -55,7 +55,7 @@ like other deferred results, are retained and delivered only through Bridge.
 | One property description | at most 160 B |
 | Server paragraph | at most 700 B |
 | Claude catalog (descriptions plus input schemas, as served) | at most 15 KiB (E-002: 21.8 KiB) |
-| Codex catalog (as served) | at most 14 KiB (owner-directed graph amendment; historical r5: 13 KiB) |
+| Codex catalog (as served) | at most 13 KiB (12,782 B with `ide.graph` restored) |
 | Claude skill | at most 6 KiB |
 | Codex skill | at most 4 KiB |
 | `ide.start` signature block | at most 700 B (T-006; historical r5 broader budget: 1.5 KiB) |
@@ -63,9 +63,9 @@ like other deferred results, are retained and delivered only through Bridge.
 | Trailer per cut | one line, at most 160 B |
 
 `facade::catalog_stays_within_the_budgets` enforces the 600 B description, 160 B property,
-700 B paragraph and 15/14 KiB catalog limits. The historical 10/7 KiB ceilings became
-15/13 KiB in r5 after measurement; the owner's graph restoration raises only Codex to
-14 KiB. Description, property, paragraph, skill and strict 700 B signature ceilings stay unchanged.
+700 B paragraph and 15/13 KiB catalog limits. The historical 10/7 KiB ceilings became
+15/13 KiB in r5 after measurement; restoring `ide.graph` to Codex fits the same 13 KiB.
+Description, property, paragraph, skill and strict 700 B signature ceilings stay unchanged.
 
 ## 4. Baseline
 

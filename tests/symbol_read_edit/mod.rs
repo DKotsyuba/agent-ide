@@ -870,7 +870,7 @@ async fn a_stale_source_ref_is_refused_and_an_open_window_reaches_the_unit_end()
     .await;
     assert_eq!(reply["result"]["outcome"], "stale_source", "{reply}");
     assert!(
-        text.contains("the supplied source_ref does not match")
+        text.contains("supplied source_ref does not match")
             && !text.contains("changed while the edit was applied"),
         "{text}"
     );

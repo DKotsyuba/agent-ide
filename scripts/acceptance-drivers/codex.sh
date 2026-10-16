@@ -484,7 +484,7 @@ verify_l2() {
     t=$DIAG_DIR/transcript-l2.jsonl
     require_codex_native_edit "$t" A_L2_NATIVE_EDIT || return 1
     require_text "$t" "LEFT_FALLBACK_OK" A_L2_FINAL || return 1
-    require_text "$t" "stale_source" A_L2_STALE_OUTCOME || return 1
+    require_text "$t" "does not match this file's current text" A_L2_STALE_OUTCOME || return 1
     left_py=$LEFT/acceptance-fixture/fixture.py
     [ "$(sed -n '1p' "$left_py")" = "# native acceptance marker" ] || return 1
     grep -qF "return 0" "$left_py" || return 1

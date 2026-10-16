@@ -11592,7 +11592,7 @@ mod stop_retry_tests {
             serde_json::json!({"operation_id":"shifted-single-op","path":"a.gamma","lines":"5-5","source_ref":"line-edit","content":"end"}),
         ).await;
         assert!(
-            matches!(&reply, PeerReply::Edit { result: EditResult { outcome: ChangesEditOutcome::StaleSource, .. }, note: Some(note), .. } if note.contains("edit:lines_moved") && note.contains("after line 2 by +1") && note.contains("ide.read {path, lines}")),
+            matches!(&reply, PeerReply::Edit { result: EditResult { outcome: ChangesEditOutcome::StaleSource, .. }, note: Some(note), .. } if note.contains("moved lines after line 2 by +1") && note.contains("with ide.read")),
             "{reply:?}"
         );
         assert_eq!(
@@ -11604,7 +11604,7 @@ mod stop_retry_tests {
             serde_json::json!({"operation_id":"shifted-batch-op","path":"a.gamma","source_ref":"line-edit","changes":[{"lines":"2-2","content":"changed"}]}),
         ).await;
         assert!(
-            matches!(&reply, PeerReply::Edit { result: EditResult { outcome: ChangesEditOutcome::StaleSource, .. }, note: Some(note), .. } if note.contains("edit:lines_moved")),
+            matches!(&reply, PeerReply::Edit { result: EditResult { outcome: ChangesEditOutcome::StaleSource, .. }, note: Some(note), .. } if note.contains("moved lines after line")),
             "{reply:?}"
         );
         assert_eq!(

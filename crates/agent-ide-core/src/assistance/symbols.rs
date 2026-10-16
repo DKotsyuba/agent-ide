@@ -3161,7 +3161,7 @@ impl Worker<'_> {
                                 },
                                 diagnostics: EditDiagnostics::Unknown {},
                                 note: Some(format!(
-                                    "stale_source (edit:lines_moved); the edit that produced {reference} moved lines after line {line} by {delta:+}; line numbers must come from a read of the current file — re-read with ide.read {{path, lines}}"
+                                    "the edit that produced {reference} moved lines after line {line} by {delta:+}; line numbers must come from a read of the current file. Repair: read the current lines again with ide.read"
                                 )),
                                 operation: None,
                             },
@@ -3344,7 +3344,7 @@ impl Worker<'_> {
                                 },
                                 diagnostics: EditDiagnostics::Unknown {},
                                 note: Some(format!(
-                                    "stale_source (edit:lines_moved); the edit that produced {reference} moved lines after line {line} by {delta:+}; line numbers must come from a read of the current file — re-read with ide.read {{path, lines}}"
+                                    "the edit that produced {reference} moved lines after line {line} by {delta:+}; line numbers must come from a read of the current file. Repair: read the current lines again with ide.read"
                                 )),
                                 operation: None,
                             },
@@ -5286,7 +5286,7 @@ const MAX_CURRENT_TEXT_REFUSAL_BYTES: usize = 4096;
 /// The stale-source reply's reason when a caller's own (deprecated) `source_ref` no longer names
 /// the file's current text; without a `source_ref` a stale write reads "changed while the edit
 /// was applied" instead.
-pub(super) const STALE_SOURCE_REF_NOTE: &str = "the supplied source_ref does not match this file's current text. Repair: send the edit without source_ref";
+pub(super) const STALE_SOURCE_REF_NOTE: &str = "the supplied source_ref does not match this file's current text. Repair: Send the edit without source_ref";
 
 /// How a syntax error relates to the change it is attributed to.
 enum Attribution {

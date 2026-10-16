@@ -1,7 +1,7 @@
 //! The call-signature block that ends every `ide.start` reply.
 //!
 //! Agents that cannot see the tool schemas cheaply (the Codex code mode prints the whole tool
-//! catalog, at most 14 KiB, once or more per agent) get the exact batch call shapes here instead,
+//! catalog, at most 13 KiB, once or more per agent) get the exact batch call shapes here instead,
 //! in at most 700 bytes. The block follows the project card and the servers
 //! line of the start reply (`docs/contracts/start-index-state-v1.md` §1) and shows one example per
 //! batch form of `docs/contracts/batch-api-v1.md`, the pushed-results rule and the required

@@ -4277,9 +4277,6 @@ impl StdioFacade {
                     note,
                 );
             }
-            FacadeOutcome::InvalidParameters => {
-                "These arguments do not match the tool schema.\nRepair: Correct the arguments and repeat this call."
-            }
             FacadeOutcome::MissingHostMetadata => {
                 // A caller whose `_meta` names no supported host contract can never correlate an
                 // invocation (the ZCode auto-mode case): name that closed cause rather than the
@@ -4291,45 +4288,61 @@ impl StdioFacade {
                     };
                     return render_reply_with_status(reply, None, envelope);
                 }
-                "The IDE host attachment is unavailable.\nRepair: Continue with native tools."
+                transport_refusal(&FacadeOutcome::MissingHostMetadata, tool)
             }
-            FacadeOutcome::Unavailable => {
-                "The IDE connection is unavailable.\nRepair: Continue with native tools."
-            }
-            FacadeOutcome::TimedOut => {
-                "The IDE connection timed out.\nRepair: Continue with native tools."
-            }
-            // The daemon refused the call before running it, so even a mutation applied nothing.
-            FacadeOutcome::Busy => {
-                "The IDE is serving too many calls; this call did not run and nothing was applied.\nRepair: Repeat this call."
-            }
-            // The daemon refused the call before running it (and a managed client already tried
-            // the replacement once), so even a mutation applied nothing.
-            FacadeOutcome::Restarting => {
-                "The IDE restarted after an internal fault; this call did not run and nothing was applied.\nRepair: Repeat this call."
-            }
-            // Never resent: the daemon may have executed the call, and a resend could only repeat
-            // a change or be refused for its already consumed pre-hook.
-            FacadeOutcome::OutcomeUnknown => match tool {
-                AssistanceTool::Edit => {
-                    "This edit may have applied; its outcome is unknown.\nRepair: Verify with ide.diff before another edit."
-                }
-                AssistanceTool::Test => {
-                    "This test may have started; its outcome is unknown.\nRepair: Review ide.test {\"history\":true} once before starting another run."
-                }
-                AssistanceTool::Start | AssistanceTool::Stop => {
-                    "This activation change may have applied; its outcome is unknown.\nRepair: Call ide.start to see the current binding."
-                }
-                _ => "This call may have run, but its reply was lost.\nRepair: Repeat this call.",
-            },
-            FacadeOutcome::ReestablishFailed => {
-                "The IDE exited and could not reconnect.\nRepair: Continue with native tools."
-            }
-            FacadeOutcome::Incomplete => {
-                "The IDE's result is unavailable.\nRepair: Continue with native tools."
-            }
+            other => transport_refusal(&other, tool),
         };
         CallToolResult::error(vec![ContentBlock::text(message)])
+    }
+}
+
+/// The model-facing refusal of one transport-level failure, as a head, one `Repair:` line and
+/// nothing else (harness-reply-v1 R5).
+///
+/// Covers every outcome that never reached a typed peer reply: invalid arguments, a missing host
+/// attachment, an unavailable or timed-out connection, a `busy`/`restarting` daemon (the call did
+/// not run, so even a mutation applied nothing), a call whose reply was lost (never resent, so the
+/// text names the check to make for `tool` instead of a replay), a failed reconnect and an
+/// incomplete reply. [`FacadeOutcome::Reply`] carries a typed reply rendered elsewhere; it maps to
+/// the incomplete-result refusal so the function stays total. The returned text is static.
+fn transport_refusal(outcome: &FacadeOutcome, tool: AssistanceTool) -> &'static str {
+    match outcome {
+        FacadeOutcome::InvalidParameters => {
+            "These arguments do not match the tool schema.\nRepair: Correct the arguments and repeat this call."
+        }
+        FacadeOutcome::MissingHostMetadata => {
+            "The IDE host attachment is unavailable.\nRepair: Continue with native tools."
+        }
+        FacadeOutcome::Unavailable => {
+            "The IDE connection is unavailable.\nRepair: Continue with native tools."
+        }
+        FacadeOutcome::TimedOut => {
+            "The IDE connection timed out.\nRepair: Continue with native tools."
+        }
+        FacadeOutcome::Busy => {
+            "The IDE is serving too many calls; this call did not run and nothing was applied.\nRepair: Repeat this call."
+        }
+        FacadeOutcome::Restarting => {
+            "The IDE restarted after an internal fault; this call did not run and nothing was applied.\nRepair: Repeat this call."
+        }
+        FacadeOutcome::OutcomeUnknown => match tool {
+            AssistanceTool::Edit => {
+                "This edit may have applied; its outcome is unknown.\nRepair: Verify with ide.diff before another edit."
+            }
+            AssistanceTool::Test => {
+                "This test may have started; its outcome is unknown.\nRepair: Review ide.test {\"history\":true} before starting another run."
+            }
+            AssistanceTool::Start | AssistanceTool::Stop => {
+                "This activation change may have applied; its outcome is unknown.\nRepair: Call ide.start to see the current binding."
+            }
+            _ => "This call may have run, but its reply was lost.\nRepair: Repeat this call.",
+        },
+        FacadeOutcome::ReestablishFailed => {
+            "The IDE exited and could not reconnect.\nRepair: Continue with native tools."
+        }
+        FacadeOutcome::Incomplete | FacadeOutcome::Reply(..) => {
+            "The IDE's result is unavailable.\nRepair: Continue with native tools."
+        }
     }
 }
 
@@ -4340,10 +4353,12 @@ impl StdioFacade {
 /// passed [`content::fits`] without shrinking, so the facade never re-cuts an accepted whole hunk.
 ///
 /// `envelope` selects whether the final carrier also duplicates the typed reply as
-/// `structuredContent` (T14B): the Claude host hands that field straight to its model in place of
-/// `content`, defeating the compact renderer, so its calls render with [`content::Envelope::TextOnly`].
-/// Every other caller — Codex, and `worker::Shared::mark_feedback_inline_delivered` tracing the
-/// exact final carrier a live caller would receive — keeps [`content::Envelope::WithStructured`].
+/// `structuredContent`. Production callers of every host (Claude, Codex, unrecognized) pass
+/// [`content::Envelope::TextOnly`] (harness-reply-v1 R1): a host that receives `structuredContent`
+/// shows it in place of `content`, defeating the compact renderer. Only a `test-seams` build
+/// with `AGENT_IDE_TEST_STRUCTURED_REPLIES=1` ([`content::reply_envelope`]) selects
+/// [`content::Envelope::WithStructured`] for non-Claude hosts as the product tests' oracle;
+/// `worker::Shared::mark_feedback_inline_delivered` traces the final text-only carrier.
 ///
 /// `pub(super)` so `worker::Shared::mark_feedback_inline_delivered` can call it directly instead of
 /// re-approximating the fitting boundary.
@@ -5585,7 +5600,7 @@ fn advertised_text_never_teaches_waiting() {
 fn catalog_stays_within_the_budgets() {
     for (host, paragraph, total_limit) in [
         (CatalogHost::Claude, SERVER_INSTRUCTIONS, 15 * 1024),
-        (CatalogHost::Codex, SERVER_INSTRUCTIONS_CODEX, 14 * 1024),
+        (CatalogHost::Codex, SERVER_INSTRUCTIONS_CODEX, 13 * 1024),
     ] {
         assert!(
             paragraph.len() <= 700,

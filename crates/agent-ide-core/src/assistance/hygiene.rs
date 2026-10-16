@@ -683,11 +683,41 @@ fn examples_in(text: &str) -> Vec<(AssistanceTool, String)> {
     found
 }
 
+/// Names the first key of `value` that the advertised schema does not list, as a dotted path.
+///
+/// Descends through every listed object property and every array `items` schema, so a nested
+/// key the host catalog removed (for example `items[].lines` on Claude's `ide.read`) is found.
+/// An object schema without `properties` is open and a non-object, non-array value has no keys;
+/// both yield `None`.
+fn undeclared_key(schema: &Value, value: &Value) -> Option<String> {
+    match value {
+        Value::Object(fields) => {
+            let properties = schema.get("properties")?.as_object()?;
+            fields
+                .iter()
+                .find_map(|(key, field)| match properties.get(key) {
+                    None => Some(key.clone()),
+                    Some(declared) => {
+                        undeclared_key(declared, field).map(|path| format!("{key}.{path}"))
+                    }
+                })
+        }
+        Value::Array(elements) => {
+            let element = schema.get("items")?;
+            elements
+                .iter()
+                .find_map(|candidate| undeclared_key(element, candidate))
+        }
+        _ => None,
+    }
+}
+
 /// Reports why an example does not hold, or `None` when it does.
 ///
-/// Complete examples pass public validation and the actual host catalog's top-level closed
-/// properties. Abbreviated examples still name only advertised keys; compatibility-only keys
-/// and tools absent from that host are refused rather than mistaken for teaching support.
+/// Complete examples pass public validation and the actual host catalog's closed properties at
+/// every nesting level (`undeclared_key`). Abbreviated examples still name only advertised
+/// keys at every level they spell out; compatibility-only keys and tools absent from that host
+/// are refused rather than mistaken for teaching support.
 fn example_problem(host: CatalogHost, tool: AssistanceTool, example: &str) -> Option<String> {
     let schema = host
         .catalog(StdioFacade::described_tool_router().list_all())
@@ -696,14 +726,10 @@ fn example_problem(host: CatalogHost, tool: AssistanceTool, example: &str) -> Op
     let Some(schema) = schema else {
         return Some("tool not advertised to this host".into());
     };
+    let advertised = Value::Object((*schema.input_schema).clone());
     if let Ok(value) = serde_json::from_str::<Value>(&example.replace('…', "x")) {
-        if let Some(fields) = value.as_object() {
-            let properties = schema.input_schema["properties"]
-                .as_object()
-                .expect("schema properties");
-            if let Some(key) = fields.keys().find(|key| !properties.contains_key(*key)) {
-                return Some(format!("`{key}` is not advertised to {host:?}"));
-            }
+        if let Some(path) = undeclared_key(&advertised, &value) {
+            return Some(format!("`{path}` is not advertised to {host:?}"));
         }
         return validate_call(tool, value)
             .err()
@@ -713,16 +739,12 @@ fn example_problem(host: CatalogHost, tool: AssistanceTool, example: &str) -> Op
         return Some("not JSON".to_owned());
     }
     let sketch = example.replace("[…]", "[]").replace("{…}", "{}");
-    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&sketch) else {
-        return Some("not a JSON object even with its placeholders emptied".to_owned());
+    let fields = match serde_json::from_str::<Value>(&sketch) {
+        Ok(value) if value.is_object() => value,
+        _ => return Some("not a JSON object even with its placeholders emptied".to_owned()),
     };
-    let properties = schema.input_schema["properties"]
-        .as_object()
-        .expect("schemas list properties");
-    fields
-        .keys()
-        .find(|key| !properties.contains_key(*key))
-        .map(|key| format!("`{key}` is not a property of {}", schema.name))
+    undeclared_key(&advertised, &fields)
+        .map(|path| format!("`{path}` is not a property of {}", schema.name))
 }
 
 /// Read batches may use native file-line coordinates; the same shape on a primary edit
@@ -912,4 +934,26 @@ fn the_example_checker_refuses_what_a_live_call_refuses() {
         None
     );
     assert!(example_problem(CatalogHost::Codex, AssistanceTool::Inspect, "{wait_ms: 5}").is_some());
+}
+
+/// A nested key the host catalog removed is refused, complete or abbreviated: Claude's read
+/// items take `offset`/`limit` and no `lines`, Codex's take `lines`; a nested edit change may
+/// carry `lines` on both hosts' structured forms.
+#[test]
+fn the_example_checker_validates_nested_schemas() {
+    let lines = r#"{"items":[{"path":"a.md","lines":"1-8"}]}"#;
+    let window = r#"{"items":[{"path":"a.md","offset":1,"limit":8}]}"#;
+    assert!(
+        example_problem(CatalogHost::Claude, AssistanceTool::Read, lines)
+            .is_some_and(|problem| problem.contains("items.lines"))
+    );
+    assert_eq!(
+        example_problem(CatalogHost::Claude, AssistanceTool::Read, window),
+        None
+    );
+    assert_eq!(
+        example_problem(CatalogHost::Codex, AssistanceTool::Read, lines),
+        None
+    );
+    assert!(example_problem(CatalogHost::Codex, AssistanceTool::Read, window).is_some());
 }

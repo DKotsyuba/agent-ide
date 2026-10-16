@@ -400,6 +400,29 @@ fn refusal_text(head: String, repair: String, excerpt: Option<String>) -> String
     text
 }
 
+/// Like [`refusal_text`] for a stale-edit refusal whose producer may supply its own note.
+///
+/// With no note (or an empty one) `head` and `repair` are used as given. A note of the form
+/// `"<sentence>. Repair: <step>"` becomes the head (first letter capitalised, closed with
+/// `; nothing was written.`) and the Repair line; a note without a `Repair:` part becomes the
+/// head and keeps the default `repair`. Performs no I/O.
+fn refusal_note(head: String, repair: String, note: Option<String>) -> String {
+    let Some(note) = note.filter(|note| !note.trim().is_empty()) else {
+        return refusal_text(head, repair, None);
+    };
+    let (sentence, step) = match note.split_once("Repair:") {
+        Some((sentence, step)) => (sentence, step.trim().trim_end_matches('.').to_owned()),
+        None => (note.as_str(), repair),
+    };
+    let sentence = sentence.trim().trim_end_matches('.');
+    let mut letters = sentence.chars();
+    let sentence = letters
+        .next()
+        .map(|first| first.to_uppercase().chain(letters).collect::<String>())
+        .unwrap_or_default();
+    refusal_text(format!("{sentence}; nothing was written."), step, None)
+}
+
 /// VM-instruction budget for one reply render; a render that exceeds it fails into the
 /// presentation-degraded fallback instead of looping. Keeps tenfold headroom over the costliest
 /// real render (the final error fallbacks walk every `elif` of `reply.jinja`, so each added error
@@ -412,7 +435,7 @@ const RENDER_RECURSION_LIMIT: usize = 16;
 /// the helpers `reply.jinja` actually uses are registered, so an added template construct fails
 /// loudly here instead of silently widening the engine (JINJA-02).
 ///
-/// Registered set: filter `join`; bounded refusal formatter; tests `defined`, `mapping`,
+/// Registered set: filter `join`; bounded refusal formatters (`refusal`, `refusal_note`); tests `defined`, `mapping`,
 /// `startingwith`, `endingwith`. The formatter receives data, never template source.
 fn reply_environment(fuel: Option<u64>) -> Environment<'static> {
     let mut environment = Environment::empty();
@@ -420,6 +443,7 @@ fn reply_environment(fuel: Option<u64>) -> Environment<'static> {
     environment.set_auto_escape_callback(|_| AutoEscape::None);
     environment.add_filter("join", minijinja::filters::join);
     environment.add_function("refusal", refusal_text);
+    environment.add_function("refusal_note", refusal_note);
     environment.add_test("defined", minijinja::tests::is_defined);
     environment.add_test("mapping", minijinja::tests::is_mapping);
     environment.add_test("startingwith", minijinja::tests::is_startingwith);
@@ -556,6 +580,9 @@ impl PresentationReceipt {
         CallToolResult::success(vec![ContentBlock::text(text)])
     }
 }
+
+#[cfg(test)]
+mod refusal_table;
 
 #[cfg(test)]
 mod tests {
@@ -1882,7 +1909,26 @@ mod tests {
             let expected = serde_json::to_value(&reply).unwrap();
             let rendered = render(reply, Envelope::WithStructured).unwrap();
             let text = text_of(&rendered);
-            assert!(text.starts_with(&format!("edit: {}", outcome.as_str())));
+            let refused = !matches!(
+                outcome,
+                EditOutcome::Created | EditOutcome::Replaced | EditOutcome::Unchanged
+            );
+            if refused {
+                // harness-reply-v1 R5: a head, one Repair line, no internal outcome label.
+                let lines = text.lines().collect::<Vec<_>>();
+                assert!(lines.len() == 2 && lines[0].len() <= 160, "{text}");
+                assert!(
+                    lines[1].starts_with("Repair: ") && lines[1].len() <= 120,
+                    "{text}"
+                );
+                assert!(!text.contains(outcome.as_str()), "{text}");
+                assert!(
+                    !lines[1].contains(" or ") && !text.contains("otherwise"),
+                    "{text}"
+                );
+            } else {
+                assert!(text.starts_with(&format!("edit: {}", outcome.as_str())));
+            }
             assert!(text.contains("src/lib.rs"));
             assert!(!text.contains("private-operation-id"));
             if !matches!(
@@ -1897,7 +1943,10 @@ mod tests {
             assert_eq!(rendered.structured_content, Some(expected));
             assert_eq!(rendered.is_error, None);
             if outcome == EditOutcome::OutcomeUnknown {
-                assert!(text.contains("do not replay") && text.contains("native tools"));
+                assert!(text.contains("do not repeat this edit") && text.contains("native tools"));
+            }
+            if refused && outcome != EditOutcome::OutcomeUnknown {
+                assert!(text.contains("nothing was written"), "{text}");
             }
         }
     }
@@ -1997,13 +2046,11 @@ mod tests {
         let text = text_of(&rendered);
         // symbol-read-edit-v1 §3.2 rule 6: a write that found the file changed answers with the
         // contract sentence and a repeat-the-call repair, and mentions no file-version reference.
-        assert!(text.contains("No write occurred"));
-        assert!(
-            text.contains(
-                "edit refused: src/lib.rs changed while the edit was applied. Repair: repeat the call"
-            ) && !text.contains("source_ref"),
-            "{text}"
+        assert_eq!(
+            text,
+            "src/lib.rs changed while the edit was applied; nothing was written.\nRepair: Repeat the call."
         );
+        assert!(!text.contains("source_ref"), "{text}");
     }
 
     /// A stale deprecated `source_ref` names itself and says to send the edit without it.
@@ -2012,15 +2059,14 @@ mod tests {
         let reply = PeerReply::Edit {
             result: edit_result(EditOutcome::StaleSource).unwrap(),
             diagnostics: EditDiagnostics::Unknown {},
-            note: Some("the supplied source_ref does not match this file's current text. Repair: send the edit without source_ref".into()),
+            note: Some("the supplied source_ref does not match this file's current text. Repair: Send the edit without source_ref".into()),
             operation: None,
         };
         let rendered = render(reply, Envelope::TextOnly).unwrap();
         let text = text_of(&rendered);
-        assert!(
-            text.contains("the supplied source_ref does not match")
-                && !text.contains("changed while the edit was applied"),
-            "{text}"
+        assert_eq!(
+            text,
+            "The supplied source_ref does not match this file's current text; nothing was written.\nRepair: Send the edit without source_ref"
         );
     }
 

@@ -367,8 +367,8 @@ impl Worker<'_> {
                 match retained {
                     Some((_, Some((line, delta)))) if lines => {
                         return Ok(Err(format!(
-                            "{label}: stale_source (edit:lines_moved; the edit that produced \
-                             {reference} moved lines after line {line} by {delta:+})"
+                            "{label}: the edit that produced {reference} moved lines after line \
+                             {line} by {delta:+}; read the current lines again with ide.read"
                         )));
                     }
                     Some((retained, _)) if retained.bytes() == observed.bytes() => retained,

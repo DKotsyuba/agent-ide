@@ -538,15 +538,13 @@ Output is compact and contains no hashes:
 
 ```text
 diff (head): 2 files, +14 −3
-inventory: 2 tracked, 0 untracked, 0 conflicted; hunks delivered: 2
-paths: "src/assistance/mod.rs", "src/lang/mod.rs"
 file: "src/assistance/mod.rs"
 @@ -12,6 +12,7 @@
  …
 hunks: 3 more (ide.inspect diff-4)
 ```
 
-The captured path inventory and its tracked/untracked/conflicted counts are separate from this page's delivered hunks. Names are bounded to five inline, then `(+N more)`; use `paths` to review the remaining inventory. The summary file count includes tracked changes and captured untracked text additions. Untracked regular UTF-8 text is captured without following symlinks and reviewed as additions against empty, without staging it. Its content is best-effort: a rewrite between reads becomes name-only (`changed during capture`) without invalidating tracked capture. Captured untracked contents remain a frozen snapshot on later pages. Binary, oversized, unreadable, symlink and special entries stay name-only with a reason. In `staged` mode, untracked names remain listed but have no content, hunks, file-count contribution or added-line totals. The existing caps apply: 256 selected paths, 64 KiB of names, 1 MiB per file, 8 MiB of total source/blob bytes and 1 MiB of patch bytes. Tracked bytes consume the budget first; remaining untracked content becomes name-only at a total cap.
+A complete capture prints no inventory: the file rows below the summary line already name every delivered path. Only a coverage exception adds framing — untracked and conflicted name lines, and, when an entry is name-only, the `inventory: N tracked, … hunks delivered: N` and `paths:` lines before the `name only:` rows. Names are bounded to five inline, then `(+N more)`; use `paths` to review the remaining inventory. The summary file count includes tracked changes and captured untracked text additions. Untracked regular UTF-8 text is captured without following symlinks and reviewed as additions against empty, without staging it. Its content is best-effort: a rewrite between reads becomes name-only (`changed during capture`) without invalidating tracked capture. Captured untracked contents remain a frozen snapshot on later pages. Binary, oversized, unreadable, symlink and special entries stay name-only with a reason. In `staged` mode, untracked names remain listed but have no content, hunks, file-count contribution or added-line totals. The existing caps apply: 256 selected paths, 64 KiB of names, 1 MiB per file, 8 MiB of total source/blob bytes and 1 MiB of patch bytes. Tracked bytes consume the budget first; remaining untracked content becomes name-only at a total cap.
 
 Normal pages select fewer whole hunks until the serialized MCP envelope fits. A lone oversized hunk is split only at complete line boundaries; every part says `hunk N of TOTAL, lines A-B of LINES`, with a continuation or last-part marker. These line numbers count the original patch header and body. Concatenating the patch bytes of consecutive parts reconstructs the complete hunk. `ide.inspect` continues the same frozen, bounded snapshot; test runs do not consume a new detail slot for each diff page. Completed test-run metadata already retains at most four runs per worktree, so no unbounded output cache is added.
 

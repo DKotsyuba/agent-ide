@@ -1206,7 +1206,7 @@ pub(crate) fn render_edit_reply(
             .join(", ");
         let mut head = if files.iter().any(|file| file.state == FileState::Unknown) {
             format!(
-                "edit: outcome_unknown — written {written} of {total}; not written or unknown: \
+                "edit: partial — written {written} of {total}; not written or possibly written: \
                  {missing}; the same operation_id resumes the rest from the recorded digests\n"
             )
         } else {
@@ -1328,8 +1328,8 @@ pub(crate) fn conflicting_duplicate_reply(operation_id: &str) -> PeerReply {
         source_ref: None,
         files: Vec::new(),
         text: format!(
-            "edit: conflicting_duplicate; operation_id {operation_id} already names a different \
-             multi-file edit; nothing written\n"
+            "operation_id {operation_id} already names a different multi-file edit; nothing was \
+             written.\nRepair: Read the targets with ide.read, then edit with a new operation_id.\n"
         ),
         truncated: false,
     }
@@ -2580,7 +2580,7 @@ mod tests {
             duplicate["text"]
                 .as_str()
                 .unwrap()
-                .starts_with("edit: conflicting_duplicate")
+                .starts_with("operation_id")
         );
         let lost = structured(edit_batch_reply(
             "op-5",
@@ -2599,7 +2599,7 @@ mod tests {
             lost["text"]
                 .as_str()
                 .unwrap()
-                .starts_with("edit: outcome_unknown — written 1 of 3")
+                .starts_with("edit: partial — written 1 of 3")
         );
         let panicked = structured(unknown_batch_reply(
             "op-6",

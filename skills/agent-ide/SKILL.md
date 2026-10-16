@@ -26,7 +26,7 @@ Start/stop are once-per-task lifecycle calls.
    including a warm cache; acceptance is not the graph. Approximate/lexical edges and
    unavailable coverage remain explicit, never exact negative evidence.
 3. Read related code together:
-   `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"docs/b.md","lines":"1-80"}]}`
+   `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"docs/b.md","offset":1,"limit":80}]}`
    (path ranges only for non-code text).
    In an observed context epoch, unchanged delivered items return an acknowledgement.
    Reuse prior code; `force:true` handles lost context or an intentional reread. Unknown

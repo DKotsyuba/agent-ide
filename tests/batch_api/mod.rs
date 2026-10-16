@@ -1014,7 +1014,10 @@ async fn multi_file_edit_stops_at_a_native_write_and_resumes_only_unchanged_base
         let mut other = arguments.clone();
         other["files"][0]["changes"][0]["content"] = json!("different");
         let (duplicate, text) = settled_edit(&mut actor, &fixture, other).await;
-        assert!(text.starts_with("edit: conflicting_duplicate"), "{text}");
+        assert!(
+            text.starts_with("operation_id") && text.contains("Repair: "),
+            "{text}"
+        );
         assert_eq!(duplicate["outcome"], "conflicting_duplicate", "{duplicate}");
         assert_eq!(duplicate["files"], json!([]), "{duplicate}");
         assert_files(&fixture, edited, "a conflicting duplicate writes nothing");
@@ -1292,7 +1295,10 @@ async fn rename_stopped_midway_reports_each_file_and_the_same_operation_id_finis
     let mut other = rename.clone();
     other["new_name"] = json!("different");
     let (_, text) = settled_edit(&mut actor, &fixture, other).await;
-    assert!(text.starts_with("edit: conflicting_duplicate"), "{text}");
+    assert!(
+        text.starts_with("operation_id") && text.contains("Repair: "),
+        "{text}"
+    );
     assert_eq!(
         std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
         lib.replace("helper", "assist")
