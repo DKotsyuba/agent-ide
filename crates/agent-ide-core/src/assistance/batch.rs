@@ -874,7 +874,8 @@ const FILE_SHAPE: &str = "an array of 1 to 16 entries, each with \"path\" and ex
 /// Validates one `ide.edit {operation_id, source_ref?, files}` request object.
 ///
 /// Only `operation_id` (the facade fills a missing one in), a batch default `source_ref` and `files` may appear. `files`
-/// holds 1 to [`MAX_EDIT_FILES`] objects with unique paths, each exactly one of `changes`
+/// holds 1 to [`MAX_EDIT_FILES`] objects with unique paths (one leading `/` of an absolute
+/// location is accepted; the worker makes it worktree-relative), each exactly one of `changes`
 /// (validated exactly as the one-file `changes` form with the entry's or the batch's
 /// `source_ref`), `content` with `create: true` (validated as the creation form) or `content`
 /// alone (a whole-content replacement of the file's current bytes; `source_ref` is optional). Across all files at most
@@ -933,6 +934,9 @@ pub(crate) fn validate_edit_files(object: &Map<String, Value>) -> Result<(), Par
             .and_then(Value::as_str)
             .filter(|path| !path.is_empty() && path.len() <= 1024)
             .ok_or_else(shape)?;
+        // One leading `/` is an absolute location copied from `grep -n`; the worker makes it
+        // worktree-relative and refuses a file outside the worktree.
+        let path = path.strip_prefix('/').unwrap_or(path);
         if let Some(rule) = path_shape_rule(path) {
             return Err(invalid_field("files", rule));
         }

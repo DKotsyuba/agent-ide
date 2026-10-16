@@ -2589,6 +2589,28 @@ fn edit_operation(parameters: &Value) -> Option<String> {
     }
 }
 
+/// Returns the `edit:refused` detail when two `files` entries of `parameters` name the same file.
+///
+/// The facade only compares the paths as written, so an absolute and a relative spelling of one
+/// file pass it; once the worker made them worktree-relative they are the same file, which a
+/// multi-file edit refuses (batch-api-v1 section 3) before anything is planned or written.
+/// `None` when every path is distinct or the call has no `files`.
+fn repeated_file(parameters: &Value) -> Option<String> {
+    let files = parameters.get("files")?.as_array()?;
+    let mut seen = BTreeSet::new();
+    for (index, file) in files.iter().enumerate() {
+        let path = file.get("path")?.as_str()?;
+        if !seen.insert(path) {
+            return Some(format!(
+                "edit:refused: 1 of {} files refused, nothing written — file {} {path}: another entry names the same file",
+                files.len(),
+                index + 1
+            ));
+        }
+    }
+    None
+}
+
 /// Settled details another live binding keeps before its oldest facts may be evicted.
 const FAIR_DETAILS_PER_BINDING: usize = 8;
 /// An active binding with no tool activity this long may have its settled results reclaimed.
@@ -5717,20 +5739,34 @@ impl<'a> Worker<'a> {
     /// section 1) edits like `src/a.rs:130`.
     ///
     /// The rewritten strings are `path`, `symbol` and each `changes` entry's `symbol` and
-    /// `within`; a string that does not start with `/` is left as is. An absolute file outside
+    /// `within`, and for a multi-file `files` call each entry's `path` and the same fields of its
+    /// `changes`; a string that does not start with `/` is left as is. An absolute file outside
     /// the binding's worktree refuses with `outside_allowed_roots` before anything is resolved or
     /// written. Idempotent, so a resumed job sees the same relative targets.
     async fn relativize_edit_targets(&mut self, job: &mut Job) -> Result<(), FailureCode> {
+        /// Collects the `symbol` and `within` strings of one `changes` array.
+        fn change_targets<'v>(changes: &'v mut Value, targets: &mut Vec<&'v mut Value>) {
+            for entry in changes.as_array_mut().into_iter().flatten() {
+                for (key, value) in entry.as_object_mut().into_iter().flatten() {
+                    if matches!(key.as_str(), "symbol" | "within") {
+                        targets.push(value);
+                    }
+                }
+            }
+        }
         let mut targets: Vec<&mut Value> = Vec::new();
         if let Some(object) = job.parameters.as_object_mut() {
             for (key, value) in object.iter_mut() {
                 match key.as_str() {
                     "path" | "symbol" => targets.push(value),
-                    "changes" => {
-                        for entry in value.as_array_mut().into_iter().flatten() {
-                            for (key, value) in entry.as_object_mut().into_iter().flatten() {
-                                if matches!(key.as_str(), "symbol" | "within") {
-                                    targets.push(value);
+                    "changes" => change_targets(value, &mut targets),
+                    "files" => {
+                        for file in value.as_array_mut().into_iter().flatten() {
+                            for (key, value) in file.as_object_mut().into_iter().flatten() {
+                                match key.as_str() {
+                                    "path" => targets.push(value),
+                                    "changes" => change_targets(value, &mut targets),
+                                    _ => {}
                                 }
                             }
                         }
@@ -5841,6 +5877,11 @@ impl<'a> Worker<'a> {
             return self.edit_patch(job).await;
         }
         if job.parameters.get("files").is_some() {
+            self.relativize_edit_targets(job).await?;
+            if let Some(detail) = repeated_file(&job.parameters) {
+                job.failure_detail = Some(detail);
+                return Err(FailureCode::EditRefused);
+            }
             return self.edit_files(job).await;
         }
         if job.parameters.get("changes").is_some() {

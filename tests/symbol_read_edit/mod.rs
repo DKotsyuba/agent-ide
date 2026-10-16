@@ -1016,6 +1016,44 @@ async fn absolute_locations_edit_inside_the_worktree_only() {
     finished(actor, daemon, &fixture).await;
 }
 
+/// The multi-file form takes the same absolute locations: an entry's `path` and its changes'
+/// `symbol` (as `path:line` or `path#unit`) are made worktree-relative, and an entry whose file
+/// lies outside the worktree refuses the whole call before anything is written (§1).
+#[tokio::test]
+async fn absolute_locations_edit_inside_the_worktree_in_the_multi_file_form() {
+    let (fixture, daemon, mut actor) = started("sre-abs-files").await;
+    let root = fixture.root.join(FILE);
+    let body = "pub fn utility(x: u32) -> u32 {\n    x\n}";
+    for symbol in [
+        format!("{}:9", root.display()),
+        format!("{}#utility", root.display()),
+    ] {
+        let (reply, text) = call(
+            &mut actor,
+            &fixture,
+            "ide.edit",
+            json!({"files":[{"path":root.display().to_string(),"changes":[{"symbol":symbol,"content":body}]}]}),
+        )
+        .await;
+        assert_eq!(reply["state"], "edit_batch", "{text}");
+        assert!(text.starts_with("edit: applied"), "{text}");
+        assert!(!on_disk(&fixture).contains("Doubles"), "{symbol}");
+        reset(&fixture);
+    }
+    let outside = std::env::temp_dir().join("outside-the-worktree-files.rs");
+    let (reply, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"files":[{"path":outside.display().to_string(),"changes":[{"symbol":format!("{}:1", outside.display()),"content":"x"}]}]}),
+    )
+    .await;
+    assert_eq!(reply["state"], "error", "{text}");
+    assert!(!outside.exists());
+    assert_eq!(on_disk(&fixture), ORIGINAL);
+    finished(actor, daemon, &fixture).await;
+}
+
 /// A fixture whose `impl` closes after its last method: line 7 is the closing brace.
 const WITH_IMPL: &str =
     "pub struct S;\n\nimpl S {\n    pub fn a(&self) -> u32 {\n        1\n    }\n}\n";
