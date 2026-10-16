@@ -815,7 +815,8 @@ fn assert_claude_envelope(reply: &Value) -> &str {
         "Claude must never receive the structured JSON duplicate: {reply}"
     );
     // Closed failures and edits that were refused, cancelled or left unknown are MCP errors; a
-    // created, replaced or unchanged file is not (the same rule as `assert_compact_envelope`).
+    // created, replaced or unchanged file, or one an operation word (inserted, deleted, renamed)
+    // reports, is not (the same rule as `assert_compact_envelope`).
     let fields = claude_fields("", text);
     let failed = matches!(
         fields["state"].as_str(),
@@ -823,7 +824,7 @@ fn assert_claude_envelope(reply: &Value) -> &str {
     ) || (fields["state"] == "edit"
         && !matches!(
             fields["result"]["outcome"].as_str(),
-            Some("created" | "replaced" | "unchanged")
+            Some("created" | "replaced" | "unchanged" | "inserted" | "deleted" | "renamed")
         ));
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
