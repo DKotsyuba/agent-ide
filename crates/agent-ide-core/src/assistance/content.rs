@@ -240,7 +240,7 @@ fn project(
         None => reply_text,
     };
     let content = vec![ContentBlock::text(text)];
-    let failed = reports_failure(&reply);
+    let failed = reports_failure(reply);
     let mut rendered = if failed {
         CallToolResult::error(content)
     } else {
