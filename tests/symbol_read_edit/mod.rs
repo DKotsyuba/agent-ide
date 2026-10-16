@@ -869,6 +869,9 @@ async fn a_stale_source_ref_is_refused_and_an_open_window_reaches_the_unit_end()
     )
     .await;
     assert_eq!(reply["result"]["outcome"], "stale_source", "{reply}");
+    // `call` runs the compact-envelope oracle, which requires a refused edit (outcome
+    // `stale_source`) to be an MCP error, not a success carrying a refusal sentence.
+    assert_eq!(reply["state"], "edit", "{reply}");
     assert!(
         text.contains("supplied source_ref does not match")
             && !text.contains("changed while the edit was applied"),
@@ -939,9 +942,6 @@ async fn lines_edits_echo_and_locations_address_units_and_regions() {
     finished(actor, daemon, &fixture).await;
 }
 
-/// A file with a small function and a `big` one whose numbered text is larger than one reply
-/// page. Unit lines of `big`: 1 is its header, 2-6001 the repeated `let`, 6002-6003 its tail.
-#[cfg(feature = "test-seams")]
 /// A window that ends past its unit is refused on edits (symbol-read-edit-v1 §3.2) although the
 /// same window is clamped on reads; the refusal names the unit's length and writes nothing.
 #[tokio::test]
@@ -1050,6 +1050,9 @@ async fn a_location_on_a_closing_container_line_reads_the_container() {
     finished(actor, daemon, &fixture).await;
 }
 
+/// A file with a small function and a `big` one whose numbered text is larger than one reply
+/// page. Unit lines of `big`: 1 is its header, 2-6001 the repeated `let`, 6002-6003 its tail.
+#[cfg(feature = "test-seams")]
 fn paged_source() -> String {
     format!(
         "pub fn small() -> u32 {{\n    1\n}}\n\npub fn big() -> u32 {{\n{}    7\n}}\n",

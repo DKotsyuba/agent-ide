@@ -4999,7 +4999,7 @@ fn oversized_edit_replies_keep_outcome_operation_id_and_no_replay() {
             .starts_with("edit: outcome_unknown; path src/lib.rs; operation_id operation-9")
     );
     assert!(text.text.contains("do not replay this operation"));
-    assert_ne!(unknown.is_error, Some(true));
+    assert_eq!(unknown.is_error, Some(true));
 
     // A read that cannot be presented keeps the historical generic bounded-envelope error: it
     // carries no effect whose outcome must survive, and shrinking owner text cannot rescue it.

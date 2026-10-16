@@ -779,9 +779,19 @@ fn assert_compact_envelope(reply: &Value) {
         let word = structured["operation"].as_str().unwrap_or(outcome);
         assert!(text.starts_with(&format!("edit: {word}")), "{reply}");
     }
+    // Closed failures and edits that were refused, cancelled, left unknown or applied in part are
+    // MCP errors; a created, replaced or unchanged file and a fully applied edit are not.
+    let failed = matches!(state, "error" | "invalid_parameters")
+        || (state == "edit"
+            && !matches!(
+                structured["result"]["outcome"].as_str(),
+                Some("created" | "replaced" | "unchanged")
+            ))
+        || (state == "edit_batch" && structured["outcome"].as_str() != Some("applied"));
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
-        matches!(state, "error" | "invalid_parameters")
+        failed,
+        "{reply}"
     );
 }
 

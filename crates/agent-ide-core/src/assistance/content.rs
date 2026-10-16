@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use rmcp::model::{CallToolResult, ContentBlock};
 
-use super::reply::{FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, PeerReply, ResultKind};
+use super::reply::{
+    EditBatchOutcome, FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, PeerReply, ResultKind,
+};
 use crate::changes::edit::EditOutcome;
 
 /// Build-embedded MiniJinja source projecting every closed [`PeerReply`] state into its compact
@@ -45,8 +47,8 @@ pub(crate) fn reply_envelope() -> Envelope {
 ///
 /// The returned result contains exactly one text content block and, when `envelope` is
 /// [`Envelope::WithStructured`], the complete serialized reply in `structured_content`. Only
-/// [`PeerReply::Error`] and [`PeerReply::InvalidParameters`] set `is_error`; invalid serialization or a non-shrinkable oversized result
-/// returns `None` without partially emitting identifiers.
+/// the replies [`reports_failure`] names set `is_error`; invalid serialization or a non-shrinkable
+/// oversized result returns `None` without partially emitting identifiers.
 ///
 /// `status` is the optional due status plate (T28B): the complete `<agent-ide>` plate text, which
 /// prefixes the compact content text, separated by one newline, and is the leading `status` string
@@ -238,10 +240,8 @@ fn project(
         None => reply_text,
     };
     let content = vec![ContentBlock::text(text)];
-    let mut rendered = if matches!(
-        reply,
-        PeerReply::Error { .. } | PeerReply::InvalidParameters { .. }
-    ) {
+    let failed = reports_failure(&reply);
+    let mut rendered = if failed {
         CallToolResult::error(content)
     } else {
         CallToolResult::success(content)
@@ -249,12 +249,31 @@ fn project(
     if matches!(envelope, Envelope::WithStructured) {
         rendered.structured_content = Some(structured);
     }
-    rendered.is_error = matches!(
-        reply,
-        PeerReply::Error { .. } | PeerReply::InvalidParameters { .. }
-    )
-    .then_some(true);
+    rendered.is_error = failed.then_some(true);
     Some(rendered)
+}
+
+/// Whether a one-file edit `outcome` is not a write the call asked for: everything but a created,
+/// replaced or unchanged file.
+fn edit_outcome_failed(outcome: EditOutcome) -> bool {
+    !matches!(
+        outcome,
+        EditOutcome::Created | EditOutcome::Replaced | EditOutcome::Unchanged
+    )
+}
+
+/// Whether `reply` tells the model its call did not do what it asked, so the MCP result is an
+/// error: a closed failure, rejected parameters, or an edit that was refused, cancelled, left
+/// unknown or applied only in part (everything but a created, replaced or unchanged file, and a
+/// fully applied multi-file edit). A call that ran and answered a question, an unavailable
+/// session plate or a pending result is not a failure.
+fn reports_failure(reply: &PeerReply) -> bool {
+    match reply {
+        PeerReply::Error { .. } | PeerReply::InvalidParameters { .. } => true,
+        PeerReply::Edit { result, .. } => edit_outcome_failed(result.outcome),
+        PeerReply::EditBatch { outcome, .. } => *outcome != EditBatchOutcome::Applied,
+        _ => false,
+    }
 }
 
 /// Escapes every untrusted label the template interpolates into reply text (SAFE-02): paths,
@@ -563,8 +582,13 @@ impl PresentationReceipt {
     }
 
     /// Renders the small fixed-wording fallback from the receipt; `is_error` keeps the value the normal
-    /// projection of the same reply would set, so a confirmed mutation stays success-shaped.
+    /// projection of the same reply would set ([`reports_failure`]), so a confirmed mutation stays
+    /// success-shaped and a refused or unknown one stays an error.
     pub(crate) fn degraded(self) -> CallToolResult {
+        let failed = match &self {
+            Self::Edit { outcome, .. } => edit_outcome_failed(*outcome),
+            Self::Stop | Self::Activation => false,
+        };
         let text = match self {
             Self::Edit {
                 outcome,
@@ -600,7 +624,12 @@ impl PresentationReceipt {
                     .to_owned()
             }
         };
-        CallToolResult::success(vec![ContentBlock::text(text)])
+        let content = vec![ContentBlock::text(text)];
+        if failed {
+            CallToolResult::error(content)
+        } else {
+            CallToolResult::success(content)
+        }
     }
 }
 
@@ -1964,7 +1993,13 @@ mod tests {
                 assert!(!text.contains("operation_id"));
             }
             assert_eq!(rendered.structured_content, Some(expected));
-            assert_eq!(rendered.is_error, None);
+            // Only a file that was created, replaced or found unchanged is a success; every
+            // refusal, cancellation and unknown outcome is an MCP error.
+            let written = matches!(
+                outcome,
+                EditOutcome::Created | EditOutcome::Replaced | EditOutcome::Unchanged
+            );
+            assert_eq!(rendered.is_error, (!written).then_some(true), "{outcome:?}");
             if outcome == EditOutcome::OutcomeUnknown {
                 assert!(text.contains("do not repeat this edit") && text.contains("native tools"));
             }
@@ -2589,7 +2624,7 @@ mod tests {
             "edit: outcome_unknown; path src/lib.rs; operation_id private-operation-id"
         ));
         assert!(text.contains("do not replay this operation"), "{text}");
-        assert_ne!(rendered.is_error, Some(true));
+        assert_eq!(rendered.is_error, Some(true));
 
         let refused = PeerReply::Edit {
             result: edit_result(EditOutcome::StaleSource).unwrap(),
@@ -2600,6 +2635,7 @@ mod tests {
         let refused_degraded = PresentationReceipt::of(&refused).unwrap().degraded();
         let text = text_of(&refused_degraded);
         assert!(text.contains("No write occurred."), "{text}");
+        assert_eq!(refused_degraded.is_error, Some(true));
 
         // Reads carry no receipt: their loss is the requested answer, not an unreported effect.
         assert!(
