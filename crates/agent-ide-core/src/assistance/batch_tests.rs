@@ -31,6 +31,8 @@ enum TargetPlan {
         Option<String>,
         Option<crate::modules::calls::PlannedStart>,
     ),
+    /// Explicit argv needs no test discovery or semantic provider.
+    Command(Vec<String>),
     /// It runs nothing; the line's outcome.
     Settled(String),
     /// A symbol's definition address, its referencing tests and their language.
@@ -45,8 +47,9 @@ impl Worker<'_> {
     /// language cannot run, an ambiguous or unknown symbol) is answered on its own line and never
     /// fails the others. When nothing runs at all the reply is `tests: nothing to run` with the
     /// target lines. A started run answers `tests #N: started — <n> targets in <r> runs (budget
-    /// <b> s); the result arrives by itself as a test-finished fact` and a line per target; a busy
-    /// worktree answers the live run, whose result reaches this session too.
+    /// <b> s); the result is retained under its reference; Bridge delivers it automatically when
+    /// configured` and a line per target; a busy worktree answers the live run and retains its
+    /// result for this subscriber too.
     pub(super) async fn batch_tests(
         &mut self,
         job: &mut Job,
@@ -84,6 +87,26 @@ impl Worker<'_> {
                         .batch_launch(job, &root, vec![index], argv, language, start)
                         .await?;
                     planned.push((index, launch, count));
+                }
+                TargetPlan::Command(argv) => {
+                    let language = crate::lang::registered()
+                        .first()
+                        .copied()
+                        .ok_or(FailureCode::ProviderUnavailable)?;
+                    let resolution =
+                        crate::assistance::tests::resolve_command(&root, &root, &argv, None)
+                            .await
+                            .map_err(|failure| symbols::module_failure(job, &failure))?;
+                    planned.push((
+                        index,
+                        BatchLaunch {
+                            targets: vec![index],
+                            language,
+                            argv,
+                            start: BatchCommand::Resolved(resolution),
+                        },
+                        None,
+                    ));
                 }
                 TargetPlan::Settled(outcome) => targets[index].settled = Some(outcome),
                 TargetPlan::File(path, language) => {
@@ -234,7 +257,7 @@ impl Worker<'_> {
             StartResult::Started(id) => {
                 // The caller leaves with a started line: the outcome is pushed once as a
                 // `test-finished` fact (OUTBOX §2).
-                self.shared.test_started(id, &binding, budget);
+                self.shared.test_started(id, &binding);
                 complete(
                     format!("{}{started_lines}", started_line(id, count, runs, budget)),
                     Some(job.reference.clone()),
@@ -296,6 +319,7 @@ impl Worker<'_> {
                 }
                 test_selection(root, TestTarget::File(target), budget).await
             }
+            TestTargetSpec::Command(argv) => return Ok(TargetPlan::Command(argv.clone())),
             TestTargetSpec::Pattern(pattern) => {
                 test_selection(root, TestTarget::Pattern(pattern.clone()), budget).await
             }
@@ -418,18 +442,19 @@ impl Worker<'_> {
 }
 
 /// The first line of a started several-target run: `tests #N: started — <n> targets in <r> runs
-/// (budget <b> s); the result arrives by itself as a test-finished fact`.
+/// (budget <b> s); the result is retained under its reference; Bridge delivers it automatically
+/// when configured`.
 fn started_line(id: u64, targets: usize, runs: usize, budget: Duration) -> String {
     format!(
         "tests #{id}: started — {targets} targets in {runs} runs (budget {} s); the result \
-         arrives by itself as a test-finished fact",
+         is retained under its reference; Bridge delivers it automatically when configured",
         budget.as_secs()
     )
 }
 
 /// The reply of a several-target start while the worktree's run `id` is live, exactly the
 /// hygiene text `tests #N: still running` (no seconds on unfinished work, M024-M027-REPLY-HYGIENE
-/// r2 §2); nothing new starts and the live run's result reaches this session too.
+/// r2 §2); nothing new starts and the live run's result stays retained for this session too.
 fn running_line(id: u64) -> String {
     format!("tests #{id}: still running")
 }
@@ -538,8 +563,8 @@ mod tests {
         let started = started_line(4, 3, 2, Duration::from_secs(300));
         assert_eq!(
             started,
-            "tests #4: started — 3 targets in 2 runs (budget 300 s); the result arrives by itself \
-             as a test-finished fact"
+            "tests #4: started — 3 targets in 2 runs (budget 300 s); the result is retained under \
+             its reference; Bridge delivers it automatically when configured"
         );
         crate::assistance::batch::assert_no_polling(&started);
         let running = running_line(4);

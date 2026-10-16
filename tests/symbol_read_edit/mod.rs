@@ -661,7 +661,13 @@ async fn full_file_reads_guard_all_units_after_own_edits() {
     let mut actor = batch_started_actor(&fixture, "sre-many-units-guard", FILE).await;
     for own_edit in [false, true] {
         std::fs::write(fixture.root.join(FILE), &source).unwrap();
-        let (reply, read) = call(&mut actor, &fixture, "ide.read", json!({"path":FILE})).await;
+        let (reply, read) = call(
+            &mut actor,
+            &fixture,
+            "ide.read",
+            json!({"path":FILE,"force":true}),
+        )
+        .await;
         assert_eq!(reply["kind"], "read", "{reply}");
         assert_eq!(
             reply["truncated"], false,

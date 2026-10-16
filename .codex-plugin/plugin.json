@@ -1,7 +1,7 @@
 {
   "name": "agent-ide",
   "version": "0.10.9",
-  "description": "Agent IDE coding-companion skill: find a symbol address, read the symbol, replace it or edit lines inside it, with the ide.start/diff/inspect/stop/edit/outline/read/symbol/graph/test tools.",
+  "description": "Batch related ide.* discovery, source reads, atomic multi-file edits and tests; automatic Bridge completion.",
   "author": {
     "name": "DKotsyuba"
   },
@@ -10,13 +10,15 @@
   "skills": "./skills/codex/",
   "interface": {
     "displayName": "Agent IDE",
-    "shortDescription": "Bounded ide.* workflow for active-session source edits",
-    "longDescription": "Ten ide.* tools (start, diff, inspect, stop, edit, outline, read, symbol, graph, test): symbol cards/positional lookup, graph call chains, inspect file diagnostics/check problems. Native fallback remains available.",
+    "shortDescription": "Batch related code work with ide.*",
+    "longDescription": "Collect related targets; batch outline paths, symbol/graph roots, read items, multi-file patches, test targets and aggregate diff paths. Retrieve known details together. Reuse code/results; end idle turns for Bridge completion.",
     "developerName": "DKotsyuba",
     "category": "Development",
-    "capabilities": ["Interactive"],
+    "capabilities": [
+      "Interactive"
+    ],
     "defaultPrompt": [
-      "Use $agent-ide while editing this worktree."
+      "Use $agent-ide: batch related discovery, reads, multi-file edits and tests; reuse results and end idle turns for Bridge completion."
     ]
   }
 }

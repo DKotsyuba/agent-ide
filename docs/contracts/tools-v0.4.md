@@ -2,39 +2,57 @@
 
 ## Current model workflow
 
-The symbol-address/read-edit r2 and harness-reply r5 contracts govern model-facing behavior throughout this guide. Find an address, read its unit, edit that unit, and review the diff. Project checks and long results arrive by themselves; never poll. Refusals carry one bounded head and one Repair line; internal reason tags belong to operator diagnostics. Both hosts use ide.inspect {"kind":"problems"} for project problems. Native tools remain available when the IDE cannot answer.
+Batch related discovery → reads → one atomic multifile edit → tests/checks. Native tools
+remain available when IDE cannot answer. Both hosts advertise ten names, including graph;
+the former public context call is removed. The generated host catalogs are authoritative.
 
-Both hosts advertise the same ten names including `ide.graph`. The former combined
-context tool is removed, an owner-authorized breaking MCP change.
-`ide.symbol {"symbol":"src/a.rs#f","callers":1}` is a card with
-signature/doc/definition/usages/history and immediate neighbors. Use
-`ide.graph {"symbol":"src/a.rs#f","direction":"callers","depth":2}` for call chains:
-signature/public behavior changes, shared-function refactors, indirect faults, architecture
-or cross-language connections. Start depth 2; expand within 1–3 only as needed. `callers`
-shows what a change can affect, `callees` traces execution/dependencies, `both` explores
-both sides; `tests:true` expands test nodes. Tiny edits need only the card.
+Collect related targets before making tool calls. Use bounded batches: outline paths/glob,
+symbol/graph symbols, read items, one multi-file edit (Codex patch / Claude files), test
+targets, aggregate diff paths and known inspect detail_refs. Do not issue one call per
+file, symbol or tiny hunk when the related set fits a batch. Split only for advertised
+limits or newly discovered work. Start/stop are once-only lifecycle calls per worktree.
 
-Former context source reads use `ide.read {"path":"src/a.rs"}` or bounded `lines`/`items`;
-skeletons use `ide.outline`. Exact-position lookup uses
-`ide.symbol {"path":"src/a.rs","byte_offset":42}` instead of an address/name/batch.
-The offset is a zero-based UTF-8 semantic position, never a continuation cursor;
-split code points and out-of-file offsets refuse before a provider query. This form is
-useful at a particular use-site or for shadowed names. Its compact card carries
-definitions/references and lexical matches with explicit semantic/lexical provenance,
-the location encoding, and related links, without whole-file source or authority/version
-bookkeeping. Provider-free or unavailable evidence never becomes a semantic reference.
-Source fences and per-path proof for definitions/references remain unchanged, including
-when later pages are inspected under the invoking actor's live profile.
+`ide.symbol` returns a card and direct neighbors. Positive caller/callee values never mean
+deeper traversal. For signature/shared behavior changes, indirect faults or wider impact use
+`ide.graph {"symbols":["src/a.rs#f"],"direction":"callers","depth":2}`.
+Callers show impact, callees show dependencies, both shows both sides; depth is 1–3 and
+`tests:true` expands test nodes. With the staged direct Bridge deployment graph always returns
+acceptance/reference, even when warm; its useful result stays retained and Bridge delivers it.
+Missing live
+semantic evidence remains approximate/lexical/unavailable, never exact absence.
 
-File provider diagnostics use `ide.inspect {"kind":"diagnostics","path":"src/a.rs"}`;
-project check problems use `ide.inspect {"kind":"problems","language":"rust"}`.
-These query forms cannot mix with `detail_ref`/`detail_refs`; continuations use a separate
-`ide.inspect {"detail_ref":"…"}`. Neither diagnostic query launches a build or check.
-File reports retain source/generation/document-version qualification, readiness and
-freshness. Missing or unqualified reports stay unknown; unversioned nonempty counts are
-provisional lower bounds. Located rows use symbol addresses when resolvable and paginate
-without dropping the retained rows; provider truncation remains explicit. The private
-Context engine/transport remains reusable, but is not a public compatibility route.
+Read related units with `ide.read {"items":[{"symbol":"src/a.rs#f"}]}`. File entries use
+worktree-relative paths, Codex `lines` or Claude native-style `offset`/`limit`. Equivalent old
+forms reuse the same source-reader and memory boundaries. An unchanged already delivered item is acknowledged
+without reprinting; `force:true` handles lost context. Changed bytes, independent actors and
+observed compaction epochs retain separate freshness. No unknown compaction state claims
+that the model still remembers a previous read.
+
+Codex edits advertise only one apply_patch-like `patch` form with optional operation id;
+Add File and Update File are supported, deletion/moves unsupported. Claude advertises
+structured files/changes. Related production/tests edits belong in one atomic call.
+
+All test operations use `ide.test`: run symbol/path/pattern/command, combine up to eight targets
+including explicit command argv, read `result`, list `history:true`, continue `detail_ref`,
+or request `cancel`. A batch has ordered steps and one budget. History is bounded to four
+completed runs per worktree/ten minutes in the current daemon, actor/channel scoped across
+activation generations; restart loses it. Full output references preserve current access
+checks. Cancellation belongs to the exact active owner generation and settles after reaping.
+No recognized test counts means unavailable counts, not a passing run.
+
+In the staged Bridge-only deployment graph/test/deferred-check outcomes arrive automatically.
+When no independent work remains, end the model turn and retain the activation/run. Do not
+poll inspect/test, sleep, self-message, finish the agent or stop IDE while awaiting results.
+Extra graph/read/test pages use the originating tool's `detail_ref`. Source changes may
+invalidate a result; no obsolete source is presented as current.
+
+File/provider diagnostics and project problems still use `ide.inspect`. Unknown is never
+clean and these queries do not launch checks. Inspect retirement is gradual. `ide.diff`
+remains optional for incremental/paged changes; native Git diff is valid.
+
+Delivery is Bridge-only: explicit nonempty Bridge native-store configuration enables it, and
+IDE keeps no fallback carrier, hold or wake. Current Agent Run-managed stock Codex CLI idle wake
+is not qualified; queue custody alone must not be used to claim that the model resumed.
 
 ## Operator compatibility reference
 
@@ -55,7 +73,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 | `ide.edit` symbol operations (`replace`, `insert`, `delete`, `rename`) and `path` + `lines` range operation | implemented (landing now) |
 | Long-lived language server session for Rust | implemented |
 | `ide.start` project card | implemented (appended to the activation reply; no `ide.project`, no `not_a_project`; servers always `not started`) |
-| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status` / `targets`, `budget_s`; one job per worktree; the outcome pushed once as a `test-finished` fact in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (historical wire version 4: 11 tools; current public catalog: 10) |
+| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status` / `targets`, `budget_s`; one job per worktree; the outcome handed once to Bridge as a `test-finished` fact; full output paged through `ide.inspect`) | implemented (historical wire version 4: 11 tools; current public catalog: 10) |
 | `ide.graph` (`symbol`, `direction`, `depth`, `tests`; live bounded caller/callee tree; only functions and methods are nodes, and tests collapse to one `+N tests` line per parent unless `tests: true` expands them with `[test]` marks) | implemented (historical wire version 5: 11 tools; current public catalog: 10) |
 | `ide.diff` cleanup (compact default, `provenance` flag, plain-`git diff` fallback, untracked symlinks listed) | implemented (v0.6.1) |
 | `ide.inspect` project problems and file diagnostics | implemented; no separate problems tool |
@@ -68,7 +86,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 3. **Keep responses compact.** Responses contain no internal bookkeeping fields (`authority_epoch`, hashes, generations). Lists have ceilings and report “N more”; retrieve the complete list through `detail_ref`.
 4. Model refusals follow harness-reply-v1 r5: one head sentence (at most 160 UTF-8 bytes), exactly one Repair line (at most 120 bytes), and optional bounded current text. Internal reason/stage codes remain in operator journals and typed compatibility data, not model text.
 5. The language server runs as it would in a human's editor and remains alive for the session.
-6. Every host returns an immediately available result directly; long work arrives by itself in an `<agent-ide>` block. A retained result reference allows explicit retrieval of its body without polling or waiting.
+6. Every host returns an immediately available result directly. Long work stays retained under its reference; Bridge delivers it automatically when configured. The reference allows explicit retrieval of its body without polling or waiting.
 
 `ide.start` refusals name the actionable cause: an absent requested root includes the nearest existing ancestor under an allowed root; Git discovery failures include a short reason; unresolved worktrees and durable state failures have distinct stages. A worktree conflict says whether another actor owns it, this actor's other channel owns it, or this actor already owns another worktree, and names `ide.stop` or reuse as the remedy. An `ide.start` of another root by the actor that already holds an activation elsewhere hands that activation over without an `ide.stop` when nothing is pending on it (no queued or pending job, no edit that is unsettled or `outcome_unknown`, no running test): the old authority, provider ownership and leases are released as a stop would release them, the same session's grant moves to the new root in one durable step (a stopped session cannot start again), another session of the actor is revoked and stopped first, and the handover is journaled (`handover: released <path>`). Otherwise the `start:actor_owns_another_worktree` refusal stays, names the held worktree path and what keeps it (`; worktree <path>; kept: <reason>`), and releases nothing; another actor's activation is never touched by that handover. A writer start that meets another actor's writer takes it over only when that holder's session ended (its MCP front's lease closed and nothing arrived from it since) or when it has had no tool call and no IDE work in flight for 30 minutes; the reply names the displaced holder and the evidence, and the displaced actor's next call answers `taken_over` ([start-index-state](start-index-state-v1.md) §4). Provider cache namespace conflicts have their own stage and recovery. A successful repeat by the same actor and binding reports the existing activation idempotently. The start card explains which tools can answer from source while a language server starts. Its baseline says why coverage is partial: Git metadata and source bytes are captured separately, so an atomic window is not proven.
 
@@ -103,39 +121,35 @@ ambiguous_symbol: new matches 3 symbols; repeat ide.symbol with one exact path:
 
 ### Readiness and waiting
 
-- Long work returns a pending reference when needed; its result arrives by itself in an <agent-ide> block. Continue useful work or end the turn. ide.inspect with a supplied detail_ref retrieves an available body or continuation; it is never an idle-wait instruction.
+- Long work returns a pending reference when needed; its result stays retained under that reference and Bridge delivers it automatically when configured. Continue useful work or end the turn. ide.inspect with a supplied detail_ref retrieves an available body or continuation; it is never an idle-wait instruction.
 - Servers start lazily: the first `ide.symbol` or `ide.graph` call of a language starts its server; `ide.start` launches none and its card reports each server language as `ready`, `warming`, `not started` or `unavailable (<cause>)` ([start-index-state](start-index-state-v1.md) §2).
-- While a server loads, `ide.symbol` and `ide.graph` answer at once and never park inside the call: for a language whose source outline is exact (Rust today) with an answer labelled `approximate:` (definition from the source outline, usages and depth-1 callers as name matches marked `~`), otherwise `pending`; the same job keeps running for up to 10 minutes (at most 4 per session) and its precise answer follows as a fact ([symbol-graph-item](symbol-graph-item-v1.md) §4-§5). A call that still meets a loading server outside that path answers `error: provider_loading (<detail>); the language server is still loading the workspace, so this call was not answered and nothing was changed. Continue with other work or native tools; ide.symbol and ide.graph answer at once meanwhile`.
+- While a server loads, `ide.symbol` and `ide.graph` answer at once and never park inside the call: for a language whose source outline is exact (Rust today) with an answer labelled `approximate:` (definition from the source outline, usages and depth-1 callers as name matches marked `~`), otherwise `pending`; the same job keeps running for up to 10 minutes (at most 4 per session), retains its precise answer under the reference and hands it to Bridge when configured ([symbol-graph-item](symbol-graph-item-v1.md) §4-§5). A call that still meets a loading server outside that path answers `error: provider_loading (<detail>); the language server is still loading the workspace, so this call was not answered and nothing was changed. Continue with other work or native tools; ide.symbol and ide.graph answer at once meanwhile`.
 - A language that opts in to outlining from its text while loading (today only Rust) answers `ide.outline`, `ide.read {symbol}` and the symbol form of `ide.edit` (`replace`/`insert`/`delete`) from that lexical outline while its registered server is still loading, when that server is unavailable (its workspace failed to load, or no launch configures it), and when its ready session's `documentSymbols` exchange itself fails, and the reply says so in one compact line — `outline: from source, exact (rust-analyzer still indexing; no need to repeat)` while it loads, `outline: from source, exact (rust-analyzer unavailable; no need to repeat)` when it failed, `outline: from source, exact (rust-analyzer request failed: <short cause>; no need to repeat)` when the exchange failed — the outline is already exact, so the call needs no repeat, but semantic facts (usages, callers, rename) are not included. A lexical outline is either exactly the outline the server path would give for the same text (addresses, kinds, ranges, children) or it is not used: a file it cannot reproduce exactly (for Rust, whose lexical outline comes from a full parse: a syntax error, from which rust-analyzer recovers with a tree of its own; comment text directly above an item, which rust-analyzer may attach to the item's range; an `extern` block; a `// region:` comment; more tokens or deeper brackets than the parse's bounded stack is sized for — 240 000 tokens, 128 brackets) keeps `provider_loading` rather than a guessed range while the server loads, and `provider_unavailable` when it failed or its exchange did. An address the lexical outline does not contain is not proven absent: while the server loads the call waits for it (`provider_loading`, parked like any loading call; an edit answers it at once) instead of `unknown_symbol`, and when the server is unavailable the call answers `provider_unavailable` at once rather than park for a server that will not answer. `ide.symbol` answers approximately while the server loads (above); when the server is unavailable it answers the definition-only card — signature, doc and definition come from the lexical outline — with each live-session section noting the failed workspace (`usages: unavailable (rust-analyzer workspace failed to load)`). `ide.graph` answers approximately while the server loads (above); `rename` always waits for the server. A refusal on these paths names its stage (`<server>: workspace load failed`, `<server>: transport gone`, `<server>: documentSymbols/references request failed`) and its reply states what still works (`ide.outline`/`ide.read` from source), what does not (usages, callers) and how to recover (retry later; if it keeps failing, fix what stops the project from loading — `ide.inspect {"kind":"problems"}` shows the project check). The moment the live session answers, the server path is used again.
 
 ### `<agent-ide>` status block
 
-A hook or the top of a response may include the check status plate (at most 256 bytes) and the facts that are due, in one block ([session-outbox](session-outbox-v1.md) §3-§4). A test run contributes nothing while it runs; its outcome arrives once as a `test-finished` fact ([reply hygiene](reply-hygiene-v1.md) §1):
+A native hook or the top of a response may include the check status plate (at most 256 bytes) in one block:
 
 ```text
 <agent-ide>
 rust: 0 errors, 0 warnings
-test-finished tests #3: 3 passed, 1 failed, 12 s
-  FAIL assistance::worker::tests::stop_cancels_queue
-       src/assistance/worker.rs:4012  assertion failed: left 5, right 6
-  rerun: cargo test stop_cancels_queue
-  full output: ide.inspect test-3
 </agent-ide>
 ```
 
-Test runs no longer ride this block (OUTBOX-r3 §4): a settled run arrives once as a `test-finished` fact, see [Delivered results](#delivered-results).
+Test runs never ride this block: a settled run stays retained and is handed to Bridge once as a `test-finished` fact when configured, see [Delivered results](#delivered-results).
 
 When the worktree's checked-out branch or detached commit changed outside the IDE (another process ran `git checkout`/`switch`), the plate of the first call that probes HEAD afterwards leads with one line, delivered once. HEAD is probed when the session starts and then by a completed call at most once per 30 s, so the line can trail the switch by up to 30 s of calls: `git: HEAD moved 4e2e2e2 → 9daac64 (claude/a → claude/b) outside Agent IDE; earlier indexed answers may be stale`. A commit on the same branch is not reported. It is a notice only: nothing is invalidated or restarted.
 
 ### Delivered results
 
-Long work delivers its own result ([session outbox](session-outbox-v1.md)). A call that leaves without its answer — a `pending` reply, a `tests #N: started` line, an edit with `diagnostics: pending` — later receives one fact in the same `<agent-ide>` block, after the plate lines: `test-finished tests #3: …`, `edit-checked edit op-7: …`, `job-ready ide.symbol src/a.rs#Foo: …`, each with `result:`/`full output: ide.inspect <ref>` when more text is kept. The first carrier takes it, exactly once: the next terminal `ide.*` reply, the next native `PostToolUse` hook, the hold of an ending turn (the `Stop` hook continues the turn and asks for the final answer to be restated), or, for an interactive Claude session that went idle, one wake message. Source text rides only replies and `ide.inspect`; a hook names the result and its reference. `ide.stop` lists what no carrier took. After a daemon restart, an actor's first call says once which of its requests may have been lost (`lost-after-restart restart: …`).
+Long work retains its own result ([session outbox](session-outbox-v1.md)). A call that leaves without its answer — a `pending` reply, a `tests #N: started` line, an edit with `diagnostics: pending` — keeps the result under its reference and, when configured, IDE hands Bridge one fact (`test-finished tests #3: …`, `edit-checked edit op-7: …`, `job-ready ide.symbol src/a.rs#Foo: …`, each with `result:`/`full output: ide.inspect <ref>` when more text is kept); Bridge owns transport, queueing, retry, carrier selection and native wake. IDE has no other carrier: no reply piggyback of queued facts, native `PostToolUse` delivery, `Stop` hold or idle wake. Without a Bridge route the result stays retained and is read explicitly with `ide.inspect {detail_ref}`. After a daemon restart, the actor's re-activation forgets unresolved subjects only when Bridge accepts the `lost-after-restart restart: …` publication or its outcome is uncertain; no route or definite no-effect retains them for a later eligible re-activation.
 
-`ide.inspect` has three forms:
+`ide.inspect` has two reference forms:
 
-- `{"detail_ref": R, "page"?: N}` — one result or page, as before; reading a job by its reference delivers its fact.
+- `{"detail_ref": R, "page"?: N}` — one result or page, as before; reading a job by its reference ends its deferral, so no fact is handed over afterwards.
 - `{"detail_refs": [R1, …, R8]}` — up to eight references answered in order, one `== R ==` section each.
-- `{}` returns undelivered facts or current retained summaries immediately. The unadvertised wait_ms compatibility parameter is reserved for explicit operator protocol clients, not the model workflow.
+
+The unadvertised wait_ms compatibility parameter, valid only beside a reference, is reserved for explicit operator protocol clients, not the model workflow. `{}` is refused: no session fact list exists.
 
 ### Ceilings and pages
 
@@ -246,7 +260,7 @@ Errors: `no_such_file` (the requested path does not exist in the worktree; fix t
 
 Input: `{symbol, usages?: true, callers?: 0..3, callees?: 0..3, history?: true}`. Values 0–3 remain accepted for compatibility: 0 omits that section; every positive value returns only immediate neighbors. Use `ide.graph` for deeper call chains. Defaults: usages, callers 1, callees 0; `history` is opt-in (boolean) and shows the last 3 commits touching the definition.
 
-Several symbols in one call ([batch API v1](batch-api-v1.md) §4–§5): `ide.symbol {symbols: [...], …}` and `ide.graph {symbols: [...], …}` take 1–8 entries instead of `symbol`, with the single form's options for all of them. The reply opens with `symbols: <n> — <k> cards, <a> approximate, <p> pending, <f> failed` (or `graph: <n> roots (<direction>, depth <d>) — <k> graphs, <a> approximate, <p> pending, <u> unavailable, <f> failed`), then each entry's block in request order, exactly the single form's reply text; a failed entry shows the single form's error and fails only itself. Whole blocks are delivered while they fit and the rest are named with the exact call. While a server is still loading, the call answers at once: an entry of a language whose source outline is exact shows the single form's labelled `approximate:` block, any other loading entry reads `pending: <entry> - will be delivered`; the same job then re-runs only those entries precisely (for up to 10 minutes, after which an entry still loading fails as `provider_loading`) and its final reply arrives as one `job-ready` fact, subject `ide.symbol batch <detail_ref>: items <i,j>`, that holds the turn only when an entry got no early answer; `ide.inspect` of the `detail_ref` returns the whole final reply. A caller that already left, or a session with 4 jobs already waiting for precise answers, gets the whole batch once it can be answered.
+Several symbols in one call ([batch API v1](batch-api-v1.md) §4–§5): `ide.symbol {symbols: [...], …}` and `ide.graph {symbols: [...], …}` take 1–8 entries instead of `symbol`, with the single form's options for all of them. The reply opens with `symbols: <n> — <k> cards, <a> approximate, <p> pending, <f> failed` (or `graph: <n> roots (<direction>, depth <d>) — <k> graphs, <a> approximate, <p> pending, <u> unavailable, <f> failed`), then each entry's block in request order, exactly the single form's reply text; a failed entry shows the single form's error and fails only itself. Whole blocks are delivered while they fit and the rest are named with the exact call. While a server is still loading, the call answers at once: an entry of a language whose source outline is exact shows the single form's labelled `approximate:` block, any other loading entry names the retained batch reference and conditional Bridge delivery; the same job then re-runs only those entries precisely (for up to 10 minutes, after which an entry still loading fails as `provider_loading`), retains its final reply under the batch reference and hands one `job-ready` fact to Bridge when configured, subject `ide.symbol batch <detail_ref>: items <i,j>`; `ide.inspect` of the `detail_ref` returns the whole final reply. A caller that already left, or a session with 4 jobs already waiting for precise answers, gets the whole batch once it can be answered.
 
 Output:
 
@@ -424,7 +438,7 @@ lines after 12 moved +3
 edit: replaced; path src/lang/path.rs; source_ref …-4; diagnostics: current_clean. Next: use ide.diff
 ```
 
-`current_clean` is only ever derived from a completed project check that named no problem in the file; a language server's empty publish is not taken as proof. A clean file in a project whose completed check reports errors in other files answers `diagnostics: current_clean for this file; the project check reports N errors in other files. Next: use ide.context with kind problems` (structured `project_errors: N`), so a clean edit never reads as a passing build. When the check could not have analysed the file, the reply says `diagnostics: not_analysed (<reason>)`, and the reason carries its own next step. For Rust, a file no unconditional `mod` declaration reaches from a build target answers ``rust check may not have compiled this file — no unconditional `mod` declaration reaches it; declare it, then edit again``; a file reached only behind a gate — an inner `#![cfg]` (an integration test behind `feature = "…"`), a `cfg`/`cfg_attr`-gated `mod` on its chain, or a `#[path]` declaration the walk cannot follow — answers that it is built only under that condition and should be checked by a build or `ide.test` command that enables it. A `#[path = "…"]` declaration whose literal names a file beside the declaring file reaches it. A file no IDE language checks (a template, a manifest) answers `not_analysed (no IDE language checks this file type)`. The closed diagnostics vocabulary is `current_reported`, `current_clean`, `not_analysed`, `unknown`, `pending`, and `not_analysed` is never clean. Python files outside every project root, or under a root without an environment, are `not_analysed` with that reason (`the Python project root beside this file has no environment; create one or pick it with ide.start environment`); TypeScript files are always treated as analysed (an unimported file can still read `current_clean`). A provider report for the exact post-edit version (an error rust-analyzer or tsserver found on its own) is kept as it arrives instantly. When the project check cannot analyse the file (it could not run — for example no Python environment — or it skipped the file), a language server's report for the exact post-edit version still answers `current_reported`, one `path:line:col severity [code] message` line per diagnostic, with the delta `language server reported N diagnostics for the exact post-edit source generation; project check did not analyse this file: <reason>` (or `; project check unavailable`): imports may be unchecked, and with no completed check there is no new/pre-existing split. Without such a report the reply is `not_analysed (<reason>)`, never `unknown`. `ide.inspect {"kind":"diagnostics","path":"…"}` lists provider diagnostic rows in the same located form. The reply waits at most 90 s for the check, then says `diagnostics: unknown` and the result reaches the next `<agent-ide>` block or `ide.inspect {"kind":"diagnostics","path":"…"}`. The `rerun tests:` hint arrives with `ide.test` (§2.6).
+`current_clean` is only ever derived from a completed project check that named no problem in the file; a language server's empty publish is not taken as proof. A clean file in a project whose completed check reports errors in other files answers `diagnostics: current_clean for this file; the project check reports N errors in other files. Next: use ide.context with kind problems` (structured `project_errors: N`), so a clean edit never reads as a passing build. When the check could not have analysed the file, the reply says `diagnostics: not_analysed (<reason>)`, and the reason carries its own next step. For Rust, a file no unconditional `mod` declaration reaches from a build target answers ``rust check may not have compiled this file — no unconditional `mod` declaration reaches it; declare it, then edit again``; a file reached only behind a gate — an inner `#![cfg]` (an integration test behind `feature = "…"`), a `cfg`/`cfg_attr`-gated `mod` on its chain, or a `#[path]` declaration the walk cannot follow — answers that it is built only under that condition and should be checked by a build or `ide.test` command that enables it. A `#[path = "…"]` declaration whose literal names a file beside the declaring file reaches it. A file no IDE language checks (a template, a manifest) answers `not_analysed (no IDE language checks this file type)`. The closed diagnostics vocabulary is `current_reported`, `current_clean`, `not_analysed`, `unknown`, `pending`, and `not_analysed` is never clean. Python files outside every project root, or under a root without an environment, are `not_analysed` with that reason (`the Python project root beside this file has no environment; create one or pick it with ide.start environment`); TypeScript files are always treated as analysed (an unimported file can still read `current_clean`). A provider report for the exact post-edit version (an error rust-analyzer or tsserver found on its own) is kept as it arrives instantly. When the project check cannot analyse the file (it could not run — for example no Python environment — or it skipped the file), a language server's report for the exact post-edit version still answers `current_reported`, one `path:line:col severity [code] message` line per diagnostic, with the delta `language server reported N diagnostics for the exact post-edit source generation; project check did not analyse this file: <reason>` (or `; project check unavailable`): imports may be unchecked, and with no completed check there is no new/pre-existing split. Without such a report the reply is `not_analysed (<reason>)`, never `unknown`. `ide.inspect {"kind":"diagnostics","path":"…"}` lists provider diagnostic rows in the same located form. The reply waits at most 90 s for the check, then says `diagnostics: unknown`; the result stays retained under its reference, Bridge delivers it when configured, and `ide.inspect {"kind":"diagnostics","path":"…"}` reads current diagnostics explicitly. The `rerun tests:` hint arrives with `ide.test` (§2.6).
 
 For `rename`:
 
@@ -477,12 +491,12 @@ At most 32 changes per file, 128 changes and 128 KiB of `content`/`new` text in 
 Input: `{symbol}` | `{path}` | `{pattern}` | `{command}`, with optional `budget_s?: 120`.
 
 - `symbol` selects tests that reference the symbol (using the language crate); `path` selects tests for a file/module (for Rust, scoped to that file's package with `--manifest-path`, so one file's tests do not build every target in the workspace); `pattern` filters through the test runner; `command` is an exact project command.
-- `targets` ([batch API v1](batch-api-v1.md) §6) runs 1–8 of `{symbol}`, `{path}` and `{pattern}` as ONE run of the worktree (`command` stays single-target): the symbol targets of one language merge into one runner invocation (the language's own filters for every referencing test: libtest exact names, pytest node ids, vitest files), the path targets of one language share one invocation when its runner takes several files (pytest, vitest, jest, node; cargo's admitted recipes run one file target each), every other target is its own invocation, and the invocations run one after another under one run number, holding the worktree's one live run throughout; `budget_s` covers the whole run and an invocation whose turn comes after it is spent does not run. A target that runs nothing (no tests reference it, a file without tests, a file the runner cannot take, an ambiguous name) is answered on its own line and never fails the others. The started reply is `tests #N: started — <n> targets in <r> runs (budget <b> s); the result arrives by itself as a test-finished fact` with one line per target (`target 1 symbol src/a.rs#parse: run 1 (3 tests selected)`), and a start while the worktree's run is live answers `tests #N: still running` (no seconds on unfinished work); the settled result is the standard result with the summed counts and failures, one line per target (`target 3 path tests/cli.rs: run 2 — 4 passed, 0 failed`) and one `rerun:` line that reproduces the whole run (one invocation's own command, or every invocation in order as one `sh -c` line).
+- `targets` ([batch API v1](batch-api-v1.md) §6) runs 1–8 of `{symbol}`, `{path}` and `{pattern}` as ONE run of the worktree (`command` stays single-target): the symbol targets of one language merge into one runner invocation (the language's own filters for every referencing test: libtest exact names, pytest node ids, vitest files), the path targets of one language share one invocation when its runner takes several files (pytest, vitest, jest, node; cargo's admitted recipes run one file target each), every other target is its own invocation, and the invocations run one after another under one run number, holding the worktree's one live run throughout; `budget_s` covers the whole run and an invocation whose turn comes after it is spent does not run. A target that runs nothing (no tests reference it, a file without tests, a file the runner cannot take, an ambiguous name) is answered on its own line and never fails the others. The started reply is `tests #N: started — <n> targets in <r> runs (budget <b> s); the result is retained under its reference; Bridge delivers it automatically when configured` with one line per target (`target 1 symbol src/a.rs#parse: run 1 (3 tests selected)`), and a start while the worktree's run is live answers `tests #N: still running` (no seconds on unfinished work); the settled result is the standard result with the summed counts and failures, one line per target (`target 3 path tests/cli.rs: run 2 — 4 passed, 0 failed`) and one `rerun:` line that reproduces the whole run (one invocation's own command, or every invocation in order as one `sh -c` line).
 
 Immediate output:
 
 ```text
-tests #3: started — cargo test --workspace worker::  (4 tests selected, budget 120 s); the result arrives by itself in a later <agent-ide> block
+tests #3: started — cargo test --workspace worker::  (4 tests selected, budget 120 s); the result is retained under its reference; Bridge delivers it automatically when configured
 ```
 
 The `symbol` form first asks the live language server for the symbol's references, which takes
@@ -498,7 +512,7 @@ up to 4 KiB of output, and `rerun:`; the run's owner also gets
 ordinary started line. Parsed
 test-runner replies read as the terminal text below.
 
-The outcome of a run arrives once, as the `test-finished` fact of the session outbox and as the
+The outcome of a run stays retained and, when configured, is handed to Bridge once as the `test-finished` fact and as the
 settled reply body of `ide.test` with `status`, of `ide.inspect` of the handle, or of a run that
 ends inside the starting call. Both are the text of `terminal_fact`
 ([reply hygiene](reply-hygiene-v1.md) §1):

@@ -72,9 +72,9 @@ impl TerminalFact {
     }
 }
 
-/// The sentence that ends a started line: the result of a long run reaches the agent by itself
-/// (wording of the session outbox contract, §8.7).
-const RESULT_ARRIVES: &str = "; the result arrives by itself in a later <agent-ide> block";
+/// The sentence that ends a started line: the long run stays retained under its reference and
+/// Bridge delivers it automatically only when configured (session outbox contract §8.7).
+const RESULT_ARRIVES: &str = "; the result is retained under its reference; Bridge delivers it automatically when configured";
 
 /// Renders the reply to a successful `ide.test` start of run `id`: the command the run executes
 /// (`command`, already shell-quoted for display), the optional count of selected tests
@@ -117,7 +117,7 @@ struct Entry {
 /// `_id` is the daemon-local run number; the text itself carries no run number because the
 /// caller adds it (`tests #<id>` in a reply, the fact subject in the outbox). `owns_detail` says
 /// whether the recipient started the run: only the owner may read the run's full output, so only
-/// the owner's text ends with `full output: ide.inspect <detail_ref>` (and only when the run kept
+/// the owner's text ends with `full output: ide.test {detail_ref}` (and only when the run kept
 /// any output).
 ///
 /// The summary is chosen from the run's state, first match wins:
@@ -204,7 +204,12 @@ pub(super) fn summary_text(result: &RunResult) -> String {
     let report = &result.report;
     let seconds = result.elapsed.as_secs();
     let counted = report.passed != 0 || report.failed != 0;
-    let mut base = if result.stopped {
+    let mut base = if result.cancelled {
+        format!(
+            "cancelled — {} passed, {} failed so far",
+            report.passed, report.failed
+        )
+    } else if result.stopped {
         format!(
             "stopped at budget {} s — {} passed, {} failed so far",
             result.budget.as_secs(),
@@ -223,8 +228,12 @@ pub(super) fn summary_text(result: &RunResult) -> String {
         )
     } else {
         format!(
-            "{} passed, {} failed, {seconds} s",
-            report.passed, report.failed
+            "{} passed, {} failed, {seconds} s (exit {})",
+            report.passed,
+            report.failed,
+            result
+                .exit
+                .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
         )
     };
     if let Some(label) = &result.environment_label {
@@ -252,7 +261,10 @@ pub(super) fn closing_lines(result: &RunResult, owns_detail: bool) -> Vec<String
         cut_with_ellipsis(&rerun_text(result), MAX_RERUN_BYTES)
     )];
     if owns_detail && (!result.output.is_empty() || result.output_paged) {
-        closing.push(format!("  full output: ide.inspect {}", result.detail_ref));
+        closing.push(format!(
+            "  full output: ide.test {}",
+            serde_json::json!({"detail_ref":result.detail_ref})
+        ));
     }
     closing
 }
@@ -353,6 +365,7 @@ mod tests {
             output_paged: false,
             elapsed: Duration::from_secs(12),
             stopped: false,
+            cancelled: false,
             exit: Some(if failed == 0 { 0 } else { 101 }),
             budget: Duration::from_secs(120),
             detail_ref: "ref-3".to_owned(),
@@ -382,7 +395,6 @@ mod tests {
             detail: Some(fact.detail.clone()),
             detail_ref: Some("ref-3".to_owned()),
             failed: true,
-            holds_turn: true,
             source_bearing: false,
             fence_paths: Vec::new(),
         };
@@ -412,14 +424,14 @@ mod tests {
     #[test]
     fn counted_run_is_summary_rerun_and_reference() {
         let fact = terminal_fact(3, &run(3, 0, Vec::new()), true);
-        assert_eq!(fact.summary, "3 passed, 0 failed, 12 s");
+        assert_eq!(fact.summary, "3 passed, 0 failed, 12 s (exit 0)");
         assert_eq!(
             fact.detail,
-            "  rerun: cargo test\n  full output: ide.inspect ref-3"
+            "  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3\"}"
         );
         assert_eq!(
             fact.reply_text(3),
-            "tests #3: 3 passed, 0 failed, 12 s\n  rerun: cargo test\n  full output: ide.inspect ref-3"
+            "tests #3: 3 passed, 0 failed, 12 s (exit 0)\n  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3\"}"
         );
         assert_in_contract(&fact);
     }
@@ -432,10 +444,10 @@ mod tests {
             &run(2, 1, vec![failure("tests::fails", 40, "assertion failed")]),
             true,
         );
-        assert_eq!(fact.summary, "2 passed, 1 failed, 12 s");
+        assert_eq!(fact.summary, "2 passed, 1 failed, 12 s (exit 101)");
         assert_eq!(
             fact.detail,
-            "  FAIL tests::fails\n       src/a.rs:40  assertion failed\n  rerun: cargo test\n  full output: ide.inspect ref-3"
+            "  FAIL tests::fails\n       src/a.rs:40  assertion failed\n  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3\"}"
         );
         assert_in_contract(&fact);
     }
@@ -464,7 +476,8 @@ mod tests {
         );
         assert!(fact.detail.contains("  rerun: cargo test"), "{fact:?}");
         assert!(
-            fact.detail.ends_with("  full output: ide.inspect ref-3"),
+            fact.detail
+                .ends_with("  full output: ide.test {\"detail_ref\":\"ref-3\"}"),
             "{fact:?}"
         );
     }
@@ -581,7 +594,7 @@ mod tests {
         result.environment_label = Some("tool env".to_owned());
         assert_eq!(
             terminal_fact(1, &result, true).summary,
-            "1 passed, 0 failed, 12 s · env tool env"
+            "1 passed, 0 failed, 12 s (exit 0) · env tool env"
         );
         result.environment_label = Some("é".repeat(400));
         let fact = terminal_fact(1, &result, true);
@@ -638,12 +651,13 @@ mod tests {
         assert_eq!(
             started_line(4, "cargo test --lib", Some("3 tests selected"), 120),
             "tests #4: started — cargo test --lib (3 tests selected) (budget 120 s); \
-             the result arrives by itself in a later <agent-ide> block"
+             the result is retained under its reference; Bridge delivers it automatically when \
+             configured"
         );
         assert_eq!(
             started_line(5, "make test", None, 30),
-            "tests #5: started — make test (budget 30 s); \
-             the result arrives by itself in a later <agent-ide> block"
+            "tests #5: started — make test (budget 30 s); the result is retained under its \
+             reference; Bridge delivers it automatically when configured"
         );
         for line in [
             running_line(4),
@@ -673,7 +687,7 @@ mod tests {
         let fact = terminal_fact(8, &result, true);
         assert_eq!(
             fact.detail,
-            "  FAIL tests::fails\n       src/a.rs:4  boom\n  target 1 symbol a.rs#f: run 1 — 2 passed, 0 failed\n  target 2 path b.rs: run 1 — 1 passed, 1 failed\n  rerun: cargo test\n  full output: ide.inspect ref-3"
+            "  FAIL tests::fails\n       src/a.rs:4  boom\n  target 1 symbol a.rs#f: run 1 — 2 passed, 0 failed\n  target 2 path b.rs: run 1 — 1 passed, 1 failed\n  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3\"}"
         );
         assert_in_contract(&fact);
         let failures = (0..8)

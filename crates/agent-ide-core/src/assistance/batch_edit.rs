@@ -68,7 +68,8 @@ pub(super) struct BatchCheck {
     /// The written files with their post-write digests, the fact's fence.
     fences: Vec<crate::assistance::outbox::FencedPath>,
     /// True once the caller got the reply with `diagnostics: pending`; the check's outcome is
-    /// then pushed as one `edit-checked` fact instead (session-outbox-v1 §8.6).
+    /// then retained under its reference and handed to Bridge as one `edit-checked` fact when
+    /// configured (session-outbox-v1 §8.6).
     answered_early: bool,
 }
 
@@ -593,20 +594,15 @@ impl Worker<'_> {
         if reports.iter().all(|report| report.state.written()) {
             let _ = receipts.settle(operation_id).await;
         }
-        // Count this call's writes for the outbox's staleness labels before any check fact is
-        // registered, so the operation's own fact never labels its own writes.
-        let written_now = reports
-            .iter()
-            .filter(|report| {
-                matches!(
-                    report.state,
-                    FileState::Created | FileState::Replaced | FileState::Unchanged
-                )
-            })
-            .map(|report| report.path.clone())
-            .collect::<Vec<_>>();
-        if !written_now.is_empty() {
-            self.shared.outbox.note_edit(binding, &written_now);
+        // Count this call's writes before any check fact is registered, so the operation's own
+        // fact's fence epoch includes its own writes.
+        if reports.iter().any(|report| {
+            matches!(
+                report.state,
+                FileState::Created | FileState::Replaced | FileState::Unchanged
+            )
+        }) {
+            self.shared.outbox.note_edit(binding);
         }
         if unknown {
             self.unsettled_edits
@@ -850,7 +846,7 @@ impl Worker<'_> {
         }
         diagnostics.extend(check.unchecked.iter().cloned());
         if check.answered_early
-            && let Some(work) = self.shared.outbox.take_holding(&job.reference)
+            && let Some(work) = self.shared.outbox.take_work(&job.reference)
         {
             let draft = batch::edit_checked_draft(
                 &check.operation_id,
@@ -860,9 +856,7 @@ impl Worker<'_> {
             );
             let mut recipients = vec![work.owner];
             recipients.extend(work.subscribers);
-            self.shared
-                .outbox
-                .push_draft(&recipients, draft, work.epoch);
+            self.shared.push_or_transfer(&recipients, draft);
         }
         if check.reports.iter().all(|report| report.state.written()) {
             let _ = self
@@ -887,10 +881,10 @@ impl Worker<'_> {
     /// pending` at once, right after the writes (symbol-read-edit-v1 §3.3), as the one-file edit
     /// does.
     ///
-    /// Only a caller still waiting is answered, only once, and only when the session's outbox
-    /// can hold the check as in-flight work under the job's reference: the job stays parked on
-    /// its check, and [`Self::finish_batch_check`] then pushes one `edit-checked` fact for the
-    /// whole operation. Otherwise nothing changes and the final reply carries the diagnostics.
+    /// Only a caller still waiting is answered, only once, and only when the session ledger can
+    /// track the check as in-flight work under the job's reference: the job stays parked on its
+    /// check, and [`Self::finish_batch_check`] then hands one `edit-checked` fact for the whole
+    /// operation to Bridge. Otherwise nothing changes and the final reply carries the diagnostics.
     fn reply_batch_early(&self, job: &mut Job, check: &mut BatchCheck) {
         if check.answered_early {
             return;
@@ -903,12 +897,7 @@ impl Worker<'_> {
         if !waiting || !self.shared.outbox.is_open(&binding) {
             return;
         }
-        let subject = format!("edit {}", check.operation_id);
-        if !self
-            .shared
-            .outbox
-            .begin_holding(&job.reference, &binding, &subject, check.deadline)
-        {
+        if !self.shared.outbox.begin_work(&job.reference, &binding) {
             return;
         }
         let mut pending: Vec<(String, EditDiagnostics)> = check
@@ -933,7 +922,7 @@ impl Worker<'_> {
         );
         if let Some(sender) = job.stop_reply.take() {
             if sender.send(reply).is_err() {
-                let _ = self.shared.outbox.take_holding(&job.reference);
+                let _ = self.shared.outbox.take_work(&job.reference);
                 return;
             }
             check.answered_early = true;

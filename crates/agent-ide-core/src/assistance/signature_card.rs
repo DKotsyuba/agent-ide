@@ -13,17 +13,16 @@
 const MAX_SIGNATURE_BYTES: usize = 700;
 
 /// The signature block text, without a leading or trailing newline.
-const SIGNATURE_BLOCK: &str = r#"call forms (JSON): symbol = card/direct neighbors; graph = call chains
+const SIGNATURE_BLOCK: &str = r#"Batch call forms (JSON): symbol = card/direct neighbors; graph = call chains
 ide.outline {"paths":["a.rs","b.rs"]} or {"glob":"src/*.rs"}
-ide.symbol {"symbols":["a.rs#f"]}
-ide.graph {"symbol":"a.rs#f","direction":"callers","depth":2}
+ide.symbol {"symbols":["a.rs#f","b.rs#g"]}
+ide.graph {"symbols":["a.rs#f","b.rs#g"],"direction":"callers","depth":2}
 ide.read {"items":[{"symbol":"a.rs#f:1-3"},{"symbol":"a.rs#@imports"}]}
-ide.edit {"symbol":"a.rs#f","content":"fn f() {}"} or {"symbol":"a.rs#f","old":"0","new":"1"}
-ide.edit {"files":[{"path":"a.rs","changes":[{"symbol":"a.rs#f","old":"0","new":"1"}]}]}
-ide.test {"targets":[{"symbol":"a.rs#f"},{"path":"tests/f.rs"},{"pattern":"f_"}]}
-ide.inspect {"detail_refs":["<ref>"]} or {}
-Results arrive by themselves in an <agent-ide> block. End the task with ide.stop."#;
-
+Use ide.edit schema: one multi-file patch (Codex) or files (Claude).
+ide.test {"targets":[{"path":"tests/f.rs"},{"command":["cargo","check"]}]}
+ide.diff {"paths":["a.rs","b.rs"]}
+ide.inspect {"detail_refs":["<ref1>","<ref2>"]}
+Bridge mode: results arrive through Bridge; end idle turns. End the task with ide.stop."#;
 /// Returns the call-signature block that follows the project card in an `ide.start` reply.
 ///
 /// The text is constant, language-neutral and at most 700 bytes; every example is a JSON object
@@ -47,19 +46,17 @@ mod tests {
             "ide.outline {\"paths\"",
             "{\"glob\"",
             "ide.symbol {\"symbols\"",
-            "ide.graph {\"symbol\"",
+            "ide.graph {\"symbols\"",
             "ide.test {\"targets\"",
-            "ide.edit {\"symbol\"",
-            "\"files\"",
+            "ide.edit schema",
             "#@imports",
-            "ide.inspect {\"detail_refs\"",
         ] {
             assert!(block.contains(form), "{form}");
         }
         assert!(!block.contains("wait_ms"), "nothing teaches waiting");
         assert!(block.contains("card/direct neighbors; graph = call chains"));
         assert!(block.contains("\"direction\":\"callers\",\"depth\":2"));
-        assert!(block.contains("arrive by themselves in an <agent-ide> block"));
+        assert!(block.contains("results arrive through Bridge"));
         assert!(block.contains("End the task with ide.stop."));
         assert!(!block.starts_with('\n') && !block.ends_with('\n'));
     }
@@ -91,6 +88,6 @@ mod tests {
                 examples += 1;
             }
         }
-        assert_eq!(examples, 11);
+        assert_eq!(examples, 8);
     }
 }

@@ -133,7 +133,19 @@ fn violations(tier: Tier, text: &str) -> Vec<&'static str> {
 /// Returns the stale forms `text` of the source `name` teaches. The `ide.context` tool may name
 /// itself, and nothing else may name it.
 fn stale_forms(name: &str, text: &str) -> Vec<&'static str> {
-    let text = normalised(text);
+    // Native file-line coordinates are supported inside a validated read batch. They are
+    // not line-first mutation guidance; edits still retain the original stale-form guard.
+    let mut governed = text.to_owned();
+    for (tool, example) in examples_in(text) {
+        if tool == AssistanceTool::Read
+            && let Ok(value) = serde_json::from_str::<Value>(&example)
+            && value.get("items").is_some()
+            && validate_call(tool, value).is_ok()
+        {
+            governed = governed.replace(&example, "validated read batch");
+        }
+    }
+    let text = normalised(&governed);
     STALE_FORMS
         .iter()
         .copied()
@@ -287,6 +299,21 @@ fn surfaces() -> Vec<Surface> {
         "skills/agent-ide/agents/openai.yaml",
         Tier::Teaching,
     ));
+    surfaces.push(Surface {
+        name: "SERVER_INSTRUCTIONS_CODEX".into(),
+        tier: Tier::Teaching,
+        text: CatalogHost::Codex.instructions().into(),
+        unfinished: false,
+    });
+    for path in [
+        "skills/codex/agent-ide/SKILL.md",
+        "skills/codex/agent-ide/agents/openai.yaml",
+        ".codex-plugin/plugin.json",
+        ".claude-plugin/plugin.json",
+        ".claude-plugin/marketplace.json",
+    ] {
+        surfaces.push(file_surface(path, Tier::Teaching));
+    }
     surfaces
 }
 
@@ -297,10 +324,10 @@ fn stop_surfaces() -> Vec<Surface> {
         "#2 other runner".to_owned(),
     ];
     vec![
-        reply_surface("ide.stop reply", stop_text(true, &runs, None), true),
+        reply_surface("ide.stop reply", stop_text(true, &runs), true),
         reply_surface(
             "ide.stop reply, nothing active",
-            stop_text(false, &[], None),
+            stop_text(false, &[]),
             false,
         ),
     ]
@@ -696,6 +723,90 @@ fn example_problem(host: CatalogHost, tool: AssistanceTool, example: &str) -> Op
         .keys()
         .find(|key| !properties.contains_key(*key))
         .map(|key| format!("`{key}` is not a property of {}", schema.name))
+}
+
+/// Read batches may use native file-line coordinates; the same shape on a primary edit
+/// remains stale guidance rather than silently disabling the mutation-address guard.
+#[test]
+fn native_read_ranges_do_not_weaken_edit_guidance() {
+    assert!(
+        stale_forms(
+            "skill",
+            r#"ide.read {"items":[{"path":"a.rs","lines":"1-8"}]}"#
+        )
+        .is_empty()
+    );
+    assert!(
+        stale_forms(
+            "skill",
+            r#"ide.edit {"path":"a.rs","lines":"1-8","content":"x"}"#
+        )
+        .contains(&"\"lines\":\"")
+    );
+}
+
+/// Every host's live description advertises its supported batch shape first; lifecycle calls
+/// remain once-only instead of inventing unsupported arrays. Installed entry prompts agree.
+#[test]
+fn live_agent_guidance_promotes_supported_batches() {
+    for host in [CatalogHost::Claude, CatalogHost::Codex] {
+        let tools = host.catalog(StdioFacade::described_tool_router().list_all());
+        for tool in tools {
+            let text = tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase();
+            let shape = match tool.name.as_ref() {
+                "ide.start" | "ide.stop" => {
+                    assert!(text.contains("once"), "{}: {text}", tool.name);
+                    continue;
+                }
+                "ide.outline" => "paths",
+                "ide.symbol" | "ide.graph" => "symbols",
+                "ide.read" => "items",
+                "ide.edit" => {
+                    if host == CatalogHost::Codex {
+                        "patch"
+                    } else {
+                        "files"
+                    }
+                }
+                "ide.test" => "targets",
+                "ide.diff" => "paths",
+                "ide.inspect" => "detail_refs",
+                other => panic!("new visible tool requires batch/lifecycle guidance: {other}"),
+            };
+            assert!(text.contains(shape), "{} omits {shape}: {text}", tool.name);
+            assert!(
+                text.contains("batch") || text.contains("one call"),
+                "{} does not prefer a batch: {text}",
+                tool.name
+            );
+        }
+    }
+    for path in [
+        "skills/agent-ide/SKILL.md",
+        "skills/codex/agent-ide/SKILL.md",
+        "skills/agent-ide/agents/openai.yaml",
+        "skills/codex/agent-ide/agents/openai.yaml",
+        "agents/ide-reviewer.md",
+        ".codex-plugin/plugin.json",
+        ".claude-plugin/plugin.json",
+        ".claude-plugin/marketplace.json",
+        "README.md",
+        "AGENTS.md",
+    ] {
+        let text = file_surface(path, Tier::Teaching).text;
+        assert!(
+            text.to_lowercase().contains("batch"),
+            "{path} omits batch workflow"
+        );
+        assert!(
+            !text.contains("mcp__agent-ide__ide_context"),
+            "{path} advertises removed context"
+        );
+    }
 }
 
 /// Every `ide.<tool> {…}` example the teaching text shows — the server instructions, the tool

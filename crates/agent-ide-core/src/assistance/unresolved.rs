@@ -1,13 +1,15 @@
 //! The MCP front's memory of requested work it relayed unresolved (OUTBOX-r3 §10).
 //!
-//! The session outbox lives in the daemon and dies with it. The MCP front, one per host session,
+//! The session ledger lives in the daemon and dies with it. The MCP front, one per host session,
 //! survives a daemon replacement, so it remembers per actor up to
 //! [`MAX_UNRESOLVED`](crate::assistance::unresolved::MAX_UNRESOLVED) subjects of work whose
 //! caller got no answer: a `pending` reply, a `tests #N: started` line, an edit with
-//! `diagnostics: pending`. A subject is resolved when the front relays its fact, reads its
-//! reference back, or relays the settled run. When the actor is re-activated on a new daemon,
-//! the subjects travel with the re-activation and the new daemon queues one `lost-after-restart`
-//! fact. A hook that delivered a result is invisible here, so that fact says "may be lost".
+//! `diagnostics: pending`. A subject is resolved when the front reads its reference back or relays
+//! the settled run. When the actor is re-activated on a new daemon,
+//! the subjects travel with the re-activation and the new daemon attempts one
+//! `lost-after-restart` Bridge publication. The front clears them only after accepted or
+//! uncertain custody; a definite no-effect refusal retains them for a later eligible restart.
+//! Model observation remains unknown, so the fact says "may be lost".
 
 use std::sync::Mutex;
 
@@ -15,9 +17,7 @@ use serde_json::Value;
 
 use super::{
     facade::AssistanceTool,
-    outbox::FactKind,
     reply::{EditDiagnostics, PeerReply},
-    session_outbox::sanitize,
     worker::{owed_fact, settled_run},
 };
 
@@ -28,8 +28,6 @@ const MAX_ACTORS: usize = 32;
 
 /// One relayed request whose result the front has not seen.
 struct Entry {
-    /// Kind of the fact that will answer it.
-    kind: FactKind,
     /// Fact subject (`tests #3`, `edit op-7`, `ide.symbol src/a.rs#Foo`).
     subject: String,
     /// Reference that reads the result back, when the reply named one.
@@ -42,20 +40,16 @@ struct Entry {
 pub struct Unresolved(Mutex<Vec<(String, Vec<Entry>)>>);
 
 impl Unresolved {
-    /// Updates `actor`'s memory with one relayed reply to `tool` called with `parameters`: what
-    /// the reply resolves is forgotten, what it leaves owed is remembered.
+    /// Updates `actor`'s memory with one relayed reply to `tool` called with `parameters`: every
+    /// singular or plural continuation reference the reply resolves is forgotten, and what the
+    /// reply leaves owed is remembered.
     pub fn observe(
         &self,
         actor: &str,
         tool: AssistanceTool,
         parameters: &Value,
         reply: &PeerReply,
-        status: Option<&str>,
     ) {
-        let text = match reply {
-            PeerReply::Complete { text, .. } => text.as_str(),
-            _ => "",
-        };
         let answered = !matches!(
             reply,
             PeerReply::Pending { .. }
@@ -64,10 +58,35 @@ impl Unresolved {
                     ..
                 }
         );
-        let read = (tool == AssistanceTool::Inspect && answered)
-            .then(|| parameters.get("detail_ref").and_then(Value::as_str))
-            .flatten();
-        let settled = settled_run(reply).map(|id| format!("tests #{id}"));
+        let reads = matches!(
+            tool,
+            AssistanceTool::Inspect
+                | AssistanceTool::Read
+                | AssistanceTool::Graph
+                | AssistanceTool::Diff
+                | AssistanceTool::Test
+        ) && answered;
+        let reads = if reads {
+            parameters
+                .get("detail_ref")
+                .and_then(Value::as_str)
+                .into_iter()
+                .chain(
+                    parameters
+                        .get("detail_refs")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                )
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let settled = (parameters.get("history").is_none() && parameters.get("cancel").is_none())
+            .then(|| settled_run(reply))
+            .flatten()
+            .map(|id| format!("tests #{id}"));
         let owed = owed_fact(tool, parameters, reply);
         let Ok(mut actors) = self.0.lock() else {
             return;
@@ -85,24 +104,17 @@ impl Unresolved {
         };
         let entries = &mut actors[index].1;
         entries.retain(|entry| {
-            let line = format!("{} {}:", entry.kind.label(), sanitize(&entry.subject));
-            let delivered =
-                text.contains(&line) || status.is_some_and(|block| block.contains(&line));
-            let read_back = read.is_some_and(|read| {
-                entry.reference.as_deref() == Some(read) || entry.subject == read
-            });
-            !(delivered || read_back || settled.as_deref() == Some(entry.subject.as_str()))
+            let read_back = reads
+                .iter()
+                .any(|read| entry.reference.as_deref() == Some(*read) || entry.subject == *read);
+            !(read_back || settled.as_deref() == Some(entry.subject.as_str()))
         });
-        if let Some((kind, subject, reference)) = owed {
+        if let Some((subject, reference)) = owed {
             entries.retain(|entry| entry.subject != subject);
             if entries.len() >= MAX_UNRESOLVED {
                 entries.remove(0);
             }
-            entries.push(Entry {
-                kind,
-                subject,
-                reference,
-            });
+            entries.push(Entry { subject, reference });
         }
     }
 
@@ -120,7 +132,8 @@ impl Unresolved {
             .unwrap_or_default()
     }
 
-    /// Forgets `actor`: its subjects were reported after a restart, or it stopped.
+    /// Forgets `actor`: its restart notice obtained accepted or uncertain Bridge custody, or the
+    /// actor stopped.
     pub fn forget(&self, actor: &str) {
         if let Ok(mut actors) = self.0.lock() {
             actors.retain(|(known, _)| known != actor);
@@ -155,6 +168,125 @@ mod tests {
         }
     }
 
+    /// A started test retains its actual job locator, so reading saved output resolves that
+    /// run without guessing a tests-subject string from an unrelated detail reference.
+    #[test]
+    fn test_output_reference_resolves_the_started_run() {
+        let memory = Unresolved::default();
+        let started = PeerReply::Complete {
+            kind: ResultKind::Test,
+            text: "tests #3: started".into(),
+            detail_ref: Some("opaque-output-ref".into()),
+            truncated: false,
+            continuation: false,
+        };
+        memory.observe("a", AssistanceTool::Test, &Value::Null, &started);
+        assert_eq!(memory.subjects("a"), ["tests #3"]);
+        memory.observe(
+            "a",
+            AssistanceTool::Test,
+            &serde_json::json!({"detail_ref":"opaque-output-ref"}),
+            &read_reply("captured output"),
+        );
+        assert!(memory.subjects("a").is_empty());
+    }
+
+    /// History/cancel acknowledgements do not pretend to deliver a test result; successful
+    /// originating-tool continuation resolves only the exact actor's owed reference.
+    #[test]
+    fn domain_queries_only_resolve_results_they_deliver() {
+        let memory = Unresolved::default();
+        memory.observe(
+            "a",
+            AssistanceTool::Test,
+            &Value::Null,
+            &test_reply("tests #3: started"),
+        );
+        memory.observe(
+            "a",
+            AssistanceTool::Test,
+            &serde_json::json!({"history":true}),
+            &test_reply("tests #3: 2 passed"),
+        );
+        memory.observe(
+            "a",
+            AssistanceTool::Test,
+            &serde_json::json!({"cancel":3}),
+            &test_reply("tests #3: already settled"),
+        );
+        assert_eq!(memory.subjects("a"), ["tests #3"]);
+        for tool in [
+            AssistanceTool::Read,
+            AssistanceTool::Graph,
+            AssistanceTool::Test,
+        ] {
+            let reference = format!("reference-{}", tool.mcp_name());
+            memory.observe(
+                "b",
+                tool,
+                &Value::Null,
+                &PeerReply::Pending {
+                    detail_ref: reference.clone(),
+                },
+            );
+            assert_eq!(memory.subjects("b").len(), 1);
+            memory.observe(
+                "b",
+                tool,
+                &serde_json::json!({"detail_ref":reference}),
+                &read_reply("body"),
+            );
+            assert!(memory.subjects("b").is_empty());
+        }
+    }
+
+    /// One plural Inspect continuation clears every exact reference it delivered and leaves an
+    /// unrelated owed result intact.
+    #[test]
+    fn plural_inspect_resolves_every_explicit_reference() {
+        let memory = Unresolved::default();
+        for reference in ["detail-a", "detail-b", "detail-c"] {
+            memory.observe(
+                "a",
+                AssistanceTool::Symbol,
+                &serde_json::json!({"symbol":format!("src/lib.rs#{reference}")}),
+                &PeerReply::Pending {
+                    detail_ref: reference.to_owned(),
+                },
+            );
+        }
+        memory.observe(
+            "a",
+            AssistanceTool::Inspect,
+            &serde_json::json!({"detail_refs":["detail-a","detail-c"]}),
+            &read_reply("two retained results"),
+        );
+        assert_eq!(memory.subjects("a"), ["ide.symbol src/lib.rs#detail-b"]);
+    }
+
+    /// A Diff continuation is an explicit read of its retained result, so it clears the exact
+    /// pre-restart subject instead of reporting already-read work as lost.
+    #[test]
+    fn diff_continuation_resolves_its_explicit_reference() {
+        let memory = Unresolved::default();
+        memory.observe(
+            "a",
+            AssistanceTool::Diff,
+            &serde_json::json!({"mode":"head"}),
+            &PeerReply::Pending {
+                detail_ref: "diff-page".to_owned(),
+            },
+        );
+        assert_eq!(memory.subjects("a"), ["ide.diff call"]);
+        memory.observe(
+            "a",
+            AssistanceTool::Diff,
+            &serde_json::json!({"detail_ref":"diff-page"}),
+            &read_reply("remaining diff"),
+        );
+        assert!(memory.subjects("a").is_empty());
+    }
+
     /// Pending answers, started runs and pending checks are remembered per actor until their
     /// fact, their reference or the settled run is relayed; answered calls add nothing.
     #[test]
@@ -168,14 +300,12 @@ mod tests {
             &PeerReply::Pending {
                 detail_ref: "sym-1".to_owned(),
             },
-            None,
         );
         memory.observe(
             "a",
             AssistanceTool::Test,
             &none,
             &test_reply("tests #3: started — cargo test (budget 60 s)"),
-            None,
         );
         memory.observe(
             "b",
@@ -184,22 +314,30 @@ mod tests {
             &PeerReply::Pending {
                 detail_ref: "read-2".to_owned(),
             },
-            None,
         );
-        memory.observe("c", AssistanceTool::Read, &none, &read_reply("x"), None);
+        memory.observe("c", AssistanceTool::Read, &none, &read_reply("x"));
         assert_eq!(
             memory.subjects("a"),
             ["ide.symbol src/a.rs#Foo", "tests #3"]
         );
         assert_eq!(memory.subjects("b"), ["ide.read src/b.rs"]);
         assert!(memory.subjects("c").is_empty());
-        // A carried fact resolves its subject; a running status does not.
+        // A running status resolves nothing.
         memory.observe(
             "a",
             AssistanceTool::Test,
             &serde_json::json!({"status":3}),
             &test_reply("tests #3: running"),
-            Some("<agent-ide>\njob-ready ide.symbol src/a.rs#Foo: ready\n</agent-ide>"),
+        );
+        assert_eq!(
+            memory.subjects("a"),
+            ["ide.symbol src/a.rs#Foo", "tests #3"]
+        );
+        memory.observe(
+            "a",
+            AssistanceTool::Inspect,
+            &serde_json::json!({"detail_ref":"sym-1"}),
+            &read_reply("fn foo() {}"),
         );
         assert_eq!(memory.subjects("a"), ["tests #3"]);
         memory.observe(
@@ -207,7 +345,6 @@ mod tests {
             AssistanceTool::Inspect,
             &serde_json::json!({"detail_ref":"tests #3"}),
             &test_reply("tests #3: 2 passed"),
-            None,
         );
         assert!(memory.subjects("a").is_empty());
         // Reading the reference back resolves a pending answer; another actor's read does not.
@@ -216,7 +353,6 @@ mod tests {
             AssistanceTool::Inspect,
             &serde_json::json!({"detail_ref":"read-2"}),
             &read_reply("fn b() {}"),
-            None,
         );
         assert_eq!(memory.subjects("b"), ["ide.read src/b.rs"]);
         memory.observe(
@@ -224,7 +360,6 @@ mod tests {
             AssistanceTool::Inspect,
             &serde_json::json!({"detail_ref":"read-2"}),
             &read_reply("fn b() {}"),
-            None,
         );
         assert!(memory.subjects("b").is_empty());
     }
@@ -239,7 +374,6 @@ mod tests {
                 AssistanceTool::Test,
                 &Value::Null,
                 &test_reply(&format!("tests #{id}: started")),
-                None,
             );
         }
         let subjects = memory.subjects("a");

@@ -22,12 +22,15 @@ use bridge_sdk::{Client, Config, bridge_protocol as wire};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-/// Content-free test completion kind owned by IDE, opaque to Bridge.
+/// Opaque test completion kind owned by IDE, with producer-composed bounded result text.
 pub(crate) const TEST_KIND: &str = "ide.test.finished";
-/// Content-free edit-check completion kind owned by IDE, opaque to Bridge.
+/// Opaque edit-check completion kind owned by IDE; Bridge never interprets diagnostics.
 pub(crate) const EDIT_KIND: &str = "ide.edit.checked";
 /// Private frontend-to-daemon route association; never a model argument.
 pub(crate) const ROUTE_META: &str = "agent-ide/bridge-route";
+/// One Bridge SDK exchange budget. Five seconds is the standalone SDK's documented baseline;
+/// native-owner handoff keeps its separate Bridge-owned deadline after custody is committed.
+const BRIDGE_SDK_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Explicit restart-only deployment configuration; absent means legacy delivery.
 /// Endpoint parents and credential must be private, current-user-owned, real paths.
@@ -40,11 +43,42 @@ pub struct BridgeConfig {
     pub core_socket: PathBuf,
     /// Absolute regular owner-only credential file, read once; never an inline secret.
     pub credential_file: PathBuf,
+    /// Operator-selected native stores; actor ids still come only from validated IDE bindings.
+    /// An empty list retains historical route compatibility during migration, never guesses a store.
+    #[serde(default)]
+    pub native_stores: Vec<NativeStore>,
+}
+
+/// One configured native store prefix for direct-address delivery, never caller authority.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeStore {
+    /// Supported native harness whose independently validated actor owns the result.
+    pub harness: wire::Host,
+    /// Explicit native OS host namespace, not derived from a worktree or process.
+    pub host: String,
+    /// Explicit native home/store namespace admitted by the operator’s Bridge profile.
+    pub store: String,
 }
 
 impl BridgeConfig {
     /// Checks normalized absolute paths without I/O or granting host/workspace authority.
     pub(crate) fn validate(&self) -> bool {
+        if self.native_stores.len() > 2
+            || self
+                .native_stores
+                .iter()
+                .enumerate()
+                .any(|(index, native)| {
+                    wire::validate_id("host", &native.host, wire::MAX_ID_BYTES).is_err()
+                        || wire::validate_id("store", &native.store, wire::MAX_ID_BYTES).is_err()
+                        || self.native_stores[..index]
+                            .iter()
+                            .any(|prior| prior.harness == native.harness)
+                })
+        {
+            return false;
+        }
         [
             &self.registration_socket,
             &self.core_socket,
@@ -98,15 +132,26 @@ impl BridgeConfig {
         if credential.len() > 16 * 1024 {
             return None;
         }
+        let owner = identity(
+            "sender-owner",
+            &[
+                &self.registration_socket.to_string_lossy(),
+                &self.core_socket.to_string_lossy(),
+                blake3::hash(credential.trim_end_matches(['\r', '\n']).as_bytes())
+                    .to_hex()
+                    .as_str(),
+            ],
+        );
         let config = Config::new(
             &self.registration_socket,
             &self.core_socket,
             wire::Secret::new(credential.trim_end_matches(['\r', '\n'])),
-            Duration::from_millis(1500),
+            BRIDGE_SDK_DEADLINE,
         )
         .ok()?;
         Some(Arc::new(BridgeClient {
             client: Client::new(config).ok()?,
+            owner,
             capabilities: Default::default(),
             registration_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         }))
@@ -123,8 +168,10 @@ fn private_owner(metadata: &std::fs::Metadata) -> bool {
 pub(crate) struct BridgeClient {
     /// Approved standalone SDK; owns its protected credential and finite socket budget.
     client: Client,
+    /// Opaque endpoint/credential-owner pin for immutable handoff evidence; never printed.
+    owner: String,
     /// Sixty-second supported gate, five-second failure gate; original calls remain fresh.
-    capabilities: std::sync::Mutex<Option<(std::time::Instant, bool)>>,
+    capabilities: std::sync::Mutex<Option<(std::time::Instant, Option<wire::Capabilities>)>>,
     /// Bounds still-running blocking registrations after an inline wait expires.
     registration_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -166,16 +213,48 @@ impl RouteTicket {
     }
 }
 
+/// One frozen delivery destination; neither variant grants caller or workspace authority.
+#[derive(Clone)]
+pub(crate) enum DeliveryTarget {
+    /// Historical same-call route, retained temporarily for old deployment compatibility.
+    Route(RouteTicket),
+    /// Exact native address built from operator store configuration and validated local actor.
+    Address(String),
+}
+
+impl From<RouteTicket> for DeliveryTarget {
+    /// Preserves historical private route callers during the direct-address migration.
+    fn from(route: RouteTicket) -> Self {
+        Self::Route(route)
+    }
+}
+
+impl DeliveryTarget {
+    /// Produces the frozen SDK destination without inferring any local execution permission.
+    fn destination(&self) -> wire::Destination {
+        match self {
+            Self::Route(route) => wire::Destination::Route {
+                route_key: route.route_key.clone(),
+            },
+            Self::Address(address) => wire::Destination::Address {
+                address: address.clone(),
+            },
+        }
+    }
+}
+
 /// One optional daemon delivery owner, using the existing Application SQLite store.
-/// No route or payload is persisted. Durable intent precedes publication; uncertain
-/// outcomes never return to legacy carriers. All source-bearing facts stay local.
+/// Immutable destination/body/sender linkage is retained beside domain outcome metadata before
+/// publication. Authorized result content is carried by Bridge; this class owns no sender loop.
 pub(crate) struct BridgeDelivery {
     /// Protected producer client shared across finite blocking exchanges.
     client: Arc<BridgeClient>,
     /// Existing daemon store; retains only opaque ids and custody dispositions.
     store: Arc<Store>,
     /// At most 64 current local generations with same-actor delivery routes.
-    routes: std::sync::Mutex<std::collections::BTreeMap<BindingRef, RouteTicket>>,
+    routes: std::sync::Mutex<std::collections::BTreeMap<BindingRef, DeliveryTarget>>,
+    /// Explicit configured store prefixes, independent of caller/operation admission.
+    native_stores: Vec<NativeStore>,
     /// Boot fence prevents restarted generation numbers from reusing delivery scopes.
     boot: String,
     /// Eight concurrent exchanges maximum; saturation keeps legacy delivery.
@@ -207,10 +286,45 @@ impl BridgeDelivery {
         ) {
             return None;
         }
-        let scopes: Vec<String> = store.read_many(
-            "SELECT DISTINCT scope_key FROM ide_bridge_delivery WHERE state!='retired' LIMIT 1001",
-            vec![], 1001, |row| row.get(0),
+        let sql = TrustedUpSql::new("CREATE TABLE ide_bridge_intention(event_id TEXT PRIMARY KEY REFERENCES ide_bridge_delivery(event_id) ON DELETE CASCADE,destination TEXT NOT NULL,payload TEXT NOT NULL,sender_owner TEXT NOT NULL) STRICT;").ok()?;
+        if !matches!(
+            store
+                .admit_migration(DomainMigration {
+                    domain: DomainName::new("ide_bridge").ok()?,
+                    key: MigrationKey::new("delivery_intention_v2").ok()?,
+                    expected_digest: MigrationDigest::from_sql(&sql),
+                    up_sql: sql
+                })
+                .await
+                .ok()?,
+            MigrationAdmission::Applied { .. } | MigrationAdmission::AlreadyApplied { .. }
+        ) {
+            return None;
+        }
+        // Expired evidence follows the existing seventy-minute retention even if no new
+        // publication can start; foreign nonexpired effects are never silently rehomed.
+        let expired_before = now_ms()?.saturating_sub(60 * 60 * 1000);
+        store
+            .execute_untracked_settled(move |tx| {
+                tx.execute(
+                    "DELETE FROM ide_bridge_delivery WHERE expires_at_ms<?1",
+                    [expired_before],
+                )?;
+                Ok(())
+            })
+            .await
+            .ok()?;
+        let scopes: Vec<(String, Option<String>)> = store.read_many(
+            "SELECT DISTINCT d.scope_key,i.sender_owner FROM ide_bridge_delivery d LEFT JOIN ide_bridge_intention i ON i.event_id=d.event_id WHERE d.state!='retired' LIMIT 1001",
+            vec![], 1001, |row| Ok((row.get(0)?, row.get(1)?)),
         ).await.ok()?;
+        // Old/foreign handoff ownership is never silently rebound to a new credential/service.
+        if scopes
+            .iter()
+            .any(|(_, owner)| owner.as_deref() != Some(client.owner.as_str()))
+        {
+            return None;
+        }
         if scopes.len() > 1000 {
             return None;
         }
@@ -218,10 +332,11 @@ impl BridgeDelivery {
             client,
             store: Arc::clone(&store),
             routes: Default::default(),
+            native_stores: config.native_stores.clone(),
             boot: blake3::Hash::from_bytes(nonce).to_hex().to_string(),
             permits: Arc::new(tokio::sync::Semaphore::new(8)),
         });
-        for scope in scopes {
+        for (scope, _) in scopes {
             if !delivery.retire(scope).await {
                 return None;
             }
@@ -235,8 +350,50 @@ impl BridgeDelivery {
         if let Ok(mut routes) = self.routes.lock()
             && (routes.contains_key(binding) || routes.len() < 64)
         {
-            routes.insert(binding.clone(), ticket);
+            routes.insert(binding.clone(), DeliveryTarget::Route(ticket));
         }
+    }
+
+    /// Checks the direct-address/auto/result-kind grant without blocking the async worker on IPC.
+    /// This is a bounded admission observation, never proof of later native arrival.
+    pub(crate) async fn direct_capable(&self) -> bool {
+        let client = Arc::clone(&self.client);
+        tokio::task::spawn_blocking(move || {
+            client
+                .capability_snapshot("ide-direct-capabilities")
+                .is_some_and(|caps| usable_direct(&caps))
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Checks whether this boot has an explicit address for a validated local actor. This is
+    /// recipient selection only, not a claim of Bridge health, native arrival or source authority.
+    pub(crate) fn can_target(&self, binding: &BindingRef) -> bool {
+        self.known_address(binding).is_some()
+    }
+
+    /// Resolves only the configured prefix plus the positively validated binding actor.
+    /// Missing stores refuse rather than guessing a home, parent actor or other recipient.
+    fn known_address(&self, binding: &BindingRef) -> Option<String> {
+        let harness = match binding.host() {
+            super::host_binding::HostKind::Codex => wire::Host::Codex,
+            super::host_binding::HostKind::Claude => wire::Host::ClaudeCode,
+        };
+        let native = self
+            .native_stores
+            .iter()
+            .find(|native| native.harness == harness)?;
+        wire::validate_id("session", binding.native_actor_id(), wire::MAX_ID_BYTES).ok()?;
+        Some(
+            wire::NativeAddress {
+                host: native.host.clone(),
+                harness,
+                store: native.store.clone(),
+                session: binding.native_actor_id().to_owned(),
+            }
+            .canonical(),
+        )
     }
 
     /// Creates one boot-and-generation-scoped lifetime identity, independent of actor text.
@@ -255,38 +412,84 @@ impl BridgeDelivery {
     /// Reserves the sole delivery owner synchronously before any legacy push. Returns
     /// `None` when no eligible route/capacity exists; otherwise the caller must await the
     /// owned attempt and fall back only for a positive no-publication result.
-    /// Failed and source-bearing drafts always stay on their existing guarded carriers.
+    /// Success, failure and source-bearing drafts use the same transport; the producer must
+    /// prove source access/currency before calling. Configured exact destinations take priority.
     pub(crate) fn reserve(
         &self,
         binding: &BindingRef,
         draft: &FactDraft,
-    ) -> Option<(RouteTicket, tokio::sync::OwnedSemaphorePermit)> {
-        if draft.source_bearing
-            || draft.failed
-            || !matches!(draft.kind, FactKind::TestFinished | FactKind::EditChecked)
+    ) -> Option<(DeliveryTarget, tokio::sync::OwnedSemaphorePermit)> {
+        draft.validate().ok()?;
+        if self.native_stores.is_empty()
+            && (draft.source_bearing
+                || draft.failed
+                || !matches!(draft.kind, FactKind::TestFinished | FactKind::EditChecked))
         {
             return None;
         }
         let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
-        let route = self.routes.lock().ok()?.get(binding)?.clone();
-        Some((route, permit))
+        let address = self.known_address(binding);
+        let mut routes = self.routes.lock().ok()?;
+        if let Some(address) = address {
+            if !routes.contains_key(binding) && routes.len() >= 64 {
+                return None;
+            }
+            routes.insert(binding.clone(), DeliveryTarget::Address(address));
+        }
+        let destination = routes.get(binding)?.clone();
+        Some((destination, permit))
     }
 
     /// Durably records the stable intent, then publishes a closed completion notice.
     /// `true` means custody OR uncertainty: never send through a second carrier. `false`
-    /// is positive no-write evidence and permits one legacy fallback. No native/model
-    /// observation is inferred. Cancelled generation retirement fences new custody.
+    /// is positive no-write evidence, including a route retired after preparation but before
+    /// socket I/O. No native/model observation is inferred. Cancelled generation retirement
+    /// fences new custody; callers retain domain work instead of adding a fallback carrier.
     pub(crate) async fn publish(
         &self,
         binding: BindingRef,
         draft: &FactDraft,
-        route: RouteTicket,
+        target: impl Into<DeliveryTarget>,
     ) -> bool {
+        let target = target.into();
+        let direct = matches!(target, DeliveryTarget::Address(_));
+        let destination = target.destination();
         let scope = self.scope(&binding);
-        let event = identity("event", &[&scope, draft.kind.label(), &draft.subject]);
+        let event = event_identity(&scope, draft);
         let Some(expires) = now_ms().and_then(|now| now.checked_add(10 * 60 * 1000)) else {
             return false;
         };
+        let payload = if direct {
+            format!(
+                "{} {}: {}{}",
+                draft.kind.label(),
+                draft.subject,
+                draft.summary,
+                draft
+                    .detail
+                    .as_ref()
+                    .map(|detail| format!("\n{detail}"))
+                    .unwrap_or_default()
+            )
+        } else {
+            format!(
+                "{}: completion recorded{}",
+                draft.kind.label(),
+                draft
+                    .detail_ref
+                    .as_ref()
+                    .filter(
+                        |reference| wire::validate_id("reference", reference, 128).is_ok()
+                            && !reference.contains(['<', '>'])
+                    )
+                    .map(|reference| format!(" [ref {reference}]"))
+                    .unwrap_or_default()
+            )
+        };
+        let stored_destination =
+            serde_json::to_string(&destination).expect("typed SDK destination");
+        let stored_payload = payload.clone();
+        let sender_owner = self.client.owner.clone();
         let operation = OperationId::new(format!("bridge-prepare-{event}"))
             .expect("bounded internal operation");
         let insert_event = event.clone();
@@ -310,6 +513,15 @@ impl BridgeDelivery {
                     "INSERT INTO ide_bridge_delivery VALUES(?1,?2,'intent',?3)",
                     rusqlite::params![insert_event, insert_scope, expires],
                 )?;
+                transaction.execute(
+                    "INSERT INTO ide_bridge_intention VALUES(?1,?2,?3,?4)",
+                    rusqlite::params![
+                        insert_event,
+                        stored_destination,
+                        stored_payload,
+                        sender_owner
+                    ],
+                )?;
                 Ok(())
             })
             .await;
@@ -328,24 +540,13 @@ impl BridgeDelivery {
             .is_some_and(|routes| routes.contains_key(&binding))
         {
             let _ = self.set_state(event, "retired").await;
-            return true;
+            return false;
         }
-        let payload = format!(
-            "{}: completion recorded{}",
-            draft.kind.label(),
-            draft
-                .detail_ref
-                .as_ref()
-                .filter(
-                    |reference| wire::validate_id("reference", reference, 128).is_ok()
-                        && !reference.contains(['<', '>'])
-                )
-                .map(|reference| format!(" [ref {reference}]"))
-                .unwrap_or_default()
-        );
         let kind = match draft.kind {
             FactKind::TestFinished => TEST_KIND,
-            _ => EDIT_KIND,
+            FactKind::EditChecked => EDIT_KIND,
+            FactKind::JobReady => "ide.job.finished",
+            FactKind::LostAfterRestart => "ide.job.lost",
         };
         let client = Arc::clone(&self.client);
         let sent_event = event.clone();
@@ -353,13 +554,15 @@ impl BridgeDelivery {
             client.client.publish(
                 sent_event.clone(),
                 wire::PublishParams {
-                    destination: wire::Destination::Route {
-                        route_key: route.route_key,
-                    },
+                    destination,
                     event_id: sent_event,
                     kind: kind.into(),
                     payload: wire::Payload::new(payload).expect("closed bounded completion notice"),
-                    mode: wire::Mode::Message,
+                    mode: if direct {
+                        wire::Mode::Auto
+                    } else {
+                        wire::Mode::Message
+                    },
                     policy: wire::Policy::KeepAll,
                     metadata: Default::default(),
                     expires_at_ms: Some(expires),
@@ -370,7 +573,17 @@ impl BridgeDelivery {
         .await;
         let state = match &result {
             Ok(Ok(result)) if result.receipt.event_id == event => "custody",
-            Ok(Err(error)) if definitely_unsent(error) => "refused",
+            Ok(Err(error)) if definitely_unsent(error) => {
+                crate::errorlog::record(
+                    crate::errorlog::Method::Daemon,
+                    crate::errorlog::Outcome::Failed,
+                    crate::errorlog::Fields {
+                        detail: Some(refusal_detail(error)),
+                        ..Default::default()
+                    },
+                );
+                "refused"
+            }
             _ => "unknown",
         };
         let _ = self.set_state(event, state).await;
@@ -434,7 +647,9 @@ impl BridgeDelivery {
                 }
             ))
             .await,
-            Ok(Ok(_))
+            Ok(Ok(ref result)) if result.receipt.scope_key == scope
+                && result.receipt.action == wire::RetirementAction::RetireUnhanded
+                && result.receipt.request_id == identity("retire", &[&scope])
         ) {
             return false;
         }
@@ -472,6 +687,17 @@ fn definitely_unsent(error: &bridge_sdk::ClientError) -> bool {
     }
 }
 
+/// Returns one content-free diagnostic for a proven no-effect publication refusal. Transport
+/// reasons are SDK-owned static strings; service bodies, addresses and reconciliation ids stay out.
+fn refusal_detail(error: &bridge_sdk::ClientError) -> &'static str {
+    match error {
+        bridge_sdk::ClientError::InvalidConfig(reason) => reason,
+        bridge_sdk::ClientError::InvalidRequest(_) => "bridge:publish_refused:invalid_request",
+        bridge_sdk::ClientError::Service(_) => "bridge:publish_refused:service_not_committed",
+        bridge_sdk::ClientError::Transport { reason, .. } => reason,
+    }
+}
+
 impl std::fmt::Debug for RouteTicket {
     /// Prints no native actor, call or route identifier.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -480,23 +706,30 @@ impl std::fmt::Debug for RouteTicket {
 }
 
 impl BridgeClient {
-    /// Caches capability support only, never native evidence or route authority.
-    /// Unavailable service short-circuits subsequent calls for five seconds.
-    fn usable(&self, id: &str) -> bool {
-        if let Some((at, usable)) = self.capabilities.lock().ok().and_then(|cache| *cache)
-            && at.elapsed() < Duration::from_secs(if usable { 60 } else { 5 })
+    /// Caches only service/grant capabilities for60s (failed reads5s), never native actor proof.
+    fn capability_snapshot(&self, id: &str) -> Option<wire::Capabilities> {
+        if let Some((at, caps)) = self
+            .capabilities
+            .lock()
+            .ok()
+            .and_then(|cache| cache.clone())
+            && at.elapsed() < Duration::from_secs(if caps.is_some() { 60 } else { 5 })
         {
-            return usable;
+            return caps;
         }
-        let supported = self
-            .client
-            .capabilities(format!("cap-{id}"))
-            .is_ok_and(|capabilities| usable(&capabilities));
+        let caps = self.client.capabilities(format!("cap-{id}")).ok();
         if let Ok(mut cache) = self.capabilities.lock() {
-            *cache = Some((std::time::Instant::now(), supported));
+            *cache = Some((std::time::Instant::now(), caps.clone()));
         }
-        supported
+        caps
     }
+
+    /// Keeps the historical registration gate separate from direct-address publication support.
+    fn usable(&self, id: &str) -> bool {
+        self.capability_snapshot(id)
+            .is_some_and(|caps| usable(&caps))
+    }
+
     /// Registers original Codex direct-call metadata once before local dispatch. Exact
     /// native-call-derived ids survive reconnect without new operations; historical replay
     /// never attaches a route. Unavailable/unsupported Bridge leaves legacy delivery intact.
@@ -607,6 +840,41 @@ fn usable(capabilities: &wire::Capabilities) -> bool {
             .all(|kind| allowed(&capabilities.grant.allowed_kinds, kind))
 }
 
+/// Requires direct address custody, explicit auto mode, all result kinds and the lifetime fence
+/// used by this consumer. Generic caller-registration paths do not gate address delivery.
+fn usable_direct(caps: &wire::Capabilities) -> bool {
+    caps.api_version == wire::API_VERSION
+        && caps.grant.direct_address
+        && caps.features.delivery_scopes
+        && ["publish", "retire_delivery_scope"]
+            .iter()
+            .all(|op| caps.operations.iter().any(|item| item == op))
+        && caps.modes.contains(&wire::Mode::Auto)
+        && caps.grant.allowed_modes.contains(&wire::Mode::Auto)
+        && caps.policies.contains(&wire::PolicyKind::KeepAll)
+        && caps
+            .grant
+            .allowed_policies
+            .contains(&wire::PolicyKind::KeepAll)
+        && caps.limits.payload_bytes >= 8 * 1024
+        && [TEST_KIND, EDIT_KIND, "ide.job.finished", "ide.job.lost"]
+            .iter()
+            .all(|kind| allowed(&caps.grant.allowed_kinds, kind))
+}
+
+/// Stable facts deduplicate; independent graph jobs on the same symbol keep their own result id.
+fn event_identity(scope: &str, draft: &FactDraft) -> String {
+    let job_reference = if draft.kind == FactKind::JobReady {
+        draft.detail_ref.as_deref().unwrap_or("")
+    } else {
+        ""
+    };
+    identity(
+        "event",
+        &[scope, draft.kind.label(), &draft.subject, job_reference],
+    )
+}
+
 /// Tests the authenticated closed kind grant, accepting only exact names or its wildcard.
 fn allowed(kinds: &[String], kind: &str) -> bool {
     kinds.iter().any(|item| item == kind || item == "*")
@@ -636,6 +904,145 @@ pub(crate) fn now_ms() -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// Direct-address admission needs explicit Auto, KeepAll, all result kinds and lifetime
+    /// retirement; missing generic registration support does not disable this independent path.
+    #[test]
+    fn direct_capabilities_require_exact_delivery_contract() {
+        let mut caps: wire::Capabilities = serde_json::from_value(serde_json::json!({
+            "api_version":wire::API_VERSION, "supported_versions":[wire::API_VERSION],
+            "operations":["publish","retire_delivery_scope"], "evidence_variants":[],
+            "native_contracts":[], "modes":["auto"], "policies":["keep_all"], "reply_policies":[],
+            "limits":{"registration_request_bytes":65536,"core_request_bytes":65536,"response_bytes":65536,
+                "payload_bytes":32768,"metadata_entries":0,"rendered_manifest_bytes":65536,"open_routes":0,"assertions":0},
+            "grant":{"allowed_modes":["auto"],"allowed_policies":["keep_all"],"allowed_kinds":["*"],
+                "reply_policies":[],"direct_address":true,"native_scopes":["*"]},
+            "features":{"consume_assertion":false,"delivery_scopes":true,"host_observations":false},
+            "retention":{"durable_keys":true,"closed_tombstones":true,"credential_independent_identity":true}
+        })).unwrap();
+        assert!(usable_direct(&caps));
+        for mutation in 0..6 {
+            let mut changed = caps.clone();
+            match mutation {
+                0 => changed.grant.allowed_modes = vec![wire::Mode::Message, wire::Mode::Inject],
+                1 => changed.grant.direct_address = false,
+                2 => changed.features.delivery_scopes = false,
+                3 => changed.grant.allowed_kinds = vec![TEST_KIND.into()],
+                4 => changed
+                    .operations
+                    .retain(|op| op != "retire_delivery_scope"),
+                _ => changed.policies.clear(),
+            }
+            assert!(!usable_direct(&changed), "mutation {mutation}");
+        }
+        caps.native_contracts.clear();
+        assert!(
+            usable_direct(&caps),
+            "generic registration contracts are not direct delivery authority"
+        );
+    }
+
+    /// Graph jobs for the same root have distinct immutable identities, while replaying one
+    /// completion or a test result keeps its existing identity.
+    #[test]
+    fn graph_event_identity_distinguishes_jobs_on_same_symbol() {
+        let mut fact = FactDraft {
+            kind: FactKind::JobReady,
+            subject: "a.rs#f".into(),
+            summary: "done".into(),
+            detail: None,
+            detail_ref: Some("job-one".into()),
+            failed: false,
+            source_bearing: false,
+            fence_paths: vec![],
+        };
+        let first = event_identity("scope", &fact);
+        assert_eq!(first, event_identity("scope", &fact));
+        fact.detail_ref = Some("job-two".into());
+        assert_ne!(first, event_identity("scope", &fact));
+        fact.kind = FactKind::TestFinished;
+        let first = event_identity("scope", &fact);
+        fact.detail_ref = Some("page-next".into());
+        assert_eq!(first, event_identity("scope", &fact));
+    }
+
+    /// Restart never retires or adopts possible effects owned by a different credential/service.
+    /// The foreign intent remains intact even when the currently configured endpoint is available.
+    #[tokio::test]
+    async fn recovery_refuses_foreign_sender_before_socket_io() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let scratch = crate::scratch::ScratchDir::new("bridge-owner-fence");
+        let config = BridgeConfig {
+            registration_socket: scratch.join("adapter.sock"),
+            core_socket: scratch.join("core.sock"),
+            credential_file: scratch.join("token"),
+            native_stores: vec![],
+        };
+        std::fs::write(&config.credential_file, "owned-fixture-token").unwrap();
+        std::fs::set_permissions(
+            &config.credential_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let store = Arc::new(
+            Store::open_with_backup_root(
+                &scratch.join("state.sqlite"),
+                &scratch.join("backups"),
+                crate::app::config::EffectiveConfig::defaults().store(),
+            )
+            .unwrap(),
+        );
+        let delivery = BridgeDelivery::open(&config, store.clone(), [1; 32])
+            .await
+            .unwrap();
+        store.execute_untracked_settled(|tx| {
+            tx.execute("INSERT INTO ide_bridge_delivery VALUES('old','scope-old','unknown',?1)",[now_ms().unwrap()+600000])?;
+            tx.execute("INSERT INTO ide_bridge_intention VALUES('old','destination','body','foreign-owner')",[])?;
+            Ok(())
+        }).await.unwrap();
+        let listener = UnixListener::bind(&config.core_socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            BridgeDelivery::open(&config, store.clone(), [2; 32])
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let state: String = store
+            .read_one(
+                "SELECT state FROM ide_bridge_delivery WHERE event_id='old'",
+                vec![],
+                |row| row.get(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, "unknown");
+        store
+            .execute_untracked_settled(|tx| {
+                tx.execute(
+                    "UPDATE ide_bridge_delivery SET expires_at_ms=0 WHERE event_id='old'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            BridgeDelivery::open(&config, store.clone(), [3; 32])
+                .await
+                .is_some(),
+            "bounded expired evidence cannot poison future boots forever"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(delivery);
+    }
+
     /// Repeated retirement remains successful after a late inserted intent, while a late
     /// publication settle cannot reopen a retired row. No publication is replayed on recovery.
     #[tokio::test]
@@ -649,6 +1056,7 @@ mod tests {
             registration_socket: scratch.join("adapter.sock"),
             core_socket: scratch.join("core.sock"),
             credential_file: scratch.join("token"),
+            native_stores: Vec::new(),
         };
         std::fs::write(&config.credential_file, "synthetic-token").unwrap();
         std::fs::set_permissions(
@@ -657,8 +1065,9 @@ mod tests {
         )
         .unwrap();
         let store = Arc::new(
-            Store::open(
+            Store::open_with_backup_root(
                 &scratch.join("state.sqlite"),
+                &scratch.join("backups"),
                 crate::app::config::EffectiveConfig::defaults().store(),
             )
             .unwrap(),
@@ -668,7 +1077,7 @@ mod tests {
             .unwrap();
         let listener = UnixListener::bind(&config.core_socket).unwrap();
         let server = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for attempt in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
@@ -685,7 +1094,11 @@ mod tests {
                         receipt: wire::RetireReceipt {
                             producer: "fixture".into(),
                             request_id: request.request_id,
-                            scope_key: params.scope_key,
+                            scope_key: if attempt == 2 {
+                                "wrong-scope".into()
+                            } else {
+                                params.scope_key
+                            },
                             action: params.action,
                             retired_at_ms: 1,
                             disposed: 0,
@@ -735,7 +1148,6 @@ mod tests {
             .await
             .unwrap();
         assert!(delivery.retire("scope-a".into()).await);
-        server.join().unwrap();
         let states: Vec<String> = store
             .read_many(
                 "SELECT state FROM ide_bridge_delivery ORDER BY event_id",
@@ -746,14 +1158,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(states, ["retired", "retired"]);
+        store
+            .execute_untracked_settled(|tx| {
+                tx.execute(
+                    "INSERT INTO ide_bridge_delivery VALUES('event-c','scope-c','intent',100000)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            !delivery.retire("scope-c".into()).await,
+            "a mismatched receipt cannot retire local state"
+        );
+        server.join().unwrap();
+        let state: String = store
+            .read_one(
+                "SELECT state FROM ide_bridge_delivery WHERE event_id='event-c'",
+                vec![],
+                |row| row.get(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, "intent");
         drop(delivery);
         drop(store);
     }
 
-    /// Exercises the real SDK/socket boundary: intent precedes bytes, private content
-    /// never leaves, and a committed/unknown/conflicting response cannot enable fallback.
+    /// A route removed after reservation but before publication is definite no-effect: the
+    /// prepared intent retires, no transport call occurs and the caller keeps restart-loss work.
     #[tokio::test]
-    async fn publication_intent_precedes_wire_and_unknown_never_replays() {
+    async fn route_retired_before_publication_is_definite_no_effect() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let scratch = crate::scratch::ScratchDir::new("bridge-retired-before-publish");
+        let config = BridgeConfig {
+            registration_socket: scratch.join("adapter.sock"),
+            core_socket: scratch.join("core.sock"),
+            credential_file: scratch.join("token"),
+            native_stores: vec![NativeStore {
+                harness: wire::Host::ClaudeCode,
+                host: "local".into(),
+                store: "fixture".into(),
+            }],
+        };
+        std::fs::write(&config.credential_file, "synthetic-token").unwrap();
+        std::fs::set_permissions(
+            &config.credential_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let store = Arc::new(
+            Store::open_with_backup_root(
+                &scratch.join("state.sqlite"),
+                &scratch.join("backups"),
+                crate::app::config::EffectiveConfig::defaults().store(),
+            )
+            .unwrap(),
+        );
+        let delivery = BridgeDelivery::open(&config, Arc::clone(&store), [5; 32])
+            .await
+            .unwrap();
+        let binding = BindingRef::fixture("actor", "channel", 1);
+        let draft = FactDraft {
+            kind: FactKind::LostAfterRestart,
+            subject: "restart".into(),
+            summary: "results may be lost".into(),
+            detail: None,
+            detail_ref: None,
+            failed: false,
+            source_bearing: false,
+            fence_paths: vec![],
+        };
+        let (route, _permit) = delivery
+            .reserve(&binding, &draft)
+            .expect("direct route reserves");
+        assert!(delivery.routes.lock().unwrap().remove(&binding).is_some());
+        let listener = UnixListener::bind(&config.core_socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        assert!(!delivery.publish(binding, &draft, route).await);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "retirement before publication performs no transport I/O"
+        );
+        let state: String = store
+            .read_one("SELECT state FROM ide_bridge_delivery", vec![], |row| {
+                row.get(0)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, "retired");
+    }
+
+    /// Exercises real SDK/socket handoff: immutable authorized body precedes bytes, useful
+    /// success/failure content reaches Bridge, and uncertain effects never create another send.
+    #[tokio::test]
+    async fn publication_intent_and_body_precede_wire_and_unknown_never_replays() {
         use std::{
             io::{BufRead, BufReader, Write},
             os::unix::{fs::PermissionsExt, net::UnixListener},
@@ -785,6 +1289,7 @@ mod tests {
                 registration_socket: scratch.join("adapter.sock"),
                 core_socket: scratch.join("core.sock"),
                 credential_file: scratch.join("token"),
+                native_stores: Vec::new(),
             };
             std::fs::write(&config.credential_file, "synthetic-token").unwrap();
             std::fs::set_permissions(
@@ -794,8 +1299,9 @@ mod tests {
             .unwrap();
             let database = scratch.join("state.sqlite");
             let store = Arc::new(
-                Store::open(
+                Store::open_with_backup_root(
                     &database,
+                    &scratch.join("backups"),
                     crate::app::config::EffectiveConfig::defaults().store(),
                 )
                 .unwrap(),
@@ -811,77 +1317,104 @@ mod tests {
             };
             delivery.note_route(&binding, route.clone());
             let listener = UnixListener::bind(&config.core_socket).unwrap();
-            let thread = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                let mut frame = String::new();
-                BufReader::new(&stream).read_line(&mut frame).unwrap();
-                let request = wire::decode_request(frame.trim_end().as_bytes()).unwrap();
-                let wire::Operation::Publish(params) = &request.operation else {
-                    panic!("publication");
-                };
-                assert_eq!(request.request_id, params.event_id);
-                assert_eq!(
-                    params.payload.as_str(),
-                    "test-finished: completion recorded [ref retained-detail]"
-                );
-                assert!(!frame.contains("PRIVATE_SOURCE") && !frame.contains("PRIVATE_DIAGNOSTIC"));
-                let connection = rusqlite::Connection::open_with_flags(
-                    &database,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
-                .unwrap();
-                let state: String = connection
-                    .query_row(
-                        "SELECT state FROM ide_bridge_delivery WHERE event_id=?1",
-                        [&params.event_id],
-                        |row| row.get(0),
+            let thread =
+                std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut frame = String::new();
+                    BufReader::new(&stream).read_line(&mut frame).unwrap();
+                    let request = wire::decode_request(frame.trim_end().as_bytes()).unwrap();
+                    let wire::Operation::Publish(params) = &request.operation else {
+                        panic!("publication");
+                    };
+                    assert_eq!(request.request_id, params.event_id);
+                    assert_eq!(
+                        params.payload.as_str(),
+                        "test-finished tests #1: AUTHORIZED_DIAGNOSTIC\nAUTHORIZED_SOURCE"
+                    );
+                    assert_eq!(params.mode, wire::Mode::Auto);
+                    if class == wire::ErrorClass::Capacity {
+                        // A response slower than the retired 1.5-second budget must still be read
+                        // as the service's definite no-effect refusal, never misclassified as an
+                        // unknown transport outcome.
+                        std::thread::sleep(Duration::from_millis(1700));
+                    }
+                    let connection = rusqlite::Connection::open_with_flags(
+                        &database,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                     )
                     .unwrap();
-                assert_eq!(
-                    state, "intent",
-                    "durable intent must exist before first socket write"
-                );
-                let response = wire::Response::error(
-                    request.request_id,
-                    wire::ApiError {
-                        class,
-                        reason: "fixture".into(),
-                        retry_hint: wire::RetryHint::Never,
-                        effect: Some(effect),
-                        reconciliation: Some(wire::ReconciliationKey::Event {
-                            event_id: params.event_id.clone(),
-                        }),
-                        detail: "fixture".into(),
-                    },
-                );
-                stream
-                    .write_all(&wire::encode_response(&response).unwrap())
-                    .unwrap();
-                stream.write_all(b"\n").unwrap();
-            });
+                    let state: String = connection
+                        .query_row(
+                            "SELECT state FROM ide_bridge_delivery WHERE event_id=?1",
+                            [&params.event_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        state, "intent",
+                        "durable intent must exist before first socket write"
+                    );
+                    let stored: (String, String) = connection.query_row(
+                    "SELECT payload,destination FROM ide_bridge_intention WHERE event_id=?1",
+                    [&params.event_id], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                    assert_eq!(stored.0, params.payload.as_str());
+                    assert_eq!(
+                        stored.1,
+                        serde_json::to_string(&params.destination).unwrap()
+                    );
+                    let response = wire::Response::error(
+                        request.request_id,
+                        wire::ApiError {
+                            class,
+                            reason: "fixture".into(),
+                            retry_hint: wire::RetryHint::Never,
+                            effect: Some(effect),
+                            reconciliation: Some(wire::ReconciliationKey::Event {
+                                event_id: params.event_id.clone(),
+                            }),
+                            detail: "fixture".into(),
+                        },
+                    );
+                    stream
+                        .write_all(&wire::encode_response(&response).unwrap())
+                        .unwrap();
+                    stream.write_all(b"\n").unwrap();
+                });
             let draft = FactDraft {
                 kind: FactKind::TestFinished,
                 subject: "tests #1".into(),
-                summary: "PRIVATE_DIAGNOSTIC".into(),
-                detail: Some("PRIVATE_SOURCE".into()),
+                summary: "AUTHORIZED_DIAGNOSTIC".into(),
+                detail: Some("AUTHORIZED_SOURCE".into()),
                 detail_ref: Some("retained-detail".into()),
                 failed: false,
-                holds_turn: true,
                 source_bearing: false,
                 fence_paths: vec![],
             };
             assert_eq!(
                 delivery
-                    .publish(binding.clone(), &draft, route.clone())
+                    .publish(
+                        binding.clone(),
+                        &draft,
+                        DeliveryTarget::Address("local/claude-code/fixture/actor".into())
+                    )
                     .await,
                 transferred
             );
             thread.join().unwrap();
             // Same completed fact never writes another socket or invents an event identity.
-            assert!(delivery.publish(binding, &draft, route).await);
+            assert!(
+                delivery
+                    .publish(
+                        binding,
+                        &draft,
+                        DeliveryTarget::Address("local/claude-code/fixture/actor".into())
+                    )
+                    .await
+            );
             drop(delivery);
             drop(store);
         }
@@ -896,14 +1429,13 @@ mod tests {
             (TransportOutcome::OutcomeUnknown, false),
             (TransportOutcome::ReadFailed, false),
         ] {
-            assert_eq!(
-                definitely_unsent(&ClientError::Transport {
-                    outcome,
-                    reconciliation: None,
-                    reason: "fixture"
-                }),
-                expected
-            );
+            let error = ClientError::Transport {
+                outcome,
+                reconciliation: None,
+                reason: "fixture",
+            };
+            assert_eq!(definitely_unsent(&error), expected);
+            assert_eq!(refusal_detail(&error), "fixture");
         }
         for (class, effect, expected) in [
             (
@@ -932,16 +1464,18 @@ mod tests {
                 false,
             ),
         ] {
+            let error = ClientError::Service(wire::ApiError {
+                class,
+                reason: "fixture".into(),
+                retry_hint: wire::RetryHint::Never,
+                effect: Some(effect),
+                reconciliation: None,
+                detail: "fixture".into(),
+            });
+            assert_eq!(definitely_unsent(&error), expected);
             assert_eq!(
-                definitely_unsent(&ClientError::Service(wire::ApiError {
-                    class,
-                    reason: "fixture".into(),
-                    retry_hint: wire::RetryHint::Never,
-                    effect: Some(effect),
-                    reconciliation: None,
-                    detail: "fixture".into()
-                })),
-                expected
+                refusal_detail(&error),
+                "bridge:publish_refused:service_not_committed"
             );
         }
     }
@@ -980,6 +1514,150 @@ mod tests {
         );
     }
 
+    /// Exact addresses come from configured native stores and independently established actors;
+    /// failed/source-bearing results use the same reservation without caller registration.
+    #[tokio::test]
+    async fn direct_targets_preserve_host_actor_and_useful_failure_content() {
+        use super::super::host_binding::{
+            BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = crate::scratch::ScratchDir::new("bridge-direct-target");
+        let config = BridgeConfig {
+            registration_socket: scratch.join("adapter.sock"),
+            core_socket: scratch.join("core.sock"),
+            credential_file: scratch.join("token"),
+            native_stores: vec![
+                NativeStore {
+                    harness: wire::Host::Codex,
+                    host: "local".into(),
+                    store: "codex-owned".into(),
+                },
+                NativeStore {
+                    harness: wire::Host::ClaudeCode,
+                    host: "local".into(),
+                    store: "claude-owned".into(),
+                },
+            ],
+        };
+        std::fs::write(&config.credential_file, "synthetic-token").unwrap();
+        std::fs::set_permissions(
+            &config.credential_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let store = Arc::new(
+            Store::open_with_backup_root(
+                &scratch.join("state.sqlite"),
+                &scratch.join("backups"),
+                crate::app::config::EffectiveConfig::defaults().store(),
+            )
+            .unwrap(),
+        );
+        let delivery = BridgeDelivery::open(&config, store, [9; 32]).await.unwrap();
+        let mut guard = HostBindingGuard::default();
+        let metadata = serde_json::json!({"threadId":"codex-actor", "callId":"call", "x-codex-turn-metadata":{}});
+        let BindingStatus::Validated(invocation) = guard.establish_managed_codex_start(
+            parse_candidate(metadata.as_object().unwrap()).unwrap(),
+            parse_channel_session(b"owned-channel").unwrap(),
+        ) else {
+            panic!("fixture correlation");
+        };
+        let draft = FactDraft {
+            kind: FactKind::TestFinished,
+            subject: "tests #1".into(),
+            summary: "1 failed".into(),
+            detail: Some("authorized failure details".into()),
+            detail_ref: None,
+            failed: true,
+            source_bearing: true,
+            fence_paths: Vec::new(),
+        };
+        for (binding, expected) in [
+            (
+                invocation.binding_ref().clone(),
+                "local/codex/codex-owned/codex-actor",
+            ),
+            (
+                BindingRef::fixture("claude-actor", "owned-channel", 1),
+                "local/claude-code/claude-owned/claude-actor",
+            ),
+        ] {
+            let (target, permit) = delivery.reserve(&binding, &draft).unwrap();
+            assert_eq!(
+                target.destination(),
+                wire::Destination::Address {
+                    address: expected.into()
+                }
+            );
+            drop(permit);
+        }
+        let mut invalid = config.clone();
+        invalid.native_stores.push(config.native_stores[0].clone());
+        assert!(
+            !invalid.validate(),
+            "duplicate/excess host prefixes must refuse"
+        );
+    }
+
+    /// Historical route deployments retain their closed notice and existing failure/source
+    /// carriers; enabling direct delivery must not silently broaden an old route grant.
+    #[tokio::test]
+    async fn historical_routes_refuse_failed_source_and_graph_facts() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = crate::scratch::ScratchDir::new("bridge-legacy-isolation");
+        let config = BridgeConfig {
+            registration_socket: scratch.join("adapter.sock"),
+            core_socket: scratch.join("core.sock"),
+            credential_file: scratch.join("token"),
+            native_stores: vec![],
+        };
+        std::fs::write(&config.credential_file, "fixture-token").unwrap();
+        std::fs::set_permissions(
+            &config.credential_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let store = Arc::new(
+            Store::open_with_backup_root(
+                &scratch.join("state.sqlite"),
+                &scratch.join("backups"),
+                crate::app::config::EffectiveConfig::defaults().store(),
+            )
+            .unwrap(),
+        );
+        let delivery = BridgeDelivery::open(&config, store, [5; 32]).await.unwrap();
+        let binding = BindingRef::fixture("actor", "channel", 1);
+        delivery.note_route(
+            &binding,
+            RouteTicket {
+                route_key: "route".into(),
+                actor: "actor".into(),
+                call: "call".into(),
+            },
+        );
+        let fact = FactDraft {
+            kind: FactKind::TestFinished,
+            subject: "tests #1".into(),
+            summary: "done".into(),
+            detail: None,
+            detail_ref: None,
+            failed: false,
+            source_bearing: false,
+            fence_paths: vec![],
+        };
+        assert!(delivery.reserve(&binding, &fact).is_some());
+        let mut changed = fact.clone();
+        changed.failed = true;
+        assert!(delivery.reserve(&binding, &changed).is_none());
+        let mut changed = fact.clone();
+        changed.source_bearing = true;
+        assert!(delivery.reserve(&binding, &changed).is_none());
+        let mut changed = fact;
+        changed.kind = FactKind::JobReady;
+        assert!(delivery.reserve(&binding, &changed).is_none());
+    }
+
     /// Credential adoption rejects symlinks, public permissions, directories and oversize files.
     #[test]
     fn credential_file_is_bounded_private_and_no_follow() {
@@ -992,6 +1670,7 @@ mod tests {
             registration_socket: scratch.join("adapter.sock"),
             core_socket: scratch.join("core.sock"),
             credential_file: credential.clone(),
+            native_stores: Vec::new(),
         };
         assert!(config.open().is_some());
         std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -1034,6 +1713,7 @@ mod tests {
             registration_socket: "/service/native.sock".into(),
             core_socket: "/service/core.sock".into(),
             credential_file: "/service/token".into(),
+            native_stores: Vec::new(),
         };
         assert!(config.validate());
         config.core_socket = "/service/../core.sock".into();

@@ -79,8 +79,9 @@ impl<T, E> OrCause<T> for Result<T, E> {
     }
 }
 
-/// Closed journal context a call's ingress establishes on its way through [`ProductDispatcher::
-/// handle_tagged`] (QW-4); every field stays empty for a call that never got that far.
+/// Closed per-call context ingress establishes on its way through [`ProductDispatcher::
+/// handle_tagged`] (QW-4): journal facts, retained-result delivery evidence and the optional
+/// restart handoff result. Every field stays empty for a call that never got that far.
 #[derive(Default)]
 struct CallFacts {
     /// The validated host binding the call belongs to.
@@ -90,6 +91,9 @@ struct CallFacts {
     /// Set by the inspection this call performs when it hands a retained terminal result to the
     /// call's caller; this call's own flag, shared with no other inspection.
     delivery: Arc<std::sync::atomic::AtomicBool>,
+    /// Bridge's accepted-or-unknown publication result for this re-activation's
+    /// `lost-after-restart` notice; absent when the call carried no unresolved subjects.
+    lost_handoff: Option<bool>,
 }
 
 /// The closed cause a guard refusal is reported with.
@@ -610,8 +614,6 @@ impl ProductDispatcher {
             "post_failure" => "PostToolUseFailure",
             "permission_denied" => "PermissionDenied",
             "post_batch" => "PostToolBatch",
-            "stop" => "Stop",
-            "subagent_stop" => "SubagentStop",
             "compaction" => "PreCompact",
             _ => return Err(HostBindingCause::UnsupportedHookPhase),
         };
@@ -699,51 +701,31 @@ impl ProductDispatcher {
                 }
                 if settled_plate
                     && let Some(worker) = &self.worker
-                    && let Some(block) = worker.take_facts(
-                        binding.binding_ref(),
-                        super::outbox::Carrier::Hook,
-                        with_git_notice(
-                            worker,
+                    && let Some(block) = with_git_notice(
+                        worker,
+                        &binding.binding_ref().fingerprint(),
+                        due_plate(
+                            worker.project_feed(),
+                            Some(worker),
                             &binding.binding_ref().fingerprint(),
-                            due_plate(
-                                worker.project_feed(),
-                                Some(worker),
-                                &binding.binding_ref().fingerprint(),
-                                None,
-                            )
-                            .await,
-                            |plate| plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
+                            None,
                         )
                         .await,
-                        super::reply::MAX_FEEDBACK_BYTES,
-                        |block| block.len() <= super::reply::MAX_FEEDBACK_BYTES,
+                        |plate| plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
                     )
+                    .await
                 {
                     return Ok(PeerReply::Feedback { text: block });
                 }
                 Ok(PeerReply::HookSettled {})
             }
-            // OUTBOX-r3 §8.3, §9.1: a turn end may be held for requested results; a compaction
-            // raises the session's compaction counter. Neither pairs with a call.
+            // OUTBOX-r3 §9.1: a compaction raises the session's compaction counter; it pairs with
+            // no call.
             BindingStatus::TurnObserved(binding) => {
-                let Some(worker) = &self.worker else {
-                    return Ok(PeerReply::HookObserved {});
-                };
-                if event.phase() == HookPhase::Compaction {
+                if let Some(worker) = &self.worker {
                     worker.note_compaction(&binding);
-                    return Ok(PeerReply::HookObserved {});
                 }
-                match worker
-                    .hold_turn(
-                        &binding,
-                        event.phase() == HookPhase::SubagentStop,
-                        event.session_id(),
-                    )
-                    .await
-                {
-                    Some(text) => Ok(PeerReply::Feedback { text }),
-                    None => Ok(PeerReply::NativeHookObserved {}),
-                }
+                Ok(PeerReply::HookObserved {})
             }
             BindingStatus::NativeObserved(binding) => {
                 if let Some(worker) = &self.worker {
@@ -773,7 +755,6 @@ impl ProductDispatcher {
                         );
                     }
                     worker.note_hook(&binding);
-                    let session = binding.clone();
                     let feedback = if feed.is_some_and(|feed| feed.is_read_restricted(&fingerprint))
                     {
                         None
@@ -791,20 +772,6 @@ impl ProductDispatcher {
                         |plate| reserved + plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
                     )
                     .await;
-                    // OUTBOX-r3 §8.2: a post phase also hands over the session's due facts,
-                    // after the plate and within the same bounded hook context.
-                    let block = if hook_post {
-                        let budget = super::reply::MAX_FEEDBACK_BYTES.saturating_sub(reserved);
-                        worker.take_facts(
-                            &session,
-                            super::outbox::Carrier::Hook,
-                            block,
-                            budget,
-                            |block| block.len() <= budget,
-                        )
-                    } else {
-                        block
-                    };
                     let text = match (block, feedback) {
                         (Some(block), Some(feedback)) => Some(format!("{block}\n{feedback}")),
                         (block, feedback) => block.or(feedback),
@@ -1351,7 +1318,7 @@ impl ProductDispatcher {
                         worker.stop(invocation, method.opaque_attachment()).await
                     }
                     AssistanceMethod::Inspect if call.parameters().get("kind").is_none() => {
-                        // OUTBOX-r3 §8.5: one reference, several, or the session's facts.
+                        // OUTBOX-r3 §8.5: one reference or several.
                         worker
                             .inspect_call(
                                 invocation.binding_ref().clone(),
@@ -1385,8 +1352,9 @@ impl ProductDispatcher {
                             .await
                     }
                 };
-                // OUTBOX-r3 §10: a re-activation after a daemon replacement names what its front
-                // relayed unresolved before; the actor gets one `lost-after-restart` fact.
+                // OUTBOX-r4 §10: a re-activation after a daemon replacement names what its front
+                // relayed unresolved before; the private result is true only after Bridge accepts
+                // custody or reports an uncertain effect for the `lost-after-restart` fact.
                 if reactivation
                     && matches!(
                         reply,
@@ -1398,7 +1366,8 @@ impl ProductDispatcher {
                     && let (Some(binding), Some(lost)) =
                         (facts.binding.as_ref(), meta.get("claudecode/lost"))
                 {
-                    worker.queue_lost(binding, &lost_subjects(lost));
+                    facts.lost_handoff =
+                        Some(worker.queue_lost(binding, &lost_subjects(lost)).await);
                 }
                 // T28B/T29B: reply-carrying hosts lead every terminal `ide.*` reply with the due
                 // plate. Every such call first reconciles the bound worktree's inputs (free while
@@ -1430,30 +1399,6 @@ impl ProductDispatcher {
                         })
                         .await;
                     }
-                }
-                // OUTBOX-r3 §8.2: every terminal reply of every host carries the session's due
-                // facts after the plate; `ide.stop` flushes its own, a placeholder carries none.
-                // A re-activation's reply is read by the front alone, never by the agent.
-                if method.method() != AssistanceMethod::Stop
-                    && !stopped
-                    && !reactivation
-                    && !matches!(reply, PeerReply::Pending { .. })
-                    && let Some(binding) = facts.binding.as_ref()
-                {
-                    worker.note_activity(binding);
-                    *status = worker.take_facts(
-                        binding,
-                        super::outbox::Carrier::Reply,
-                        status.take(),
-                        super::reply::MAX_FEEDBACK_BYTES,
-                        |block| {
-                            super::content::fits_with_status(
-                                &reply,
-                                block,
-                                super::content::reply_envelope(),
-                            )
-                        },
-                    );
                 }
                 Ok(reply)
             }
@@ -1664,11 +1609,14 @@ impl AssistanceDispatcher for ProductDispatcher {
                     }
                 }
             }
-            // A carried status plate (T28B) rides on top of the closed reply in the wrapped wire
-            // form; without one the encoding stays byte-identical to earlier releases.
-            let reply = match &status {
-                Some(plate) => PeerReply::encode_with_status(&result, plate),
-                None => result.encode(),
+            // A carried status plate (T28B) or restart-loss handoff result rides beside the closed
+            // reply in the private wrapper; without either the encoding stays byte-identical to
+            // earlier releases.
+            let reply = match (&status, facts.lost_handoff) {
+                (None, None) => result.encode(),
+                (status, lost_handoff) => {
+                    PeerReply::encode_delivered(&result, status.as_deref(), lost_handoff)
+                }
             }
             .ok_or(AssistanceDispatchUnavailable)?;
             // Only a front that sent `claudecode/recover` receives a tag, so older fronts keep

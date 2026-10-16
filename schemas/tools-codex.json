@@ -4,7 +4,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "What changed since your last diff (the first call: everything uncommitted), paged. A `mode`\n(`head`, `staged`, `unstaged`, `task`) asks for the whole diff of that kind. Review it\nbefore finishing instead of running `git diff`.",
+    "description": "Review all related changed paths in one call with paths; do not request a diff per file.\nDefault: changes since your last diff, paged. mode head/staged/unstaged/task selects the whole\ncomparison. Optional incremental/paged review; native git diff is also valid.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -46,124 +46,10 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Edit by address. Replace a symbol's doc and body:\n`{\"symbol\":\"src/a.rs#Type/method\",\"content\":\"…\"}`. Change inside it with `old`/`new`\nscoped to the symbol, or `content` for a window `…/method:3-5`. Also `op`\ninsert/delete/rename, `add_import`/`remove_import`, `files` for several files and `patch`\nfor apply_patch. All changes apply or none; the reply is immediate and the project check\n(cargo check, pyright or tsc) arrives by itself.",
+    "description": "Batch related production/tests edits into one atomic multi-file `patch` using apply_patch syntax: *** Begin Patch, *** Add File or *** Update File, *** End Patch. Send {patch:\"…\"}, optionally operation_id for safe retries. Deleting or moving files is not supported. Read affected code first; include related edits and tests in one patch. The reply confirms the write; its project check completes separately.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
-        "add_import": {
-          "description": "With `path`: an import statement as written in the file; added after the other imports.",
-          "type": "string"
-        },
-        "changes": {
-          "items": {
-            "additionalProperties": false,
-            "description": "Up to 32 changes to the file `path`: each is `symbol` with `content` or `old`/`new`, `lines`, `add_import` or `remove_import`. All apply or none.",
-            "properties": {
-              "add_import": {
-                "type": "string"
-              },
-              "content": {
-                "type": "string"
-              },
-              "lines": {
-                "type": "string"
-              },
-              "new": {
-                "type": "string"
-              },
-              "old": {
-                "type": "string"
-              },
-              "op": {
-                "enum": [
-                  "replace",
-                  "insert",
-                  "delete"
-                ],
-                "type": "string"
-              },
-              "remove_import": {
-                "type": "string"
-              },
-              "symbol": {
-                "type": "string"
-              },
-              "where": {
-                "enum": [
-                  "before",
-                  "after",
-                  "first",
-                  "last"
-                ],
-                "type": "string"
-              },
-              "within": {
-                "type": "string"
-              }
-            },
-            "type": "object"
-          },
-          "type": "array"
-        },
-        "content": {
-          "description": "Replacement or inserted code, including the symbol's doc comment and attributes.",
-          "type": "string"
-        },
-        "files": {
-          "description": "Up to 16 files in one call: {path, changes}, {path, create:true, content} or {path, content}. All apply or none; one project check runs.",
-          "items": {
-            "additionalProperties": false,
-            "properties": {
-              "changes": {
-                "items": {
-                  "type": "object"
-                },
-                "type": "array"
-              },
-              "content": {
-                "type": "string"
-              },
-              "create": {
-                "type": "boolean"
-              },
-              "path": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "path"
-            ],
-            "type": "object"
-          },
-          "type": "array"
-        },
-        "lines": {
-          "description": "With `path`: file lines `a-b` to replace; for code prefer a `symbol` or a window.",
-          "type": "string"
-        },
-        "new": {
-          "description": "The replacement for `old`; empty deletes the match.",
-          "type": "string"
-        },
-        "new_name": {
-          "description": "For rename: the new identifier, applied project-wide.",
-          "type": "string"
-        },
-        "old": {
-          "description": "Exact text to replace with `new`; it must occur once in the scope (the `symbol`, else the whole `path`).",
-          "type": "string"
-        },
-        "op": {
-          "default": "replace",
-          "description": "replace (default), insert (placed by `where`), delete or rename (to `new_name`, project-wide) the `symbol`.",
-          "enum": [
-            "replace",
-            "insert",
-            "delete",
-            "rename"
-          ],
-          "type": "string"
-        },
         "operation_id": {
           "description": "Optional name that makes a retry safe: repeating it never applies the edit twice.",
           "type": "string"
@@ -171,29 +57,11 @@
         "patch": {
           "description": "A Codex apply_patch body (Add File, Update File), applied atomically. Use it alone.",
           "type": "string"
-        },
-        "path": {
-          "type": "string"
-        },
-        "remove_import": {
-          "description": "With `path`: the import statement to remove, as written in the file.",
-          "type": "string"
-        },
-        "symbol": {
-          "description": "Address `src/a.rs#Type/method`, a window `…/method:3-5` (lines of the symbol) or a region `src/a.rs#@imports`.",
-          "type": "string"
-        },
-        "where": {
-          "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor.",
-          "enum": [
-            "before",
-            "after",
-            "first",
-            "last"
-          ],
-          "type": "string"
         }
       },
+      "required": [
+        "patch"
+      ],
       "type": "object"
     },
     "name": "ide.edit"
@@ -203,7 +71,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Call chains for impact/architecture/indirect faults: signature/public changes, shared\nrefactors, cross-language connections. Start depth 2 (1–3; 60 nodes), expand only as needed;\ntests:true expands tests. `{\"symbol\":\"a.rs#f\",\"depth\":2}`. Tiny edits: ide.symbol.",
+    "description": "Batch related roots with symbols (up to 8) for shared signatures, indirect faults or wider\nimpact. callers shows impact, callees dependencies, both both sides; depth 2 usually suffices\n(1–3), tests:true expands tests. In Bridge mode even warm graphs accept a job; completion\narrives automatically. Continue independent work or end the turn; never poll or finish/stop\nwhile awaiting results. Tiny edits need the ide.symbol direct-neighbor card.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -213,6 +81,10 @@
           "maximum": 3,
           "minimum": 1,
           "type": "integer"
+        },
+        "detail_ref": {
+          "description": "Read the saved result named by a Bridge notice, only when more detail is needed. Use alone; never poll.",
+          "type": "string"
         },
         "direction": {
           "default": "callers",
@@ -250,9 +122,10 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "`{}`: facts; `detail_ref`/`detail_refs`: pages. `{\"kind\":\"problems\"}`: checks.\n`{\"kind\":\"diagnostics\",\"path\":\"a.rs\"}`: file reports with freshness, unknown never clean.\nNo build/check starts. Long results arrive by themselves; never poll.",
+    "description": "Read known detail_refs together in one batch when saved detail is needed; do not query\nreferences one by one. File diagnostics use kind:diagnostics+path; project checks use\nkind:problems. Unknown never means clean; no check starts. Test results/history/output\nbelong to ide.test; graph/read pages use their own tools. Never poll async state.",
     "inputSchema": {
       "additionalProperties": false,
+      "minProperties": 1,
       "properties": {
         "detail_ref": {
           "description": "Reference from an earlier reply: continue that result.",
@@ -302,7 +175,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Skeleton of files: every symbol and region (`@header`, `@imports`) with its address,\nsignature, doc line and line numbers. Far cheaper than reading a file. Give `paths` (up to\n24) or a `glob`; `path` takes one file or a directory. Addresses look like\n`src/a.rs#Type/method` and feed ide.read and ide.edit.",
+    "description": "Batch skeletons with paths (up to 24) or one glob covering the related files. Do not outline\nfiles one at a time when they fit a batch. Returns symbol/region addresses, signatures and\ndocs without bodies; collect the needed addresses and pass them together to ide.read items.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -315,7 +188,7 @@
           "type": "string"
         },
         "path": {
-          "description": "File relative to the project root.",
+          "description": "File or directory relative to the worktree; group related entries in paths.",
           "type": "string"
         },
         "paths": {
@@ -335,19 +208,35 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "`{\"symbol\":\"a.rs#f\"}`: doc and body, numbered; `#f:1-3`: window; `#@imports`/`#@header`:\nregions. `{\"path\":\"a.rs\"}` reads source; `lines` bounds a range, `items` batches reads.\nPrefer symbol units for code. Semantic positions use ide.symbol.",
+    "description": "Batch source reads: items [{symbol:\"src/a.rs#f\"}, {path:\"src/b.rs\",lines:\"1-80\"}]. Paths are relative to the active worktree. Read related units together before one multi-file patch. Already-read unchanged items return an acknowledgement; force:true rereads after context loss. Do not reread your own successful edit merely to verify it.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "detail_ref": {
+          "description": "Continue a saved read page; use alone.",
+          "type": "string"
+        },
         "force": {
           "default": false,
-          "description": "With `items`: return an item's text even when unchanged since your last read of it.",
+          "description": "Return source again even when already read and unchanged in this context.",
           "type": "boolean"
         },
         "items": {
-          "description": "Up to 32 reads in one call: {symbol} (address, window or `path:line`), or {path} / {path, lines} for non-code files.",
+          "description": "Batch up to 32 source/text reads: {symbol} (address/window/path:line) or {path} with a host-style line range.",
           "items": {
             "additionalProperties": false,
+            "oneOf": [
+              {
+                "required": [
+                  "symbol"
+                ]
+              },
+              {
+                "required": [
+                  "path"
+                ]
+              }
+            ],
             "properties": {
               "lines": {
                 "type": "string"
@@ -360,32 +249,6 @@
               }
             },
             "type": "object"
-          },
-          "type": "array"
-        },
-        "lines": {
-          "description": "With `path`: `120-180`, `120-` (to the end) or `120`; an end past the file is clamped.",
-          "type": "string"
-        },
-        "path": {
-          "description": "Non-code file relative to the project root; alone the whole file, with `lines` or `ranges` those lines.",
-          "type": "string"
-        },
-        "ranges": {
-          "description": "Several line ranges of the non-code file `path` in one reply.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "symbol": {
-          "description": "Address `src/a.rs#Type/method`, a window `…:3-5`, a region `src/a.rs#@imports` or `path:line`; returns doc and body.",
-          "type": "string"
-        },
-        "symbols": {
-          "description": "Several addresses in one reply, request order; a failed one fails only itself.",
-          "items": {
-            "type": "string"
           },
           "type": "array"
         }
@@ -401,7 +264,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Activate Agent IDE once per task, before any other ide.* call. Returns the project card:\nlanguages, build and test commands, layout, entry points, docs and the call forms. Use it\ninstead of reading README, Cargo.toml or package.json. End the task with ide.stop.",
+    "description": "Activate once per agent/worktree; reuse this activation for the whole batch workflow.\nReturns project languages, commands, layout and call forms. Collect related targets before\noutline/symbol/graph, read them together, then one multi-file edit and one test batch.\nDo not start again per file. Call ide.stop once after all required results are collected.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -437,7 +300,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "End this task's IDE session; edited files stay on disk. Required when the task ends or\nbefore handing off: frees the writer slot, lists uncollected test runs and flushes\nundelivered results. Call it once.",
+    "description": "End this agent/worktree activation once, after all required batch results are collected.\nDo not stop between files or while waiting for Bridge completion. Frees the writer slot;\nedited files stay on disk and uncollected runs are listed.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -455,7 +318,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Symbol card: signature/doc/definition/usages/history, immediate neighbors (positive\ncallers/callees). `{\"symbol\":\"a.rs#f\"}`; ide.graph for call chains. Or\n`{\"path\":\"a.rs\",\"byte_offset\":42}`: UTF-8 use-site definitions/references,\nexplicit lexical/unavailable evidence.",
+    "description": "Batch related symbols with symbols (up to 8): signature/doc/definition/usages/history and\nimmediate neighbors (callers/callees). Every positive value means direct neighbors, never\ndepth. Use ide.graph for wider call chains. A precise UTF-8 use-site uses path+byte_offset.\nCollect needed bodies and read them in one ide.read items batch.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -513,7 +376,7 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Run tests as one run: `targets` of `{symbol}`, `{path}` or `{pattern}` (up to 8), or one\n`symbol` (the tests that reference it), `path`, `pattern` or explicit `command`. Returns\nthe pass/fail line with a rerun command; a longer run answers `started` and its outcome\narrives by itself in an `<agent-ide>` block. Use it instead of a shell.",
+    "description": "Batch tests/checks with targets: {symbol}, {path}, {pattern} or {command:[argv]}, up to 8.\nOne run id and budget; ordered steps run at the worktree root. In Bridge mode execution\naccepts a run and completion arrives automatically. End an idle turn without finish/stop;\nnever poll. Read result:N, history:true or detail_ref; cancel:N requests owner cancellation\nand completion follows process-group cleanup. Legacy deployments may return fast results inline.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -521,6 +384,11 @@
           "default": 120,
           "description": "Seconds before the run is stopped and reported as timed out.",
           "maximum": 600,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "cancel": {
+          "description": "Cancel this actor’s active run; after cleanup the result is retained and Bridge-delivered when configured. No polling.",
           "minimum": 1,
           "type": "integer"
         },
@@ -535,12 +403,23 @@
           "description": "Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`.",
           "type": "string"
         },
+        "detail_ref": {
+          "description": "Continue the saved output of a test result; no test is started.",
+          "type": "string"
+        },
         "env": {
           "additionalProperties": {
             "type": "string"
           },
           "description": "Variables added to the inherited environment; only with `command`.",
           "type": "object"
+        },
+        "history": {
+          "description": "List this actor’s retained runs in the active worktree, newest first. Does not start or wait for work.",
+          "enum": [
+            true
+          ],
+          "type": "boolean"
         },
         "path": {
           "description": "Run the tests in this file or directory.",
@@ -550,8 +429,8 @@
           "description": "Run tests whose name matches this substring (runner filter).",
           "type": "string"
         },
-        "status": {
-          "description": "Re-read run number N (from `tests #N`) instead of starting one.",
+        "result": {
+          "description": "Read a retained run result once; never starts or waits for a run. Bridge delivers it automatically when configured; do not poll.",
           "minimum": 1,
           "type": "integer"
         },
@@ -560,11 +439,17 @@
           "type": "string"
         },
         "targets": {
-          "description": "Up to 8 targets in one run, each {symbol}, {path} or {pattern}; one result line per target and one rerun line.",
+          "description": "Batch ≤8 {symbol}, {path}, {pattern} or {command:[argv]} checks. One budget and Bridge result; root cwd, ordered steps, per-target outcomes.",
           "items": {
             "additionalProperties": false,
             "minProperties": 1,
             "properties": {
+              "command": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
               "path": {
                 "type": "string"
               },

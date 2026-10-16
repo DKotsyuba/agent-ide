@@ -1,12 +1,10 @@
-//! Session outbox interface (OUTBOX-r3, `docs/contracts/session-outbox-v1.md`).
+//! Completion-fact vocabulary and the producer seam of Bridge-only delivery.
 //!
-//! Every IDE session (one [`BindingRef`](crate::assistance::host_binding::BindingRef)) owns a bounded, in-memory outbox of *facts*: state
-//! changes the agent did not receive in the reply of the call that caused them (a finished test
-//! run, an edit's project check, the final answer of a job that went `pending`). Producers in
-//! the daemon talk to the outbox only through the
-//! [`SessionOutbox`](crate::assistance::outbox::SessionOutbox) trait defined here; carriers
-//! (reply piggyback, native hooks, the Stop hold, the wake message and `ide.inspect`) take facts
-//! out through the hand-off half of the same trait.
+//! Daemon producers describe the state changes the requesting call did not receive in its reply
+//! (a finished test run, an edit's project check, the final answer of a job that went `pending`)
+//! as *facts* and hand them through the [`SessionOutbox`](crate::assistance::outbox::SessionOutbox)
+//! trait. The worker's implementation transfers each fact to Bridge, the only delivery owner;
+//! nothing here queues a fact for a hook, a Stop hold, a wake message or an `ide.inspect` carrier.
 //!
 //! This file holds the shared vocabulary only: the draft and fact types, their byte budgets and
 //! validation, the trait, and the test-only `RecordingOutbox` that consumers use in boundary
@@ -22,33 +20,25 @@ use super::host_binding::BindingRef;
 
 /// Longest fact subject, in UTF-8 bytes (OUTBOX §3.1).
 pub const MAX_SUBJECT_BYTES: usize = 128;
-/// Longest one-line fact summary, in UTF-8 bytes (OUTBOX §3.4).
+/// Longest one-line fact summary, in UTF-8 bytes (OUTBOX §3.3).
 pub const MAX_SUMMARY_BYTES: usize = 256;
-/// Longest fact text: summary plus detail, in UTF-8 bytes (OUTBOX §3.4).
+/// Longest fact text: summary plus detail, in UTF-8 bytes (OUTBOX §3.3).
 pub const MAX_FACT_BYTES: usize = 2048;
 /// Longest `test-finished` summary plus detail, in UTF-8 bytes (`M024-M026-TEST-FACT` r3).
 pub const MAX_TEST_FACT_BYTES: usize = 1536;
+/// Largest self-contained source result handed to Bridge; remains below wire/native limits.
+pub const MAX_SOURCE_FACT_BYTES: usize = 32 * 1024;
 /// Most fenced paths one fact or deferred job may name (OUTBOX §3.1).
 pub const MAX_FENCE_PATHS: usize = 16;
 /// Longest `defer` target, in UTF-8 bytes; the subject is `"<tool> <target>"` (OUTBOX §3.1).
 pub const MAX_TARGET_BYTES: usize = 120;
 /// Longest detail reference a fact may carry, in UTF-8 bytes (the `ide.inspect` bound).
 pub const MAX_DETAIL_REF_BYTES: usize = 128;
-/// Most undelivered facts one session keeps before the drop rule applies (OUTBOX §5).
-pub const MAX_UNDELIVERED: usize = 32;
-/// Delivered fact summaries one session keeps for `ide.inspect {}` recovery (OUTBOX §6).
-pub const MAX_HISTORY: usize = 16;
 /// Longest wait one `ide.inspect` may ask for, in milliseconds; larger values are clamped
 /// (OUTBOX §8.5). It stays under the Codex 300 s default tool timeout.
 pub const MAX_WAIT_MS: u64 = 240_000;
 /// Most references one `ide.inspect {"detail_refs": …}` call names (OUTBOX §8.5).
 pub const MAX_DETAIL_REFS: usize = 8;
-/// Longest one Stop/SubagentStop hold waits for a holding fact (OUTBOX §8.3).
-pub const HOLD_CAP: std::time::Duration = std::time::Duration::from_secs(300);
-/// Hook-side and transport deadline of a held Stop hook: the hold cap plus a settling margin.
-pub const HOLD_HOOK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(305);
-/// Most Stop holds one daemon serves at once; a hold beyond it releases at once (OUTBOX §8.3).
-pub const HOLD_CONNECTIONS: usize = 16;
 
 /// The closed set of fact kinds (OUTBOX §2). Adding a kind is a contract revision.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -77,9 +67,9 @@ impl FactKind {
 
 /// One path a fact depends on, with the content digest the producer observed, if any.
 ///
-/// `path` is worktree-relative. A `digest` lets reply and `ide.inspect` carriers compare the
+/// `path` is worktree-relative. A `digest` lets the source-access re-proof compare the
 /// current bytes (OUTBOX §7); without one, staleness falls back to the session's `ide.edit`
-/// counter and native epoch. Hook carriers never read files and always use that fallback.
+/// counter and native epoch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FencedPath {
     /// Worktree-relative path; at most [`MAX_SUBJECT_BYTES`] bytes, no control characters.
@@ -90,7 +80,7 @@ pub struct FencedPath {
 
 /// The session state a job started from, captured by the worker when the job began executing.
 ///
-/// Facts compare it with the session's current state at hand-off to decide staleness
+/// Facts compare it with the session's current state at settlement to decide staleness
 /// (OUTBOX §7). Producers never build it from a later observation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct JobEpoch {
@@ -100,11 +90,11 @@ pub struct JobEpoch {
     pub edit_seq: u64,
 }
 
-/// Producer input for one fact; the outbox adds the sequence number, fence epoch and state.
+/// Producer input for one fact; Bridge owns its sequencing, delivery and state.
 ///
 /// Every text field is model-visible data: no imperative sentences, no `poll`, no elapsed
-/// seconds of unfinished work (OUTBOX §3.4, HYGIENE-r1 §2). Untrusted runner text must already
-/// be stripped of control characters; the outbox additionally replaces `<` and `>` at hand-off.
+/// seconds of unfinished work (OUTBOX §3.3, HYGIENE-r1 §2). Untrusted runner text must already
+/// be stripped of control characters.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FactDraft {
     /// Closed fact kind.
@@ -121,10 +111,8 @@ pub struct FactDraft {
     pub detail_ref: Option<String>,
     /// True for a failure (failed tests, new errors, a failed job); failures are ordered first.
     pub failed: bool,
-    /// True when the requesting call got no answer for this subject (OUTBOX §2); only holding
-    /// facts may hold a Stop or wake an idle agent.
-    pub holds_turn: bool,
-    /// True when `detail` carries source-derived text; such text never rides a hook carrier.
+    /// True when `detail` carries source-derived text; such text is re-proved against its source
+    /// access and freshness right before it is handed to Bridge.
     pub source_bearing: bool,
     /// Paths the result depends on, at most [`MAX_FENCE_PATHS`]; empty means the whole worktree.
     pub fence_paths: Vec<FencedPath>,
@@ -172,10 +160,10 @@ impl FactDraft {
         if !one_line(&self.summary, MAX_SUMMARY_BYTES) {
             return Err(DraftError::Summary);
         }
-        let budget = if self.kind == FactKind::TestFinished {
-            MAX_TEST_FACT_BYTES
-        } else {
-            MAX_FACT_BYTES
+        let budget = match self.kind {
+            FactKind::TestFinished => MAX_TEST_FACT_BYTES,
+            FactKind::JobReady if self.source_bearing => MAX_SOURCE_FACT_BYTES,
+            _ => MAX_FACT_BYTES,
         };
         let detail = self.detail.as_deref().unwrap_or("");
         if self.summary.len() + detail.len() > budget
@@ -210,9 +198,6 @@ pub struct DeferSpec {
     /// Paths the answer depends on, at most [`MAX_FENCE_PATHS`]; M-025 names only definition
     /// files so usage-file edits never discard its answer.
     pub fence_paths: Vec<FencedPath>,
-    /// True when the caller already received an approximate answer; the fact then does not
-    /// hold a Stop or wake the agent (`holds_turn = false`).
-    pub approximate_given: bool,
 }
 
 impl DeferSpec {
@@ -234,94 +219,19 @@ impl DeferSpec {
     }
 }
 
-/// The carrier asking for facts; it decides rendering limits and the hand-off rule (OUTBOX §6, §8).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Carrier {
-    /// A terminal `ide.*` reply; committed only after the reply reached a live receiver whole.
-    Reply,
-    /// A native PostToolUse/PostToolUseFailure hook; committed when the hook reply is produced.
-    Hook,
-    /// A Stop/SubagentStop hold; committed when the `block` reply is produced.
-    StopHold,
-    /// An idle wake message; committed when the transport accepted it or the outcome is ambiguous.
-    Wake,
-    /// `ide.inspect {}`; source-bearing bodies may be expanded by the worker after re-proof.
-    Inspect,
-    /// The `ide.stop` flush; summary and reference lines only, then the outbox is dropped.
-    StopReply,
-}
-
-impl Carrier {
-    /// Returns whether this carrier may carry source-derived text (reply-shaped carriers only).
-    pub const fn carries_source(self) -> bool {
-        matches!(self, Carrier::Reply | Carrier::Inspect)
-    }
-}
-
-/// What a carrier asks for in one hand-off.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HandoffRequest {
-    /// The asking carrier.
-    pub carrier: Carrier,
-    /// Bytes available for rendered fact text in this carrier, after any ambient lines.
-    pub budget: usize,
-    /// True to select holding facts first and only (Stop hold and wake decisions).
-    pub holding_only: bool,
-}
-
-/// One undelivered fact as a carrier sees it, already checked for staleness.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingFact {
-    /// Per-session sequence number, monotonic from 1 within one binding generation; not rendered.
-    pub seq: u64,
-    /// Closed fact kind.
-    pub kind: FactKind,
-    /// Coalescing subject.
-    pub subject: String,
-    /// One-line outcome.
-    pub summary: String,
-    /// Further lines, rendered verbatim; `None` on carriers that may not carry source text when
-    /// the fact is source-bearing.
-    pub detail: Option<String>,
-    /// Re-read reference, if any.
-    pub detail_ref: Option<String>,
-    /// Failure ordering flag.
-    pub failed: bool,
-    /// Holding flag (OUTBOX §2).
-    pub holds_turn: bool,
-    /// Source-bearing flag.
-    pub source_bearing: bool,
-    /// Staleness label such as `(ran before your later edits to a.rs)`, when stale (OUTBOX §7).
-    pub stale: Option<String>,
-}
-
-/// Facts reserved for one carrier until it commits or releases them.
-///
-/// While reserved, no other carrier can select these facts, so two carriers racing for the same
-/// session never both deliver one (OUTBOX §6). A reservation that is neither committed nor
-/// released keeps its facts undelivered until the session is forgotten.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Reservation {
-    /// Opaque token naming this reservation for [`SessionOutbox::commit`] and
-    /// [`SessionOutbox::release`]; unique within the outbox.
-    pub token: u64,
-    /// The reserved facts in delivery order (failures first, then ascending `seq`).
-    pub facts: Vec<PendingFact>,
-    /// Number of undelivered facts left out because they did not fit or were not selected.
-    pub remaining: usize,
-}
-
-/// The only in-daemon seam between fact producers, carriers and the session outbox (OUTBOX §3.1).
+/// The only in-daemon seam between fact producers and Bridge delivery (OUTBOX §3.1).
 ///
 /// Implementations are shared across tasks (`Send + Sync`), never block on I/O, and never hold
 /// a lock across an await. All methods are fail-open: a refusal returns `false`/`None` and never
-/// panics or affects the caller's own reply.
+/// panics or affects the caller's own reply. A fact is handed to Bridge at most once; with no
+/// Bridge route the result stays retained under its reference and nothing else delivers it.
 pub trait SessionOutbox: Send + Sync {
-    /// Queues one fact for each recipient session.
+    /// Hands one fact to Bridge for each recipient session.
     ///
-    /// `epoch` is the state the producing job started from. Returns `false` when the draft fails
-    /// [`FactDraft::validate`] or no recipient is an active session; otherwise the fact is queued
-    /// for every active recipient, replacing an undelivered fact with the same kind and subject.
+    /// `epoch` is the state the producing job started from. Returns `true` only when at least one
+    /// recipient accepted the local handoff; this never means Bridge published it or the model
+    /// observed it. Invalid drafts, empty recipients and an unavailable delivery owner return
+    /// `false`.
     fn push(&self, recipients: &[BindingRef], draft: FactDraft, epoch: JobEpoch) -> bool;
 
     /// Makes the final reply (or final failure) of the job behind `reference` one `job-ready`
@@ -331,28 +241,14 @@ pub trait SessionOutbox: Send + Sync {
     /// `false` as well for an invalid spec or an unknown or already settled-and-read reference.
     fn defer(&self, reference: &str, spec: DeferSpec) -> bool;
 
-    /// Drops every undelivered fact, reservation and deferral of `binding` silently.
+    /// Drops every deferral and in-flight registration of `binding` silently.
     ///
-    /// Called on displacement (`release_binding_state`); `ide.stop` reserves a flush first.
+    /// Called on displacement (`release_binding_state`) and by `ide.stop`.
     fn forget(&self, binding: &BindingRef);
 
     /// Returns the session's compaction counter (OUTBOX §9.1), or `None` when its channel never
     /// delivered a native hook and compaction therefore cannot be observed.
     fn context_epoch(&self, binding: &BindingRef) -> Option<u64>;
-
-    /// Selects and reserves the undelivered facts of `binding` that fit `request`.
-    ///
-    /// Returns `None` when nothing fits or the session is unknown. Hook-shaped carriers get
-    /// source-bearing facts without `detail`.
-    fn reserve(&self, binding: &BindingRef, request: HandoffRequest) -> Option<Reservation>;
-
-    /// Marks every fact of reservation `token` delivered and records it in the history.
-    ///
-    /// Returns the number of facts marked; an unknown token marks nothing.
-    fn commit(&self, binding: &BindingRef, token: u64) -> usize;
-
-    /// Returns the facts of reservation `token` to the undelivered queue unchanged.
-    fn release(&self, binding: &BindingRef, token: u64);
 }
 
 /// One call observed by [`RecordingOutbox`], in call order.
@@ -388,8 +284,7 @@ pub enum OutboxCall {
 
 /// Test-only [`SessionOutbox`] that records producer calls and applies the same validation.
 ///
-/// It keeps no queue: `reserve` always returns `None` and `commit`/`release` do nothing, so
-/// producer tests assert on [`RecordingOutbox::calls`]. `push` accepts a valid draft with at
+/// It keeps no queue, so producer tests assert on [`RecordingOutbox::calls`]. `push` accepts a valid draft with at
 /// least one recipient; `defer` accepts a valid spec once per reference; `context_epoch` returns
 /// what [`RecordingOutbox::set_context_epoch`] stored.
 #[cfg(test)]
@@ -481,19 +376,6 @@ impl SessionOutbox for RecordingOutbox {
     fn context_epoch(&self, binding: &BindingRef) -> Option<u64> {
         self.epochs.lock().ok()?.get(binding).copied()
     }
-
-    /// Keeps no queue, so nothing is ever reserved.
-    fn reserve(&self, _binding: &BindingRef, _request: HandoffRequest) -> Option<Reservation> {
-        None
-    }
-
-    /// Nothing is ever reserved, so nothing is marked.
-    fn commit(&self, _binding: &BindingRef, _token: u64) -> usize {
-        0
-    }
-
-    /// Nothing is ever reserved, so nothing is released.
-    fn release(&self, _binding: &BindingRef, _token: u64) {}
 }
 
 #[cfg(test)]
@@ -509,7 +391,6 @@ mod tests {
             detail: Some("  FAIL a::b\n  rerun: cargo test a::b".to_owned()),
             detail_ref: Some("r-12".to_owned()),
             failed: true,
-            holds_turn: true,
             source_bearing: false,
             fence_paths: Vec::new(),
         }
@@ -579,7 +460,6 @@ mod tests {
                 path: "src/a.rs".to_owned(),
                 digest: Some([7; 32]),
             }],
-            approximate_given: true,
         };
         assert_eq!(spec.subject(), "ide.symbol src/a.rs#Foo");
         assert!(outbox.defer("r-1", spec.clone()));
@@ -595,19 +475,12 @@ mod tests {
 
     /// The recorder reports test-set compaction counters and keeps no queue.
     #[test]
-    fn recorder_reports_context_epoch_and_never_reserves() {
+    fn recorder_reports_context_epoch_and_records_forget() {
         let outbox = RecordingOutbox::default();
         let session = binding("a");
         assert_eq!(outbox.context_epoch(&session), None);
         outbox.set_context_epoch(&session, 2);
         assert_eq!(outbox.context_epoch(&session), Some(2));
-        let request = HandoffRequest {
-            carrier: Carrier::Hook,
-            budget: 4096,
-            holding_only: false,
-        };
-        assert_eq!(outbox.reserve(&session, request), None);
-        assert_eq!(outbox.commit(&session, 1), 0);
         outbox.forget(&session);
         assert_eq!(
             outbox.calls(),
@@ -615,19 +488,9 @@ mod tests {
         );
     }
 
-    /// Only reply-shaped carriers may carry source text (T36B-r).
+    /// Fact kinds keep their fixed rendered labels.
     #[test]
-    fn only_reply_shaped_carriers_carry_source() {
-        assert!(Carrier::Reply.carries_source());
-        assert!(Carrier::Inspect.carries_source());
-        for carrier in [
-            Carrier::Hook,
-            Carrier::StopHold,
-            Carrier::Wake,
-            Carrier::StopReply,
-        ] {
-            assert!(!carrier.carries_source());
-        }
+    fn fact_kinds_keep_their_labels() {
         assert_eq!(FactKind::TestFinished.label(), "test-finished");
     }
 }

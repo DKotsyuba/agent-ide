@@ -537,7 +537,7 @@ impl PresentationReceipt {
                     _ => "No write occurred.",
                 };
                 let diagnostics = detail_ref.as_ref().map_or_else(String::new, |reference| {
-                    format!(" Diagnostics pending: ide.inspect with detail_ref {reference}")
+                    format!(" Diagnostics pending; result retained under {reference}; Bridge delivers it automatically when configured.")
                 });
                 format!(
                     "edit: {word}; path {path}; operation_id {operation_id}\n\
@@ -1000,7 +1000,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "This IDE activation has stopped.\nRepair: Read the retained run with ide.inspect {\"detail_ref\":\"tests #7\"}."
+            "This IDE activation has stopped.\nRepair: Call ide.start {\"read_only\":true}, then ide.test {\"result\":7}."
         );
         let other = render_with_call(
             PeerReply::Unavailable {
@@ -1596,7 +1596,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&staged),
-            "The IDE's bounded queue or result store is full.\nRepair: Repeat this call."
+            "The IDE's bounded queue or result store is full.\nRepair: Retry once; otherwise use native tools."
         );
         for (stage, recovery) in [
             ("worker:queue_full", "request queue"),
@@ -1628,7 +1628,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "The IDE's bounded queue or result store is full.\nRepair: Repeat this call."
+            "The IDE's bounded queue or result store is full.\nRepair: Retry once; otherwise use native tools."
         );
     }
 
@@ -1917,8 +1917,8 @@ mod tests {
                     detail_ref: "diagnostic-detail".into(),
                 },
                 "pending",
-                // OUTBOX-r3 §8.7: the check arrives by itself; no polling call is named.
-                "arrives by itself as an edit-checked fact",
+                // OUTBOX-r4 §8.7: the check stays retained and Bridge delivery is conditional.
+                "result retained under diagnostic-detail; Bridge delivers it automatically when configured",
             ),
         ];
         for (diagnostics, state, next_tool) in cases {
@@ -2106,6 +2106,37 @@ mod tests {
         .unwrap();
         let text = text_of(&rendered);
         assert_eq!(text, "beta: unavailable:env_missing");
+    }
+
+    /// Page hints select the actual implemented originating read/graph/test tool; compatibility
+    /// context pages retain inspect instead of advertising the removed public context call.
+    #[test]
+    fn continuation_hints_use_the_originating_domain() {
+        for (kind, tool) in [
+            (ResultKind::Read, "ide.read"),
+            (ResultKind::Graph, "ide.graph"),
+            (ResultKind::Test, "ide.test"),
+            (ResultKind::Context, "ide.inspect"),
+        ] {
+            let result = render(
+                PeerReply::Complete {
+                    kind,
+                    text: "body".into(),
+                    detail_ref: Some("next".into()),
+                    truncated: true,
+                    continuation: true,
+                },
+                Envelope::TextOnly,
+            )
+            .unwrap();
+            assert!(
+                text_of(&result).ends_with(&format!(
+                    "Cut; {tool} {{\"detail_ref\":\"next\"}} continues"
+                )),
+                "{}",
+                text_of(&result)
+            );
+        }
     }
 
     /// Keeps a page's final source newline separate from the continuation instruction.
@@ -2417,7 +2448,8 @@ mod tests {
             text_of(&rendered),
             "edit: renamed; path src/lib.rs; operation_id private-operation-id\n\
              Presentation degraded (presentation_failed). Do not repeat the mutation to repair \
-             this response. Diagnostics pending: ide.inspect with detail_ref diag-detail"
+             this response. Diagnostics pending; result retained under diag-detail; Bridge \
+             delivers it automatically when configured."
         );
         assert_ne!(rendered.is_error, Some(true));
 

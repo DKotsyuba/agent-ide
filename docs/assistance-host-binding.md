@@ -336,43 +336,24 @@ mechanisms keep the session usable without the agent being told to re-activate:
   invalid `detail_ref` after a replacement appends "issued before the IDE restarted; re-read",
   and `ide.stop` of a known activation that a replacement already revoked answers success-shaped
   ("stopped (the IDE had already restarted)").
-- **Results a restart may have lost (OUTBOX-r3 §10).** A current daemon tags every reply to a
+- **Results a restart may have lost (OUTBOX-r4 §10).** A current daemon tags every reply to a
   current managed Claude front with the calling actor's tag (not only starts), so the front
   remembers, per actor, up to 16 requests it relayed without their answer (`pending`, `tests #N:
-  started`, `diagnostics: pending`); a relayed fact line, a read of the reference or a settled run
-  resolves one. The re-activation start carries the remaining subjects as `claudecode/lost` (inert
-  on older daemons); the new daemon queues one `lost-after-restart` fact for that actor, runs
-  labelled "before restart", and the re-activation reply, read only by the front, takes no facts.
+  started`, `diagnostics: pending`); a read of the reference or a settled run resolves one. The re-activation start carries the remaining subjects as `claudecode/lost` (inert
+  on older daemons); the new daemon hands Bridge one `lost-after-restart` fact for that actor, runs
+  labelled "before restart".
   Untagged daemons and Codex keep one anonymous memory.
 
-### Turn ends, holds and the idle wake (OUTBOX-r3 §8.3, §8.4, §9)
+### Compaction (OUTBOX-r4 §9.1)
 
-Three more hook phases pair with no tool call and find the actor's active binding: `stop`
-(Claude `Stop`, Codex `Stop`), `subagent_stop` (Claude `SubagentStop`) and `compaction` (Claude
-`PreCompact` and `SessionStart` with source `compact` or `clear`, Codex `PreCompact`). A
+One more hook phase pairs with no tool call and finds the actor's active binding: `compaction`
+(Claude `PreCompact` and `SessionStart` with source `compact` or `clear`, Codex `PreCompact`). A
 compaction raises the context epoch of every session on the channel; a probe on Claude 2.1.294
 and codex-cli 0.160.1 saw one `PreCompact` per compaction, naming the session only.
 
-A turn end with an undelivered requested result blocks at once; with requested work in flight it
-is held inside the hook until the first result or the earlier of 300 s and the work's budget
-end; otherwise it releases and the session counts as idle. A block continues the same turn on
-both hosts, its reason being the facts followed by the request to restate the complete final
-answer. Holds ride their own daemon lane (16 connections, 305 s on both transport ends), so the
-four-connection hook lane keeps pairing tool calls. Claude overrides the ninth consecutive block
-without a tool call and ends the turn with an empty answer, so a session's turn ends are blocked
-at most seven times in a row; any hook or MCP call resets the count.
-
-A Claude session counts as interactive only when its session-registry descriptor
-(`<config>/sessions/<pid>.json`) has kind `interactive` and an entry point that is not an `sdk`
-one: a headless `claude --print` session (agent-run's) registers as kind `interactive` with entry
-point `sdk-cli`. Only an interactive session holds a `SubagentStop`, because a headless session's
-background subagent that outlives its parent's result breaks the runner. The same rule gates the
-idle wake: a requested result for an idle, interactive main session is sent once per idle period,
-2 s after it became ready, as one user message through the session's inbox (auth frame, one user
-frame, peer proven by pid and uid). An idle session takes the frame at once and sends no receipt,
-so silence counts as delivered and is never retried. Subagents, headless sessions and Codex get
-no wake: Codex Desktop does not hand its thread pipe to the managed MCP, so the Codex cover is
-the `Stop` hold and `ide.inspect {"wait_ms": N}`.
+`Stop` and `SubagentStop` are not supported phases: IDE neither holds a turn end nor wakes an idle
+session (Bridge owns both), so a stale installed `Stop` entry exits silently without effect and
+the shipped configurations carry none.
 
 ### Stale writer takeover
 

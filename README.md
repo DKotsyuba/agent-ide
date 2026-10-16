@@ -14,6 +14,22 @@ agent-run to Codex). Go support was removed in 0.10.8; an old launcher entry for
 Tagged releases are built on GitHub Actions using an arm64 macOS runner and published
 with a SHA-256 checksum in GitHub Releases. See [docs/release.md](docs/release.md).
 
+## Agent workflow
+
+Collect related targets before making tool calls. Use bounded batches: outline paths/glob,
+symbol/graph symbols, read items, one multi-file edit (Codex patch / Claude files), test
+targets, aggregate diff paths and known inspect detail_refs. Do not issue one call per
+file, symbol or tiny hunk when the related set fits a batch. Split only for advertised
+limits or newly discovered work. Start/stop are once-only lifecycle calls per worktree.
+
+Read and plan the related changes together, apply them atomically, then run checks together.
+In Bridge mode, graph/test results arrive automatically for a qualified live host.
+Continue independent work or end the current turn; never poll, finish or stop while waiting.
+Reuse unchanged reads; force only for lost context or deliberate rereading. Native tools
+remain a fallback, and native Git diff is valid. See the shipped host skill and the
+[active tool contract](docs/contracts/tools-v0.4.md). Stock managed Codex
+CLI passive wake stays unqualified.
+
 ## Install
 
 Use the same command for a fresh installation or an update:

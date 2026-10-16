@@ -404,3 +404,40 @@ fn read_only_call_after_stop_answers_an_identity_that_admits_nothing() {
         BindingStatus::Unavailable(BindingUnavailable::InactiveBinding)
     ));
 }
+
+/// Regression guard for the removed legacy deferred-result delivery: IDE keeps no `Stop` or
+/// `SubagentStop` hold (Bridge owns wake), so neither host parser admits those phases and no
+/// shipped hook configuration registers them. Re-adding a Stop carrier fails this test.
+#[test]
+fn stop_and_subagent_stop_hooks_are_unsupported_and_unshipped() {
+    for phase in ["Stop", "SubagentStop"] {
+        let payload = json!({"hook_event_name": phase, "session_id": "actor"}).to_string();
+        assert!(
+            matches!(
+                parse_hook_event(payload.as_bytes()),
+                Err(BindingUnavailable::UnsupportedHookPhase)
+            ),
+            "codex {phase}"
+        );
+        assert!(
+            matches!(
+                parse_claude_hook_event(payload.as_bytes()),
+                Err(BindingUnavailable::UnsupportedHookPhase)
+            ),
+            "claude {phase}"
+        );
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for shipped in [
+        "hooks/hooks.json",
+        "docs/examples/codex-hooks.json",
+        "docs/examples/codex-hooks.toml",
+        "docs/examples/claude-settings.json",
+    ] {
+        let text = std::fs::read_to_string(root.join(shipped)).unwrap();
+        assert!(
+            !text.contains("Stop"),
+            "{shipped} registers a Stop-style hold hook"
+        );
+    }
+}

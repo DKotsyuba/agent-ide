@@ -1098,7 +1098,8 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
             .and_then(|line| line.split_once("; diagnostics: "))
             .map(|(_, words)| words.to_owned())
     };
-    // The first reply may be the immediate `pending` one (the check arrives as a fact); the
+    // The first reply may be the immediate `pending` one (the check stays retained and is
+    // Bridge-delivered when configured); the
     // retry then answers the settled diagnostics, which are never pending.
     let first_pending = summary(&text).is_some_and(|words| words.starts_with("pending"));
     if first_pending {
@@ -1145,10 +1146,10 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
 }
 
 /// A multi-file edit whose one project check outlasts the inline window answers at once with
-/// every file written and `diagnostics: pending`; the check then reaches the agent as exactly one
-/// `edit-checked` fact for the whole operation (session-outbox-v1 §3.3, §8.6).
+/// every file written and `diagnostics: pending`, never a whole-reply `pending`; the one
+/// `edit-checked` fact for the whole operation is Bridge's to deliver (session-outbox-v1 §3.3, §8.6).
 #[tokio::test]
-async fn slow_multi_file_edit_check_arrives_as_one_edit_checked_fact() {
+async fn slow_multi_file_edit_check_answers_at_once_with_pending_diagnostics() {
     let fixture = ProductFixture::new(json!([]));
     std::fs::write(
         fixture.root.join("src/a.rs"),
@@ -1194,29 +1195,12 @@ async fn slow_multi_file_edit_check_arrives_as_one_edit_checked_fact() {
     );
     assert_no_source_ref(&text);
     assert!(
-        text.contains(
-            "diagnostics: pending; the project check arrives by itself as an edit-checked fact"
-        ),
+        text.contains("diagnostics: pending; project check retained under"),
         "{text}"
     );
-    let checked = actor
-        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
-        .await;
-    let checked_text = batch_without_status_plate(checked["text"].as_str().unwrap_or_default());
     assert!(
-        checked_text.starts_with("edit-checked edit slow-batch: 2 files"),
-        "{checked}"
-    );
-    assert!(
-        checked_text.contains("src/lib.rs: ") && checked_text.contains("src/a.rs: "),
-        "{checked}"
-    );
-    let again = actor.call(&fixture, "ide.inspect", json!({})).await;
-    assert!(
-        again["text"]
-            .as_str()
-            .is_some_and(|text| batch_without_status_plate(text).starts_with("nothing ready yet")),
-        "the fact is handed over once: {again}"
+        text.contains("Bridge delivers it automatically when configured"),
+        "{text}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
@@ -1377,8 +1361,8 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
     let text = batch_without_status_plate(run["text"].as_str().unwrap_or_default()).to_owned();
     assert!(
         text.starts_with(
-            "tests #1: started — 5 targets in 3 runs (budget 120 s); the result arrives by itself \
-             as a test-finished fact\n"
+            "tests #1: started — 5 targets in 3 runs (budget 120 s); the result is retained under \
+             its reference; Bridge delivers it automatically when configured\n"
         ),
         "{text}"
     );

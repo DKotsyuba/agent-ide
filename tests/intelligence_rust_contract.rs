@@ -86,8 +86,9 @@ fn profile(cache_namespace: &Path) -> RustProfile {
 
 /// Creates a private Cargo project and its profile-local writable cache directories.
 /// `item` returns the given Rust type and expression; returns the project root, its `src/lib.rs`
-/// URI, and the verified absolute cache namespace prepared under that same root. The successful
-/// caller removes the root, which also reclaims the namespace.
+/// URI and a verified absolute sibling cache namespace. Keeping Cargo and provider temporary
+/// writes outside the watched worktree avoids self-generated watcher activity delaying readiness.
+/// Successful callers remove both owned directories after proving child reaping.
 fn project(label: &str, result: &str, expression: &str) -> (PathBuf, String, PathBuf) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = std::env::temp_dir().join(format!(
@@ -96,7 +97,11 @@ fn project(label: &str, result: &str, expression: &str) -> (PathBuf, String, Pat
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(root.join("src")).unwrap();
-    let cache_namespace = root.join("rust-native-v1");
+    let cache_namespace = root.with_extension("rust-native-v1");
+    assert!(
+        !cache_namespace.starts_with(&root),
+        "provider cache must not be watched as project source"
+    );
     for directory in ["cargo", "target", "tmp"] {
         fs::create_dir_all(cache_namespace.join(directory)).unwrap();
     }
@@ -544,7 +549,9 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
     );
     assert_ne!(first_cache_namespace, second_cache_namespace);
     fs::remove_dir_all(first_root).unwrap();
+    fs::remove_dir_all(first_cache_namespace).unwrap();
     fs::remove_dir_all(second_root).unwrap();
+    fs::remove_dir_all(second_cache_namespace).unwrap();
 }
 
 /// Exercises the accepted Rust settings/version/status barrier through the production Session API.
@@ -669,6 +676,7 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
         String::from_utf8_lossy(&reaped.stderr.bytes)
     );
     fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(cache_namespace).unwrap();
 }
 
 /// A relative cache namespace would resolve against the spawned child's working directory (the

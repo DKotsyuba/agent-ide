@@ -38,7 +38,7 @@ entry and never re-implement it.
 - Batch framing, per-entry isolation, ordering, reply budget, the counting of approximate and
   unavailable entries, and the follow-up of approximate or deferred entries are the batch
   contract's. The batch re-runs those entries in `precise` mode inside its own job, and the
-  follow-up fact names the batch `detail_ref` and the entry indexes (session outbox v1 §13.3). The
+  follow-up fact names the batch `detail_ref` and the entry indexes (session outbox v1 §3.2). The
   single form's follow-up is §5.
 
 ## 2. Bare names
@@ -82,7 +82,7 @@ Applies when the file's language server is loading and the language's source out
 
 - First line of the text:
   `approximate: <server> is still indexing; usages and callers below are name matches from source, marked ~`.
-  The single form appends `; the precise answer follows as a fact`.
+  The single form appends `; the precise answer is retained under its reference; Bridge delivers it automatically when configured`.
 - Symbol card:
   - heading, signature, doc and definition come from the source outline;
   - usages are every whole-word occurrence of the name in the worktree's files of that language,
@@ -102,8 +102,8 @@ Applies when the file's language server is loading and the language's source out
   - header `graph: callers of <root> (approximate, depth 1 of <d>, <n> nodes, <m> edges)`.
 - A language without an exact source outline (Python, TypeScript in this revision) never parks
   inside the call while its server starts: the entry is `deferred`. The single form answers at
-  once with the ordinary `pending` shape and its `detail_ref`; the outbox delivers the answer as
-  the generic pending `job-ready` fact (`holds_turn = true`).
+  once with the ordinary `pending` shape and its `detail_ref`; the answer stays retained and is handed to Bridge as
+  the generic pending `job-ready` fact.
 - No entry text asks the agent to poll, wait or repeat.
 
 ## 5. Precise follow-up of the single form
@@ -114,19 +114,18 @@ Applies when the file's language server is loading and the language's source out
   `precise answer not scheduled: 4 already pending for this session` and no job continues.
 - When it settles, the precise reply (or its final failure: `provider_loading` after 10 minutes,
   `provider_unavailable` when the server failed) replaces the job's retained detail and is pushed
-  as one `job-ready` fact under session outbox v1 §13.2:
+  as one `job-ready` fact under session outbox v1 §3.2:
 
 | Field | Value |
 |---|---|
 | subject | `symbol <requested>` or `graph <requested>` |
-| holds_turn | `false` |
 | source_bearing | `true` |
 | fence_paths | `[<definition file>]` |
 | detail_ref | the job's own `detail_ref` |
 | failed | `true` for a final failure |
 
 - If the approximate reply never reached a live caller (the caller's inline wait ended first and
-  it received `pending`), the job's single fact is the generic pending one (`holds_turn = true`).
+  it received `pending`), the job's single fact is the generic pending one.
   A job yields one fact either way.
 - `ide.inspect` of the `detail_ref` returns the precise answer once settled, re-proved against the
   definition file.

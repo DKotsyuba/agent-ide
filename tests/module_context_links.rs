@@ -47,33 +47,19 @@ fn page() -> String {
     )
 }
 
-/// Source or positional queries on a fresh daemon with the selected module mode.
-async fn context(mode: &str, requests: &[Value]) -> Vec<String> {
-    let fixture = fixture();
-    let env: Vec<(&str, &str)> = if mode.is_empty() {
-        Vec::new()
-    } else {
-        vec![(LANGUAGE_MODE, mode)]
-    };
-    let _daemon = Daemon::start(&fixture, &env).await;
-    let mut session = Session::start(&fixture).await;
+/// Reads a complete comparison sweep on the same warmed fixture/session. Forced source reads
+/// measure actual related-link parity instead of an unchanged-body acknowledgement.
+async fn context(fixture: &Fixture, session: &mut Session, requests: &[Value]) -> Vec<String> {
     let mut replies = Vec::new();
     for request in requests {
-        let reply = session
-            .call(
-                &fixture,
-                source_query_tool(&request.clone()),
-                request.clone(),
-            )
-            .await;
-        replies.push(line_for(
-            &fixture,
-            source_query_tool(request),
-            request,
-            &reply,
-        ));
+        let tool = source_query_tool(request);
+        let mut query = request.clone();
+        if tool == "ide.read" {
+            query["force"] = json!(true);
+        }
+        let reply = session.call(fixture, tool, query).await;
+        replies.push(line_for(fixture, tool, request, &reply));
     }
-    session.close(&fixture).await;
     replies
 }
 
@@ -91,20 +77,31 @@ fn requests(page: &str) -> Vec<Value> {
     ]
 }
 
-/// A module still starting reads `unavailable for:`; the next sweep asks again, so the block of
-/// the settled index is what is compared.
+/// Warms one real daemon/session until its related-link index settles or the existing forty
+/// second limit expires. Retries retain the warming work rather than repeatedly restarting it.
 async fn settled(mode: &str, requests: &[Value]) -> Vec<String> {
+    let fixture = fixture();
+    let env = if mode.is_empty() {
+        vec![]
+    } else {
+        vec![(LANGUAGE_MODE, mode)]
+    };
+    let _daemon = Daemon::start(&fixture, &env).await;
+    let mut session = Session::start(&fixture).await;
     let started = std::time::Instant::now();
-    loop {
-        let replies = context(mode, requests).await;
+    let replies = loop {
+        let replies = context(&fixture, &mut session, requests).await;
         if replies
             .iter()
             .all(|reply| !reply.contains("unavailable for:"))
             || started.elapsed() > std::time::Duration::from_secs(40)
         {
-            return replies;
+            break replies;
         }
-    }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    session.close(&fixture).await;
+    replies
 }
 
 /// The block lists what the file defines and links with the card's rows and labels, is the same

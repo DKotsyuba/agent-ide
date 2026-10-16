@@ -11,37 +11,44 @@ An optional top-level `bridge` object selects a protected local Bridge deploymen
 {
   "registration_socket": "/absolute/private-bridge/adapter.sock",
   "core_socket": "/absolute/private-bridge/core.sock",
-  "credential_file": "/absolute/private-bridge/producer.token"
+  "credential_file": "/absolute/private-bridge/producer.token",
+  "native_stores": [{"harness":"codex","host":"local","store":"owned-codex"}]
 }
 ```
 
-This object has no other fields. Paths must be normalized and absolute; their direct
-parents must be real owner-only directories of the current user. The credential must
-be a regular owner-only file of at most 16 KiB; symlinks are refused. Each managed
-front and daemon reads it once, without environment discovery. Socket exchanges use
-the standalone pinned Bridge SDK with a finite 1500 ms deadline and one identical
-reconnect. Missing configuration or unavailable/unsupported registration preserves
-legacy delivery. Configuration alone does not qualify a native host or enable it.
-Registration adds at most 250 ms to the call's inline wait. Capability support is
-cached for 60 seconds and failure for five; at most eight registration exchanges
-may continue behind an expired wait, producing only expiring unused routes.
+Paths must be normalized absolute paths with real owner-only current-user parents. The
+credential is a no-follow owner-only regular file, at most 16 KiB. Each process reads it
+once; there is no ambient credential discovery. SDK calls use the standalone client's finite
+five-second exchange baseline; Bridge owns the separate native handoff deadline after custody.
+`native_stores` accepts at most two unique harnesses (`codex`, `claude_code`), each with
+an explicit Bridge host/store namespace. The actor comes only from the independently
+validated IDE binding, never model arguments, cwd or parent-session guesses.
 
-Only managed Codex direct-MCP `ide.test` and `ide.edit` calls register their original
-protected host metadata. The route carries notification identity, never Workspace
-authority. Local binding, root, source, generation, cancellation and operation guards
-remain in force. Eligible completions transfer to one delivery owner before a carrier
-can take them; the Bridge body is a closed completion notice and optional owner detail
-reference, without source text or diagnostic messages. Custody is not native arrival
-or model observation. An uncertain publication never falls back to a second carrier.
-Stop/displacement retires that boot's binding scope; restart retires retained old
-intents without publishing them again. The event expiry bounds crash-only uncertainty
-when the runtime store itself was removed. Claude, nested calls, source-bearing facts
-and host observations retain their existing IDE paths.
-Failed test and edit-check facts retain the existing turn-holding delivery so a
-content-free notice cannot hide failure diagnostics or release a failing turn.
-Bridge recovery uses only the owned runtime's `state.sqlite`. A custom shared
-`AGENT_IDE_STATE_DATABASE` keeps legacy delivery because another daemon's live
-scopes cannot be treated as abandoned.
+A nonempty mapping selects Bridge-only delivery: IDE has no fallback carrier, wake or Stop hold.
+Graph always accepts a job, including cached results; tests return their run id without
+waiting for the child. Useful result/error bodies go to Bridge with Auto/KeepAll. Admission
+requires explicit direct-address, Auto, result-kind, size and delivery-scope capabilities.
+These capabilities are not a claim of an idle receiver's native wake support: that requires
+separate qualification for the actual executable/home/launch. Current Bridge stock Codex
+CLI queue acceptance does not prove passive model resumption. Do not enable a production
+cutover from a declared profile or custody receipt alone.
+
+Before possible SDK writes IDE commits immutable destination/body/sender-owner intent. Test
+facts deduplicate by run; independent graph jobs include their result reference. Unknown
+outcomes never create another send or carrier. Stop/displacement retires the boot/binding
+scope; restart retires only retained intents belonging to the same service/credential owner.
+A mismatched owner disables recovery instead of silently rehoming possible effects. Custody
+is not model observation and does not consume the saved domain result.
+
+Source-bearing bodies recheck current workspace/binding, no-follow source bytes and recorded
+path disclosure before publication; superseded results carry an explicit terminal outcome.
+Bridge does not grant IDE source access. Results describe the captured source revision, not
+an assurance that source will remain current until eventual receipt.
+
+Empty/omitted `native_stores` configures no Bridge delivery: IDE has no fallback carrier, so
+results of deferred work stay retained under their `detail_ref` and are read explicitly with
+`ide.inspect`.
+No global profile, installed service or operator grant is changed by building the candidate.
 
 The IDE's only path policy is the top-level `allowed_roots` list: `ide.start` admits its working
 directory (the optional `root` parameter, else the target `candidate`), the discovered Git

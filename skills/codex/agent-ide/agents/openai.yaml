@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent IDE"
-  short_description: "Language-server-backed ide.* tools for reading, editing and testing source"
-  default_prompt: "Use $agent-ide: ide.start, then find an address with ide.outline or ide.symbol, read it with ide.read, change it with ide.edit, run ide.test, review with ide.diff, and end with ide.stop."
+  short_description: "Batch source discovery, reads, atomic multi-file edits and checks"
+  default_prompt: "Use $agent-ide. Start once; collect related targets, batch outline paths and symbol/graph roots, read items together, apply one multi-file edit, launch test targets together and inspect known detail_refs as a batch only when needed. Use diff paths once for aggregate review. Reuse unchanged code. In Bridge mode, end an idle turn for automatic completion; never poll or finish/stop while waiting. Stop once at task end."

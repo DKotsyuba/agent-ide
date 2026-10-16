@@ -1,14 +1,14 @@
-//! Worker-side wiring of the session outbox (OUTBOX-r3 §2-§3, §6, §12).
+//! Worker-side production of completion facts for Bridge-only delivery (OUTBOX-r3 §2-§3, §12).
 //!
 //! The worker's `Shared` state is the daemon's
 //! [`SessionOutbox`](crate::assistance::outbox::SessionOutbox): it owns the in-memory
-//! [`Outbox`](crate::assistance::session_outbox::Outbox) store and adds what only the worker knows,
+//! [`Outbox`](crate::assistance::session_outbox::Outbox) ledger and adds what only the worker knows,
 //! the job ledger behind `defer`, the test-run registry behind `test-finished` facts, and the
-//! translation of settled replies into `job-ready` fact drafts. Everything here is synchronous
-//! bookkeeping under short locks, except the idle wake, which runs detached after its grace;
-//! nothing awaits while a lock is held.
+//! translation of settled replies into fact drafts that are transferred to Bridge. Everything here
+//! is synchronous bookkeeping under short locks, except the detached Bridge publication; nothing
+//! awaits while a lock is held.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -16,33 +16,20 @@ use super::super::{
     content::{self, Envelope},
     facade::AssistanceTool,
     host_binding::BindingRef,
-    outbox::Carrier,
     outbox::FencedPath,
     outbox::{
-        DeferSpec, FactDraft, FactKind, HandoffRequest, JobEpoch, MAX_FACT_BYTES,
-        MAX_SUBJECT_BYTES, MAX_SUMMARY_BYTES, MAX_TARGET_BYTES, Reservation, SessionOutbox,
+        DeferSpec, FactDraft, FactKind, JobEpoch, MAX_FACT_BYTES, MAX_SUBJECT_BYTES,
+        MAX_SUMMARY_BYTES, MAX_TARGET_BYTES, SessionOutbox,
     },
     reply::{EditDiagnostics, PeerReply, ResultKind},
-    session_outbox::{AgentState, Outbox, compose_block, render_fact},
     test_fact::terminal_fact,
-    tests::{RunResult, TestRuns, summary_absent},
-    wake::{MAX_WAKE_BYTES, SessionWaker, WakeOutcome, WakeTarget},
+    tests::{RunResult, summary_absent},
 };
 use super::{Job, JobStage, Shared, Worker, edit_operation};
 use crate::changes::edit::EditResult;
 
-/// Slack added to a run's budget before its holding registration expires: settlement, output
-/// draining and the settle hook itself.
-const RUN_SETTLE_SLACK: Duration = Duration::from_secs(5);
 /// Most diagnostic `new:` lines one `edit-checked` fact carries (OUTBOX §3.3).
 const MAX_NEW_LINES: usize = 8;
-/// How long a holding fact waits before an idle session is woken, so an imminent hook takes it
-/// instead (OUTBOX §8.4).
-const WAKE_GRACE: Duration = Duration::from_secs(2);
-/// The sentence that ends every wake message (OUTBOX §8.4).
-const WAKE_TAIL: &str = "Results you requested from Agent IDE arrived while you were idle.";
-/// Room in a wake message for the envelope tags and the overflow line around the facts.
-const WAKE_FRAME: usize = 96;
 
 /// Returns the fact subject of test run `id`: `tests #N`, the handle every `ide.test` line names.
 pub(super) fn test_subject(id: u64) -> String {
@@ -84,13 +71,13 @@ pub(super) fn call_target(tool: AssistanceTool, parameters: &Value) -> String {
 }
 
 /// What one call's reply leaves owed to its caller (OUTBOX §2: the request got no answer for
-/// this subject): the fact kind and subject that will answer it, and the reference that reads it
+/// this subject): the subject of the fact that will answer it, and the reference that reads it
 /// back. `None` when the reply answered the call.
 pub(crate) fn owed_fact(
     tool: AssistanceTool,
     parameters: &Value,
     reply: &PeerReply,
-) -> Option<(FactKind, String, Option<String>)> {
+) -> Option<(String, Option<String>)> {
     match reply {
         PeerReply::Pending { detail_ref }
             if !matches!(tool, AssistanceTool::Start | AssistanceTool::Stop)
@@ -98,7 +85,6 @@ pub(crate) fn owed_fact(
         {
             let subject = format!("{} {}", tool.mcp_name(), call_target(tool, parameters));
             Some((
-                FactKind::JobReady,
                 bounded(&subject, MAX_SUBJECT_BYTES, false),
                 Some(detail_ref.clone()),
             ))
@@ -108,7 +94,6 @@ pub(crate) fn owed_fact(
             diagnostics: EditDiagnostics::Pending { detail_ref },
             ..
         } if tool == AssistanceTool::Edit => Some((
-            FactKind::EditChecked,
             bounded(
                 &format!("edit {}", result.operation_id),
                 MAX_SUBJECT_BYTES,
@@ -117,11 +102,30 @@ pub(crate) fn owed_fact(
             Some(detail_ref.clone()),
         )),
         PeerReply::Complete {
+            kind: ResultKind::Graph,
+            text,
+            detail_ref: Some(reference),
+            ..
+        } if tool == AssistanceTool::Graph && text.starts_with("graph job ") => Some((
+            bounded(
+                &format!("ide.graph {}", call_target(tool, parameters)),
+                MAX_SUBJECT_BYTES,
+                false,
+            ),
+            Some(reference.clone()),
+        )),
+        PeerReply::Complete {
             kind: ResultKind::Test,
             text,
             ..
         } if tool == AssistanceTool::Test => match run_line(text) {
-            Some((id, "started")) => Some((FactKind::TestFinished, test_subject(id), None)),
+            Some((id, "started")) => Some((
+                test_subject(id),
+                match reply {
+                    PeerReply::Complete { detail_ref, .. } => detail_ref.clone(),
+                    _ => None,
+                },
+            )),
             _ => None,
         },
         _ => None,
@@ -192,13 +196,12 @@ fn lost_fact(subjects: &[String]) -> Option<FactDraft> {
         detail: None,
         detail_ref: None,
         failed: false,
-        holds_turn: false,
         source_bearing: false,
         fence_paths: Vec::new(),
     })
 }
 
-/// Whether a job's answer is source-derived and must never ride a hook carrier.
+/// Whether a job's answer is source-derived and needs source-access proof before it is published.
 /// Inspect jobs are diagnostic/problem queries; ordinary detail retrieval creates no job.
 fn source_bearing(tool: AssistanceTool) -> bool {
     matches!(
@@ -259,10 +262,57 @@ fn job_fact(reference: &str, reply: &PeerReply, spec: &DeferSpec) -> FactDraft {
         detail,
         detail_ref: Some(reference.to_owned()),
         failed,
-        holds_turn: !spec.approximate_given,
         source_bearing: bearing && !failed,
         fence_paths: spec.fence_paths.clone(),
     }
+}
+
+/// Builds the useful deferred body for Bridge after local job authorization. A changed observed
+/// source epoch yields an explicit terminal superseded result with no obsolete source body.
+/// The public graph page is already bounded by the normal renderer; large continuations remain
+/// explicit. This is domain result composition, not a transport queue or freshness grant.
+fn bridge_job_fact(
+    reference: &str,
+    reply: &PeerReply,
+    spec: &DeferSpec,
+    captured: JobEpoch,
+    current: JobEpoch,
+) -> FactDraft {
+    let mut fact = job_fact(reference, reply, spec);
+    if fact.source_bearing && captured != current {
+        fact.summary = "superseded: source changed during computation".into();
+        fact.detail = Some(format!(
+            "result_ref: {reference}; captured source is not current"
+        ));
+        fact.failed = true;
+        fact.source_bearing = false;
+        return fact;
+    }
+    if fact.source_bearing {
+        let text = compact_text(reply).unwrap_or_else(|| "result unavailable".into());
+        let mut lines = text.lines();
+        fact.summary = bounded(
+            lines.next().unwrap_or("result unavailable"),
+            MAX_SUMMARY_BYTES,
+            false,
+        );
+        let rest = lines.collect::<Vec<_>>().join("\n");
+        let ceiling = 6 * 1024 - fact.summary.len() - reference.len() - 128;
+        let mut detail = bounded(&rest, ceiling, true);
+        if rest.len() > detail.len() {
+            detail.push_str(&format!(
+                "\npartial: bounded result; continue with {} {}",
+                spec.tool.mcp_name(),
+                serde_json::json!({"detail_ref":reference})
+            ));
+        }
+        detail.push_str(&format!(
+            "\nresult_ref: {reference}; source epoch {}/{}",
+            captured.native_epoch, captured.edit_seq
+        ));
+        fact.detail = Some(detail);
+    }
+    fact
 }
 
 /// Builds the `test-finished` draft of settled run `id` for one recipient.
@@ -281,7 +331,6 @@ fn test_fact(id: u64, result: &RunResult, owns_detail: bool) -> FactDraft {
             || result.stopped
             || result.exit != Some(0)
             || summary_absent(result),
-        holds_turn: true,
         source_bearing: false,
         fence_paths: Vec::new(),
     }
@@ -290,7 +339,7 @@ fn test_fact(id: u64, result: &RunResult, owns_detail: bool) -> FactDraft {
 /// Builds the `edit-checked` draft of one single-file edit's project check (OUTBOX §3.3).
 ///
 /// Reported diagnostics become at most eight `new:` lines under the counts summary; the fact is
-/// never source-bearing, so every carrier keeps them. `reference` is the edit job's own result
+/// never source-bearing. `reference` is the edit job's own result
 /// reference: reading it delivers the fact.
 fn edit_checked_fact(
     reference: &str,
@@ -355,9 +404,7 @@ fn edit_checked_fact(
         detail,
         detail_ref: Some(reference.to_owned()),
         failed,
-        holds_turn: true,
-        // Diagnostics name the file and the problem, never its source text (OUTBOX §2), so the
-        // `new:` lines ride every carrier, hooks, the Stop hold and the wake included.
+        // Diagnostics name the file and the problem, never its source text (OUTBOX §2).
         source_bearing: false,
         fence_paths: vec![FencedPath {
             path: result.path.clone(),
@@ -370,16 +417,13 @@ impl Worker<'_> {
     /// Answers an edit whose project check is still running with `diagnostics: pending` at once,
     /// right after the write is observed, without waiting for the check (symbol-read-edit-v1 §3.3).
     ///
-    /// Only a caller still waiting is answered, and only when the session's outbox can hold the
+    /// Only a caller still waiting is answered, and only when the session ledger can track the
     /// check as in-flight work under the job's reference: the job stays parked on its check and
-    /// its settlement pushes one `edit-checked` fact ([`Shared::job_settled`]). The write is
-    /// counted for staleness before the registration, so the fact never labels its own edit.
+    /// its settlement hands one `edit-checked` fact to Bridge ([`Shared::job_settled`]). The write
+    /// is counted before the registration, so the fact's fence epoch includes its own edit.
     pub(super) fn reply_edit_early(&self, job: &mut Job, stage: &JobStage) {
         // A multi-file edit answers early through its own path (`batch_edit`).
-        let JobStage::EditAwaitingCheck {
-            result, deadline, ..
-        } = stage
-        else {
+        let JobStage::EditAwaitingCheck { result, .. } = stage else {
             return;
         };
         let waiting = job
@@ -391,16 +435,9 @@ impl Worker<'_> {
             return;
         }
         if result.outcome.has_post_source() {
-            self.shared
-                .outbox
-                .note_edit(&binding, std::slice::from_ref(&result.path));
+            self.shared.outbox.note_edit(&binding);
         }
-        let subject = format!("edit {}", result.operation_id);
-        if !self
-            .shared
-            .outbox
-            .begin_holding(&job.reference, &binding, &subject, *deadline)
-        {
+        if !self.shared.outbox.begin_work(&job.reference, &binding) {
             return;
         }
         let reply = PeerReply::Edit {
@@ -417,19 +454,24 @@ impl Worker<'_> {
         if let Some(sender) = job.stop_reply.take()
             && sender.send(reply).is_err()
         {
-            let _ = self.shared.outbox.take_holding(&job.reference);
+            let _ = self.shared.outbox.take_work(&job.reference);
         }
     }
 }
 
 impl SessionOutbox for Shared {
-    /// Queues the draft for every open recipient session (the store's validation applies).
-    fn push(&self, recipients: &[BindingRef], draft: FactDraft, epoch: JobEpoch) -> bool {
-        self.outbox.push_draft(recipients, draft, epoch)
+    /// Hands the draft to Bridge for each recipient; nothing else carries it. Returns `true` only
+    /// when at least one recipient reserved Bridge capacity and its local handoff task was
+    /// spawned, never as evidence of native observation.
+    fn push(&self, recipients: &[BindingRef], draft: FactDraft, _epoch: JobEpoch) -> bool {
+        if draft.validate().is_err() {
+            return false;
+        }
+        self.push_or_transfer(recipients, draft)
     }
 
-    /// Registers a pending job for its `job-ready` fact, or pushes the fact at once when the job
-    /// already settled unread. The ledger lock is held across the pending check and the
+    /// Registers a pending job for its `job-ready` fact, or hands the fact to Bridge at once when
+    /// the job already settled unread. The ledger lock is held across the pending check and the
     /// registration, so a concurrent settlement either sees the registration or is seen here.
     fn defer(&self, reference: &str, spec: DeferSpec) -> bool {
         if spec.validate().is_err() {
@@ -456,14 +498,6 @@ impl SessionOutbox for Shared {
             ledger
                 .deferred
                 .insert(reference.to_owned(), (spec.clone(), epoch));
-            // Registered before the ledger is released: a settlement waits for the ledger, so it
-            // always finds and takes this registration (ledger before outbox, as everywhere).
-            if !spec.approximate_given {
-                let until = tokio::time::Instant::now()
-                    + Duration::from_millis(self.launcher.limits.operation_ms);
-                self.outbox
-                    .begin_holding(reference, &owner, &spec.subject(), until);
-            }
             drop(ledger);
             #[cfg(test)]
             tests::DEFER_GAP.with(|gap| {
@@ -475,11 +509,18 @@ impl SessionOutbox for Shared {
         }
         let reply = detail.reply.clone();
         drop(ledger);
-        self.outbox
-            .push_draft(&[owner], job_fact(reference, &reply, &spec), epoch)
+        let draft = bridge_job_fact(
+            reference,
+            &reply,
+            &spec,
+            epoch,
+            self.outbox.current_epoch(&owner),
+        );
+        self.push_or_transfer(&[owner], draft);
+        true
     }
 
-    /// Drops the session's facts, holds and deferrals silently.
+    /// Drops the session's in-flight registrations and deferrals silently.
     fn forget(&self, binding: &BindingRef) {
         if let Ok(mut ledger) = self.ledger.lock() {
             let owned = ledger
@@ -497,125 +538,70 @@ impl SessionOutbox for Shared {
 
     /// The session's compaction counter.
     fn context_epoch(&self, binding: &BindingRef) -> Option<u64> {
-        self.outbox.session_context_epoch(binding)
+        self.current_context_epoch(binding)
     }
-
-    /// Reserves facts for a carrier.
-    fn reserve(&self, binding: &BindingRef, request: HandoffRequest) -> Option<Reservation> {
-        self.outbox.reserve_facts(binding, request)
-    }
-
-    /// Commits a reservation and marks the owner's settled test runs among it collected.
-    fn commit(&self, binding: &BindingRef, token: u64) -> usize {
-        commit_collected(&self.outbox, &self.test_runs, binding, token)
-    }
-
-    /// Releases a reservation unchanged.
-    fn release(&self, binding: &BindingRef, token: u64) {
-        self.outbox.release_reservation(binding, token);
-    }
-}
-
-/// Commits reservation `token` of `binding` and marks the owner's settled test runs among it
-/// collected; returns the number of facts delivered.
-fn commit_collected(
-    outbox: &Outbox,
-    test_runs: &TestRuns,
-    binding: &BindingRef,
-    token: u64,
-) -> usize {
-    let committed = outbox.commit_taken(binding, token);
-    for (kind, subject) in &committed {
-        if *kind == FactKind::TestFinished
-            && let Some(id) = subject
-                .strip_prefix("tests #")
-                .and_then(|id| id.parse::<u64>().ok())
-        {
-            test_runs.mark_observed(id, &binding.fingerprint());
-        }
-    }
-    committed.len()
-}
-
-/// Wakes `binding`'s idle host session with its holding facts as one user message (OUTBOX §8.4).
-///
-/// At most one attempt per idle period: the session must be idle, unwoken since it last worked,
-/// and hold an undelivered holding fact. Only holding facts ride the wake, never source text. An
-/// accepted or ambiguous wake delivers them; a refused or unavailable one returns them unchanged.
-/// Returns `None` when no wake was attempted.
-async fn wake_session(
-    outbox: &Outbox,
-    test_runs: &TestRuns,
-    waker: &dyn SessionWaker,
-    binding: &BindingRef,
-) -> Option<WakeOutcome> {
-    let session_id = outbox.claim_wake(binding)?;
-    let Some(reservation) = outbox.reserve_facts(
-        binding,
-        HandoffRequest {
-            carrier: Carrier::Wake,
-            budget: MAX_WAKE_BYTES - WAKE_TAIL.len() - WAKE_FRAME,
-            holding_only: true,
-        },
-    ) else {
-        // Another carrier took the fact meanwhile: no wake was sent, so none is spent.
-        outbox.unclaim_wake(binding);
-        return None;
-    };
-    let lines = reservation
-        .facts
-        .iter()
-        .map(render_fact)
-        .collect::<Vec<_>>();
-    let text = compose_block(None, &lines, reservation.remaining)
-        .map(|block| format!("{block}\n{WAKE_TAIL}"))
-        .filter(|text| text.len() <= MAX_WAKE_BYTES);
-    let target = WakeTarget {
-        host: binding.host(),
-        actor_is_main: binding.actor_is(&session_id),
-        session_id,
-    };
-    let outcome = match &text {
-        Some(text) => waker.wake(&target, text).await,
-        None => WakeOutcome::Refused,
-    };
-    if matches!(outcome, WakeOutcome::Accepted | WakeOutcome::Ambiguous) {
-        commit_collected(outbox, test_runs, binding, reservation.token);
-    } else {
-        outbox.release_reservation(binding, reservation.token);
-    }
-    Some(outcome)
 }
 
 impl Shared {
-    /// Transfers eligible content-free completions to exactly one delivery owner.
-    /// Legacy receives only unreserved or positively unsent events. Source-bearing facts
-    /// keep existing currency checks and carriers. A retired binding emits nothing.
-    fn push_or_transfer(&self, recipients: &[BindingRef], draft: FactDraft, epoch: JobEpoch) {
+    /// Transfers one completion fact to Bridge, the only delivery owner, for each recipient.
+    ///
+    /// A recipient without a reserved Bridge route is skipped: the domain result stays retained
+    /// under its reference and nothing else delivers it. A fact that carries source or names an
+    /// authority is re-proved on the detached task right before publication and is replaced by an
+    /// explicit superseded result when access or freshness changed. A retired binding emits
+    /// nothing. Returns whether at least one local Bridge handoff was reserved and spawned; an
+    /// accepted or uncertain async publication is never retried through another carrier.
+    pub(super) fn push_or_transfer(&self, recipients: &[BindingRef], draft: FactDraft) -> bool {
         let bridge = self.bridge.lock().ok().and_then(|bridge| bridge.clone());
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let mut handed_off = false;
         for binding in recipients {
             let reserved = bridge
                 .as_ref()
                 .and_then(|bridge| bridge.reserve(binding, &draft));
             let Some((route, permit)) = reserved else {
-                self.outbox
-                    .push_draft(std::slice::from_ref(binding), draft.clone(), epoch);
-                self.schedule_wake(std::slice::from_ref(binding));
+                if self.direct_delivery() {
+                    crate::errorlog::record(
+                        crate::errorlog::Method::Daemon,
+                        crate::errorlog::Outcome::Failed,
+                        crate::errorlog::Fields {
+                            detail: Some("bridge:handoff_unavailable; domain result retained"),
+                            ..Default::default()
+                        },
+                    );
+                }
                 continue;
             };
-            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-                self.outbox
-                    .push_draft(std::slice::from_ref(binding), draft.clone(), epoch);
-                self.schedule_wake(std::slice::from_ref(binding));
-                continue;
+            let source_proof = if draft.source_bearing || draft.detail.is_some() {
+                draft.detail_ref.as_ref().and_then(|reference| {
+                    self.ledger.lock().ok().and_then(|ledger| {
+                        ledger
+                            .details
+                            .get(reference)
+                            .filter(|detail| &detail.binding == binding)
+                            .map(|detail| {
+                                (
+                                    detail.authority.clone(),
+                                    detail.source.clone(),
+                                    detail.diff_provenance.clone(),
+                                )
+                            })
+                    })
+                })
+            } else {
+                None
             };
+            let workspace = self
+                .publication_workspace
+                .lock()
+                .ok()
+                .and_then(|owner| owner.clone());
             let bridge = Arc::clone(bridge.as_ref().expect("reserved owner"));
             let bindings = Arc::clone(&self.bindings);
             let binding = binding.clone();
-            let draft = draft.clone();
-            let outbox = Arc::clone(&self.outbox);
-            let waker = Arc::clone(&self.waker);
-            let tests = self.test_runs.clone();
+            let mut draft = draft.clone();
             runtime.spawn(async move {
                 let _permit = permit;
                 if !bindings
@@ -626,19 +612,46 @@ impl Shared {
                     bridge.end_scope(&binding);
                     return;
                 }
-                if !bridge.publish(binding.clone(), &draft, route).await
-                    && bindings
-                        .lock()
-                        .ok()
-                        .is_some_and(|guard| guard.check_active(&binding).is_ok())
-                {
-                    outbox.push_draft(std::slice::from_ref(&binding), draft, epoch);
-                    tokio::time::sleep(WAKE_GRACE).await;
-                    let _ = wake_session(&outbox, &tests, waker.as_ref(), &binding).await;
+                // Source-bearing data always needs proof. Source-free lifecycle/error facts
+                // without an authority retain the already checked active-binding boundary.
+                let has_authority = source_proof
+                    .as_ref()
+                    .is_some_and(|(authority, _, _)| authority.is_some());
+                if draft.source_bearing || has_authority {
+                    let permitted =
+                        if let (Some(workspace), Some((Some(authority), source, paths))) =
+                            (workspace, source_proof)
+                        {
+                            super::reprove_disclosure(
+                                &workspace,
+                                &bindings,
+                                &binding,
+                                Some(&authority),
+                                source.as_ref(),
+                                paths.as_ref(),
+                            )
+                            .await
+                            .is_ok()
+                        } else {
+                            false
+                        };
+                    if !permitted {
+                        draft.summary = "superseded: source access or freshness changed".into();
+                        draft.detail = Some(
+                            "No obsolete source body was disclosed; result requires a fresh query."
+                                .into(),
+                        );
+                        draft.failed = true;
+                        draft.source_bearing = false;
+                    }
                 }
+                bridge.publish(binding.clone(), &draft, route).await;
             });
+            handed_off = true;
         }
+        handed_off
     }
+
     /// Records the session state the job behind `reference` started from, once: the epoch its
     /// `job-ready` fact is fenced at (OUTBOX §3.1). Records of results no longer retained go.
     pub(super) fn note_job_started(&self, reference: &str, binding: &BindingRef) {
@@ -654,44 +667,22 @@ impl Shared {
         }
     }
 
-    /// Schedules the idle wake (OUTBOX §8.4) of each of `recipients` whose agent is idle; the
-    /// attempt runs after [`WAKE_GRACE`] and re-checks every condition then.
-    pub(super) fn schedule_wake(&self, recipients: &[BindingRef]) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        for binding in recipients {
-            if self.outbox.agent_state(binding) != Some(AgentState::Idle) {
-                continue;
-            }
-            let outbox = Arc::clone(&self.outbox);
-            let test_runs = self.test_runs.clone();
-            let waker = Arc::clone(&self.waker);
-            let binding = binding.clone();
-            runtime.spawn(async move {
-                tokio::time::sleep(WAKE_GRACE).await;
-                let _ = wake_session(&outbox, &test_runs, waker.as_ref(), &binding).await;
-            });
-        }
-    }
-
     /// Defers the job behind `reference` after its caller left with `pending` (the inline-wait
-    /// timeout): its final answer becomes a holding `job-ready` fact.
+    /// timeout): its final answer becomes a `job-ready` fact handed to Bridge.
     pub(super) fn defer_pending(&self, reference: &str, tool: AssistanceTool, target: String) {
         let spec = DeferSpec {
             tool,
             target,
             fence_paths: Vec::new(),
-            approximate_given: false,
         };
         let _ = SessionOutbox::defer(self, reference, spec);
     }
 
-    /// Settles the outbox side of a job: a written edit advances the owner's edit counter, and a
-    /// deferred job's final reply becomes its `job-ready` fact.
+    /// Settles the ledger side of a job: a written edit advances the owner's edit counter, and a
+    /// deferred job's final reply becomes its `job-ready` fact for Bridge.
     ///
-    /// An edit already answered early with `diagnostics: pending` (its holding registration is
-    /// keyed by the job's reference) pushes its `edit-checked` fact instead, and its write was
+    /// An edit already answered early with `diagnostics: pending` (its in-flight registration is
+    /// keyed by the job's reference) hands its `edit-checked` fact over instead, and its write was
     /// already counted when it was answered.
     pub(super) fn job_settled(
         &self,
@@ -700,21 +691,22 @@ impl Shared {
         reply: &PeerReply,
         deferred: Option<(DeferSpec, JobEpoch)>,
     ) {
-        let held = self.outbox.take_holding(reference);
+        let held = self.outbox.take_work(reference);
         if let PeerReply::Edit { result, .. } = reply
             && result.outcome.has_post_source()
             && (held.is_none() || deferred.is_some())
         {
-            self.outbox
-                .note_edit(owner, std::slice::from_ref(&result.path));
+            self.outbox.note_edit(owner);
         }
         if let Some((spec, epoch)) = deferred {
-            self.outbox.push_draft(
-                std::slice::from_ref(owner),
-                job_fact(reference, reply, &spec),
+            let draft = bridge_job_fact(
+                reference,
+                reply,
+                &spec,
                 epoch,
+                self.outbox.current_epoch(owner),
             );
-            self.schedule_wake(std::slice::from_ref(owner));
+            self.push_or_transfer(std::slice::from_ref(owner), draft);
             return;
         }
         if let (
@@ -729,34 +721,27 @@ impl Shared {
             self.push_or_transfer(
                 std::slice::from_ref(&work.owner),
                 edit_checked_fact(reference, result, diagnostics),
-                work.epoch,
             );
         }
     }
 
-    /// The job behind `reference` reached `binding` through its own reference: its deferral ends
-    /// and any pushed fact for it is delivered.
-    pub(super) fn reference_read(&self, binding: &BindingRef, reference: &str) {
+    /// The job behind `reference` reached `binding` through its own reference: its deferral ends.
+    pub(super) fn reference_read(&self, reference: &str) {
         let deferred = self
             .ledger
             .lock()
             .ok()
             .and_then(|mut ledger| ledger.deferred.remove(reference));
         if deferred.is_some() {
-            let _ = self.outbox.take_holding(reference);
+            let _ = self.outbox.take_work(reference);
         }
-        self.outbox.mark_reference_read(binding, reference);
     }
 
-    /// Registers run `id`, whose caller left with a started line, as holding work of `binding`
-    /// until its budget ends; a run that already settled pushes its fact at once.
-    pub(super) fn test_started(&self, id: u64, binding: &BindingRef, budget: Duration) {
+    /// Registers run `id`, whose caller left with a started line, as in-flight work of `binding`;
+    /// a run that already settled hands its fact over at once.
+    pub(super) fn test_started(&self, id: u64, binding: &BindingRef) {
         let subject = test_subject(id);
-        let until = tokio::time::Instant::now() + budget + RUN_SETTLE_SLACK;
-        if self
-            .outbox
-            .begin_holding(&subject, binding, &subject, until)
-            && self.test_runs.settled_result(id).is_some()
+        if self.outbox.begin_work(&subject, binding) && self.test_runs.settled_result(id).is_some()
         {
             self.test_settled(id);
         }
@@ -767,22 +752,22 @@ impl Shared {
         let _ = self.outbox.subscribe(&test_subject(id), binding);
     }
 
-    /// Pushes settled run `id`'s `test-finished` fact to its owner and subscribers, exactly once:
-    /// only the call that takes the run's holding registration pushes.
+    /// Hands settled run `id`'s `test-finished` fact to Bridge for its owner and subscribers,
+    /// exactly once: only the call that takes the run's in-flight registration hands it over.
     pub(super) fn test_settled(&self, id: u64) {
         let Some(result) = self.test_runs.settled_result(id) else {
             return;
         };
-        let Some(work) = self.outbox.take_holding(&test_subject(id)) else {
+        let Some(work) = self.outbox.take_work(&test_subject(id)) else {
             return;
         };
+        self.retain_test_output(id, &work.owner, &result);
         self.push_or_transfer(
             std::slice::from_ref(&work.owner),
             test_fact(id, &result, true),
-            work.epoch,
         );
         if !work.subscribers.is_empty() {
-            self.push_or_transfer(&work.subscribers, test_fact(id, &result, false), work.epoch);
+            self.push_or_transfer(&work.subscribers, test_fact(id, &result, false));
         }
     }
 
@@ -800,7 +785,7 @@ impl Shared {
 
 impl super::WorkerHandle {
     /// Associates a same-call Bridge route only after local managed Codex admission.
-    /// Cross-actor/call/malformed tickets are ignored and leave legacy delivery intact.
+    /// Cross-actor/call/malformed tickets are ignored and associate no route.
     pub(crate) fn note_bridge_route(&self, binding: &BindingRef, call: &str, value: &Value) {
         let Some(ticket) = super::super::bridge::RouteTicket::from_private(value, binding, call)
         else {
@@ -824,24 +809,49 @@ impl super::WorkerHandle {
             bridge.note_route(binding, ticket);
         }
     }
-    /// Queues the one `lost-after-restart` fact of `binding`, just re-activated after a daemon
-    /// replacement, for the `subjects` its front relayed unresolved (OUTBOX §10). A later
-    /// re-activation with the same list replaces it (coalescing on the fixed subject).
-    pub fn queue_lost(&self, binding: &BindingRef, subjects: &[String]) {
-        if let Some(draft) = lost_fact(subjects) {
-            let outbox = &self.shared.outbox;
-            outbox.push_draft(
-                std::slice::from_ref(binding),
-                draft,
-                outbox.current_epoch(binding),
-            );
+    /// Publishes the one `lost-after-restart` fact of `binding`, just re-activated after a daemon
+    /// replacement, for the `subjects` its front relayed unresolved (OUTBOX §10).
+    ///
+    /// Unlike ordinary retained result facts, the restart notice has no readable `detail_ref`, so
+    /// this path awaits Bridge's bounded publication result. Returns `true` only for accepted or
+    /// uncertain custody, which must never be retried; a missing reservation, retired binding or
+    /// definite no-effect refusal returns `false` so the front retains the subjects for a later
+    /// eligible restart. No Bridge or binding lock is held across the await.
+    pub async fn queue_lost(&self, binding: &BindingRef, subjects: &[String]) -> bool {
+        let Some(draft) = lost_fact(subjects) else {
+            return false;
+        };
+        let Some(bridge) = self
+            .shared
+            .bridge
+            .lock()
+            .ok()
+            .and_then(|bridge| bridge.clone())
+        else {
+            return false;
+        };
+        let Some((route, permit)) = bridge.reserve(binding, &draft) else {
+            return false;
+        };
+        let active = self
+            .shared
+            .bindings
+            .lock()
+            .ok()
+            .is_some_and(|guard| guard.check_active(binding).is_ok());
+        if !active {
+            bridge.end_scope(binding);
+            return false;
         }
+        let _permit = permit;
+        bridge.publish(binding.clone(), &draft, route).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     thread_local! {
         /// Test seam: runs on the calling thread right after `defer` released the ledger, the
@@ -891,6 +901,7 @@ mod tests {
             output_paged: false,
             elapsed: Duration::from_secs(3),
             stopped: false,
+            cancelled: false,
             exit: Some(101),
             budget: Duration::from_secs(120),
             detail_ref: "run-detail".to_owned(),
@@ -901,10 +912,10 @@ mod tests {
         };
         let owner = test_fact(7, &result, true);
         let expected = terminal_fact(7, &result, true);
-        assert_eq!(owner.summary, "2 passed, 1 failed, 3 s");
+        assert_eq!(owner.summary, "2 passed, 1 failed, 3 s (exit 101)");
         assert_eq!(owner.detail.as_deref(), Some(expected.detail.as_str()));
         assert_eq!(owner.subject, "tests #7");
-        assert!(owner.failed && owner.holds_turn && !owner.source_bearing);
+        assert!(owner.failed && !owner.source_bearing);
         assert_eq!(owner.detail_ref.as_deref(), Some("run-detail"));
         assert_eq!(owner.validate(), Ok(()));
         assert_eq!(
@@ -934,6 +945,7 @@ mod tests {
             output_paged: false,
             elapsed: Duration::from_secs(1),
             stopped: false,
+            cancelled: false,
             exit: Some(0),
             budget: Duration::from_secs(120),
             detail_ref: "run-detail".to_owned(),
@@ -957,7 +969,6 @@ mod tests {
             tool: AssistanceTool::Symbol,
             target: "src/a.rs#Foo".to_owned(),
             fence_paths: Vec::new(),
-            approximate_given: false,
         };
         let ready = PeerReply::Complete {
             kind: super::super::super::reply::ResultKind::Context,
@@ -969,7 +980,7 @@ mod tests {
         let fact = job_fact("r-1", &ready, &spec);
         assert_eq!(fact.summary, "ready");
         assert_eq!(fact.detail, None);
-        assert!(fact.source_bearing && fact.holds_turn && !fact.failed);
+        assert!(fact.source_bearing && !fact.failed);
         assert_eq!(fact.subject, "ide.symbol src/a.rs#Foo");
         assert_eq!(fact.validate(), Ok(()));
         let failed = PeerReply::Error {
@@ -994,10 +1005,8 @@ mod tests {
             tool: AssistanceTool::Symbol,
             target: call_target(AssistanceTool::Symbol, &symbol),
             fence_paths: Vec::new(),
-            approximate_given: false,
         };
-        let Some((FactKind::JobReady, subject, Some(reference))) =
-            owed_fact(AssistanceTool::Symbol, &symbol, &pending)
+        let Some((subject, Some(reference))) = owed_fact(AssistanceTool::Symbol, &symbol, &pending)
         else {
             panic!("a pending answer owes a job-ready fact")
         };
@@ -1017,7 +1026,7 @@ mod tests {
                 &Value::Null,
                 &line("tests #4: started — cargo test (budget 60 s)")
             ),
-            Some((FactKind::TestFinished, "tests #4".to_owned(), None))
+            Some(("tests #4".to_owned(), None))
         );
         assert_eq!(
             owed_fact(
@@ -1031,8 +1040,8 @@ mod tests {
         assert_eq!(settled_run(&line("tests #4: 3 passed, 2 s")), Some(4));
     }
 
-    /// The restart fact lists every subject, labels runs, fits its summary bound and never holds
-    /// a turn; nothing to report queues nothing.
+    /// The restart fact lists every subject, labels runs and fits its summary bound; nothing to
+    /// report produces no fact.
     #[test]
     fn the_lost_fact_lists_subjects_within_its_bound() {
         let fact = lost_fact(&["tests #3".to_owned(), "edit op-7".to_owned()]).unwrap();
@@ -1042,7 +1051,7 @@ mod tests {
              restart), edit op-7"
         );
         assert_eq!(fact.subject, "restart");
-        assert!(!fact.holds_turn && fact.validate().is_ok());
+        assert!(fact.validate().is_ok());
         let many = (0..16)
             .map(|index| format!("ide.symbol src/{index}/{}", "x".repeat(40)))
             .collect::<Vec<_>>();
@@ -1059,9 +1068,9 @@ mod worker_tests {
     use super::super::super::host_binding::{
         BindingStatus, HostBindingGuard, parse_candidate, parse_channel_session, parse_hook_event,
     };
-    use super::super::super::outbox::Carrier;
     use super::super::*;
     use super::*;
+    use std::time::Duration;
 
     /// Establishes one real Codex binding for `actor` on `bindings`, as the dedup tests do.
     fn bind(bindings: &Arc<Mutex<HostBindingGuard>>, actor: &str) -> BindingRef {
@@ -1155,27 +1164,26 @@ mod worker_tests {
             tool: AssistanceTool::Read,
             target: "src/a.rs".to_owned(),
             fence_paths: Vec::new(),
-            approximate_given: false,
         }
     }
 
-    /// A hook-shaped hand-off request.
-    fn hook() -> HandoffRequest {
-        HandoffRequest {
-            carrier: Carrier::Hook,
-            budget: 4096,
-            holding_only: false,
-        }
-    }
-
-    /// OUTBOX §3.2 boundary: a deferred pending job settles into exactly one holding `job-ready`
-    /// fact for its owner, with no source text on a hook carrier, delivered once.
+    /// OUTBOX §3.2 boundary: a deferred pending job registers once, and a read through its own
+    /// reference ends the deferral; a defer of an already settled job registers nothing. Without
+    /// a Bridge route no other carrier takes the settled result.
     #[tokio::test]
-    async fn a_deferred_job_settles_into_one_job_ready_fact() {
+    async fn a_deferral_registers_once_and_a_read_ends_it() {
         let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
         let owner = bind(&bindings, "owner");
         let handle = handle(bindings);
         let shared = &*handle.shared;
+        let deferred = |reference: &str| {
+            shared
+                .ledger
+                .lock()
+                .unwrap()
+                .deferred
+                .contains_key(reference)
+        };
         shared.outbox.open(&owner);
         plant(&handle, "r-1", &owner, pending("r-1"));
         assert!(SessionOutbox::defer(shared, "r-1", read_spec()));
@@ -1183,50 +1191,216 @@ mod worker_tests {
             !SessionOutbox::defer(shared, "r-1", read_spec()),
             "a second defer is a no-op"
         );
-        assert!(shared.outbox.holding_until(&owner).is_some());
-        assert!(!shared.outbox.has_undelivered(&owner, false));
+        assert!(deferred("r-1"));
         shared.complete("r-1", answer(), None, None, 0);
-        assert!(shared.outbox.holding_until(&owner).is_none());
-        let reservation = shared.reserve(&owner, hook()).expect("one fact");
-        assert_eq!(reservation.facts.len(), 1);
-        let fact = &reservation.facts[0];
-        assert_eq!(fact.kind, FactKind::JobReady);
-        assert_eq!(fact.subject, "ide.read src/a.rs");
-        assert_eq!(fact.summary, "ready");
-        assert_eq!(fact.detail, None);
-        assert_eq!(fact.detail_ref.as_deref(), Some("r-1"));
-        assert!(fact.holds_turn);
-        assert_eq!(shared.commit(&owner, reservation.token), 1);
-        assert!(shared.reserve(&owner, hook()).is_none(), "delivered once");
+        assert!(!deferred("r-1"), "settlement takes the registration");
+        plant(&handle, "r-2", &owner, answer());
+        assert!(SessionOutbox::defer(shared, "r-2", read_spec()));
+        assert!(!deferred("r-2"), "a settled job registers nothing");
+        plant(&handle, "r-3", &owner, pending("r-3"));
+        assert!(SessionOutbox::defer(shared, "r-3", read_spec()));
+        shared.reference_read("r-3");
+        assert!(!deferred("r-3"), "a read ends the deferral");
+        shared.complete("r-3", answer(), None, None, 0);
     }
 
-    /// A job read through its own reference is never pushed: before settlement the deferral
-    /// ends, after it the pushed fact is delivered; a defer of an already settled job pushes once.
+    /// Restart-loss subjects stay with the front when this daemon has no Bridge delivery owner;
+    /// an activation reply alone is not a handoff acknowledgment.
     #[tokio::test]
-    async fn reads_through_the_reference_deliver_and_late_defers_push_once() {
+    async fn restart_loss_without_bridge_reports_no_handoff() {
         let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
         let owner = bind(&bindings, "owner");
         let handle = handle(bindings);
-        let shared = &*handle.shared;
-        shared.outbox.open(&owner);
-        plant(&handle, "r-2", &owner, answer());
-        assert!(SessionOutbox::defer(shared, "r-2", read_spec()));
-        assert!(shared.outbox.has_undelivered(&owner, true));
-        shared.reference_read(&owner, "r-2");
-        assert!(!shared.outbox.has_undelivered(&owner, false));
-        plant(&handle, "r-3", &owner, pending("r-3"));
-        assert!(SessionOutbox::defer(shared, "r-3", read_spec()));
-        shared.reference_read(&owner, "r-3");
-        shared.complete("r-3", answer(), None, None, 0);
-        assert!(!shared.outbox.has_undelivered(&owner, false));
-        assert!(shared.outbox.holding_until(&owner).is_none());
+        assert!(
+            !handle
+                .queue_lost(&owner, &["ide.read src/a.rs".to_owned()])
+                .await
+        );
     }
 
-    /// A run whose caller left with a started line pushes one `test-finished` fact to its owner
-    /// (with the output reference) and one to a subscriber (without), exactly once; handing the
-    /// owner's fact over collects the run for `ide.stop`.
+    /// A reservable restart notice reports Bridge's final bounded custody classification: a
+    /// definite no-effect refusal stays retryable, while accepted and uncertain outcomes consume
+    /// the front's unresolved subjects and never use another carrier.
     #[tokio::test]
-    async fn a_started_run_reaches_owner_and_subscriber_once() {
+    async fn restart_loss_awaits_bridge_custody_before_handoff() {
+        use crate::{
+            app::store::Store,
+            assistance::bridge::{BridgeConfig, BridgeDelivery, NativeStore},
+        };
+        use bridge_sdk::bridge_protocol as wire;
+        use std::{
+            io::{BufRead, BufReader, Write},
+            os::unix::{fs::PermissionsExt, net::UnixListener},
+        };
+
+        for (index, response, expected) in [
+            (
+                0,
+                Some((
+                    wire::ErrorClass::Capacity,
+                    wire::MutationEffect::NotCommitted,
+                )),
+                false,
+            ),
+            (
+                1,
+                Some((
+                    wire::ErrorClass::OutcomeUnknown,
+                    wire::MutationEffect::Unknown,
+                )),
+                true,
+            ),
+            (2, None, true),
+        ] {
+            let scratch = crate::scratch::ScratchDir::new(&format!("lost-handoff-{index}"));
+            let config = BridgeConfig {
+                registration_socket: scratch.join("adapter.sock"),
+                core_socket: scratch.join("core.sock"),
+                credential_file: scratch.join("token"),
+                native_stores: vec![NativeStore {
+                    harness: wire::Host::Codex,
+                    host: "local".into(),
+                    store: "fixture".into(),
+                }],
+            };
+            std::fs::write(&config.credential_file, "fixture-token").unwrap();
+            std::fs::set_permissions(
+                &config.credential_file,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let store = Arc::new(
+                Store::open_with_backup_root(
+                    &scratch.join("state.sqlite"),
+                    &scratch.join("backups"),
+                    crate::app::config::EffectiveConfig::defaults().store(),
+                )
+                .unwrap(),
+            );
+            let bridge = BridgeDelivery::open(&config, store, [index as u8 + 1; 32])
+                .await
+                .unwrap();
+            let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+            let owner = bind(&bindings, "owner");
+            let handle = handle(bindings);
+            *handle.shared.bridge.lock().unwrap() = Some(bridge);
+
+            let listener = UnixListener::bind(&config.core_socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut frame = String::new();
+                BufReader::new(&socket).read_line(&mut frame).unwrap();
+                let request = wire::decode_request(frame.trim_end().as_bytes()).unwrap();
+                let wire::Operation::Publish(params) = &request.operation else {
+                    panic!("publish only")
+                };
+                assert_eq!(params.kind, "ide.job.lost");
+                let response = match response {
+                    Some((class, effect)) => wire::Response::error(
+                        request.request_id,
+                        wire::ApiError {
+                            class,
+                            reason: "fixture".into(),
+                            retry_hint: wire::RetryHint::Never,
+                            effect: Some(effect),
+                            reconciliation: Some(wire::ReconciliationKey::Event {
+                                event_id: params.event_id.clone(),
+                            }),
+                            detail: "fixture".into(),
+                        },
+                    ),
+                    None => {
+                        let address = match &params.destination {
+                            wire::Destination::Address { address } => address.clone(),
+                            _ => panic!("direct address"),
+                        };
+                        wire::Response::ok(
+                            request.request_id.clone(),
+                            wire::OperationResult::Publish(wire::PublishResult {
+                                receipt: wire::EventReceipt {
+                                    producer: "fixture".into(),
+                                    event_id: params.event_id.clone(),
+                                    intent_hash: wire::publication_intent_fingerprint(params)
+                                        .unwrap(),
+                                    envelope_hash: "a".repeat(64),
+                                    accepted_at_ms: 1,
+                                    acceptance_seq: 1,
+                                    destination: wire::FrozenDestination {
+                                        address,
+                                        route_key: None,
+                                        caller_scope: None,
+                                        destination_scope: None,
+                                    },
+                                },
+                                replayed: false,
+                            }),
+                        )
+                    }
+                };
+                socket
+                    .write_all(&wire::encode_response(&response).unwrap())
+                    .unwrap();
+                socket.write_all(b"\n").unwrap();
+            });
+
+            assert_eq!(
+                handle
+                    .queue_lost(&owner, &[format!("ide.read src/{index}.rs")])
+                    .await,
+                expected
+            );
+            server.join().unwrap();
+        }
+    }
+
+    /// A useful graph body is delivered without an inspect detour; changed source state yields
+    /// an explicit terminal superseded event with no outdated graph content.
+    #[test]
+    fn direct_graph_completion_is_useful_and_source_versioned() {
+        let spec = DeferSpec {
+            tool: AssistanceTool::Graph,
+            target: "src/a.rs#f".into(),
+            fence_paths: Vec::new(),
+        };
+        let reply = PeerReply::Complete {
+            kind: ResultKind::Graph,
+            text: "graph: f\n  caller: g".into(),
+            detail_ref: None,
+            truncated: false,
+            continuation: false,
+        };
+        let epoch = JobEpoch {
+            native_epoch: 2,
+            edit_seq: 3,
+        };
+        let fact = bridge_job_fact("graph-ref", &reply, &spec, epoch, epoch);
+        assert!(fact.detail.as_deref().unwrap().contains("caller: g"));
+        assert!(fact.detail.as_deref().unwrap().contains("source epoch 2/3"));
+        assert!(fact.validate().is_ok());
+        let stale = bridge_job_fact(
+            "graph-ref",
+            &reply,
+            &spec,
+            epoch,
+            JobEpoch {
+                edit_seq: 4,
+                ..epoch
+            },
+        );
+        assert!(stale.failed);
+        assert!(stale.summary.starts_with("superseded"));
+        assert!(!stale.detail.as_deref().unwrap().contains("caller: g"));
+        assert!(stale.validate().is_ok());
+    }
+
+    /// A run whose caller left with a started line hands its work over exactly once when it
+    /// settles, and nothing but an explicit read collects it for `ide.stop`: no carrier marks it
+    /// observed.
+    #[tokio::test]
+    async fn a_started_run_is_handed_over_once_and_stays_uncollected() {
         crate::lang::testing::install();
         let gamma = crate::lang::Language::by_id("gamma").expect("test language");
         let root = std::fs::canonicalize(std::env::temp_dir())
@@ -1237,13 +1411,12 @@ mod worker_tests {
         let owner = bind(&bindings, "owner");
         let subscriber = bind(&bindings, "subscriber");
         let handle = handle(bindings);
-        handle.shared.install_test_settle_hook();
         let shared = &*handle.shared;
         shared.outbox.open(&owner);
         shared.outbox.open(&subscriber);
         let id = match shared.test_runs.start(
             root.clone(),
-            vec!["/bin/sleep".into(), "0.3".into()],
+            vec!["/bin/echo".into(), "done".into()],
             gamma,
             Duration::from_secs(30),
             "run-detail".into(),
@@ -1252,201 +1425,171 @@ mod worker_tests {
             StartResult::Started(id) => id,
             StartResult::Running(..) | StartResult::Failed { .. } => panic!("run must start"),
         };
-        shared.test_started(id, &owner, Duration::from_secs(30));
+        shared.test_started(id, &owner);
         shared.test_subscribed(id, &subscriber);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        assert!(shared.outbox.wait_ready(&owner, true, deadline).await);
-        let owned = shared.reserve(&owner, hook()).expect("owner fact");
-        assert_eq!(owned.facts.len(), 1);
-        assert_eq!(owned.facts[0].subject, test_subject(id));
-        assert_eq!(owned.facts[0].detail_ref.as_deref(), Some("run-detail"));
-        let subscribed = shared
-            .reserve(&subscriber, hook())
-            .expect("subscriber fact");
-        assert_eq!(subscribed.facts[0].detail_ref, None);
+        while shared.test_runs.settled_result(id).is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "the run settles");
+            tokio::task::yield_now().await;
+        }
+        shared.test_settled(id);
+        assert!(
+            shared.outbox.take_work(&test_subject(id)).is_none(),
+            "settlement consumed the in-flight work"
+        );
         assert!(
             shared
                 .test_runs
                 .uncollected(&owner.fingerprint())
                 .iter()
-                .any(|(run, _, _)| *run == id)
-        );
-        assert_eq!(shared.commit(&owner, owned.token), 1);
-        assert!(
-            shared
-                .test_runs
-                .uncollected(&owner.fingerprint())
-                .is_empty()
-        );
-        shared.test_settled(id);
-        assert!(
-            shared.reserve(&owner, hook()).is_none(),
-            "a second settle pushes nothing"
+                .any(|(run, _, _)| *run == id),
+            "no carrier collects a run"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
-
-    /// A draft fenced at the session's current epoch.
-    fn finished(shared: &Shared, owner: &BindingRef, subject: &str) -> bool {
-        SessionOutbox::push(
-            shared,
-            std::slice::from_ref(owner),
-            FactDraft {
-                kind: FactKind::TestFinished,
-                subject: subject.to_owned(),
-                summary: "1 passed, 1 failed, 2 s".to_owned(),
-                detail: Some("  FAIL a::b".to_owned()),
-                detail_ref: Some("run-1".to_owned()),
-                failed: true,
-                holds_turn: true,
-                source_bearing: false,
-                fence_paths: Vec::new(),
-            },
-            shared.outbox.current_epoch(owner),
-        )
-    }
-
-    /// OUTBOX §6 boundary: two carriers racing for one session (a hook and a reply) hand each
-    /// fact over exactly once, whatever the interleaving.
-    #[test]
-    fn concurrent_carriers_hand_a_fact_over_once() {
-        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
-        let owner = bind(&bindings, "owner");
-        let handle = Arc::new(handle(bindings));
-        handle.shared.outbox.open(&owner);
-        for round in 0..200 {
-            assert!(finished(&handle.shared, &owner, &format!("tests #{round}")));
-            let carriers = [Carrier::Hook, Carrier::Reply].map(|carrier| {
-                let handle = handle.clone();
-                let owner = owner.clone();
-                std::thread::spawn(move || handle.take_facts(&owner, carrier, None, 4096, |_| true))
-            });
-            let delivered = carriers
-                .into_iter()
-                .filter_map(|carrier| carrier.join().unwrap())
-                .collect::<Vec<_>>();
-            assert_eq!(delivered.len(), 1, "round {round}: {delivered:?}");
-            assert!(delivered[0].contains(&format!("test-finished tests #{round}: ")));
-        }
-    }
-
-    /// A carrier composes facts after the plate in one block, labels a fact that ran before a
-    /// later edit, keeps it when the block does not fit, and never repeats a delivered fact.
-    #[test]
-    fn carriers_compose_label_and_release() {
-        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
-        let owner = bind(&bindings, "owner");
-        let handle = handle(bindings);
-        handle.shared.outbox.open(&owner);
-        assert!(finished(&handle.shared, &owner, "tests #1"));
-        handle
-            .shared
-            .outbox
-            .note_edit(&owner, &["src/b.rs".to_owned()]);
-        let plate = Some("<agent-ide>\nrust: 0 errors, 0 warnings\n</agent-ide>".to_owned());
-        let refused = handle.take_facts(&owner, Carrier::Reply, plate.clone(), 4096, |_| false);
-        assert_eq!(refused, plate, "a block that does not fit keeps the facts");
-        let block = handle
-            .take_facts(&owner, Carrier::Hook, plate.clone(), 4096, |_| true)
-            .unwrap();
-        assert_eq!(
-            block,
-            "<agent-ide>\nrust: 0 errors, 0 warnings\ntest-finished tests #1: 1 passed, 1 \
-             failed, 2 s (ran before your later edits to src/b.rs)\n  FAIL a::b\n  full output: \
-             ide.inspect run-1\n</agent-ide>"
-        );
-        assert_eq!(
-            handle.take_facts(&owner, Carrier::Hook, plate.clone(), 4096, |_| true),
-            plate
-        );
-    }
-
-    /// OUTBOX §8.3 boundary: a turn end with a ready holding fact blocks once with the facts and
-    /// the restate sentence; the next turn end, with nothing left and nothing in flight, releases
-    /// at once and leaves the session idle.
+    /// Actual direct handoff preserves subscriber/error facts without source authority, while
+    /// an unproved source body is replaced before SDK I/O; no historical fallback receives it.
     #[tokio::test]
-    async fn a_hold_blocks_once_with_a_ready_fact_and_releases_without_one() {
-        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
-        let owner = bind(&bindings, "owner");
-        let handle = handle(bindings);
-        handle.shared.outbox.open(&owner);
-        assert!(finished(&handle.shared, &owner, "tests #1"));
-        let reason = handle
-            .hold_turn(&owner, false, Some("owner"))
-            .await
-            .expect("a ready holding fact blocks");
-        assert!(
-            reason.starts_with("<agent-ide>\ntest-finished tests #1: 1 passed, 1 failed"),
-            "{reason}"
-        );
-        assert!(
-            reason.ends_with(&format!("</agent-ide>\n{}", super::super::turn::RESTATE)),
-            "{reason}"
-        );
-        let started = tokio::time::Instant::now();
-        assert_eq!(handle.hold_turn(&owner, false, Some("owner")).await, None);
-        assert!(started.elapsed() < Duration::from_millis(100));
-        assert_eq!(
-            handle.shared.outbox.agent_state(&owner),
-            Some(super::super::super::session_outbox::AgentState::Idle)
-        );
-    }
-
-    /// A turn end with holding work in flight waits for its fact and blocks with it; work that
-    /// never settles releases at its budget end without a block.
-    #[tokio::test]
-    async fn a_hold_waits_for_in_flight_work_and_releases_at_its_deadline() {
-        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
-        let owner = bind(&bindings, "owner");
-        let handle = Arc::new(handle(bindings));
-        handle.shared.outbox.open(&owner);
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
-        assert!(
-            handle
-                .shared
-                .outbox
-                .begin_holding("tests #1", &owner, "tests #1", until)
-        );
-        let settle = {
-            let handle = handle.clone();
-            let owner = owner.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let _ = handle.shared.outbox.take_holding("tests #1");
-                assert!(finished(&handle.shared, &owner, "tests #1"));
-            })
+    async fn direct_push_preserves_lifecycle_errors_and_fences_unproved_source() {
+        use crate::{
+            app::store::Store,
+            assistance::bridge::{BridgeConfig, BridgeDelivery, NativeStore},
         };
-        let reason = handle.hold_turn(&owner, false, None).await;
-        settle.await.unwrap();
-        assert!(reason.is_some_and(|reason| reason.contains("test-finished tests #1")));
-        let short = tokio::time::Instant::now() + Duration::from_millis(200);
-        assert!(
-            handle
-                .shared
-                .outbox
-                .begin_holding("tests #2", &owner, "tests #2", short)
+        use bridge_sdk::bridge_protocol as wire;
+        use std::{
+            io::{BufRead, BufReader, Write},
+            os::unix::{fs::PermissionsExt, net::UnixListener},
+        };
+        let scratch = crate::scratch::ScratchDir::new("direct-push-regression");
+        let config = BridgeConfig {
+            registration_socket: scratch.join("adapter.sock"),
+            core_socket: scratch.join("core.sock"),
+            credential_file: scratch.join("token"),
+            native_stores: vec![NativeStore {
+                harness: wire::Host::Codex,
+                host: "local".into(),
+                store: "fixture".into(),
+            }],
+        };
+        std::fs::write(&config.credential_file, "fixture-token").unwrap();
+        std::fs::set_permissions(
+            &config.credential_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let store = Arc::new(
+            Store::open_with_backup_root(
+                &scratch.join("state.sqlite"),
+                &scratch.join("backups"),
+                crate::app::config::EffectiveConfig::defaults().store(),
+            )
+            .unwrap(),
         );
-        let started = tokio::time::Instant::now();
-        assert_eq!(handle.hold_turn(&owner, false, None).await, None);
-        assert!(started.elapsed() >= Duration::from_millis(150));
-    }
-
-    /// A Claude subagent's turn end whose session the registry does not prove interactive (a
-    /// headless run) releases at once and keeps the fact for another carrier (OUTBOX §8.3 rule 6).
-    #[tokio::test]
-    async fn a_headless_subagent_stop_releases() {
+        let bridge = BridgeDelivery::open(&config, store, [7; 32]).await.unwrap();
+        let launcher=LauncherConfig::parse(&serde_json::to_vec(&serde_json::json!({"version":1,"limits":{"queued":8,"details":8,"operation_ms":5000,"output_bytes":1024},"targets":[],"bridge":{"registration_socket":config.registration_socket,"core_socket":config.core_socket,"credential_file":config.credential_file,"native_stores":[{"harness":"codex","host":"local","store":"fixture"}]}})).unwrap()).unwrap();
         let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
         let owner = bind(&bindings, "owner");
-        let handle = handle(bindings);
-        handle.shared.outbox.open(&owner);
-        assert!(finished(&handle.shared, &owner, "tests #1"));
-        assert_eq!(
-            handle
-                .hold_turn(&owner, true, Some("no-registry-session"))
-                .await,
-            None
+        let handle = WorkerHandle::new(
+            bindings,
+            launcher,
+            [9; 32],
+            Arc::new(Mutex::new(admission_controller())),
         );
-        assert!(handle.shared.outbox.has_undelivered(&owner, true));
+        *handle.shared.bridge.lock().unwrap() = Some(bridge);
+        let listener = UnixListener::bind(&config.core_socket).unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut frame = String::new();
+                BufReader::new(&socket).read_line(&mut frame).unwrap();
+                let request = wire::decode_request(frame.trim_end().as_bytes()).unwrap();
+                let wire::Operation::Publish(params) = &request.operation else {
+                    panic!("publish only")
+                };
+                bodies.push(params.payload.as_str().to_owned());
+                let response = wire::Response::error(
+                    request.request_id,
+                    wire::ApiError {
+                        class: wire::ErrorClass::Capacity,
+                        reason: "fixture".into(),
+                        retry_hint: wire::RetryHint::Never,
+                        effect: Some(wire::MutationEffect::NotCommitted),
+                        reconciliation: None,
+                        detail: "fixture".into(),
+                    },
+                );
+                socket
+                    .write_all(&wire::encode_response(&response).unwrap())
+                    .unwrap();
+                socket.write_all(b"\n").unwrap();
+            }
+            sent.send(bodies).unwrap();
+        });
+        for (kind, subject, body, source_bearing) in [
+            (
+                FactKind::TestFinished,
+                "tests #1",
+                "subscriber rerun detail",
+                false,
+            ),
+            (
+                FactKind::JobReady,
+                "failed job",
+                "Repair: useful original error",
+                false,
+            ),
+            (
+                FactKind::JobReady,
+                "source job",
+                "SOURCE_MUST_NOT_LEAK",
+                true,
+            ),
+        ] {
+            assert!(handle.shared.push_or_transfer(
+                std::slice::from_ref(&owner),
+                FactDraft {
+                    kind,
+                    subject: subject.into(),
+                    summary: "original result".into(),
+                    detail: Some(body.into()),
+                    detail_ref: None,
+                    failed: false,
+                    source_bearing,
+                    fence_paths: vec![],
+                },
+            ));
+        }
+        let bodies = tokio::time::timeout(Duration::from_secs(5), received)
+            .await
+            .unwrap()
+            .unwrap();
+        server.join().unwrap();
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("subscriber rerun detail")),
+            "{bodies:?}"
+        );
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("Repair: useful original error")),
+            "{bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("superseded")),
+            "{bodies:?}"
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|body| body.contains("SOURCE_MUST_NOT_LEAK"))
+        );
     }
 
     /// A compaction raises the compaction counter of the session's channel (OUTBOX §9.1).
@@ -1456,24 +1599,23 @@ mod worker_tests {
         let owner = bind(&bindings, "owner");
         let handle = handle(bindings);
         handle.shared.outbox.open(&owner);
-        assert_eq!(handle.outbox().context_epoch(&owner), None);
+        assert_eq!(SessionOutbox::context_epoch(&*handle.shared, &owner), None);
         handle.note_compaction(&owner);
-        assert_eq!(handle.outbox().context_epoch(&owner), Some(1));
+        assert_eq!(
+            SessionOutbox::context_epoch(&*handle.shared, &owner),
+            Some(1)
+        );
         handle.note_compaction(&owner);
-        assert_eq!(handle.outbox().context_epoch(&owner), Some(2));
+        assert_eq!(
+            SessionOutbox::context_epoch(&*handle.shared, &owner),
+            Some(2)
+        );
     }
 
-    /// Review fix (OUTBOX §2, §3.3, §7): an edit check that found new diagnostics is not
-    /// source-bearing, so its `new:` lines reach the agent on the hook, the Stop hold and the
-    /// wake alike, never only as counts.
-    #[tokio::test]
-    async fn a_failed_edit_check_keeps_its_new_lines_on_every_carrier() {
-        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
-        let owner = bind(&bindings, "owner");
-        let handle = handle(bindings);
-        let shared = &*handle.shared;
-        shared.outbox.open(&owner);
-        shared.outbox.note_host_session(&owner, "owner");
+    /// An edit check that found new diagnostics is not source-bearing, so its `new:` lines reach
+    /// Bridge with the fact, never only as counts.
+    #[test]
+    fn a_failed_edit_check_keeps_its_new_lines() {
         let draft = edit_checked_fact(
             "edit-ref",
             &EditResult {
@@ -1488,45 +1630,20 @@ mod worker_tests {
                 truncated: false,
             },
         );
-        let push = || {
-            assert!(SessionOutbox::push(
-                shared,
-                std::slice::from_ref(&owner),
-                draft.clone(),
-                shared.outbox.current_epoch(&owner),
-            ));
-        };
-        let new_line = "  new: src/a.rs: expected `;`, found `}`";
-        push();
-        let hook = handle
-            .take_facts(&owner, Carrier::Hook, None, 4096, |_| true)
-            .expect("the hook carries the fact");
-        assert!(hook.contains(new_line), "{hook}");
-        push();
-        let hold = handle
-            .hold_turn(&owner, false, Some("owner"))
-            .await
-            .expect("the hold blocks with the fact");
-        assert!(hold.contains(new_line), "{hold}");
-        push();
-        shared.outbox.set_agent_state(&owner, AgentState::Idle);
-        let waker = FakeWaker {
-            outcome: WakeOutcome::Accepted,
-            woken: Mutex::default(),
-        };
-        assert_eq!(
-            wake_session(&shared.outbox, &shared.test_runs, &waker, &owner).await,
-            Some(WakeOutcome::Accepted)
+        assert!(draft.failed && !draft.source_bearing);
+        assert_eq!(draft.validate(), Ok(()));
+        assert!(
+            draft
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("  new: src/a.rs: expected `;`, found `}`"))
         );
-        let woken = waker.woken.lock().unwrap();
-        assert!(woken[0].1.contains(new_line), "{:?}", woken[0].1);
     }
 
-    /// Review fix: a job that settles in the instant after `defer` released the ledger still
-    /// pushes its fact and leaves no holding work behind, so a later turn end is never held for
-    /// work that already finished.
+    /// Review fix: a job that settles in the instant after `defer` released the ledger takes the
+    /// registration itself, so nothing stays deferred for work that already finished.
     #[tokio::test]
-    async fn a_job_settling_right_after_its_defer_leaves_nothing_in_flight() {
+    async fn a_job_settling_right_after_its_defer_leaves_nothing_deferred() {
         let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
         let owner = bind(&bindings, "owner");
         let handle = handle(bindings);
@@ -1541,18 +1658,11 @@ mod worker_tests {
         });
         assert!(SessionOutbox::defer(&*shared, "r-9", read_spec()));
         tests::DEFER_GAP.with(|gap| *gap.borrow_mut() = None);
-        assert!(
-            shared.outbox.holding_until(&owner).is_none(),
-            "no work stays in flight"
-        );
-        assert!(
-            shared.outbox.has_undelivered(&owner, true),
-            "the fact was pushed"
-        );
+        assert!(!shared.ledger.lock().unwrap().deferred.contains_key("r-9"));
     }
 
     /// Review fix (OUTBOX §3.1): a deferred job's fact is fenced at the state the job started
-    /// from, not at the later defer, so an edit made while it ran labels its answer.
+    /// from, not at the later defer, so an edit made while it ran is seen as a changed epoch.
     #[tokio::test]
     async fn a_deferred_fact_is_fenced_at_the_job_start() {
         let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
@@ -1562,181 +1672,10 @@ mod worker_tests {
         shared.outbox.open(&owner);
         plant(&handle, "r-5", &owner, pending("r-5"));
         shared.note_job_started("r-5", &owner);
-        shared.outbox.note_edit(&owner, &["src/a.rs".to_owned()]);
+        shared.outbox.note_edit(&owner);
         assert!(SessionOutbox::defer(shared, "r-5", read_spec()));
-        shared.complete("r-5", answer(), None, None, 0);
-        let block = handle
-            .take_facts(&owner, Carrier::Reply, None, 4096, |_| true)
-            .expect("the fact");
-        assert!(
-            block.contains("job-ready ide.read src/a.rs: ready (files changed since)"),
-            "{block}"
-        );
-    }
-
-    /// Probe Q1: Claude overrides a ninth consecutive Stop block, so a session's turn ends are
-    /// blocked at most seven times in a row; any tool call or hook resets the count.
-    #[tokio::test]
-    async fn turn_ends_are_blocked_at_most_seven_times_in_a_row() {
-        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
-        let owner = bind(&bindings, "owner");
-        let handle = handle(bindings);
-        handle.shared.outbox.open(&owner);
-        for round in 1..=7 {
-            assert!(finished(&handle.shared, &owner, &format!("tests #{round}")));
-            assert!(
-                handle.hold_turn(&owner, false, None).await.is_some(),
-                "block {round}"
-            );
-        }
-        assert!(finished(&handle.shared, &owner, "tests #8"));
-        assert_eq!(handle.hold_turn(&owner, false, None).await, None);
-        assert!(handle.shared.outbox.has_undelivered(&owner, true));
-        handle.note_activity(&owner);
-        assert!(handle.hold_turn(&owner, false, None).await.is_some());
-    }
-
-    /// OUTBOX §11: the stop flush lists every undelivered fact once; afterwards no producer,
-    /// hold or wake reaches the stopped session.
-    #[tokio::test]
-    async fn a_stop_flushes_once_and_nothing_follows() {
-        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
-        let owner = bind(&bindings, "owner");
-        let handle = handle(bindings);
-        let outbox = &handle.shared.outbox;
-        outbox.open(&owner);
-        outbox.note_host_session(&owner, "owner");
-        let until = tokio::time::Instant::now() + Duration::from_secs(60);
-        assert!(outbox.begin_holding("tests #2", &owner, "tests #2", until));
-        assert!(finished(&handle.shared, &owner, "tests #1"));
-        let flush = outbox.flush_for_stop(&owner).expect("an undelivered fact");
-        assert!(flush.contains("test-finished tests #1: "), "{flush}");
-        assert_eq!(outbox.flush_for_stop(&owner), None);
-        assert!(
-            outbox.take_holding("tests #2").is_none(),
-            "in-flight work ends"
-        );
-        assert!(!finished(&handle.shared, &owner, "tests #2"));
-        handle.queue_lost(&owner, &["tests #9".to_owned()]);
-        assert!(!outbox.has_undelivered(&owner, false));
-        outbox.set_agent_state(&owner, AgentState::Idle);
-        assert_eq!(outbox.claim_wake(&owner), None);
-        let started = tokio::time::Instant::now();
-        assert_eq!(handle.hold_turn(&owner, false, Some("owner")).await, None);
-        assert!(started.elapsed() < Duration::from_millis(100));
-    }
-
-    /// OUTBOX §10: a re-activated session receives one `lost-after-restart` fact, and a repeated
-    /// re-activation with the same list replaces it rather than adding another.
-    #[test]
-    fn lost_after_restart_is_one_fact_per_session() {
-        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
-        let owner = bind(&bindings, "owner");
-        let other = bind(&bindings, "other");
-        let handle = handle(bindings);
-        handle.shared.outbox.open(&owner);
-        handle.shared.outbox.open(&other);
-        let lost = ["tests #3".to_owned(), "edit op-7".to_owned()];
-        handle.queue_lost(&owner, &lost);
-        handle.queue_lost(&owner, &lost);
-        let block = handle
-            .take_facts(&owner, Carrier::Hook, None, 4096, |_| true)
-            .expect("the restart fact");
-        assert_eq!(block.matches("lost-after-restart restart: ").count(), 1);
-        assert!(
-            block.contains("tests #3 (before restart), edit op-7"),
-            "{block}"
-        );
-        assert!(!handle.shared.outbox.has_undelivered(&other, false));
-        assert!(!handle.shared.outbox.has_undelivered(&owner, true));
-    }
-
-    /// A waker that records each wake and answers a fixed outcome.
-    struct FakeWaker {
-        /// Outcome every wake answers.
-        outcome: WakeOutcome,
-        /// Every target and text woken.
-        woken: Mutex<Vec<(WakeTarget, String)>>,
-    }
-
-    impl SessionWaker for FakeWaker {
-        /// Records the wake and answers the fixed outcome.
-        fn wake<'a>(
-            &'a self,
-            target: &'a WakeTarget,
-            text: &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WakeOutcome> + Send + 'a>> {
-            self.woken
-                .lock()
-                .unwrap()
-                .push((target.clone(), text.to_owned()));
-            Box::pin(std::future::ready(self.outcome))
-        }
-    }
-
-    /// OUTBOX §8.4: only an idle session with an undelivered holding fact is woken, once per idle
-    /// period, with its holding facts only; a refused wake keeps them, an accepted one delivers.
-    #[tokio::test]
-    async fn an_idle_session_is_woken_once_with_its_holding_facts() {
-        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
-        let owner = bind(&bindings, "owner");
-        let handle = handle(bindings);
-        let shared = &handle.shared;
-        let outbox = &shared.outbox;
-        let waker = |outcome| FakeWaker {
-            outcome,
-            woken: Mutex::default(),
-        };
-        let accepting = waker(WakeOutcome::Accepted);
-        let refusing = waker(WakeOutcome::Refused);
-        outbox.open(&owner);
-        outbox.note_host_session(&owner, "owner");
-        outbox.set_agent_state(&owner, AgentState::Idle);
-        let unrequested = FactDraft {
-            kind: FactKind::JobReady,
-            subject: "ide.read src/a.rs".to_owned(),
-            summary: "ready".to_owned(),
-            detail: None,
-            detail_ref: Some("job-1".to_owned()),
-            failed: false,
-            holds_turn: false,
-            source_bearing: false,
-            fence_paths: Vec::new(),
-        };
-        assert!(SessionOutbox::push(
-            shared.as_ref(),
-            std::slice::from_ref(&owner),
-            unrequested,
-            outbox.current_epoch(&owner)
-        ));
-        let wake = |waker| wake_session(outbox, &shared.test_runs, waker, &owner);
-        assert_eq!(wake(&accepting).await, None, "unrequested facts never wake");
-        outbox.set_agent_state(&owner, AgentState::Working);
-        assert!(finished(shared, &owner, "tests #1"));
-        assert_eq!(wake(&accepting).await, None, "a working agent is not woken");
-        outbox.set_agent_state(&owner, AgentState::Idle);
-        assert_eq!(wake(&refusing).await, Some(WakeOutcome::Refused));
-        assert!(outbox.has_undelivered(&owner, true), "a refused wake keeps");
-        assert_eq!(wake(&accepting).await, None, "one attempt per idle period");
-        outbox.set_agent_state(&owner, AgentState::Working);
-        outbox.set_agent_state(&owner, AgentState::Idle);
-        assert_eq!(wake(&accepting).await, Some(WakeOutcome::Accepted));
-        let woken = accepting.woken.lock().unwrap();
-        let [(target, text)] = woken.as_slice() else {
-            panic!("exactly one wake: {woken:?}")
-        };
-        assert_eq!(target.session_id, "owner");
-        assert!(target.actor_is_main);
-        assert!(
-            text.starts_with("<agent-ide>\ntest-finished tests #1"),
-            "{text}"
-        );
-        assert!(
-            text.ends_with(&format!("</agent-ide>\n{WAKE_TAIL}")),
-            "{text}"
-        );
-        assert!(!text.contains("ide.read"), "{text}");
-        assert!(!outbox.has_undelivered(&owner, true));
-        assert!(outbox.has_undelivered(&owner, false));
+        let captured = shared.ledger.lock().unwrap().deferred["r-5"].1;
+        assert_eq!(captured.edit_seq, 0);
+        assert_eq!(shared.outbox.current_epoch(&owner).edit_seq, 1);
     }
 }

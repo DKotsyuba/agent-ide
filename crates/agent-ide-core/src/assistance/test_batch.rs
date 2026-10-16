@@ -33,7 +33,7 @@ pub struct BatchLaunch {
 
 /// One target of a several-target run, as its line names it.
 pub struct BatchTarget {
-    /// `symbol <address>`, `path <path>` or `pattern <filter>`.
+    /// `symbol <address>`, `path <path>`, `pattern <filter>` or displayed explicit command argv.
     pub label: String,
     /// The target's whole outcome when it runs nothing (`no tests reference …`, a refusal), else
     /// `None`: the invocation that runs it supplies the outcome.
@@ -62,6 +62,8 @@ enum Ran {
     NotStarted(String),
     /// The budget was spent before its turn.
     Skipped,
+    /// Owner cancellation prevented this invocation from starting.
+    Cancelled,
 }
 
 impl TestRuns {
@@ -97,6 +99,7 @@ impl TestRuns {
         let lease = crate::retention::SettledLease::new(Some(lease));
         state.next_id = state.next_id.saturating_add(1);
         let id = state.next_id;
+        let cancel = tokio_util::sync::CancellationToken::new();
         state.jobs.insert(
             id,
             Job {
@@ -110,6 +113,7 @@ impl TestRuns {
                 result: None,
                 completed_at: None,
                 observed: false,
+                cancel: cancel.clone(),
             },
         );
         drop(state);
@@ -120,6 +124,10 @@ impl TestRuns {
             let mut ran = Vec::with_capacity(plan.launches.len());
             for launch in &plan.launches {
                 let remaining = plan.budget.saturating_sub(started.elapsed());
+                if cancel.is_cancelled() {
+                    ran.push(Ran::Cancelled);
+                    continue;
+                }
                 if remaining.is_zero() {
                     ran.push(Ran::Skipped);
                     continue;
@@ -150,13 +158,22 @@ impl TestRuns {
                 };
                 ran.push(match spawned {
                     Ok(child) => Ran::Result(Box::new(
-                        run_child_capped(launch.language, budget, child, &root, cap).await,
+                        run_child_cancellable(
+                            launch.language,
+                            budget,
+                            child,
+                            &root,
+                            cap,
+                            cancel.clone(),
+                        )
+                        .await,
                     )),
                     Err(error) => Ran::NotStarted(error.to_string()),
                 });
             }
             lease.settled();
-            let result = combine(&plan, &ran, started.elapsed());
+            let mut result = combine(&plan, &ran, started.elapsed());
+            result.cancelled |= ran.iter().any(|run| matches!(run, Ran::Cancelled));
             let mut on_settle = None;
             if let Ok(mut state) = registry.lock()
                 && let Some(job) = state.jobs.get_mut(&id)
@@ -214,6 +231,11 @@ fn combine(plan: &BatchPlan, ran: &[Ran], elapsed: Duration) -> RunResult {
                 }
                 output.push_str(&format!("could not start: {error}\n"));
             }
+            Ran::Cancelled => {
+                report.incomplete = true;
+                stopped = true;
+                output.push_str("not run: cancelled by owner\n");
+            }
             Ran::Skipped => {
                 report.incomplete = true;
                 stopped = true;
@@ -249,6 +271,9 @@ fn combine(plan: &BatchPlan, ran: &[Ran], elapsed: Duration) -> RunResult {
         output_paged: false,
         elapsed,
         stopped,
+        cancelled: ran
+            .iter()
+            .any(|run| matches!(run, Ran::Result(result) if result.cancelled)),
         exit,
         budget: plan.budget,
         detail_ref: plan.detail_ref.clone(),
@@ -267,7 +292,14 @@ fn run_outcome(run: usize, ran: Option<&Ran>) -> String {
     match ran {
         Some(Ran::Result(result)) => {
             let report = &result.report;
-            if report.passed == 0 && report.failed == 0 && result.exit.is_some_and(|code| code != 0)
+            if summary_absent(result) {
+                let exit = result
+                    .exit
+                    .map_or_else(|| "unavailable".to_owned(), |code| code.to_string());
+                format!("run {number} — exit {exit}; test counts unavailable")
+            } else if report.passed == 0
+                && report.failed == 0
+                && result.exit.is_some_and(|code| code != 0)
             {
                 format!(
                     "run {number} — no test results (exit {})",
@@ -278,13 +310,19 @@ fn run_outcome(run: usize, ran: Option<&Ran>) -> String {
                     "run {number} — {} passed, {} failed",
                     report.passed, report.failed
                 );
-                if result.stopped {
+                if report.incomplete && !result.stopped {
+                    line.push_str(", partial counts");
+                }
+                if result.cancelled {
+                    line.push_str(", cancelled");
+                } else if result.stopped {
                     line.push_str(", stopped at budget");
                 }
                 line
             }
         }
         Some(Ran::NotStarted(error)) => format!("run {number} — could not start: {error}"),
+        Some(Ran::Cancelled) => format!("run {number} — not run: cancelled by owner"),
         Some(Ran::Skipped) | None => format!("run {number} — not run: the budget was spent"),
     }
 }
@@ -321,6 +359,72 @@ mod batch_tests {
             budget: Duration::from_secs(5),
             detail_ref: "batch-ref".into(),
         }
+    }
+
+    /// An explicit check with no parsed tests reports its real exit and unavailable counts,
+    /// rather than inventing a zero-count passing test report for that command.
+    #[test]
+    fn command_step_without_test_summary_reports_unavailable_counts() {
+        let mut result = failed_run(Duration::from_secs(1), "check finished".into());
+        result.exit = Some(0);
+        let line = run_outcome(0, Some(&Ran::Result(Box::new(result))));
+        assert_eq!(line, "run 1 — exit 0; test counts unavailable");
+        assert!(!line.contains("passed"));
+    }
+
+    /// Cancellation reaps the active invocation, skips later commands and preserves a terminal
+    /// per-target result, rather than labelling the unused budget as a timeout.
+    #[tokio::test]
+    async fn cancelling_batch_reaps_current_and_skips_remaining_commands() {
+        let scratch = crate::scratch::ScratchDir::new("batch-cancel");
+        let root = scratch.to_path_buf();
+        let runs = TestRuns::default();
+        let owner = BindingRef::fixture("batch-cancel", "channel", 1);
+        let settled = Arc::new(tokio::sync::Notify::new());
+        let note = settled.clone();
+        runs.on_settle(Arc::new(move |_| note.notify_one()));
+        let first = shell(vec![0], "printf ready > ready; sleep 30");
+        let second = shell(vec![1], "printf forbidden > second");
+        assert!(matches!(
+            runs.start_batch(
+                root.clone(),
+                &owner,
+                plan(
+                    &[("command one", None), ("command two", None)],
+                    vec![first, second]
+                )
+            ),
+            StartResult::Started(1)
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !root.join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runs.cancel(&root, 1, &owner), Some(true));
+        tokio::time::timeout(Duration::from_secs(3), settled.notified())
+            .await
+            .unwrap();
+        let result = runs.settled_result(1).unwrap();
+        assert!(result.cancelled && result.stopped);
+        assert!(!root.join("second").exists());
+        assert!(
+            result.targets[0].contains("cancelled"),
+            "{:?}",
+            result.targets
+        );
+        assert!(
+            result.targets[1].contains("not run: cancelled by owner"),
+            "{:?}",
+            result.targets
+        );
+        assert!(
+            crate::assistance::test_fact::terminal_fact(1, &result, true)
+                .summary
+                .starts_with("cancelled")
+        );
     }
 
     /// Waits for run `id` of `root` to settle and returns its result.

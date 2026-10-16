@@ -165,7 +165,8 @@ mod start_card_tests {
             servers_line,
             "servers: rust not started; outline, read and edit answer from source; the first \
              symbol or graph call starts it and answers approximately at once · python not \
-             started; the first symbol or graph call starts it and its answer follows as a fact"
+             started; the first symbol or graph call starts it; its result is retained under its \
+             reference and Bridge delivers it when configured"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

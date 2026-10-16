@@ -115,10 +115,21 @@ impl AssistanceTool {
         }
     }
 
-    /// Reports whether this call can change binding, worktree or run state, so a reply lost after
-    /// delivery must be reported as an unknown outcome rather than a call to simply repeat.
+    /// Reports whether this tool has any binding/worktree/run mutation operation. For a
+    /// validated concrete request use mutates_with, which excludes read-only test queries.
     pub const fn mutates(self) -> bool {
         matches!(self, Self::Start | Self::Stop | Self::Edit | Self::Test)
+    }
+
+    /// Classifies a validated request for lost-reply handling. Test history/result/output queries
+    /// do not start work; execution and cancellation operations remain mutating. Callers
+    /// must validate first so conflicting execution/read selectors cannot hide a mutation.
+    pub fn mutates_with(self, parameters: &Value) -> bool {
+        self.mutates()
+            && !(self == Self::Test
+                && ["result", "status", "history", "detail_ref"]
+                    .iter()
+                    .any(|field| parameters.get(*field).is_some()))
     }
 
     /// Returns the corresponding closed Application transport tag.
@@ -267,7 +278,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
         schema(
             AssistanceTool::Inspect,
             json!({
-                "type": "object", "additionalProperties": false,
+                "type": "object", "additionalProperties": false, "minProperties": 1,
                 "properties": {
                     "kind": {"type":"string", "enum":["problems", "diagnostics"], "description":"problems: project checks; diagnostics: file provider reports."},
                     "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"With diagnostics: worktree-relative file."},
@@ -319,7 +330,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root."},
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File or directory relative to the worktree; group related entries in paths."},
                     "paths": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_OUTLINE_FILES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "description": "Up to 24 worktree-relative files, outlined in request order."},
                     "glob": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Worktree-relative pattern (`*`, `?`, `**`), e.g. `crates/x/src/**/*.rs`; at most 24 files."},
                     "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region))*$", "description": "Comma list of symbol kinds to keep (a container of a match still shows); `region` also lists @header, @imports."}
@@ -332,12 +343,13 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Address `src/a.rs#Type/method`, a window `…:3-5`, a region `src/a.rs#@imports` or `path:line`; returns doc and body."},
-                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Non-code file relative to the project root; alone the whole file, with `lines` or `ranges` those lines."},
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the worktree; use items for related files. Alone: whole file; lines/ranges: selected lines."},
                     "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$", "description": "With `path`: `120-180`, `120-` (to the end) or `120`; an end past the file is clamped."},
                     "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several addresses in one reply, request order; a failed one fails only itself."},
-                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "description": "Several line ranges of the non-code file `path` in one reply."},
-                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}}}, "description": "Up to 32 reads in one call: {symbol} (address, window or `path:line`), or {path} / {path, lines} for non-code files."},
-                    "force": {"type": "boolean", "default": false, "description": "With `items`: return an item's text even when unchanged since your last read of it."}
+                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "description": "Several line ranges of one source/text file in one reply."},
+                    "detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES,"description":"Continue a saved read page; use alone."},
+                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "offset":{"type":"integer","minimum":0,"description":"First line with path: 1-based; 0 also means 1."}, "limit":{"type":"integer","minimum":1,"description":"Line count with path; default 2000 when offset is used."}}}, "description": "Batch up to 32 source/text reads: {symbol} (address/window/path:line) or {path} with a host-style line range."},
+                    "force": {"type": "boolean", "default": false, "description": "Return source again even when already read and unchanged in this context."}
                 }
             }),
         ),
@@ -366,7 +378,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "symbols": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_SYMBOL_ENTRIES, "items":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "description":"Up to 8 addresses or bare names in one call, request order; a failed one fails only itself."},
                     "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers", "description":"callers: impact of changing it; callees: execution/dependency path; both: both sides."},
                     "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2, "description":"Levels to expand; 2 is usually enough."},
-                    "tests": {"type":"boolean", "default":false, "description":"Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent."}
+                    "tests": {"type":"boolean", "default":false, "description":"Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent."},
+                    "detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES,"description":"Read the saved result named by a Bridge notice, only when more detail is needed. Use alone; never poll."}
                 }
             }),
         ),
@@ -381,9 +394,12 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "command": {"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_COMMAND_BYTES}, "description":"Explicit argv to run instead of the detected runner; all argument bytes together are limited to 16 KiB."},
                     "cwd": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`."},
                     "env": {"type":"object", "maxProperties":MAX_ENV_ENTRIES, "additionalProperties":{"type":"string", "maxLength":MAX_ENV_VALUE_BYTES}, "description":"Variables added to the inherited environment; only with `command`."},
-                    "status": {"type":"integer", "minimum":1, "description":"Re-read run number N (from `tests #N`) instead of starting one."},
+                    "cancel": {"type":"integer", "minimum":1, "description":"Cancel this actor’s active run; after cleanup the result is retained and Bridge-delivered when configured. No polling."},
+                    "result": {"type":"integer", "minimum":1, "description":"Read a retained run result once; never starts or waits for a run. Bridge delivers it automatically when configured; do not poll."},
+                    "history": {"type":"boolean", "enum":[true], "description":"List this actor’s retained runs in the active worktree, newest first. Does not start or wait for work."},
+                    "detail_ref": {"type":"string", "minLength":1, "maxLength":MAX_DETAIL_REF_BYTES, "description":"Continue the saved output of a test result; no test is started."},
                     "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped and reported as timed out."},
-                    "targets": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_TEST_TARGETS, "items":{"type":"object", "additionalProperties":false, "minProperties":1, "maxProperties":1, "properties":{"symbol":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "path":{"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES}, "pattern":{"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES}}}, "description":"Up to 8 targets in one run, each {symbol}, {path} or {pattern}; one result line per target and one rerun line."}
+                    "targets": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_TEST_TARGETS, "items":{"type":"object", "additionalProperties":false, "minProperties":1, "maxProperties":1, "properties":{"symbol":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "path":{"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES}, "pattern":{"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES}, "command":{"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_COMMAND_BYTES}}}}, "description":"Batch ≤8 {symbol}, {path}, {pattern} or {command:[argv]} checks. One budget and Bridge result; root cwd, ordered steps, per-target outcomes."}
                 }
             }),
         ),
@@ -735,7 +751,14 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         ],
         AssistanceTool::Outline => &["path", "kinds", "paths", "glob"],
         AssistanceTool::Read => &[
-            "symbol", "path", "lines", "symbols", "ranges", "items", "force",
+            "symbol",
+            "path",
+            "lines",
+            "symbols",
+            "ranges",
+            "items",
+            "force",
+            "detail_ref",
         ],
         AssistanceTool::Symbol => &[
             "symbol",
@@ -747,9 +770,28 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "path",
             "byte_offset",
         ],
-        AssistanceTool::Graph => &["symbol", "direction", "depth", "tests", "symbols"],
+        AssistanceTool::Graph => &[
+            "symbol",
+            "direction",
+            "depth",
+            "tests",
+            "symbols",
+            "detail_ref",
+        ],
         AssistanceTool::Test => &[
-            "symbol", "path", "pattern", "command", "cwd", "env", "status", "budget_s", "targets",
+            "symbol",
+            "path",
+            "pattern",
+            "command",
+            "cwd",
+            "env",
+            "status",
+            "cancel",
+            "result",
+            "history",
+            "detail_ref",
+            "budget_s",
+            "targets",
         ],
     }
 }
@@ -833,6 +875,22 @@ pub(crate) fn validate_normalized_call(
     tool: AssistanceTool,
     mut parameters: Value,
 ) -> Result<ValidatedCall, ParameterError> {
+    if tool == AssistanceTool::Read {
+        normalize_read_ranges(&mut parameters)?;
+    }
+    // Result is the public domain name; status remains accepted for older clients.
+    if tool == AssistanceTool::Test
+        && let Some(object) = parameters.as_object_mut()
+        && let Some(result) = object.remove("result")
+    {
+        if object.contains_key("status") {
+            return Err(invalid_field(
+                "result",
+                FieldRule::OneOf("not together with status"),
+            ));
+        }
+        object.insert("status".to_owned(), result);
+    }
     // Public inspect queries have closed modes before reusing the private Context operation.
     if tool == AssistanceTool::Inspect && parameters.get("kind").is_some() {
         let object = parameters
@@ -921,15 +979,24 @@ pub(crate) fn validate_normalized_call(
                 ));
             }
         }
+        AssistanceTool::Read | AssistanceTool::Graph if object.contains_key("detail_ref") => {
+            if object.len() != 1 {
+                return Err(invalid_field(
+                    "detail_ref",
+                    FieldRule::OneOf("alone, without a new selection"),
+                ));
+            }
+            required_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+        }
         AssistanceTool::Read if object.contains_key("items") => {
             super::batch::validate_read_items(object)?;
         }
         AssistanceTool::Read => {
-            if object.contains_key("force") {
-                return Err(invalid_field(
-                    "force",
-                    FieldRule::OneOf("used only together with \"items\""),
-                ));
+            if object
+                .get("force")
+                .is_some_and(|value| value.as_bool().is_none())
+            {
+                return Err(invalid_field("force", FieldRule::OneOf("true or false")));
             }
             optional_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
             optional_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
@@ -1048,14 +1115,25 @@ pub(crate) fn validate_normalized_call(
             super::batch::validate_test_targets(object)?;
         }
         AssistanceTool::Test => {
-            let targets = ["symbol", "path", "pattern", "command", "status"]
-                .into_iter()
-                .filter(|field| object.contains_key(*field))
-                .count();
+            let targets = [
+                "symbol",
+                "path",
+                "pattern",
+                "command",
+                "status",
+                "cancel",
+                "history",
+                "detail_ref",
+            ]
+            .into_iter()
+            .filter(|field| object.contains_key(*field))
+            .count();
             if targets != 1 {
                 return Err(invalid_field(
                     "target",
-                    FieldRule::OneOf("exactly one of symbol, path, pattern, command, or status"),
+                    FieldRule::OneOf(
+                        "exactly one of symbol, path, pattern, command, result, history, cancel, or detail_ref",
+                    ),
                 ));
             }
             optional_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
@@ -1074,6 +1152,24 @@ pub(crate) fn validate_normalized_call(
                 }
             }
             optional_string(object, "pattern", MAX_TEXT_BYTES)?;
+            optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+            if object
+                .get("history")
+                .is_some_and(|value| value.as_bool() != Some(true))
+            {
+                return Err(invalid_field("history", FieldRule::OneOf("true")));
+            }
+            if (object.contains_key("history")
+                || object.contains_key("status")
+                || object.contains_key("cancel")
+                || object.contains_key("detail_ref"))
+                && object.contains_key("budget_s")
+            {
+                return Err(invalid_field(
+                    "budget_s",
+                    FieldRule::OneOf("only with a new run"),
+                ));
+            }
             if object.contains_key("cwd") || object.contains_key("env") {
                 if !object.contains_key("command") {
                     return Err(invalid_field("cwd", FieldRule::OneOf("only with command")));
@@ -1143,6 +1239,15 @@ pub(crate) fn validate_normalized_call(
                         FieldRule::OneOf("argv strings without NUL totaling at most 16384 bytes"),
                     ));
                 }
+            }
+            if object
+                .get("cancel")
+                .is_some_and(|value| value.as_u64().is_none_or(|id| id == 0))
+            {
+                return Err(invalid_field(
+                    "cancel",
+                    FieldRule::NonNegativeInteger(u64::MAX),
+                ));
             }
             if object
                 .get("status")
@@ -1327,9 +1432,12 @@ pub(crate) fn validate_normalized_call(
             validate_normalized_call(fold_inspect_problems(tool, &parameters), parameters.clone())?;
         }
         AssistanceTool::Inspect => {
-            // OUTBOX-r3 §8.5: one reference, up to eight in order, or none (the session's facts),
-            // each with an optional bounded wait.
+            // OUTBOX-r3 §8.5: one reference or up to eight in order, each with an optional bounded
+            // wait; naming neither is refused because no session fact list exists to read.
             optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+            if !object.contains_key("detail_ref") && !object.contains_key("detail_refs") {
+                return Err(invalid_field("detail_ref", FieldRule::Required));
+            }
             if let Some(references) =
                 string_list(object, "detail_refs", super::outbox::MAX_DETAIL_REFS)?
             {
@@ -1696,6 +1804,84 @@ pub(crate) fn validate_normalized_call(
     Ok(ValidatedCall { tool, parameters })
 }
 
+/// Converts native-style offset/count operands into the existing closed range form without I/O.
+/// Offset0 aliases line1; absent count is2000. Conflicts, invalid integers and overflow refuse.
+fn normalize_read_ranges(parameters: &mut Value) -> Result<(), ParameterError> {
+    let normalize = |object: &mut Map<String, Value>| -> Result<(), ParameterError> {
+        if !object.contains_key("offset") && !object.contains_key("limit") {
+            return Ok(());
+        }
+        if !object.contains_key("path")
+            || ["symbol", "symbols", "ranges", "lines", "items"]
+                .iter()
+                .any(|key| object.contains_key(*key))
+        {
+            return Err(invalid_field(
+                "offset",
+                FieldRule::OneOf("with path only; use offset/limit or lines, never both"),
+            ));
+        }
+        let start = match object.get("offset") {
+            None => 1,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n <= u32::MAX as u64)
+                .ok_or_else(|| {
+                    invalid_field(
+                        "offset",
+                        FieldRule::IntegerRange {
+                            min: 0,
+                            max: u32::MAX as u64,
+                        },
+                    )
+                })?
+                .max(1),
+        };
+        let count = match object.get("limit") {
+            None => 2000,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n > 0 && *n <= u32::MAX as u64)
+                .ok_or_else(|| {
+                    invalid_field(
+                        "limit",
+                        FieldRule::IntegerRange {
+                            min: 1,
+                            max: u32::MAX as u64,
+                        },
+                    )
+                })?,
+        };
+        let end = start
+            .checked_add(count - 1)
+            .filter(|n| *n <= u32::MAX as u64)
+            .ok_or_else(|| {
+                invalid_field(
+                    "limit",
+                    FieldRule::IntegerRange {
+                        min: 1,
+                        max: u32::MAX as u64,
+                    },
+                )
+            })?;
+        object.remove("offset");
+        object.remove("limit");
+        object.insert("lines".into(), json!(format!("{start}-{end}")));
+        Ok(())
+    };
+    if let Some(object) = parameters.as_object_mut() {
+        normalize(object)?;
+        if let Some(items) = object.get_mut("items").and_then(Value::as_array_mut) {
+            for item in items {
+                if let Some(item) = item.as_object_mut() {
+                    normalize(item)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reads one required bounded nonempty string from one `changes` entry, refusing on the entry
 /// field's own name so the caller learns exactly which key was missing or empty.
 fn entry_string<'a>(
@@ -1897,28 +2083,32 @@ impl AssistanceFacade {
     }
 
     /// [`Self::dispatch_at`], also returning the private actor tag a current managed Claude
-    /// daemon attaches to start replies, identity answers and `recovery_needed` refusals;
-    /// `Some(None)` is an identity answer that names no actor.
+    /// daemon attaches to start replies, identity answers and `recovery_needed` refusals, plus
+    /// the optional accepted-or-unknown Bridge publication result of a restart-loss notice.
+    /// `Some(None)` is an identity answer that names no actor; the handoff result never claims
+    /// model observation.
     pub async fn dispatch_at_tagged(
         &self,
         runtime_dir: &Path,
         host: &TrustedTransport,
         tool: AssistanceTool,
         parameters: Value,
-    ) -> (FacadeOutcome, Option<Option<String>>) {
+    ) -> (FacadeOutcome, Option<Option<String>>, Option<bool>) {
         let Ok(call) = validate_call(tool, parameters) else {
-            return (FacadeOutcome::InvalidParameters, None);
+            return (FacadeOutcome::InvalidParameters, None, None);
         };
         self.dispatch_validated(runtime_dir, host, call).await
     }
 
     /// Shared tail of [`Self::dispatch`] and [`Self::dispatch_at`] once parameters are validated.
+    /// Returns the closed facade outcome, an optional managed-Claude actor wrapper, and the
+    /// restart-loss Bridge publication result when the daemon supplied one.
     async fn dispatch_validated(
         &self,
         runtime_dir: &Path,
         host: &TrustedTransport,
         call: ValidatedCall,
-    ) -> (FacadeOutcome, Option<Option<String>>) {
+    ) -> (FacadeOutcome, Option<Option<String>>, Option<bool>) {
         let tool = call.tool();
         // The method envelope has the daemon's own method-payload bound, so the front's private
         // host metadata never takes room from bounded model arguments.
@@ -1926,7 +2116,7 @@ impl AssistanceFacade {
             &json!({"parameters":call.parameters(),"host_meta":host.host_meta}),
             crate::app::MAX_ASSISTANCE_JSON_BYTES,
         ) else {
-            return (FacadeOutcome::InvalidParameters, None);
+            return (FacadeOutcome::InvalidParameters, None, None);
         };
         let Some(request) = MethodDispatch::new(
             host.request_id.clone(),
@@ -1935,9 +2125,10 @@ impl AssistanceFacade {
             call.tool().transport_method(),
             parameters,
         ) else {
-            return (FacadeOutcome::Unavailable, None);
+            return (FacadeOutcome::Unavailable, None, None);
         };
         let mut tag = None;
+        let mut lost_handoff = None;
         let outcome = match dispatch_method_if_running(runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
             MethodDispatchTransportResult::TimedOut => {
@@ -1946,9 +2137,16 @@ impl AssistanceFacade {
             }
             MethodDispatchTransportResult::Busy => FacadeOutcome::Busy,
             MethodDispatchTransportResult::Restarting => FacadeOutcome::Restarting,
+            MethodDispatchTransportResult::OutcomeUnknown
+                if tool == AssistanceTool::Test && !tool.mutates_with(call.parameters()) =>
+            {
+                FacadeOutcome::Incomplete
+            }
             MethodDispatchTransportResult::OutcomeUnknown => FacadeOutcome::OutcomeUnknown,
             // A read-only call that timed out after delivery changed nothing worth checking.
-            MethodDispatchTransportResult::WrittenTimedOut if tool.mutates() => {
+            MethodDispatchTransportResult::WrittenTimedOut
+                if tool.mutates_with(call.parameters()) =>
+            {
                 journal_transport_timeout(tool, "reply");
                 FacadeOutcome::OutcomeUnknown
             }
@@ -1980,26 +2178,33 @@ impl AssistanceFacade {
                         | PeerReply::Error { .. }
                         | PeerReply::InvalidParameters { .. }),
                         status,
-                    )) => FacadeOutcome::Reply(Box::new(reply), status),
+                        handoff,
+                    )) => {
+                        lost_handoff = handoff;
+                        FacadeOutcome::Reply(Box::new(reply), status)
+                    }
                     Some((
                         reply @ (PeerReply::Edit { .. } | PeerReply::EditBatch { .. }),
                         status,
+                        handoff,
                     )) if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) => {
+                        lost_handoff = handoff;
                         FacadeOutcome::Reply(Box::new(reply), status)
                     }
-                    Some((reply @ PeerReply::Complete { kind, .. }, status))
+                    Some((reply @ PeerReply::Complete { kind, .. }, status, handoff))
                         if tool == AssistanceTool::Inspect
                             || tool_accepts_result_kind(tool, kind) =>
                     {
+                        lost_handoff = handoff;
                         FacadeOutcome::Reply(Box::new(reply), status)
                     }
                     // An undecodable reply to a delivered mutation cannot prove it did not apply.
-                    _ if tool.mutates() => FacadeOutcome::OutcomeUnknown,
+                    _ if tool.mutates_with(call.parameters()) => FacadeOutcome::OutcomeUnknown,
                     _ => FacadeOutcome::Incomplete,
                 }
             }
         };
-        (outcome, tag)
+        (outcome, tag, lost_handoff)
     }
 }
 
@@ -2124,8 +2329,6 @@ pub async fn submit_hook_event(
             HookPhase::PostFailure => "post_failure",
             HookPhase::PermissionDenied => "permission_denied",
             HookPhase::PostBatch => "post_batch",
-            HookPhase::Stop => "stop",
-            HookPhase::SubagentStop => "subagent_stop",
             HookPhase::Compaction => "compaction",
         },
         "actor_id": event.actor_id(),
@@ -2152,17 +2355,8 @@ pub async fn submit_hook_event(
     match submit_hook_if_running(
         runtime_dir,
         request,
-        // A held Stop waits for the daemon's hold (OUTBOX-r3 §8.3); every other hook stays short.
-        HookTransportLimits::new(
-            128 * 1024,
-            MAX_HOOK_BYTES,
-            if event.phase().holds() {
-                super::outbox::HOLD_HOOK_DEADLINE
-            } else {
-                Duration::from_secs(1)
-            },
-        )
-        .expect("fixed Assistance hook limits are valid"),
+        HookTransportLimits::new(128 * 1024, MAX_HOOK_BYTES, Duration::from_secs(1))
+            .expect("fixed Assistance hook limits are valid"),
     )
     .await
     {
@@ -2184,9 +2378,7 @@ pub async fn submit_hook_event(
 /// Encodes one bounded post-hook delta in the model-context schema required by its explicit host.
 ///
 /// Pre-hooks, empty/oversized text, invalid JSON serialization, and a `PermissionDenied` outcome
-/// all produce no output. A held `Stop`/`SubagentStop` renders the host's turn-continuation shape
-/// `{"decision":"block","reason":…}` with the text as its reason (OUTBOX-r3 §8.3); a compaction
-/// event renders nothing. Both current host contracts use `hookSpecificOutput`, but the event name
+/// all produce no output; a compaction event renders nothing. Both current host contracts use `hookSpecificOutput`, but the event name
 /// is selected from the validated host event rather than copied from arbitrary input.
 pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
     if text.is_empty() || text.len() > MAX_FEEDBACK_BYTES {
@@ -2198,10 +2390,6 @@ pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
         HookPhase::PostFailure => "PostToolUseFailure",
         HookPhase::PermissionDenied => return None,
         HookPhase::PostBatch => "PostToolBatch",
-        // OUTBOX-r3 §8.3: a held turn end continues with the facts as the block reason.
-        HookPhase::Stop | HookPhase::SubagentStop => {
-            return serde_json::to_string(&json!({"decision": "block", "reason": text})).ok();
-        }
         HookPhase::Compaction => return None,
     };
     serde_json::to_string(&json!({
@@ -3055,12 +3243,15 @@ impl StdioFacade {
     }
 
     /// Reads an optional protected Bridge deployment once at trusted managed startup.
-    /// Invalid/unavailable credentials disable only Bridge; no socket is probed here.
+    /// Direct delivery needs no frontend registration. Historical empty-store deployments read
+    /// credentials here; invalid/unavailable credentials disable only that path, with no socket probe.
     pub fn with_bridge_configuration(
         mut self,
         config: Option<&super::bridge::BridgeConfig>,
     ) -> Self {
-        self.bridge = config.and_then(super::bridge::BridgeConfig::open);
+        self.bridge = config
+            .filter(|config| config.native_stores.is_empty())
+            .and_then(super::bridge::BridgeConfig::open);
         self
     }
 
@@ -3378,7 +3569,7 @@ impl StdioFacade {
         // Managed Codex only: publish this process's route before the first dispatch of every
         // valid call. Idempotent, so retried calls after publication failure still publish.
         self.publish_codex_route(&context.meta).await;
-        let (outcome, tag) = self
+        let (outcome, tag, _) = self
             .facade
             .dispatch_at_tagged(runtime_dir, &host, tool, parameters.clone())
             .await;
@@ -3415,7 +3606,7 @@ impl StdioFacade {
         };
         // The repeat belongs to the actor just restored: a pre now owned by anyone else refuses.
         self.announce(&mut host, Some(&actor), Some(&actor));
-        let (outcome, tag) = self
+        let (outcome, tag, _) = self
             .facade
             .dispatch_at_tagged(runtime_dir, &host, tool, parameters.clone())
             .await;
@@ -3510,7 +3701,10 @@ impl StdioFacade {
     }
 
     /// Re-runs one remembered start through the ordinary `ide.start` path with the trusted
-    /// `claudecode/reactivation` host marker (T15B restart recovery); reports success.
+    /// `claudecode/reactivation` host marker (T15B restart recovery); reports activation success.
+    /// Unresolved subjects accompany every attempt and are forgotten only when the reply says
+    /// Bridge accepted custody or the publication outcome is uncertain. A definite no-effect
+    /// refusal keeps them for a later eligible restart.
     ///
     /// The daemon admits the root by the same `allowed_roots` rule as any start. `marker` names
     /// the real call whose genuine pending pre-hook lends its actor (`true`: any pre delivered
@@ -3551,8 +3745,9 @@ impl StdioFacade {
             if let Some(expected) = expected {
                 meta["claudecode/actor"] = json!(expected);
             }
-            // OUTBOX-r3 §10: what this actor was relayed unresolved before the replacement; the
-            // new daemon queues one `lost-after-restart` fact for it. Older daemons ignore it.
+            // OUTBOX-r4 §10: what this actor was relayed unresolved before the replacement; the
+            // new daemon attempts one `lost-after-restart` Bridge publication and privately
+            // reports accepted-or-unknown custody. Older daemons ignore it, so the front retains it.
             let lost = self
                 .reconnect
                 .as_ref()
@@ -3562,9 +3757,9 @@ impl StdioFacade {
                 meta["claudecode/lost"] = json!(lost);
             }
             host.host_meta = Some(meta);
-            let FacadeOutcome::Reply(reply, _) = self
+            let (FacadeOutcome::Reply(reply, _), _, lost_handoff) = self
                 .facade
-                .dispatch_at(
+                .dispatch_at_tagged(
                     runtime_dir,
                     &host,
                     AssistanceTool::Start,
@@ -3580,7 +3775,9 @@ impl StdioFacade {
                     kind: ResultKind::Activation,
                     ..
                 } => {
-                    if let Some(reconnect) = &self.reconnect {
+                    if (lost.is_empty() || lost_handoff == Some(true))
+                        && let Some(reconnect) = &self.reconnect
+                    {
                         reconnect.unresolved.forget(expected.unwrap_or_default());
                     }
                     return true;
@@ -3633,7 +3830,7 @@ impl StdioFacade {
             .await
         {
             // Only the exact identity answer names an actor; anything else proves nothing.
-            (FacadeOutcome::Reply(reply, _), Some(Some(tag)))
+            (FacadeOutcome::Reply(reply, _), Some(Some(tag)), _)
                 if matches!(
                     reply.as_ref(),
                     PeerReply::Unavailable {
@@ -3644,7 +3841,7 @@ impl StdioFacade {
             {
                 StopIdentity::Actor(tag)
             }
-            (FacadeOutcome::Reply(reply, _), None)
+            (FacadeOutcome::Reply(reply, _), None, _)
                 if matches!(
                     reply.as_ref(),
                     PeerReply::Unavailable {
@@ -3655,7 +3852,7 @@ impl StdioFacade {
             {
                 StopIdentity::Unsupported
             }
-            (outcome, _) => StopIdentity::Refused(outcome),
+            (outcome, _, _) => StopIdentity::Refused(outcome),
         }
     }
 
@@ -3829,6 +4026,7 @@ impl StdioFacade {
         if self.catalog_host == CatalogHost::Codex
             && host_kind == Some(HostKind::Codex)
             && matches!(tool, AssistanceTool::Test | AssistanceTool::Edit)
+            && tool.mutates_with(&parameters)
             && let Some(client) = &self.bridge
             && let Some(route) = client.register(&context.meta).await
         {
@@ -4028,14 +4226,13 @@ impl StdioFacade {
         // OUTBOX-r3 §10: remember what this reply leaves owed and forget what it resolves.
         if tool != AssistanceTool::Stop
             && let Some(reconnect) = &self.reconnect
-            && let FacadeOutcome::Reply(reply, status) = &outcome
+            && let FacadeOutcome::Reply(reply, _) = &outcome
         {
             reconnect.unresolved.observe(
                 tag.as_deref().unwrap_or_default(),
                 tool,
                 &stage_parameters,
                 reply,
-                status.as_deref(),
             );
         }
         crate::telemetry::adapters::log_front_outcome(
@@ -4104,12 +4301,12 @@ impl StdioFacade {
             }
             // The daemon refused the call before running it, so even a mutation applied nothing.
             FacadeOutcome::Busy => {
-                "The IDE is serving too many calls; this call did not run and nothing was applied.\nRepair: Repeat this call."
+                "The IDE is serving too many calls; this call did not run and nothing was applied.\nRepair: Retry once; otherwise use native tools."
             }
             // The daemon refused the call before running it (and a managed client already tried
             // the replacement once), so even a mutation applied nothing.
             FacadeOutcome::Restarting => {
-                "The IDE restarted after an internal fault; this call did not run and nothing was applied.\nRepair: Repeat this call."
+                "The IDE restarted after an internal fault; this call did not run and nothing was applied.\nRepair: Retry once; otherwise use native tools."
             }
             // Never resent: the daemon may have executed the call, and a resend could only repeat
             // a change or be refused for its already consumed pre-hook.
@@ -4118,12 +4315,14 @@ impl StdioFacade {
                     "This edit may have applied; its outcome is unknown.\nRepair: Verify with ide.diff before another edit."
                 }
                 AssistanceTool::Test => {
-                    "This test may have started; its outcome is unknown.\nRepair: Read ide.inspect before starting another run."
+                    "This test may have started; its outcome is unknown.\nRepair: Review ide.test {\"history\":true} once before starting another run."
                 }
                 AssistanceTool::Start | AssistanceTool::Stop => {
                     "This activation change may have applied; its outcome is unknown.\nRepair: Call ide.start to see the current binding."
                 }
-                _ => "This call may have run, but its reply was lost.\nRepair: Repeat this call.",
+                _ => {
+                    "This call may have run, but its reply was lost.\nRepair: Retry once; otherwise use native tools."
+                }
             },
             FacadeOutcome::ReestablishFailed => {
                 "The IDE exited and could not reconnect.\nRepair: Continue with native tools."
@@ -4708,7 +4907,7 @@ fn inline_complete_kinds_keep_structured_content() {
         };
         assert!(tool_accepts_result_kind(tool, kind));
         let encoded = reply.encode().unwrap();
-        let (decoded, _) = PeerReply::decode_delivered(encoded.as_str()).unwrap();
+        let (decoded, _, _) = PeerReply::decode_delivered(encoded.as_str()).unwrap();
         let rendered = render_reply(decoded, content::Envelope::WithStructured);
         assert_eq!(
             rendered.structured_content.unwrap()["kind"],
@@ -4944,9 +5143,10 @@ impl StdioFacade {
 
 #[tool_router]
 impl StdioFacade {
-    /// Activate Agent IDE once per task, before any other ide.* call. Returns the project card:
-    /// languages, build and test commands, layout, entry points, docs and the call forms. Use it
-    /// instead of reading README, {manifests_head} {manifests_tail}. End the task with ide.stop.
+    /// Activate once per agent/worktree; reuse this activation for the whole batch workflow.
+    /// Returns project languages, commands, layout and call forms. Collect related targets before
+    /// outline/symbol/graph, read them together, then one multi-file edit and one test batch.
+    /// Do not start again per file. Call ide.stop once after all required results are collected.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn start(
@@ -4957,9 +5157,9 @@ impl StdioFacade {
         self.call(AssistanceTool::Start, parameters, context).await
     }
 
-    /// What changed since your last diff (the first call: everything uncommitted), paged. A `mode`
-    /// (`head`, `staged`, `unstaged`, `task`) asks for the whole diff of that kind. Review it
-    /// before finishing instead of running `git diff`.
+    /// Review all related changed paths in one call with paths; do not request a diff per file.
+    /// Default: changes since your last diff, paged. mode head/staged/unstaged/task selects the whole
+    /// comparison. Optional incremental/paged review; native git diff is also valid.
     #[tool(name = "ide.diff", input_schema = tool_schemas()[2].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn diff(
@@ -4970,10 +5170,9 @@ impl StdioFacade {
         self.call(AssistanceTool::Diff, parameters, context).await
     }
 
-    /// Skeleton of files: every symbol and region (`@header`, `@imports`) with its address,
-    /// signature, doc line and line numbers. Far cheaper than reading a file. Give `paths` (up to
-    /// 24) or a `glob`; `path` takes one file or a directory. Addresses look like
-    /// `src/a.rs#Type/method` and feed ide.read and ide.edit.
+    /// Batch skeletons with paths (up to 24) or one glob covering the related files. Do not outline
+    /// files one at a time when they fit a batch. Returns symbol/region addresses, signatures and
+    /// docs without bodies; collect the needed addresses and pass them together to ide.read items.
     #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn outline(
@@ -4985,9 +5184,9 @@ impl StdioFacade {
             .await
     }
 
-    /// `{"symbol":"a.rs#f"}`: doc and body, numbered; `#f:1-3`: window; `#@imports`/`#@header`:
-    /// regions. `{"path":"a.rs"}` reads source; `lines` bounds a range, `items` batches reads.
-    /// Prefer symbol units for code. Semantic positions use ide.symbol.
+    /// Batch related symbol bodies, windows and file ranges with items before editing. Reuse
+    /// already-read unchanged code; force:true is for lost context or an intentional reread.
+    /// Prefer symbol units for code; use the host catalog’s line-range form for file reads.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn read(
@@ -4998,10 +5197,10 @@ impl StdioFacade {
         self.call(AssistanceTool::Read, parameters, context).await
     }
 
-    /// Symbol card: signature/doc/definition/usages/history, immediate neighbors (positive
-    /// callers/callees). `{"symbol":"a.rs#f"}`; ide.graph for call chains. Or
-    /// `{"path":"a.rs","byte_offset":42}`: UTF-8 use-site definitions/references,
-    /// explicit lexical/unavailable evidence.
+    /// Batch related symbols with symbols (up to 8): signature/doc/definition/usages/history and
+    /// immediate neighbors (callers/callees). Every positive value means direct neighbors, never
+    /// depth. Use ide.graph for wider call chains. A precise UTF-8 use-site uses path+byte_offset.
+    /// Collect needed bodies and read them in one ide.read items batch.
     #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn symbol(
@@ -5012,9 +5211,11 @@ impl StdioFacade {
         self.call(AssistanceTool::Symbol, parameters, context).await
     }
 
-    /// Call chains for impact/architecture/indirect faults: signature/public changes, shared
-    /// refactors, cross-language connections. Start depth 2 (1–3; 60 nodes), expand only as needed;
-    /// tests:true expands tests. `{"symbol":"a.rs#f","depth":2}`. Tiny edits: ide.symbol.
+    /// Batch related roots with symbols (up to 8) for shared signatures, indirect faults or wider
+    /// impact. callers shows impact, callees dependencies, both both sides; depth 2 usually suffices
+    /// (1–3), tests:true expands tests. In Bridge mode even warm graphs accept a job; completion
+    /// arrives automatically. Continue independent work or end the turn; never poll or finish/stop
+    /// while awaiting results. Tiny edits need the ide.symbol direct-neighbor card.
     #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn graph(
@@ -5025,10 +5226,11 @@ impl StdioFacade {
         self.call(AssistanceTool::Graph, parameters, context).await
     }
 
-    /// Run tests as one run: `targets` of `{symbol}`, `{path}` or `{pattern}` (up to 8), or one
-    /// `symbol` (the tests that reference it), `path`, `pattern` or explicit `command`. Returns
-    /// the pass/fail line with a rerun command; a longer run answers `started` and its outcome
-    /// arrives by itself in an `<agent-ide>` block. Use it instead of a shell.
+    /// Batch tests/checks with targets: {symbol}, {path}, {pattern} or {command:[argv]}, up to 8.
+    /// One run id and budget; ordered steps run at the worktree root. In Bridge mode execution
+    /// accepts a run and completion arrives automatically. End an idle turn without finish/stop;
+    /// never poll. Read result:N, history:true or detail_ref; cancel:N requests owner cancellation
+    /// and completion follows process-group cleanup. Legacy deployments may return fast results inline.
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false))]
     async fn test(
@@ -5039,9 +5241,10 @@ impl StdioFacade {
         self.call(AssistanceTool::Test, parameters, context).await
     }
 
-    /// `{}`: facts; `detail_ref`/`detail_refs`: pages. `{"kind":"problems"}`: checks.
-    /// `{"kind":"diagnostics","path":"a.rs"}`: file reports with freshness, unknown never clean.
-    /// No build/check starts. Long results arrive by themselves; never poll.
+    /// Read known detail_refs together in one batch when saved detail is needed; do not query
+    /// references one by one. File diagnostics use kind:diagnostics+path; project checks use
+    /// kind:problems. Unknown never means clean; no check starts. Test results/history/output
+    /// belong to ide.test; graph/read pages use their own tools. Never poll async state.
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -5053,9 +5256,9 @@ impl StdioFacade {
             .await
     }
 
-    /// End this task's IDE session; edited files stay on disk. Required when the task ends or
-    /// before handing off: frees the writer slot, lists uncollected test runs and flushes
-    /// undelivered results. Call it once.
+    /// End this agent/worktree activation once, after all required batch results are collected.
+    /// Do not stop between files or while waiting for Bridge completion. Frees the writer slot;
+    /// edited files stay on disk and uncollected runs are listed.
     #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn stop(
@@ -5066,12 +5269,11 @@ impl StdioFacade {
         self.call(AssistanceTool::Stop, parameters, context).await
     }
 
-    /// Edit by address. Replace a symbol's doc and body:
-    /// `{"symbol":"src/a.rs#Type/method","content":"…"}`. Change inside it with `old`/`new`
-    /// scoped to the symbol, or `content` for a window `…/method:3-5`. Also `op`
-    /// insert/delete/rename, `add_import`/`remove_import`, `files` for several files and `patch`
-    /// for apply_patch. All changes apply or none; the reply is immediate and the project check
-    /// ({project_checks}) arrives by itself.
+    /// Batch all related production and test changes into files, one atomic multi-file operation
+    /// and one project check. Each file accepts symbol/content, scoped old/new, line changes or
+    /// creation. Read affected units together first; do not submit one call per file or tiny hunk.
+    /// Reuse exact operation_id only for an identical retry. The write reply is immediate; the
+    /// project check ({project_checks}) completes separately.
     #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
     async fn edit(
@@ -5085,24 +5287,10 @@ impl StdioFacade {
 
 /// Connect-time instructions the host shows the model next to the tool list: the one-paragraph
 /// case for the IDE over native file tools, and the two rules every reply relies on.
-pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: ide.start once, ide.stop at task end. \
-ide.outline: addresses; ide.read: source; ide.edit: changes; ide.test: tests. \
-ide.symbol {\"symbol\":\"a.rs#f\"}: card, immediate neighbors; {\"path\":\"a.rs\",\"byte_offset\":42}: \
-semantic position. ide.graph {\"symbol\":\"a.rs#f\",\"depth\":2} traverses call chains for impact, architecture or \
-indirect faults: callers=impact, callees=dependencies, both=both sides. Expand 1–3 only as needed; \
-tests:true expands tests. Tiny edits: card. ide.inspect {\"kind\":\"problems\"}: checks; \
-{\"kind\":\"diagnostics\",\"path\":\"a.rs\"}: file reports. Long results arrive by themselves in an \
-<agent-ide> block; never poll. Native fallback remains.";
+pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: ide.start once per worktree. Collect related targets first; batch outline paths/glob, symbol/graph symbols, read items, multi-file edits, test targets, diff paths and known inspect detail_refs. One bounded batch per phase; reuse prior code/results. ide.symbol gives immediate neighbors; ide.graph traverses call chains. In Bridge mode graph/tests complete automatically. Work independently or end the turn; never poll, finish or ide.stop while awaiting results. ide.stop once at task end.";
 
-/// The Codex paragraph teaches the same ten tools and capability split, plus native patches.
-pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE: ide.start once, ide.stop at task end. \
-ide.outline: addresses; ide.read: source; ide.edit: changes (also apply_patch); \
-ide.test: tests. ide.symbol {\"symbol\":\"a.rs#f\"}: card, immediate neighbors; \
-{\"path\":\"a.rs\",\"byte_offset\":42}: semantic position. ide.graph {\"symbol\":\"a.rs#f\",\"depth\":2} \
-traverses call chains for impact, architecture or indirect faults: callers=impact, callees=dependencies, \
-both=both sides. Expand 1–3 only as needed; tests:true expands tests. Tiny edits: card. \
-ide.inspect {\"kind\":\"problems\"}: checks; {\"kind\":\"diagnostics\",\"path\":\"a.rs\"}: file reports. \
-Long results arrive by themselves in an <agent-ide> block; never poll. Native fallback remains.";
+/// Codex additionally uses its single canonical atomic patch form.
+pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE: ide.start once per worktree. Collect related targets first; batch outline paths/glob, symbol/graph symbols, read items, one multi-file apply_patch body, test targets, diff paths and known inspect detail_refs. One bounded batch per phase; reuse prior code/results. ide.symbol gives immediate neighbors; ide.graph traverses call chains. In Bridge mode graph/tests complete automatically. Work independently or end the turn; never poll, finish or ide.stop while awaiting results. ide.stop once at task end.";
 
 /// Which per-host catalog `tools/list` and the connect-time instructions answer with.
 ///
@@ -5141,8 +5329,9 @@ impl CatalogHost {
     /// Every advertised schema is slimmed (`slim_schema`) and omits the legacy aliases and the
     /// deprecated `source_ref` (the validator still accepts them), so the model reads only the
     /// symbol-first forms. Both hosts exclude the private Context operation.
-    /// Only Codex advertises the native `patch` edit form; every host's validator still accepts
-    /// it for compatibility. Projection clones schemas before trimming, never mutating another
+    /// Codex advertises only the native `patch` edit form (and optional operation_id); Claude
+    /// retains its structured forms. Validators keep legacy compatibility. Projection clones
+    /// schemas before trimming, never mutating another
     /// host's catalog or the backend validation schema.
     /// Both hosts let `ide.inspect` serve project problems and file diagnostics via the private
     /// Context engine; the removed public route is never registered.
@@ -5156,6 +5345,25 @@ impl CatalogHost {
                     for legacy in ["file_path", "old_string", "new_string", "source_ref"] {
                         properties.remove(legacy);
                     }
+                    if &*tool.name == "ide.read" {
+                        properties.retain(|key, _| matches!(key.as_str(), "items" | "force" | "detail_ref"));
+                        if let Some(Value::Object(item)) = properties.get_mut("items").and_then(|items| items.get_mut("items")) {
+                            if let Some(Value::Object(fields)) = item.get_mut("properties") {
+                                if self == Self::Codex { fields.remove("offset"); fields.remove("limit"); }
+                                else { fields.remove("lines"); }
+                            }
+                            item.insert("oneOf".into(), json!([{"required":["symbol"]},{"required":["path"]}]));
+                        }
+                        tool.description = Some(if self == Self::Codex {
+                            "Batch source reads: items [{symbol:\"src/a.rs#f\"}, {path:\"src/b.rs\",lines:\"1-80\"}]. Paths are relative to the active worktree. Read related units together before one multi-file patch. Already-read unchanged items return an acknowledgement; force:true rereads after context loss. Do not reread your own successful edit merely to verify it."
+                        } else {
+                            "Batch source reads: items [{symbol:\"src/a.rs#f\"}, {path:\"src/b.rs\",offset:1,limit:80}]. Paths are relative to the active worktree; offset/limit are native-style line coordinates. Read related units together. Already-read unchanged items return an acknowledgement; force:true rereads after context loss. Do not reread your own successful edit merely to verify it."
+                        }.into());
+                    }
+                    if self == Self::Codex && &*tool.name == "ide.edit" {
+                        properties.retain(|key, _| matches!(key.as_str(), "operation_id" | "patch"));
+                        tool.description = Some("Batch related production/tests edits into one atomic multi-file `patch` using apply_patch syntax: *** Begin Patch, *** Add File or *** Update File, *** End Patch. Send {patch:\"…\"}, optionally operation_id for safe retries. Deleting or moving files is not supported. Read affected code first; include related edits and tests in one patch. The reply confirms the write; its project check completes separately.".into());
+                    }
                     if self == Self::Claude && &*tool.name == "ide.edit" {
                         properties.remove("patch");
                         tool.description = tool.description.as_deref().map(|description| {
@@ -5164,6 +5372,9 @@ impl CatalogHost {
                                 .into()
                         });
                     }
+                }
+                if self == Self::Codex && &*tool.name == "ide.edit" {
+                    schema.insert("required".to_owned(), json!(["patch"]));
                 }
                 let mut schema = Value::Object(schema);
                 slim_schema(&mut schema);
@@ -5174,6 +5385,117 @@ impl CatalogHost {
             })
             .collect()
     }
+}
+
+/// Native ranges normalize to legacy line selectors without changing single-read enrichment. Offset0/1
+/// select line1; selector conflicts and numeric overflow still refuse before source I/O.
+#[test]
+fn native_ranges_preserve_enriched_read_forms() {
+    let read =
+        |args| validate_call(AssistanceTool::Read, args).map(|call| call.parameters().clone());
+    assert_eq!(
+        read(json!({"path":"a.rs"})).unwrap(),
+        json!({"path":"a.rs"})
+    );
+    assert_eq!(
+        read(json!({"symbol":"a.rs#f"})).unwrap(),
+        json!({"symbol":"a.rs#f"})
+    );
+    assert_eq!(
+        read(json!({"path":"a.rs","offset":0,"limit":2,"force":true})).unwrap(),
+        json!({"path":"a.rs","lines":"1-2","force":true})
+    );
+    assert_eq!(
+        read(json!({"items":[{"path":"a.rs","offset":2,"limit":2}]})).unwrap(),
+        json!({"items":[{"path":"a.rs","lines":"2-3"}]})
+    );
+    for invalid in [
+        json!({"path":"a.rs","offset":-1}),
+        json!({"path":"a.rs","limit":0}),
+        json!({"path":"a.rs","offset":4294967295_u64,"limit":2}),
+        json!({"path":"a.rs","lines":"1-2","offset":1}),
+    ] {
+        assert!(read(invalid).is_err());
+    }
+}
+
+/// The public test domain exposes read-only result/history/output queries without launching a
+/// new process, and Codex sees one unambiguous native patch form. Legacy status remains valid.
+#[test]
+fn test_api_queries_and_codex_patch_projection_are_unambiguous() {
+    let result = validate_call(AssistanceTool::Test, json!({"result":3})).unwrap();
+    assert_eq!(result.parameters()["status"], 3);
+    for read in [
+        json!({"result":3}),
+        json!({"status":3}),
+        json!({"history":true}),
+        json!({"detail_ref":"test-output"}),
+    ] {
+        let call = validate_call(AssistanceTool::Test, read).unwrap();
+        assert!(!call.tool().mutates_with(call.parameters()));
+    }
+    assert!(
+        validate_call(
+            AssistanceTool::Test,
+            json!({"targets":[{"command":["cargo","check"]},{"command":["cargo","test"]}]})
+        )
+        .is_ok()
+    );
+    assert!(validate_call(AssistanceTool::Test, json!({"targets":[{"command":[]}]})).is_err());
+    let cancellation = validate_call(AssistanceTool::Test, json!({"cancel":1})).unwrap();
+    assert!(cancellation.tool().mutates_with(cancellation.parameters()));
+    let start = validate_call(AssistanceTool::Test, json!({"targets":[{"pattern":"x"}]})).unwrap();
+    assert!(start.tool().mutates_with(start.parameters()));
+    assert!(validate_call(AssistanceTool::Test, json!({"history":true})).is_ok());
+    assert!(validate_call(AssistanceTool::Test, json!({"detail_ref":"test-output"})).is_ok());
+    for invalid in [
+        json!({"cancel":0}),
+        json!({"cancel":1,"budget_s":2}),
+        json!({"cancel":1,"history":true}),
+        json!({"targets":[{"pattern":"x"}],"cancel":1}),
+        json!({"history":false}),
+        json!({"targets":[{"pattern":"x"}],"history":true}),
+        json!({"targets":[{"pattern":"x"}],"detail_ref":"test-output"}),
+        json!({"targets":[{"pattern":"x"}],"result":1}),
+        json!({"history":true,"command":["true"]}),
+        json!({"result":0}),
+        json!({"result":1,"status":1}),
+        json!({"result":1,"budget_s":1}),
+        json!({"detail_ref":""}),
+    ] {
+        assert!(
+            validate_call(AssistanceTool::Test, invalid.clone()).is_err(),
+            "{invalid}"
+        );
+    }
+    let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
+    let edit = |host: CatalogHost| {
+        host.catalog(facade.router.list_all())
+            .into_iter()
+            .find(|tool| tool.name == "ide.edit")
+            .unwrap()
+    };
+    let codex = edit(CatalogHost::Codex);
+    assert_eq!(codex.input_schema["required"], json!(["patch"]));
+    assert_eq!(
+        codex.input_schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["operation_id", "patch"]
+    );
+    assert!(
+        edit(CatalogHost::Claude).input_schema["properties"]
+            .get("files")
+            .is_some()
+    );
+    assert!(
+        edit(CatalogHost::Claude).input_schema["properties"]
+            .get("patch")
+            .is_none()
+    );
 }
 
 /// Removes the bound keywords (`minLength`, `maxLength`, `minItems`, `maxItems`, `maxProperties`,
@@ -5248,7 +5570,13 @@ fn advertised_text_never_teaches_waiting() {
             "advertised text names {banned}"
         );
     }
-    assert!(validate_call(AssistanceTool::Inspect, json!({"wait_ms": 5})).is_ok());
+    assert!(
+        validate_call(
+            AssistanceTool::Inspect,
+            json!({"detail_ref": "a", "wait_ms": 5})
+        )
+        .is_ok()
+    );
 }
 
 /// The advertised catalog stays inside the harness-reply-v1 byte budgets: every tool description
@@ -5384,15 +5712,9 @@ fn per_host_catalogs_differ_only_by_the_declared_subset() {
                 .description
                 .as_deref()
                 .unwrap()
-                .contains("Call chains")
+                .contains("Batch related roots")
         );
-        assert!(
-            graph
-                .description
-                .as_deref()
-                .unwrap()
-                .contains("{\"symbol\":\"a.rs#f\",\"depth\":2}")
-        );
+        assert!(graph.description.as_deref().unwrap().contains("depth 2"));
         for property in ["callers", "callees"] {
             let description = symbol.input_schema["properties"][property]["description"]
                 .as_str()
@@ -6486,6 +6808,74 @@ mod managed_claude_front_tests {
             peer
         );
         assert!(text.contains("pub fn value()"), "{text}");
+    }
+
+    /// Re-activation retains unresolved subjects through definite Bridge no-effect and clears
+    /// them only after accepted or uncertain custody.
+    #[tokio::test]
+    async fn restart_loss_is_forgotten_only_after_bridge_handoff() {
+        let daemon = ScriptedDaemon::new("agent-ide.sock");
+        let front = daemon.front(Arc::new(|| Box::pin(async { None })));
+        let reconnect = front.reconnect.clone().unwrap();
+        let tag = "d".repeat(64);
+        reconnect.unresolved.observe(
+            &tag,
+            AssistanceTool::Read,
+            &json!({"path":"src/lib.rs"}),
+            &PeerReply::Pending {
+                detail_ref: "read-before-restart".to_owned(),
+            },
+        );
+        let activation = PeerReply::Complete {
+            kind: ResultKind::Activation,
+            text: "activated".into(),
+            detail_ref: None,
+            truncated: false,
+            continuation: false,
+        };
+        let peer = async {
+            for handed_off in [false, true] {
+                let (stream, request) = daemon.request().await.unwrap();
+                assert_eq!(request["dispatch_method"], "start");
+                assert_eq!(
+                    request["params_json"]["host_meta"]["claudecode/lost"],
+                    json!(["ide.read src/lib.rs"])
+                );
+                answer(
+                    stream,
+                    &request,
+                    json!({
+                        "lost_handoff": handed_off,
+                        "reply": serde_json::to_value(&activation).unwrap()
+                    }),
+                )
+                .await;
+            }
+        };
+        let client = async {
+            for (handed_off, expected) in [
+                (false, vec!["ide.read src/lib.rs".to_owned()]),
+                (true, Vec::new()),
+            ] {
+                assert!(
+                    front
+                        .reactivate(
+                            &daemon.runtime,
+                            "old",
+                            json!({"activation_id":"restored"}),
+                            json!("real-call"),
+                            Some(&tag),
+                        )
+                        .await
+                );
+                assert_eq!(
+                    reconnect.unresolved.subjects(&tag),
+                    expected,
+                    "{handed_off}"
+                );
+            }
+        };
+        tokio::join!(client, peer);
     }
 
     /// The anonymous 0.10.2 slot is re-activated before an ordinary call by naming that very

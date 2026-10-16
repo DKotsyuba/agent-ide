@@ -155,6 +155,13 @@ impl BindingRef {
         self.actor_id == session_id
     }
 
+    /// Returns the native actor already established by protected local correlation. Only trusted
+    /// delivery code may combine it with explicit operator store configuration; it is not proof
+    /// on its own and must never be accepted from model arguments or used to mint authority.
+    pub(crate) fn native_actor_id(&self) -> &str {
+        &self.actor_id
+    }
+
     /// Returns the private actor tag of this binding's actor (see [`actor_tag`]).
     pub(crate) fn actor_tag(&self) -> String {
         actor_tag(&self.actor_id)
@@ -208,14 +215,8 @@ pub enum HookPhase {
     PermissionDenied,
     /// The native host has completed a batch without supplying one synthetic tool-call identity.
     PostBatch,
-    /// The host is ending the actor's turn (Claude or Codex `Stop`); the session outbox may hold
-    /// it to hand over requested results (OUTBOX-r3 §8.3).
-    Stop,
-    /// A Claude subagent is ending its turn (`SubagentStop`), held like [`HookPhase::Stop`] only
-    /// for a session proven interactive.
-    SubagentStop,
     /// The host compacted or cleared the session's context (`PreCompact`, or Claude's
-    /// `SessionStart` with source `compact` or `clear`); it raises the outbox compaction counter.
+    /// `SessionStart` with source `compact` or `clear`); it raises the session compaction counter.
     Compaction,
 }
 
@@ -223,15 +224,7 @@ impl HookPhase {
     /// Whether this phase is a turn-level event that names no tool call: it pairs with no pre and
     /// only looks up the actor's active binding.
     pub fn is_turn_event(self) -> bool {
-        matches!(
-            self,
-            HookPhase::Stop | HookPhase::SubagentStop | HookPhase::Compaction
-        )
-    }
-
-    /// Whether the host waits on this phase's reply to end a turn, so the daemon may hold it.
-    pub fn holds(self) -> bool {
-        matches!(self, HookPhase::Stop | HookPhase::SubagentStop)
+        matches!(self, HookPhase::Compaction)
     }
 }
 
@@ -459,7 +452,7 @@ pub enum BindingStatus {
     /// A complete native hook lifecycle marks this active binding for registered-path recheck.
     /// It proves neither an MCP invocation nor a source effect or successful native command.
     NativeObserved(BindingRef),
-    /// A turn-level event (`Stop`, `SubagentStop`, a compaction) named this active binding's actor
+    /// A turn-level event (a compaction) named this active binding's actor
     /// on its channel. It pairs with no call and proves no tool effect.
     TurnObserved(BindingRef),
     /// Required host data was absent, malformed, mismatched, replayed, or unavailable.
@@ -1100,7 +1093,7 @@ impl HostBindingGuard {
     /// A pre-hook is not an authority claim. A post-hook never gates MCP result acceptance: it
     /// only settles a call that was already validated by `establish_start` or `validate_active`.
     pub fn observe_hook(&mut self, event: HookEvent, channel: ChannelSessionRef) -> BindingStatus {
-        // Any hook of a bound actor proves its session is alive (takeover evidence), a turn end
+        // Any hook of a bound actor proves its session is alive (takeover evidence), a compaction
         // and a pre delivered twice included: each stands for a real host event.
         self.note_seen(event.host, &event.actor_id, &channel);
         if event.phase.is_turn_event() {
@@ -1222,10 +1215,7 @@ impl HostBindingGuard {
                     .expect("the checked rejection scope has capacity");
                 BindingStatus::Unavailable(BindingUnavailable::Mismatch)
             }
-            HookPhase::PostBatch
-            | HookPhase::Stop
-            | HookPhase::SubagentStop
-            | HookPhase::Compaction => {
+            HookPhase::PostBatch | HookPhase::Compaction => {
                 unreachable!("batch and turn hooks return before invocation matching")
             }
         }
@@ -1759,8 +1749,6 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
         "PostToolUseFailure" => HookPhase::PostFailure,
         "PermissionDenied" => HookPhase::PermissionDenied,
         "PostToolBatch" => HookPhase::PostBatch,
-        "Stop" => HookPhase::Stop,
-        "SubagentStop" => HookPhase::SubagentStop,
         "PreCompact" => HookPhase::Compaction,
         _ => return Err(BindingUnavailable::UnsupportedHookPhase),
     };
@@ -1824,8 +1812,6 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
         "PostToolUseFailure" => HookPhase::PostFailure,
         "PermissionDenied" => HookPhase::PermissionDenied,
         "PostToolBatch" => HookPhase::PostBatch,
-        "Stop" => HookPhase::Stop,
-        "SubagentStop" => HookPhase::SubagentStop,
         "PreCompact" => HookPhase::Compaction,
         "SessionStart" if matches!(payload.source.as_deref(), Some("compact" | "clear")) => {
             HookPhase::Compaction

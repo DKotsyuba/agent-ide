@@ -11,7 +11,8 @@
 //!
 //! The same job then keeps running in precise mode, re-checking the server every 300 ms for up to
 //! [`PRECISE_BUDGET`], and is registered with the session outbox (the worker's shared state),
-//! which turns its final reply or failure into one `job-ready` fact. At most [`MAX_DEFERRED_PER_SESSION`] such jobs run per
+//! which retains its final reply or failure under its reference and hands a `job-ready` fact to
+//! Bridge when configured. At most [`MAX_DEFERRED_PER_SESSION`] such jobs run per
 //! session; beyond that the approximate answer says the precise answer is not scheduled and the
 //! job ends at its next retry, while a non-exact language keeps the 0.10.8 wait.
 
@@ -77,9 +78,8 @@ impl Worker<'_> {
     /// that answered early only keep it parked until [`PRECISE_BUDGET`] ends. The early answer is
     /// the approximate answer for a language whose source outline is exact, else `pending`.
     /// When the waiter received it, the job's deadline moves [`PRECISE_BUDGET`] ahead, it is
-    /// counted against [`MAX_DEFERRED_PER_SESSION`] and registered with the session outbox
-    /// (`approximate_given` true for an approximate answer). When the session already has that
-    /// many, an approximate answer says the precise one is not scheduled and the job ends at its
+    /// counted against [`MAX_DEFERRED_PER_SESSION`] and registered for its completion fact. When the
+    /// session already has that many, an approximate answer says the precise one is not scheduled and the job ends at its
     /// next retry; a `pending` answer is not sent and the job waits as before. A waiter that is
     /// already gone gets nothing here: the inline-wait timeout answered it `pending`.
     pub(super) async fn answer_while_loading(&mut self, job: &mut Job) {
@@ -97,7 +97,7 @@ impl Worker<'_> {
         }
         let room = self.deferred_count(&binding) < MAX_DEFERRED_PER_SESSION;
         let approximate = self.approximate(job).await;
-        let (reply, approximate_given, definition) = match approximate {
+        let (reply, definition) = match approximate {
             Some(answer) => {
                 let mut text = answer.text;
                 if !room {
@@ -118,7 +118,6 @@ impl Worker<'_> {
                         truncated: false,
                         continuation: false,
                     },
-                    true,
                     Some(answer.definition),
                 )
             }
@@ -126,7 +125,6 @@ impl Worker<'_> {
                 PeerReply::Pending {
                     detail_ref: job.reference.clone(),
                 },
-                false,
                 None,
             ),
             None => return,
@@ -159,7 +157,6 @@ impl Worker<'_> {
             tool: job.tool,
             target: bounded_target(job.parameters["symbol"].as_str().unwrap_or_default()),
             fence_paths: fence,
-            approximate_given,
         };
         SessionOutbox::defer(&*self.shared, &job.reference, spec);
     }
@@ -237,7 +234,8 @@ impl Worker<'_> {
         Some(Approximate {
             text: format!(
                 "approximate: {server} is still indexing; usages and callers below are name \
-                 matches from source, marked ~; the precise answer follows as a fact\n{text}"
+                 matches from source, marked ~; the precise answer is retained under its reference; \
+                 Bridge delivers it automatically when configured\n{text}"
             ),
             definition: file,
         })

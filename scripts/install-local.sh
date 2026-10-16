@@ -91,8 +91,8 @@ printf '  %s/skills/agent-ide\n' "$current_link"
 printf '\n'
 printf 'Codex native hooks (managed): print the exact hooks.json fragment with\n'
 printf '  %s codex-hooks print\n' "$prefix/bin/agent-ide"
-printf 'It includes Stop (timeout 330, the turn-end hold) and PreCompact; agent-run Codex harnesses\n'
-printf 'need [[harnesses.codex.hooks]] entries for PreToolUse, PostToolUse, Stop and PreCompact with\n'
+printf 'It includes PreToolUse, PostToolUse and PreCompact; agent-run Codex harnesses\n'
+printf 'need [[harnesses.codex.hooks]] entries for PreToolUse, PostToolUse and PreCompact with\n'
 printf '  command = ["%s", "codex-hook", "--managed"]\n' "$prefix/bin/agent-ide"
 printf 'agent-run resolves %s once when its service starts: restart that service after this\n' "$current_link"
 printf 'install, or its Claude runtimes keep loading the previous plugin version.\n'

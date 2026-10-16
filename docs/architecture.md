@@ -15,6 +15,17 @@ One application: a language-independent core crate, one crate per language and t
 
 Do not equate an integration edge with an implementation dependency. A consumer may use an agreed small substitute until the real provider is ready. Actual host authentication, delivery, durability, concurrency and LSP sharing need their own real integration evidence.
 
+## Bridge-only delivery
+
+The direct-address consumer is selected by explicit Bridge native-store configuration.
+Bridge owns transport, queueing, retry, carrier selection and native wake. IDE owns workspace
+and binding authority, source/cancellation fences, retained results and immutable handoff intent.
+Graph/test results arrive asynchronously, including warm graph results; IDE runs no fallback
+carrier, native `PostToolUse` delivery of results, `Stop` hold or idle wake. Both live passive-wake
+proofs (Codex and Claude) passed, so the superseded IDE-run delivery code was removed. Without a
+Bridge route a result stays retained under its `detail_ref` and is read with `ide.inspect`.
+See [launcher configuration](assistance-launcher.md) and the active [tool contract](contracts/tools-v0.4.md).
+
 ## Component contracts
 
 - [Shared vocabulary and failure semantics](contracts/common.md)
@@ -75,25 +86,23 @@ Codex has its separate `AGENT_IDE_CODEX_RENDEZVOUS_ROOT` override. Fixture and t
 uses `TMPDIR`, `TMP` and `TEMP`, and the persistent product home can be isolated with
 `AGENT_IDE_HOME`.
 
-## Session outbox and delivery (OUTBOX-r3)
+## Completion facts (OUTBOX-r4)
 
-[OUTBOX-r3](contracts/session-outbox-v1.md) makes long work deliver its own result, so no agent
-polls. All of it lives in Assistance (`crates/agent-ide-core/src/assistance/`):
+[OUTBOX-r4](contracts/session-outbox-v1.md) describes the facts long work produces so no agent
+polls. Results stay retained under their references; Bridge delivers them when configured. All of
+it lives in Assistance (`crates/agent-ide-core/src/assistance/`):
 
-- `outbox.rs` is the producer seam: `SessionOutbox` (`push`, `defer`, `forget`, `context_epoch`,
-  and the carriers' `reserve`/`commit`/`release`), the `FactDraft` kinds and budgets, and a
-  test-only `RecordingOutbox` that peer modules test against.
-- `session_outbox.rs` is the in-memory store: undelivered facts per session (32, failures first),
-  coalescing, staleness fencing against edits and native writes, the agent's turn state
-  (working, ending, idle), holding work in flight, and the history `ide.inspect {}` lists. It
-  dies with the daemon.
-- `worker/delivery.rs` turns settled jobs, test runs and slow edit checks into facts and pushes
-  them. The carriers take facts in one hand-off each: reply piggyback (`assembly.rs`), the paired
-  native `PostToolUse` hook, the `Stop`/`SubagentStop` hold (`worker/turn.rs`, its own daemon
-  lane, at most 300 s and 7 holds in a row), `ide.inspect` (`worker/inspection.rs`) and the idle
-  wake (`wake.rs`, the only seam to a host wake route; today the Claude session-registry inbox).
-- `unresolved.rs` is the MCP front's memory of what each actor was owed, reported as one
-  `lost-after-restart` fact after a daemon replacement.
+- `outbox.rs` is the producer seam: `SessionOutbox` (`push`, `defer`, `forget`, `context_epoch`),
+  the `FactDraft` kinds and budgets, and a test-only `RecordingOutbox` that peer modules test
+  against.
+- `session_outbox.rs` is the in-memory session ledger: change counters for fencing against edits
+  and native writes, and in-flight work. It queues no fact and dies with the daemon.
+- `worker/delivery.rs` turns settled jobs, test runs and slow edit checks into facts and hands each
+  one to Bridge (`bridge.rs`) after a source-access re-proof.
+- `unresolved.rs` is the MCP front's memory of what each actor was owed. After a daemon
+  replacement it clears those subjects only after Bridge accepts the one `lost-after-restart`
+  publication or reports an uncertain outcome; no route or definite no-effect retains them for a
+  later re-activation.
 
 ## Crates (v0.5)
 

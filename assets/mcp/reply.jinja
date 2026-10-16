@@ -18,7 +18,7 @@ Contract:
 -#}
 {%- if state == "unavailable" -%}
 {%- if cause_tag == "inactive_binding" and tool_name == "ide.test" and test_status_id -%}
-{{ refusal("This IDE activation has stopped.", 'Read the retained run with ide.inspect {"detail_ref":"tests #' ~ test_status_id ~ '"}.') }}
+{{ refusal("This IDE activation has stopped.", 'Call ide.start {"read_only":true}, then ide.test {"result":' ~ test_status_id ~ '}.') }}
 {%- elif cause_tag == "outside_allowed_roots" -%}
 {{ refusal("This project is outside the directories the IDE may open.", "Call ide.start with an allowed root.") }}
 {%- elif cause_tag == "replay" -%}
@@ -77,7 +77,7 @@ Event retained.
 Host binding released.
 {%- endif -%}
 {%- if state == "pending" -%}
-The result arrives by itself in an <agent-ide> block. Result reference: {{ detail_ref }}
+Result retained under {{ detail_ref }}. Bridge delivers it automatically when configured.
 {%- endif -%}
 {%- if state == "error" -%}
 {%- if code.no_such_file is defined -%}
@@ -191,13 +191,13 @@ The result arrives by itself in an <agent-ide> block. Result reference: {{ detai
 {%- elif code == "capacity" and resolution_detail is startingwith("diff:") -%}
 {{ refusal("This diff exceeds a bounded capture or reply envelope limit.", "Call ide.diff with narrower paths.") }}
 {%- elif code == "capacity" and resolution_detail is endingwith(":queue_full") -%}
-{{ refusal("The IDE's bounded request queue is full.", "Repeat this call.") }}
+{{ refusal("The IDE's bounded request queue is full.", "Retry once; otherwise use native tools.") }}
 {%- elif code == "capacity" and resolution_detail == "worker:result_store_full" -%}
-{{ refusal("The IDE's bounded result store is full.", "Repeat this call.") }}
+{{ refusal("The IDE's bounded result store is full.", "Retry once; otherwise use native tools.") }}
 {%- elif code == "capacity" and resolution_detail == "worker:actor_share_full" -%}
 {{ refusal("This call would consume capacity reserved for other active actors.", "Continue this operation with native tools.") }}
 {%- elif code == "capacity" -%}
-{{ refusal("The IDE's bounded queue or result store is full.", "Repeat this call.") }}
+{{ refusal("The IDE's bounded queue or result store is full.", "Retry once; otherwise use native tools.") }}
 {%- elif code == "cancelled" -%}
 {{ refusal("This call was cancelled when its activation stopped.", "Call ide.start before continuing.") }}
 {%- elif code == "deadline" -%}
@@ -235,7 +235,8 @@ The result arrives by itself in an <agent-ide> block. Result reference: {{ detai
 {%- if state == "complete" and (kind == "context" or kind == "diff" or kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect") -%}
 {{ text }}
 {%- if truncated and detail_ref and continuation -%}
-{{ "\n" }}Cut; ide.inspect {"detail_ref":"{{ detail_ref }}"} continues
+{%- set next_tool = "ide." ~ kind if kind in ["read", "graph", "test"] else "ide.inspect" -%}
+{{ "\n" }}Cut; {{ next_tool }} {"detail_ref":"{{ detail_ref }}"} continues
 {%- elif truncated -%}
 {{ "\n" }}Cut; nothing more to fetch
 {%- endif -%}
@@ -252,7 +253,7 @@ edit: {{ outcome }}; path {{ result.path }}; diagnostics: unknown (ide.inspect {
 {%- elif diagnostics.state == "not_analysed" -%}
 edit: {{ outcome }}; path {{ result.path }}; diagnostics: not_analysed ({{ diagnostics.reason }})
 {%- elif diagnostics.state == "pending" -%}
-edit: {{ outcome }}; path {{ result.path }}; diagnostics: pending; the project check arrives by itself as an edit-checked fact
+edit: {{ outcome }}; path {{ result.path }}; diagnostics: pending; result retained under {{ diagnostics.detail_ref }}; Bridge delivers it automatically when configured
 {%- endif -%}
 {%- if note %}{{ "\n" }}{{ note }}{%- endif %}
 {%- endif -%}

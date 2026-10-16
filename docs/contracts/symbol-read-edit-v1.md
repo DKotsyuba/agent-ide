@@ -9,7 +9,7 @@ Purpose: an agent works the way it naturally does. It finds an address (`file#Ty
 - **No file-version reference.** `source_ref` is never required by any read or edit form and no reply prints one. A supplied `source_ref` keeps its pre-v1 meaning (an extra, strict check) and is deprecated; the teaching surface does not mention it. Replies still carry a `detail_ref` for continuation and for the `edit-checked` fact.
 - **The current text is the freshness check.** An edit resolves its address against the file's bytes at the moment the call is processed. `old` must occur exactly once in its scope, a window must lie inside the unit's current extent. A call that no longer matches writes nothing and answers with the unit's current numbered text and ONE repair step (§3.5). A window edit (E2) carries a light guard (§3.2 rule 3): against the session's remembered read of that unit when there is one, and an echo of the replaced old lines in the reply when there is not.
 - **Atomic.** A call with several changes or files resolves every change before the first write; any refusal writes nothing and consumes nothing.
-- **Reply at once.** A write answers as soon as it is durable. The project check is never waited for: its result arrives by itself as one `edit-checked` fact (session-outbox-v1 §3.3).
+- **Reply at once.** A write answers as soon as it is durable. The project check is never waited for: its result stays retained under the reply's reference and Bridge delivers one `edit-checked` fact automatically when configured (session-outbox-v1 §3.3).
 - **One address language.** The `symbol` field of `ide.read` and `ide.edit` (and each entry of `symbols`, `items[].symbol`, `changes[].symbol`) takes the same strings. What a result prints is what a request accepts.
 
 ## 1. Addresses accepted (restated from symbol-address-v1)
@@ -122,7 +122,7 @@ Notes:
 Success (the first line states the outcome and the check, one line per change follows; the lines name the CHANGED LINES AFTER the edit as addresses). A single-file call:
 
 ```text
-edit: replaced; path src/a.rs; diagnostics: pending; the project check arrives by itself as an edit-checked fact
+edit: replaced; path src/a.rs; diagnostics: pending; result retained under <detail_ref>; Bridge delivers it automatically when configured
   src/a.rs#Store/transcript:12-16 (L131-135)  replaced (3 lines → 5)
   src/a.rs#@imports:7 (L9)  added
 lines after 12 moved +2
@@ -140,14 +140,14 @@ A multi-file call opens `edit: applied <n> of <n> files; diagnostics: …`, then
     13	    turns
 ```
 - The addresses are valid input for `ide.read` at once; the reply prints no source text.
-- Diagnostics words: `pending` (the check arrives as a fact), `not_analysed (<reason>)` for a file no IDE language checks. A check that cannot be held (no open outbox) reports `unknown`. The reply never contains a polling instruction.
+- Diagnostics words: `pending` (the check stays retained under its reference and Bridge delivers its fact when configured), `not_analysed (<reason>)` for a file no IDE language checks. A check that cannot be held (no open outbox) reports `unknown`. The reply never contains a polling instruction.
 - Structured result (hosts that carry it; M-030 decides the envelope): the existing `state`, `result`, `diagnostics` fields plus `changed: [{"address","verb","removed","added"}]`, and for multi-file the existing per-file states.
 - `detail_ref` stays in the structured result and in `edit-checked` facts; no `source_ref` text.
 
 ### 3.4 The check and tests
 
 - A scheduled project check is never waited for, in any form and for any language that has one: the reply is sent right after the write is observed. The provider (language-server) diagnostics refresh of a single-file edit no longer delays the reply; it only fills in the fact if the project check yields nothing for the file.
-- One `edit-checked` fact per operation, unchanged format (session-outbox-v1 §3.3). Tests are never started or named by an edit (out of scope for E-003): they run through `ide.test` as today and their result arrives as `test-finished`.
+- One `edit-checked` fact per operation, unchanged format (session-outbox-v1 §3.3), handed to Bridge when configured. Tests are never started or named by an edit (out of scope for E-003): they run through `ide.test` as today, stay retained under their references and use `test-finished` for Bridge delivery.
 
 ### 3.5 Refusals (nothing written, nothing consumed)
 

@@ -3,14 +3,13 @@
 //! loading until a test arms a session for it.
 
 use super::*;
-use crate::assistance::outbox::{Carrier, HandoffRequest};
 
 /// While the server loads, `ide.symbol {symbols}` answers its waiter at once: the entry whose
 /// definition the source outline finds is approximate, the bare name the lexical scan cannot
-/// resolve reads `pending: <entry> - will be delivered`. The job re-runs only those entries; once
-/// the server answers it settles with the precise blocks, and its final reply becomes ONE
-/// `job-ready` fact naming the batch `detail_ref` and both indexes, holding the turn because an
-/// entry got no answer early.
+/// resolve names the retained batch reference and conditional Bridge delivery. The job re-runs
+/// only those entries; once the server answers it settles with the precise blocks, and its final
+/// reply is retained under the batch `detail_ref` and handed to Bridge as one `job-ready` fact
+/// when configured, with a subject naming both indexes.
 #[tokio::test]
 async fn a_loading_batch_answers_per_entry_at_once_then_one_fact() {
     use crate::lang::testing::fixture_serve_session;
@@ -38,7 +37,12 @@ async fn a_loading_batch_answers_per_entry_at_once_then_one_fact() {
         "{text}"
     );
     assert!(text.contains("b.epsilon:2  ~ a(1)"), "{text}");
-    assert!(text.ends_with("pending: a - will be delivered\n"), "{text}");
+    assert!(
+        text.ends_with(
+            "pending: a - result retained under waiting-bl-1; Bridge delivers it automatically when configured\n"
+        ),
+        "{text}"
+    );
     assert!(job.park_until.is_some(), "the job keeps running");
     assert!(
         job.deadline > tokio::time::Instant::now() + Duration::from_secs(9 * 60),
@@ -46,8 +50,20 @@ async fn a_loading_batch_answers_per_entry_at_once_then_one_fact() {
     );
     assert_eq!(
         deferrals_of(&worker, &job.reference),
-        vec![(false, vec!["a.epsilon".to_owned()])],
-        "one deferral, fenced by the approximate entry's definition, holding the turn"
+        vec![vec!["a.epsilon".to_owned()]],
+        "one deferral, fenced by the approximate entry's definition"
+    );
+    let subject = worker
+        .shared
+        .ledger
+        .lock()
+        .unwrap()
+        .deferred
+        .get(&job.reference)
+        .map(|(spec, _)| spec.subject());
+    assert_eq!(
+        subject,
+        Some(format!("ide.symbol batch {}: items 1,2", job.reference))
     );
 
     // A retry while still loading keeps the early blocks and waits.
@@ -79,26 +95,6 @@ async fn a_loading_batch_answers_per_entry_at_once_then_one_fact() {
     assert!(precise.contains("\nsymbol: a"), "{precise}");
     assert!(!precise.contains("approximate:"), "{precise}");
     assert!(deferrals_of(&worker, &job.reference).is_empty(), "consumed");
-    let facts = worker
-        .shared
-        .outbox
-        .reserve_facts(
-            &reader,
-            HandoffRequest {
-                carrier: Carrier::Inspect,
-                budget: 8_000,
-                holding_only: false,
-            },
-        )
-        .expect("one fact")
-        .facts;
-    assert_eq!(facts.len(), 1, "{facts:?}");
-    assert_eq!(
-        facts[0].subject,
-        format!("ide.symbol batch {}: items 1,2", job.reference)
-    );
-    assert!(facts[0].holds_turn);
-    assert_eq!(facts[0].detail_ref.as_deref(), Some(job.reference.as_str()));
 }
 
 /// A several-symbol call whose caller already left (the inline wait answered it `pending`) is

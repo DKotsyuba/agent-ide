@@ -98,8 +98,8 @@ That record keeps unadvertised protocol compatibility without model idle-wait ad
 |---|---|---|---|---|
 | Diagnostics feedback fact (G via render) | `worker.rs:5100` `FeedbackDelta::new`, `facade.rs:2205` `render` | `Fact:/Next:/Freshness:` labels, "latest context result" | one line plus `ide.inspect {"detail_ref":…}`, "Read the flagged symbols with ide.read" | rewritten |
 | Problem-feed overflow line | `delivery.rs:322` | `ide.context` with kind problems | `ide.inspect {"kind":"problems"}` | rewritten |
-| `test-finished`, `started`, running lines (G) | `test_fact.rs:77`, `test_fact.rs:83` | already "arrives by itself" | unchanged | kept |
-| `edit-checked`, `job-ready` facts | `session_outbox.rs`, `delivery.rs` | already unlabelled | unchanged | kept |
+| `test-finished`, `started`, running lines (G) | `test_fact.rs:77`, `test_fact.rs:83` | claimed unconditional arrival | retained reference plus conditional Bridge delivery | rewritten |
+| `edit-checked`, `job-ready` facts (handed to Bridge) | `outbox.rs`, `delivery.rs` | already unlabelled | unchanged | kept |
 | `ide.stop` reply (G) | `worker.rs:7747` | n/a | unchanged | kept |
 | Project feed plates (`rust: …`) | `project.rs` states (G via `surfaces()`) | n/a | unchanged | kept |
 

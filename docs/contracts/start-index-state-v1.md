@@ -30,9 +30,9 @@ is probed or started for the card.
 |---|---|
 | `ready` | A live session of this worktree answers semantic requests now. |
 | `warming; symbol and graph answer approximately until ready` | Rust (exact source outline) while its session loads. |
-| `warming; symbol and graph answers follow as facts until ready` | Any other language while its session loads. |
+| `warming; symbol and graph results are retained under their references and Bridge delivers them when configured` | Any other language while its session loads. |
 | `not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once` | Rust, no session yet. |
-| `not started; the first symbol or graph call starts it and its answer follows as a fact` | Any other language, no session yet. |
+| `not started; the first symbol or graph call starts it; its result is retained under its reference and Bridge delivers it when configured` | Any other language, no session yet. |
 | `unavailable (<cause>)` | The worktree's last session failed. Causes: `workspace failed to load`, `transport gone`, `no launch configured`. |
 
 The 0.10.8 phrase `wait for the server, which starts on their first use` is retired.
@@ -92,7 +92,8 @@ The consumer teaches these:
 
 1. `ide.symbol` and `ide.graph` never leave the agent waiting. They answer precisely; or
    approximately (Rust while indexing, rows marked `~`); or `pending` (other languages while their
-   server starts). The precise answer then arrives by itself as a fact.
+   server starts). The precise answer stays retained under its reference and Bridge delivers it
+   automatically when configured.
 2. Before adding a field or changing a constructor, `ide.symbol {"symbol": "<Type>"}` lists the
    construction sites tagged `construction ~`. Before changing a signature,
    `ide.graph {"symbol": "<fn>", "direction": "callers"}` lists the call sites.

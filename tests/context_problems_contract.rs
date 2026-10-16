@@ -81,6 +81,7 @@ fn context_schema_advertises_bounded_problems_fields() {
         .expect("inspect diagnostic schema")
         .input_schema;
     assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["minProperties"], 1);
     assert_eq!(schema["properties"]["kind"]["type"], "string");
     assert_eq!(
         schema["properties"]["kind"]["enum"],
@@ -96,6 +97,7 @@ fn context_schema_advertises_bounded_problems_fields() {
     assert_eq!(schema["properties"]["offset"]["maximum"], u32::MAX);
     // The either-or rule is enforced by the handler, so the schema names no requirement at all.
     assert!(schema.get("required").is_none());
+    assert!(validate_call(AssistanceTool::Inspect, json!({})).is_err());
 }
 
 /// Accepts the problems kind without a path while rejecting every unbounded argument shape.

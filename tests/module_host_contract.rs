@@ -323,7 +323,7 @@ fn parity_normalizer_masks_only_volatile_tokens() {
             "ide.test",
             &json!({"path":"t.py"}),
             &json!({"state":"complete","kind":"test","code":null,"detail_ref":reference,
-                "text":format!("tests #1: exit 1, 0 s\n  output (tail):\n{row}\n  rerun: x\n  full output: ide.inspect {reference}")}),
+                "text":format!("tests #1: exit 1, 0 s\n  output (tail):\n{row}\n  rerun: x\n  full output: ide.test {{\"detail_ref\":\"{reference}\"}}")}),
         )
     };
     assert_ne!(

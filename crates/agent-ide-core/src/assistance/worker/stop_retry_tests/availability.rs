@@ -486,9 +486,9 @@ fn waiting_job(
     (job, wait, cancel_sender)
 }
 
-/// The deferral the worker's session outbox holds for `reference`, as `(approximate_given, fence
-/// paths)`; empty when none is registered (or the job already settled into its fact).
-fn deferrals_of(worker: &Worker<'_>, reference: &str) -> Vec<(bool, Vec<String>)> {
+/// The fence paths of the deferral the worker holds for `reference`; empty when none is registered
+/// (or the job already settled into its fact).
+fn deferrals_of(worker: &Worker<'_>, reference: &str) -> Vec<Vec<String>> {
     worker
         .shared
         .ledger
@@ -497,13 +497,10 @@ fn deferrals_of(worker: &Worker<'_>, reference: &str) -> Vec<(bool, Vec<String>)
         .deferred
         .get(reference)
         .map(|(spec, _)| {
-            (
-                spec.approximate_given,
-                spec.fence_paths
-                    .iter()
-                    .map(|fence| fence.path.clone())
-                    .collect(),
-            )
+            spec.fence_paths
+                .iter()
+                .map(|fence| fence.path.clone())
+                .collect()
         })
         .into_iter()
         .collect()
@@ -523,8 +520,8 @@ async fn loading_fixture(actor: &str) -> (Fixture, Store) {
 }
 
 /// While the server loads, `ide.symbol` answers its waiter at once with a labelled approximate
-/// card (lexical usages marked `~`), registers the precise follow-up (`approximate_given`,
-/// fenced by the definition file) and keeps running; once the server answers, the same job
+/// card (lexical usages marked `~`), registers the precise follow-up (fenced by the
+/// definition file) and keeps running; once the server answers, the same job
 /// settles with the precise card. No text tells the agent to poll, wait or repeat.
 #[tokio::test]
 async fn a_loading_symbol_answers_approximately_then_precisely() {
@@ -548,7 +545,9 @@ async fn a_loading_symbol_answers_approximately_then_precisely() {
     let text = complete_text(&early);
     assert!(text.starts_with("approximate: "), "{text}");
     assert!(
-        text.contains("the precise answer follows as a fact"),
+        text.contains(
+            "the precise answer is retained under its reference; Bridge delivers it automatically when configured"
+        ),
         "{text}"
     );
     assert!(text.contains("b.epsilon:2  ~ a(1)"), "{text}");
@@ -569,7 +568,7 @@ async fn a_loading_symbol_answers_approximately_then_precisely() {
     );
     assert_eq!(
         deferrals_of(&worker, &job.reference),
-        vec![(true, vec!["a.epsilon".to_owned()])]
+        vec![vec!["a.epsilon".to_owned()]]
     );
 
     // A retry while still loading only keeps waiting.
@@ -594,10 +593,8 @@ async fn a_loading_symbol_answers_approximately_then_precisely() {
     let precise = complete_text(&settled);
     assert!(precise.starts_with("symbol: a"), "{precise}");
     assert!(!precise.contains("approximate"), "{precise}");
-    // The settled job became its one job-ready fact; it never holds a turn (an answer was given).
+    // The settled job became its one job-ready fact for Bridge; the deferral is consumed.
     assert!(deferrals_of(&worker, &job.reference).is_empty(), "consumed");
-    assert!(worker.shared.outbox.has_undelivered(&reader, false));
-    assert!(!worker.shared.outbox.has_undelivered(&reader, true));
 }
 
 /// While the server loads, `ide.graph` answers at once with an approximate depth-1 graph.
@@ -661,7 +658,7 @@ async fn unresolvable_names_answer_pending_and_the_session_cap_holds() {
     );
     assert_eq!(
         deferrals_of(&worker, &ambiguous.reference),
-        vec![(false, Vec::new())]
+        vec![Vec::<String>::new()]
     );
     let mut keep = Vec::new();
     for index in 1..=3 {

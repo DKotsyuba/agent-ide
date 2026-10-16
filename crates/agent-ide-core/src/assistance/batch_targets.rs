@@ -8,7 +8,7 @@
 //!
 //! While a language server loads, a several-symbol call answers its caller at once: an entry of
 //! a language whose source outline is exact shows M-025's labelled approximate answer, any other
-//! loading entry reads `pending: <entry> - will be delivered`. The same job then re-runs only
+//! loading entry names the retained batch reference and conditional Bridge delivery. The same job then re-runs only
 //! those entries in precise mode and its final reply becomes ONE `job-ready` fact naming the
 //! batch `detail_ref` and the entry indexes (session-outbox-v1 §13.3).
 
@@ -33,7 +33,7 @@ enum EntryState {
     /// follows.
     Approximate,
     /// No answer yet: its server loads (and, once answered early, its language has no exact
-    /// source outline, so the block reads `pending: <entry> - will be delivered`).
+    /// source outline, so the block names its retained reference and conditional Bridge delivery).
     Deferred,
     /// A graph root whose every requested direction faulted.
     Unavailable,
@@ -315,7 +315,8 @@ impl Worker<'_> {
     /// a loading server, and registers the follow-up; returns whether the caller received it.
     ///
     /// Each loading entry gets M-025's approximate answer when its language's source outline is
-    /// exact (symbol-graph-item r2 §4), else the line `pending: <entry> - will be delivered`.
+    /// exact (symbol-graph-item r2 §4), else a line naming the retained batch reference and
+    /// conditional Bridge delivery.
     /// The reply is the batch's composed text with the job's `detail_ref`. Once sent, the job is
     /// counted against [`approximate::MAX_DEFERRED_PER_SESSION`] and deferred with the session
     /// outbox under the target `batch <detail_ref>: items <i,j>` (1-based indexes of the loading
@@ -349,7 +350,10 @@ impl Worker<'_> {
                     entry.definition = Some(answer.definition);
                 }
                 None => {
-                    entry.text = format!("pending: {} - will be delivered\n", entry.name);
+                    entry.text = format!(
+                        "pending: {} - result retained under {}; Bridge delivers it automatically when configured\n",
+                        entry.name, job.reference
+                    );
                     entry.state = EntryState::Deferred;
                 }
             }
@@ -390,9 +394,6 @@ impl Worker<'_> {
             tool: job.tool,
             target: format!("batch {}: items {indexes}", job.reference),
             fence_paths: fence,
-            approximate_given: !entries
-                .iter()
-                .any(|entry| entry.state == EntryState::Deferred),
         };
         SessionOutbox::defer(&*self.shared, &job.reference, spec);
         true
@@ -705,7 +706,7 @@ mod tests {
             ),
             entry(
                 "c.py#h",
-                "pending: c.py#h - will be delivered\n",
+                "pending: c.py#h - result retained under ref-1; Bridge delivers it automatically when configured\n",
                 EntryState::Deferred,
             ),
             entry("d.rs#x", "error: unknown_symbol\n", EntryState::Failed),
@@ -721,7 +722,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("\npending: c.py#h - will be delivered\n"),
+            text.contains("\npending: c.py#h - result retained under ref-1; Bridge delivers it automatically when configured\n"),
             "{text}"
         );
         batch::assert_no_polling(&text);

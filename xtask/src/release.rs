@@ -407,7 +407,7 @@ pub fn verify(asset: &Path) -> Result<()> {
     }
     check_sums(&bundle)?;
     if json_file(&bundle.join(".claude-plugin/marketplace.json"))?["plugins"]
-        != json!([{"name": "agent-ide", "source": "./", "description": "Agent IDE coding-companion skill and Claude lifecycle hooks.", "version": version}])
+        != json!([{"name": "agent-ide", "source": "./", "description": "Batch related source discovery, reads, atomic multi-file edits and checks; automatic Bridge completion.", "version": version}])
         || json_file(&bundle.join(".agents/plugins/marketplace.json"))?["plugins"]
             != json!([{"name": "agent-ide", "source": {"source": "local", "path": "./"}}])
     {

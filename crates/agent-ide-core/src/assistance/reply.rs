@@ -676,17 +676,23 @@ impl std::fmt::Debug for PeerReply {
     }
 }
 
-/// One daemon method reply wrapped around an attached status plate (T28B).
+/// One daemon method reply wrapped around private delivery metadata.
 ///
-/// The daemon encodes this shape exactly when a terminal reply carries a due plate for a host
-/// whose feed delivery rides replies; every other reply stays a bare [`PeerReply`], byte-identical
-/// to earlier releases.
+/// `status` carries a due plate for a host whose feed delivery rides replies. `lost_handoff`
+/// reports whether Bridge accepted custody of a re-activation's `lost-after-restart` notice or
+/// its publication outcome is uncertain. Every reply with neither field stays a bare [`PeerReply`],
+/// byte-identical to earlier releases.
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct StatusCarriedReply {
-    /// The complete `<agent-ide>` plate, delivered verbatim at the top of the rendered reply.
-    status: String,
-    /// The closed reply the plate was attached to.
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct DeliveredReply {
+    /// The complete `<agent-ide>` plate, delivered verbatim at the top of the rendered reply;
+    /// absent when this wrapper carries only the restart handoff result.
+    #[serde(default)]
+    status: Option<String>,
+    /// Whether the restart-loss publication was accepted or uncertain; absent for ordinary calls.
+    #[serde(default)]
+    lost_handoff: Option<bool>,
+    /// The unchanged closed reply the private metadata accompanies.
     reply: PeerReply,
 }
 impl PeerReply {
@@ -737,33 +743,52 @@ impl PeerReply {
         let reply: Self = serde_json::from_str(value).ok()?;
         reply.valid_reference().then_some(reply)
     }
-    /// Decodes one daemon method reply with its optional carried status plate (T28B).
+    /// Decodes one daemon method reply with its optional carried status plate and restart-loss
+    /// handoff result.
     ///
     /// Accepts the bare closed reply (`status` absent, the historical wire form) and the
-    /// [`StatusCarriedReply`] wrapper. Both forms enforce the same byte bound; a carried plate
+    /// [`DeliveredReply`] wrapper. Both forms enforce the same byte bound; a carried plate
     /// must be a nonempty block within [`MAX_FEEDBACK_BYTES`] — the ceiling a hook-delivered
     /// plate has too, since due git and environment notices join the feed's
     /// [`crate::feed::MAX_BLOCK_BYTES`] block — and its reply must pass the same
-    /// closed-reference validation as a bare one.
-    pub(crate) fn decode_delivered(value: &str) -> Option<(Self, Option<String>)> {
-        if let Ok(carried) = serde_json::from_str::<StatusCarriedReply>(value) {
+    /// closed-reference validation as a bare one. The final tuple item is present only when the
+    /// daemon evaluated a restart-loss handoff.
+    pub(crate) fn decode_delivered(value: &str) -> Option<(Self, Option<String>, Option<bool>)> {
+        if let Ok(carried) = serde_json::from_str::<DeliveredReply>(value) {
             if value.len() > MAX_REPLY_BYTES {
                 return None;
             }
             let valid = carried.reply.valid_reference()
-                && !carried.status.is_empty()
-                && carried.status.len() <= MAX_FEEDBACK_BYTES;
-            return valid.then_some((carried.reply, Some(carried.status)));
+                && (carried.status.is_some() || carried.lost_handoff.is_some())
+                && carried
+                    .status
+                    .as_ref()
+                    .is_none_or(|status| !status.is_empty() && status.len() <= MAX_FEEDBACK_BYTES);
+            return valid.then_some((carried.reply, carried.status, carried.lost_handoff));
         }
-        Some((Self::decode(value)?, None))
+        Some((Self::decode(value)?, None, None))
     }
-    /// Encodes one reply with an attached status plate in the [`StatusCarriedReply`] wire form.
+    /// Encodes one reply with optional private delivery metadata.
     ///
-    /// Callers attach a plate only after the complete final MCP carrier was proven to fit
-    /// (`content::fits_with_status`), so the wrapper — strictly smaller than that carrier —
-    /// always stays inside the transport bound; failure returns `None` rather than a cut plate.
-    pub(crate) fn encode_with_status(reply: &Self, status: &str) -> Option<OpaqueJson> {
-        let wrapped = serde_json::json!({"status": status, "reply": reply});
+    /// At least one metadata field must be present. A status plate is supplied only after the
+    /// complete final MCP carrier was proven to fit (`content::fits_with_status`), so this wrapper
+    /// stays inside the transport bound. `lost_handoff` follows Bridge's existing boolean custody
+    /// contract and never claims model observation.
+    pub(crate) fn encode_delivered(
+        reply: &Self,
+        status: Option<&str>,
+        lost_handoff: Option<bool>,
+    ) -> Option<OpaqueJson> {
+        if status.is_none() && lost_handoff.is_none() {
+            return None;
+        }
+        let mut wrapped = serde_json::json!({"reply": reply});
+        if let Some(status) = status {
+            wrapped["status"] = serde_json::json!(status);
+        }
+        if let Some(lost_handoff) = lost_handoff {
+            wrapped["lost_handoff"] = serde_json::json!(lost_handoff);
+        }
         OpaqueJson::new(serde_json::to_string(&wrapped).ok()?, MAX_REPLY_BYTES)
     }
     /// Checks reference syntax; ownership and current liveness remain worker admission gates.
@@ -815,8 +840,9 @@ fn envelopes_are_closed_and_fit_serialized_budget() {
     }
 }
 
-/// The status-carried wire form (T28B) round-trips the plate and the closed reply, keeps the bare
-/// form decoding without a plate, and refuses oversize, overlong-plate or invalid-reference wraps.
+/// The private delivery wrapper round-trips status and restart handoff metadata, keeps the bare
+/// form decoding without metadata, and refuses oversize, overlong-plate or invalid-reference
+/// wraps.
 #[test]
 fn status_carried_replies_round_trip_and_stay_closed() {
     let plate = "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>";
@@ -827,15 +853,25 @@ fn status_carried_replies_round_trip_and_stay_closed() {
         truncated: false,
         continuation: false,
     };
-    let encoded = PeerReply::encode_with_status(&reply, plate).unwrap();
-    let (decoded, status) = PeerReply::decode_delivered(encoded.as_str()).unwrap();
+    let encoded = PeerReply::encode_delivered(&reply, Some(plate), None).unwrap();
+    let (decoded, status, lost_handoff) = PeerReply::decode_delivered(encoded.as_str()).unwrap();
     assert_eq!(decoded, reply);
     assert_eq!(status.as_deref(), Some(plate));
+    assert_eq!(lost_handoff, None);
 
     // Bare replies decode exactly as before, with no plate.
-    let (bare, status) =
+    let (bare, status, lost_handoff) =
         PeerReply::decode_delivered(reply.clone().encode().unwrap().as_str()).unwrap();
-    assert_eq!((bare, status), (reply.clone(), None));
+    assert_eq!((bare, status, lost_handoff), (reply.clone(), None, None));
+
+    // Restart-loss acknowledgment is private metadata and carries both success and refusal.
+    for handed_off in [false, true] {
+        let encoded = PeerReply::encode_delivered(&reply, None, Some(handed_off)).unwrap();
+        assert_eq!(
+            PeerReply::decode_delivered(encoded.as_str()),
+            Some((reply.clone(), None, Some(handed_off)))
+        );
+    }
 
     // A wrapped reply whose inner reference is invalid fails closed.
     let forged = serde_json::json!({
@@ -851,13 +887,13 @@ fn status_carried_replies_round_trip_and_stay_closed() {
         "<agent-ide>\n{}\n</agent-ide>",
         "x".repeat(crate::feed::MAX_BLOCK_BYTES)
     );
-    let encoded = PeerReply::encode_with_status(&reply, &noticed).unwrap();
+    let encoded = PeerReply::encode_delivered(&reply, Some(&noticed), None).unwrap();
     assert!(PeerReply::decode_delivered(encoded.as_str()).is_some());
     let overlong = format!(
         "<agent-ide>\n{}\n</agent-ide>",
         "x".repeat(MAX_FEEDBACK_BYTES)
     );
-    let encoded = PeerReply::encode_with_status(&reply, &overlong).unwrap();
+    let encoded = PeerReply::encode_delivered(&reply, Some(&overlong), None).unwrap();
     assert!(PeerReply::decode_delivered(encoded.as_str()).is_none());
 }
 

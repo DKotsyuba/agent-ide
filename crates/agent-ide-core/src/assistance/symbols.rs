@@ -368,8 +368,37 @@ impl Worker<'_> {
         if Lang::for_path(&path).is_none() {
             text.push_str(NO_ANALYSIS_NOTE);
         }
+        let epoch = self.context_epoch(&binding);
+        let label = match job.parameters.get("lines").and_then(Value::as_str) {
+            Some(lines) => batch::ReadItem::Lines(path.display().to_string(), lines.into()).label(),
+            None => batch::ReadItem::Path(path.display().to_string()).label(),
+        };
+        let prior = if job.parameters.get("force").and_then(Value::as_bool) != Some(true) {
+            self.shared.ledger.lock().ok().and_then(|mut ledger| {
+                ledger
+                    .read_memory
+                    .entry(binding.clone())
+                    .or_default()
+                    .delivered_before(epoch, &label, &text)
+            })
+        } else {
+            None
+        };
+        let body = text.clone();
+        if let Some(prior) = prior {
+            text = batch::unchanged_line(&prior, &label, &text);
+        }
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Read).next(&job.reference)?;
+        if page.is_none()
+            && let Ok(mut ledger) = self.shared.ledger.lock()
+        {
+            ledger
+                .read_memory
+                .entry(binding.clone())
+                .or_default()
+                .remember(epoch, &label, &body, &job.reference);
+        }
         self.shared.set_context_page(&job.reference, page);
         self.remember_file_read(
             job,
@@ -650,6 +679,29 @@ impl Worker<'_> {
                 }
             }
         }
+        // Preserve the same related-links evidence as single-file reads before deduplication;
+        // a changed index/availability result must not be hidden as unchanged source.
+        for (text, file, item) in &mut items {
+            if !matches!(item, ReadItem::Path(_) | ReadItem::Lines(_, _)) {
+                continue;
+            }
+            let Some(index) = *file else { continue };
+            let (path, observed, source, _) = &files[index];
+            let range = match item {
+                ReadItem::Lines(_, lines) => crate::assistance::facade::parse_read_range(lines)
+                    .ok_or(FailureCode::Internal)?,
+                _ => LineRange::new(1, lang::line_count(source).max(1)),
+            };
+            let authority = self.authority(&binding).await?;
+            let links = self
+                .related_links(job, authority.worktree(), path, source.as_bytes(), range)
+                .await;
+            self.finish_symbol_job(job, &binding, observed).await?;
+            if !links.is_empty() {
+                text.push('\n');
+                text.push_str(&links);
+            }
+        }
         // The unchanged answer (batch-api-v1 §2): an `items` block whose bytes this session
         // already received in the same context epoch becomes one line, unless `force` asks for
         // the text. Its file stays covered by the reply's `source_ref`.
@@ -923,7 +975,7 @@ impl Worker<'_> {
     }
 
     /// The session's context-compaction epoch (session-outbox-v1 §9.1), which gates the read
-    /// unchanged answer: the outbox's counter for `binding`, `None` — the answer stays off —
+    /// unchanged answer: the local context counter for `binding`, `None` — the answer stays off —
     /// while the session's channel never delivered a native hook.
     ///
     /// Test seam (never read by a release build): `AGENT_IDE_TEST_CONTEXT_EPOCH_FILE` names a

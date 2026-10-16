@@ -1,9 +1,9 @@
-//! `ide.inspect` consolidation (OUTBOX-r3 §8.5): `{}`, `detail_refs` and `wait_ms`.
+//! `ide.inspect` consolidation (OUTBOX-r3 §8.5): `detail_ref`, `detail_refs` and `wait_ms`.
 //!
-//! One `ide.inspect` call reads one reference (as before), up to eight references in order, or
-//! everything the session's outbox holds. `wait_ms` waits inside the daemon, outside the worker's
-//! inspection loop, so a waiting agent spends one model turn instead of many polls and never
-//! blocks other sessions' inspections. A wait that ends without a result cancels nothing.
+//! One `ide.inspect` call reads one reference (as before) or up to eight references in order.
+//! `wait_ms` waits inside the daemon, outside the worker's inspection loop, so a waiting agent
+//! spends one model turn instead of many polls and never blocks other sessions' inspections. A
+//! wait that ends without a result cancels nothing.
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,16 +12,13 @@ use serde_json::Value;
 use super::super::{
     content::{self, Envelope},
     host_binding::BindingRef,
-    outbox::{Carrier, FactKind, HandoffRequest, MAX_DETAIL_REFS, MAX_WAIT_MS, SessionOutbox},
+    outbox::{MAX_DETAIL_REFS, MAX_WAIT_MS},
     reply::{PeerReply, ResultKind},
-    session_outbox::render_fact,
 };
 use super::WorkerHandle;
 
 /// Pause between re-reads of references that are still pending during a wait.
 const REREAD_PAUSE: Duration = Duration::from_millis(250);
-/// Byte budget of the facts an `ide.inspect {}` reply reserves before expanding bodies.
-const FACT_BUDGET: usize = 16 * 1024;
 /// Byte budget of the whole consolidated reply text, below the 64 KiB reply envelope.
 const REPLY_TEXT_BUDGET: usize = 48 * 1024;
 
@@ -58,31 +55,14 @@ fn inspect_reply(text: String) -> PeerReply {
     }
 }
 
-/// Returns the discard line for a source-bearing answer whose re-proof found its file changed
-/// (OUTBOX §7), or `None` for any other reply.
-fn discarded(reply: &PeerReply, subject: &str) -> Option<String> {
-    let PeerReply::Error {
-        detail: Some(detail),
-        ..
-    } = reply
-    else {
-        return None;
-    };
-    let path = detail.strip_prefix("inspect:source_changed:")?;
-    Some(format!(
-        "discarded: {} changed; repeat {subject}",
-        path.trim_matches('"')
-    ))
-}
-
 impl WorkerHandle {
     /// Serves one `ide.inspect` call in any of its forms (OUTBOX §8.5).
     ///
     /// `parameters` are the validated call arguments: `detail_ref` (one reference, the original
-    /// form), `detail_refs` (1-8 references answered in order) or neither (everything the session's
-    /// outbox holds), each with an optional `wait_ms` (clamped to [`MAX_WAIT_MS`]). `delivery` is
-    /// the call's QW-4 delivery flag. A wait returns as soon as a fact is ready (`{}`) or a named
-    /// reference settles; at its deadline it answers with what is there and cancels nothing.
+    /// form) or `detail_refs` (1-8 references answered in order), each with an optional `wait_ms`
+    /// (clamped to [`MAX_WAIT_MS`]). `delivery` is the call's QW-4 delivery flag. A wait returns as
+    /// soon as a named reference settles; at its deadline it answers with what is there and cancels
+    /// nothing. Arguments naming neither form are refused; the facade validator never admits them.
     pub async fn inspect_call(
         &self,
         binding: BindingRef,
@@ -123,13 +103,9 @@ impl WorkerHandle {
                 .inspect_many(&binding, &references, attachment, delivery, deadline)
                 .await;
         }
-        if !wait.is_zero() {
-            self.shared
-                .outbox
-                .wait_ready(&binding, false, deadline)
-                .await;
+        PeerReply::InvalidParameters {
+            message: "invalid bounded parameters: detail_ref or detail_refs is required".to_owned(),
         }
-        self.session_facts(&binding, attachment).await
     }
 
     /// Answers several references in order within the reply budget; with a wait, re-reads until
@@ -170,83 +146,16 @@ impl WorkerHandle {
             tokio::time::sleep(REREAD_PAUSE.min(deadline - tokio::time::Instant::now())).await;
         }
     }
-
-    /// Hands over everything the session's outbox holds (`ide.inspect {}`): each fact once, with a
-    /// deferred source-bearing answer expanded from its retained result after re-proof, or its
-    /// discard line when a fenced file changed. With nothing ready, lists the work still in flight
-    /// and the last delivered facts.
-    async fn session_facts(&self, binding: &BindingRef, attachment: &str) -> PeerReply {
-        let Some(reservation) = self.shared.reserve(
-            binding,
-            HandoffRequest {
-                carrier: Carrier::Inspect,
-                budget: FACT_BUDGET,
-                holding_only: false,
-            },
-        ) else {
-            let mut text = "nothing ready yet".to_owned();
-            let in_flight = self.shared.outbox.in_flight_subjects(binding);
-            if !in_flight.is_empty() {
-                text.push_str(&format!("\nin flight: {}", in_flight.join(", ")));
-            }
-            let history = self.shared.outbox.history(binding);
-            if !history.is_empty() {
-                text.push_str("\nrecently delivered:");
-                for line in history {
-                    text.push_str("\n  ");
-                    text.push_str(&line);
-                }
-            }
-            return inspect_reply(text);
-        };
-        let mut text = String::new();
-        for fact in &reservation.facts {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(&render_fact(fact));
-            let expandable = fact.kind == FactKind::JobReady && fact.source_bearing;
-            if let Some(reference) = fact.detail_ref.as_ref().filter(|_| expandable) {
-                let reply = self
-                    .inspect(binding.clone(), reference.clone(), attachment, None)
-                    .await;
-                let body = discarded(&reply, &fact.subject).unwrap_or_else(|| compact(&reply));
-                let room = REPLY_TEXT_BUDGET.saturating_sub(text.len() + 1);
-                text.push('\n');
-                text.push_str(cut(&body, room));
-            }
-        }
-        if reservation.remaining > 0 {
-            text.push_str(&format!(
-                "\n(+{} more facts; ide.inspect {{}} lists them)",
-                reservation.remaining
-            ));
-        }
-        self.shared.commit(binding, reservation.token);
-        inspect_reply(text)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Only a source-changed re-proof failure becomes a discard line naming the path and the call.
+    /// Cutting never splits a multi-byte character.
     #[test]
-    fn discard_lines_name_the_changed_path_and_the_call() {
-        let changed = PeerReply::Error {
-            code: super::super::super::reply::FailureCode::SourceUnavailable,
-            detail: Some("inspect:source_changed:\"src/a.rs\"".to_owned()),
-        };
-        assert_eq!(
-            discarded(&changed, "ide.symbol src/a.rs#Foo").as_deref(),
-            Some("discarded: src/a.rs changed; repeat ide.symbol src/a.rs#Foo")
-        );
-        let other = PeerReply::Error {
-            code: super::super::super::reply::FailureCode::Deadline,
-            detail: Some("inspect:deadline".to_owned()),
-        };
-        assert_eq!(discarded(&other, "x"), None);
+    fn cut_stops_on_a_character_boundary() {
         assert_eq!(cut("héllo", 2), "h");
+        assert_eq!(cut("héllo", 3), "hé");
     }
 }

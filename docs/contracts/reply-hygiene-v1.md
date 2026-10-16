@@ -33,7 +33,7 @@ pub(crate) fn terminal_fact(id: u64, result: &RunResult, owns_detail: bool) -> T
 
 Mapping to the outbox draft: `kind = test-finished`, `subject = "tests #N"`, `summary` and
 `detail` as returned, `detail_ref` = the run's output detail when `owns_detail` (the run's owner
-only), `failed = failures > 0 || exit != 0 || stopped || no summary`, `holds_turn = true`,
+only), `failed = failures > 0 || exit != 0 || stopped || no summary`,
 `source_bearing = false`, `fence = []` (whole worktree). Settled-reply body = `tests #N: ` + `summary` +
 `\n` + `detail`.
 
@@ -84,15 +84,15 @@ Rules (each one is a unit test):
    `exit C, S s` runs the reply body keeps its bounded output tail of up to 4 KiB (today's
    behaviour) and the fact carries the shorter tail above. The only other difference is the
    outbox's own hand-off sanitation of `<` and `>`.
-8. Delivery state is the outbox's: handing the fact to a carrier counts the run as collected for
-   the `ide.stop` uncollected list (`worker.rs:1711`), and a plate or hook no longer renders a test
-   line at all.
+8. Delivery is Bridge's: IDE hands the fact over once and keeps no delivery state; a run counts as
+   collected for the `ide.stop` uncollected list only when its owner reads it explicitly, and a
+   plate or hook never renders a test line.
 
 ### 1.3 Other `ide.test` lines
 
 | Line | Text |
 |---|---|
-| started (reply only) | `tests #N: started — <argv> [(K tests selected)] (budget B s); the result arrives by itself in a later <agent-ide> block` (the wording of session-outbox-v1 §8.7 for a pending result) |
+| started (reply only) | `tests #N: started — <argv> [(K tests selected)] (budget B s); the result is retained under its reference; Bridge delivers it automatically when configured` (the wording of session-outbox-v1 §8.7 for a pending result) |
 | second start while one is active | `tests #N: still running` |
 | `ide.test {status}` or inspect of `tests #N`, run still active | `tests #N: running` |
 | the same, run settled | the terminal text of rule 7 |
@@ -116,8 +116,7 @@ Further rules:
   contains a seconds count. A finished job's duration is an outcome and is allowed.
 - **Data, not orders.** Facts and plates state what happened. The permitted references are a
   `rerun:` command, `full output: ide.inspect <ref>` and a `detail_ref` handle. Sentences addressed
-  to the agent belong to the owner of that surface (the stop-hold and wake sentences are
-  session-outbox-v1's).
+  to the agent belong to the owner of that surface.
 - **Wording ownership.** M-026: `pending` and edit `diagnostics: pending`. M-025:
   `provider_loading`, warming and approximate-answer notices. M-027: batch reply lines. M-024:
   test lines, signature block, descriptions, instructions, skill. Each owner writes its own text;

@@ -671,7 +671,9 @@ fn assert_compact_envelope(reply: &Value) {
             text.starts_with("tests #")
                 || text.starts_with("tests: could not start ")
                 || text.starts_with("tests: no tests in ")
-                || text.starts_with("page "),
+                || text.starts_with("tests: no retained runs")
+                || text.starts_with("page ")
+                || (structured["detail_ref"].is_string() && !body.is_empty()),
             "{reply}"
         ),
         // A card or an ambiguity list; a later page continues one of them.
@@ -718,7 +720,12 @@ fn assert_compact_envelope(reply: &Value) {
             // A batch may open with a per-item refusal line instead of a block, and an empty
             // file's block says so instead of naming lines.
             // A batch read opens with its summary line (batch-api-v1 §2).
-            if !(header.starts_with("read: ")
+            if header.starts_with("unchanged since your read ") {
+                assert!(
+                    header.contains("\"force\":true returns the text"),
+                    "{reply}"
+                );
+            } else if !(header.starts_with("read: ")
                 || header.starts_with("no such ")
                 || header.starts_with("file has ")
                 || header.starts_with("not a readable text file")
@@ -737,7 +744,8 @@ fn assert_compact_envelope(reply: &Value) {
         }
         ("unavailable", _) => assert!(text.contains("\nRepair: "), "{reply}"),
         ("pending", _) => assert!(
-            text.contains("arrives by itself") && text.contains("Result reference:"),
+            text.contains("Result retained under")
+                && text.contains("Bridge delivers it automatically when configured."),
             "{reply}"
         ),
         _ => assert!(text.starts_with(state), "{reply}"),
@@ -935,8 +943,8 @@ fn claude_fields(tool: &str, text: &str) -> Value {
             |code| json!({"state":"error","code":code,"text":original}),
         );
     }
-    if text.starts_with("The result arrives by itself") {
-        return json!({"state":"pending","detail_ref":after(text, "Result reference: ")});
+    if let Some(rest) = text.strip_prefix("Result retained under ") {
+        return json!({"state":"pending","detail_ref":rest.split('.').next().unwrap_or_default()});
     }
     if let Some(rest) = text.strip_prefix("edit: ") {
         let outcome = token(rest);
@@ -958,6 +966,8 @@ fn claude_fields(tool: &str, text: &str) -> Value {
         "ide.start" => Some("activation"),
         "ide.read" => Some("read"),
         "ide.symbol" => Some("symbol"),
+        "ide.graph" => Some("graph"),
+        "ide.test" => Some("test"),
         "ide.diff" => Some("diff"),
         "ide.stop" => Some("stop"),
         // A continuation or a settled pending answer: its text says what it continues.
@@ -977,17 +987,37 @@ fn claude_fields(tool: &str, text: &str) -> Value {
     };
     if let Some(kind) = kind {
         let rest = text;
-        let continuation = rest.contains("\nCut; ide.inspect {");
+        let trailer = rest.lines().last().unwrap_or_default();
+        let continuation = ["ide.inspect", "ide.read", "ide.graph", "ide.test"]
+            .iter()
+            .any(|tool| trailer.starts_with(&format!("Cut; {tool} {{\"detail_ref\":")))
+            && trailer.ends_with("} continues");
         let truncated = continuation || rest.contains("\nCut; nothing more to fetch");
         let detail_ref = after(rest, "{\"detail_ref\":\"")
             .map(|reference| reference.split('"').next().unwrap_or(reference));
-        let body_end = rest.find("\nCut; ").unwrap_or(rest.len());
+        let body_end = rest.rfind("\nCut; ").unwrap_or(rest.len());
         return json!({
             "state":"complete","kind":kind,"text":&rest[..body_end],
             "truncated":truncated,"continuation":continuation,"detail_ref":detail_ref,
         });
     }
     json!({"text":original})
+}
+
+/// The test decoder accepts every supported originating-tool trailer and keeps the saved
+/// reference/page state, rather than treating a new read/graph/test footer as end-of-output.
+#[test]
+fn claude_decoder_recognizes_originating_continuations() {
+    for tool in ["ide.read", "ide.graph", "ide.test", "ide.inspect"] {
+        let text = format!(
+            "page 1; bytes 0-4 of 8\nbody\nCut; {tool} {{\"detail_ref\":\"next\"}} continues"
+        );
+        let decoded = claude_fields("ide.read", &text);
+        assert_eq!(decoded["continuation"], true, "{tool}: {decoded}");
+        assert_eq!(decoded["truncated"], true);
+        assert_eq!(decoded["detail_ref"], "next");
+        assert!(!decoded["text"].as_str().unwrap().contains("Cut;"));
+    }
 }
 
 /// Calls one managed Codex tool using only trusted request metadata for actor and sandbox identity.
@@ -2488,9 +2518,7 @@ async fn binary_codex_hooks_print_emits_only_the_managed_fragment() {
                     "type": "command", "command": command, "timeout": 1}]}],
                 "PostToolUse": [{"matcher": ".*", "hooks": [{
                     "type": "command", "command": command, "timeout": 1}]}],
-                // OUTBOX-r3 §16: the turn-end hold and the compaction signal.
-                "Stop": [{"hooks": [{
-                    "type": "command", "command": command, "timeout": 330}]}],
+                // OUTBOX-r3 §9.1: the compaction signal; no Stop/SubagentStop hold exists.
                 "PreCompact": [{"hooks": [{
                     "type": "command", "command": command, "timeout": 1}]}],
             }
@@ -6507,12 +6535,13 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     daemon.wait().await.unwrap();
 }
 
-/// OUTBOX-r3 §8.6: when an edit's project check outlasts the inline wait, the edit answers with
-/// its write and `diagnostics: pending` (never a whole-reply `pending`), the check arrives once as
-/// an `edit-checked` fact, and the edit's own reference later returns the settled reply — never
-/// the silent `inspect:internal` a byte-overlong diagnostic message used to turn it into.
+/// OUTBOX-r4 §8.6: when an edit's project check outlasts the inline wait, the edit answers with
+/// its write and `diagnostics: pending` (never a whole-reply `pending`), and the edit's own
+/// reference later returns the settled reply — never the silent `inspect:internal` a
+/// byte-overlong diagnostic message used to turn it into. Without a Bridge route no fact is
+/// delivered by IDE itself.
 #[tokio::test]
-async fn a_slow_edit_check_answers_at_once_and_arrives_as_one_fact() {
+async fn a_slow_edit_check_answers_at_once_and_its_reference_settles() {
     let fixture = ProductFixture::new(json!([]));
     // A rust check held past the inline wait, reporting one over-long multibyte message: 300
     // characters of "é" are 600 bytes, so a character-bound truncation used to leave a message
@@ -6562,30 +6591,20 @@ async fn a_slow_edit_check_answers_at_once_and_arrives_as_one_fact() {
         .as_str()
         .unwrap()
         .to_owned();
-    let checked = actor
-        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
-        .await;
-    let checked_text = checked["text"].as_str().unwrap_or_default();
-    assert!(
-        checked_text.starts_with("edit-checked edit pending-edit-1: 1 file"),
-        "{checked}"
-    );
-    for line in checked_text
-        .lines()
-        .filter(|line| line.trim_start().starts_with("new: "))
-    {
-        assert!(line.len() <= 200, "fact lines stay bounded: {checked}");
-    }
-    let again = actor.call(&fixture, "ide.inspect", json!({})).await;
-    assert!(
-        again["text"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("nothing ready yet")),
-        "the fact is handed over once: {again}"
-    );
-    let settled = actor
-        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
-        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let settled = loop {
+        let settled = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+            .await;
+        if settled["state"] == "edit" && settled["diagnostics"]["state"] != "pending" {
+            break settled;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the check never settled: {settled}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     assert_eq!(settled["state"], "edit", "{settled}");
     assert_eq!(settled["result"]["outcome"], "replaced", "{settled}");
     assert!(
@@ -6646,23 +6665,13 @@ async fn pending_and_batch_replies_never_invite_polling() {
         )
         .await;
     assert!(
-        edit["text"].as_str().is_some_and(
-            |text| text.contains("diagnostics: pending; the project check arrives by itself")
-        ),
+        edit["text"].as_str().is_some_and(|text| {
+            text.contains("diagnostics: pending; project check retained under")
+                && text.contains("Bridge delivers it automatically when configured")
+        }),
         "{edit}"
     );
     seen.push(edit);
-    let checked = actor
-        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
-        .await;
-    assert!(
-        checked["text"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("edit-checked edit hygiene-1: ")),
-        "{checked}"
-    );
-    seen.push(checked);
-    seen.push(actor.call(&fixture, "ide.inspect", json!({})).await);
     // The stop reply is read after a call too: it is held to the same rule.
     seen.push(actor.call(&fixture, "ide.stop", json!({})).await);
     for reply in &seen {
@@ -6727,26 +6736,26 @@ async fn a_pending_edit_under_a_capped_check_of_other_files_settles_unknown() {
                    "source_ref":source_ref,"content":"pub fn value() -> i32 { 7 }"}),
         )
         .await;
-    // OUTBOX-r3 §8.6: the write answers at once; the check arrives as its fact.
+    // OUTBOX-r4 §8.6: the write answers at once; the check settles under the edit's reference.
     assert_eq!(edit["diagnostics"]["state"], "pending", "{edit}");
-    let checked = actor
-        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
-        .await;
-    assert_eq!(
-        checked["text"],
-        format!(
-            "edit-checked edit capped-edit-1: 1 file, diagnostics unknown\n  result: ide.inspect {}",
-            edit["diagnostics"]["detail_ref"].as_str().unwrap()
-        ),
-        "{checked}"
-    );
-    let settled = actor
-        .call(
-            &fixture,
-            "ide.inspect",
-            json!({"detail_ref":edit["diagnostics"]["detail_ref"]}),
-        )
-        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let settled = loop {
+        let settled = actor
+            .call(
+                &fixture,
+                "ide.inspect",
+                json!({"detail_ref":edit["diagnostics"]["detail_ref"]}),
+            )
+            .await;
+        if settled["state"] == "edit" && settled["diagnostics"]["state"] != "pending" {
+            break settled;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the check never settled: {settled}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     assert_eq!(settled["state"], "edit", "{settled}");
     assert_eq!(settled["result"]["outcome"], "replaced", "{settled}");
     assert_eq!(
@@ -7342,8 +7351,12 @@ async fn text_file_read_forms_each_answer_and_a_second_call_still_answers() {
             if reply["kind"] != "read" || !text.contains(expected) {
                 failures.push(format!("{path} {form} {arguments}: {reply} {text}"));
             }
-            let (after, text) =
-                settled_read(&mut actor, &fixture, json!({"path":path,"lines":"2-2"})).await;
+            let (after, text) = settled_read(
+                &mut actor,
+                &fixture,
+                json!({"path":path,"lines":"2-2","force":true}),
+            )
+            .await;
             if after["kind"] != "read" || !text.contains(second) {
                 failures.push(format!(
                     "{path} {form}: the second call broke: {after} {text}"
@@ -9894,7 +9907,7 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     assert_eq!(
         start_text.trim_end(),
         "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); the result \
-         arrives by itself in a later <agent-ide> block",
+         is retained under its reference; Bridge delivers it automatically when configured",
         "{start_text}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -9915,8 +9928,8 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     };
     let result_text = completed["text"].as_str().unwrap();
     assert!(result_text.contains("FAIL tests::fails"), "{result_text}");
-    // OUTBOX-r3 §4/§6: a run's outcome is never a plate line, and a run read through its own
-    // handle is delivered, so no carrier repeats it as a `test-finished` fact.
+    // OUTBOX-r4: a run's outcome is never a plate line, and a run read through its own
+    // handle is not repeated by any carrier (IDE has none besides Bridge).
     assert!(
         carried_status(&completed).is_none_or(|status| !status.contains("tests #1")),
         "a read run is not carried again: {completed}"
@@ -10510,7 +10523,9 @@ async fn configured_product_cold_rust_symbol_and_graph_never_answer_pending() {
         let text = first["text"].as_str().unwrap_or_default().to_owned();
         if text.starts_with("approximate: ") {
             assert!(
-                text.contains("the precise answer follows as a fact"),
+                text.contains(
+                    "the precise answer is retained under its reference; Bridge delivers it automatically when configured"
+                ),
                 "{text}"
             );
         }
@@ -14507,7 +14522,7 @@ async fn configured_product_pending_call_and_old_reference_survive_a_crash_only_
 /// While the registered Rust server is still loading, `ide.outline`, `ide.read` and the
 /// symbol-addressed `ide.edit` answer at once from the lexical outline and say so in one
 /// compact line; `ide.symbol` answers at once with an `approximate:` card (symbol-graph-item r2
-/// §4) whose precise answer follows once the server is ready, and once the server reports ready
+/// §4) whose precise answer settles once the server is ready, and once the server reports ready
 /// the server path is used again (its own symbol appears, the lexical marker disappears).
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_NODE environment"]
@@ -14637,13 +14652,15 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     );
 
     // `ide.symbol` answers at once, labelled approximate: usages and callers need the server,
-    // so they are name matches from source until its precise answer follows.
+    // so they are name matches from source until its precise answer settles.
     let approximate = |reply: &Value| {
         assert_eq!(reply["state"], "complete", "{reply}");
         let text = reply["text"].as_str().unwrap_or_default();
         assert!(
             text.starts_with("approximate: rust-analyzer is still indexing;")
-                && text.contains("the precise answer follows as a fact"),
+                && text.contains(
+                    "the precise answer is retained under its reference; Bridge delivers it automatically when configured"
+                ),
             "{reply}"
         );
     };
@@ -15750,17 +15767,17 @@ async fn configured_product_activation_reply_includes_the_project_card() {
     assert!(text.contains("\nlayout: src/ 1"), "{text}");
     assert!(text.contains("\ndocs: README.md"), "{text}");
     assert!(
-        text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it and its answer follows as a fact"),
+        text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it; its result is retained under its reference and Bridge delivers it when configured"),
         "{text}"
     );
     // start-index-state §1: the call-signature block ends the reply, after the card and its
     // servers line, within M030/T006's 700-byte budget, with one example per batch form and stop.
     let (card, signature) = text
-        .split_once("\n\ncall forms (")
+        .split_once("\n\nBatch call forms (")
         .unwrap_or_else(|| panic!("no signature block: {text}"));
     assert!(card.contains("\nservers: "), "{text}");
     assert!(!card.contains("ide.read {\"items\""), "{text}");
-    let signature = format!("call forms ({signature}");
+    let signature = format!("Batch call forms ({signature}");
     assert!(signature.len() <= 700, "{} bytes", signature.len());
     assert!(
         signature.contains("card/direct neighbors; graph = call chains"),
@@ -15774,15 +15791,15 @@ async fn configured_product_activation_reply_includes_the_project_card() {
         "ide.read {\"items\"",
         "ide.outline {\"paths\"",
         "ide.symbol {\"symbols\"",
-        "ide.graph {\"symbol\"",
+        "ide.graph {\"symbols\"",
         "ide.test {\"targets\"",
-        "ide.edit {\"symbol\"",
+        "ide.edit schema",
         "ide.inspect {\"detail_refs\"",
     ] {
         assert!(signature.contains(form), "{form}: {signature}");
     }
     assert!(!signature.contains("wait_ms"), "{signature}");
-    assert!(signature.contains("\"files\":["), "{signature}");
+    assert!(signature.contains("files (Claude)"), "{signature}");
     assert!(text.ends_with("End the task with ide.stop."), "{text}");
     assert!(!signature.contains("poll"), "{signature}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -18953,16 +18970,13 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
 }
 
 /// A real background Context job that finishes while its own caller only ever saw `Pending`
-/// leaves one undelivered `job-ready` fact (OUTBOX-r3): the first eligible native-edit hook
-/// delivers it once, without source text, and a second must not resurrect it. This drives the
-/// actual product Worker/dispatcher entry path end to end (real daemon, real Pyright, real hook
-/// binary). `ide.inspect` is called only after both hooks, so nothing but the job's own
-/// completion and the hook can be the source of delivery; it then reads the full answer back
-/// through the fact's reference.
+/// is never delivered by IDE itself (OUTBOX-r4): neither the first nor a second eligible
+/// native-edit hook carries its result, and the retained answer is read back through the
+/// pending reference. This drives the actual product Worker/dispatcher entry path end to end
+/// (real daemon, real Pyright, real hook binary); only Bridge could deliver it unprompted.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
-async fn configured_product_pending_context_job_completes_and_native_hook_delivers_its_feedback_once()
- {
+async fn configured_product_pending_context_job_completes_and_no_native_hook_delivers_it() {
     use std::os::unix::fs::PermissionsExt;
     let node = std::env::var("AGENT_IDE_NODE").unwrap();
     let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
@@ -19050,34 +19064,13 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
         .await;
     assert!(first.status.success() && first.stderr.is_empty());
     assert!(
-        !first.stdout.is_empty(),
-        "a completed-but-unretrieved fact must deliver on the first eligible hook: got empty stdout"
+        first.stdout.is_empty(),
+        "no hook carries a completed-but-unretrieved job: {:?}",
+        String::from_utf8_lossy(&first.stdout)
     );
-    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
-    let additional = first["hookSpecificOutput"]["additionalContext"]
+    let reference = response["detail_ref"]
         .as_str()
-        .unwrap();
-    // OUTBOX-r3 §2, §8.2: the job's result arrives once as its `job-ready` fact. A context answer
-    // is source text, so the hook names the result and its reference only. The native edit
-    // lifecycle that carries it ran after the job started, so the fact says files changed since.
-    assert_eq!(
-        additional.matches("job-ready ide.symbol app.py: ").count(),
-        1,
-        "{additional}"
-    );
-    assert!(
-        additional.contains("job-ready ide.symbol app.py: ready (files changed since)"),
-        "{additional}"
-    );
-    assert!(
-        !additional.contains("def value") && !additional.contains("return"),
-        "no source text on a hook: {additional}"
-    );
-    let reference = additional
-        .split("result: ide.inspect ")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .expect("the fact names its reference")
+        .expect("the pending reply names its reference")
         .to_owned();
 
     actor
@@ -19089,7 +19082,7 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     assert!(second.status.success() && second.stderr.is_empty());
     assert!(
         second.stdout.is_empty(),
-        "the already-delivered fact must not resurrect on a second hook: {:?}",
+        "no second hook carries it either: {:?}",
         String::from_utf8_lossy(&second.stdout)
     );
 
@@ -22600,11 +22593,9 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     std::fs::remove_dir_all(base).unwrap();
 }
 
-/// OUTBOX-r3 §8.5: `ide.inspect {}` hands over the session's facts once, `wait_ms` returns on the
-/// first fact and its deadline cancels nothing, and `detail_refs` answers several references in
-/// order in one reply.
+/// OUTBOX-r4 §8.5: `detail_refs` answers several references in order in one reply.
 #[tokio::test]
-async fn outbox_inspect_waits_lists_and_batches() {
+async fn outbox_inspect_batches_references_in_order() {
     let fixture = ProductFixture::new(json!([]));
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "outbox-inspect").await;
@@ -22614,61 +22605,16 @@ async fn outbox_inspect_waits_lists_and_batches() {
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
     let text = |reply: &Value| reply["text"].as_str().unwrap_or_default().to_owned();
-    let empty = actor.call(&fixture, "ide.inspect", json!({})).await;
-    assert_eq!(empty["kind"], "inspect", "{empty}");
-    assert!(text(&empty).starts_with("nothing ready yet"), "{empty}");
-
-    // A run that outlives the inline window leaves a started line; one wait collects its fact.
-    let run = actor
-        .call(
-            &fixture,
-            "ide.test",
-            json!({"command":["/bin/sh","-c","sleep 7; echo first"]}),
-        )
-        .await;
-    assert!(text(&run).starts_with("tests #1: started"), "{run}");
-    let waited_from = tokio::time::Instant::now();
-    let waited = actor
-        .call(&fixture, "ide.inspect", json!({"wait_ms":30000}))
-        .await;
-    assert!(
-        text(&waited).starts_with("test-finished tests #1: "),
-        "{waited}"
-    );
-    assert!(waited_from.elapsed() < Duration::from_secs(25), "{waited}");
-    let again = actor.call(&fixture, "ide.inspect", json!({})).await;
-    let again = text(&again);
-    assert!(again.starts_with("nothing ready yet"), "{again}");
-    assert!(
-        again.contains("recently delivered:\n  test-finished tests #1: "),
-        "{again}"
-    );
-
-    // A short wait that ends first answers what is in flight and leaves the run running.
-    let second = actor
-        .call(
-            &fixture,
-            "ide.test",
-            json!({"command":["/bin/sh","-c","sleep 8; echo second"]}),
-        )
-        .await;
-    assert!(text(&second).starts_with("tests #2: started"), "{second}");
-    let short = actor
-        .call(&fixture, "ide.inspect", json!({"wait_ms":200}))
-        .await;
-    assert!(
-        text(&short).starts_with("nothing ready yet\nin flight: tests #2"),
-        "{short}"
-    );
-    let late = actor
-        .call(&fixture, "ide.inspect", json!({"wait_ms":30000}))
-        .await;
-    assert!(
-        text(&late).starts_with("test-finished tests #2: "),
-        "{late}"
-    );
-
-    // Several references in one reply, in order.
+    for (id, word) in [(1, "first"), (2, "second")] {
+        let run = actor
+            .call(
+                &fixture,
+                "ide.test",
+                json!({"command":["/bin/sh","-c",format!("echo {word}")]}),
+            )
+            .await;
+        assert!(text(&run).starts_with(&format!("tests #{id}: ")), "{run}");
+    }
     let batch = actor
         .call(
             &fixture,
@@ -22688,8 +22634,8 @@ async fn outbox_inspect_waits_lists_and_batches() {
     daemon.wait().await.unwrap();
 }
 
-/// Runs one Claude `Stop` hook for `actor` through the real hook command, allowing a held turn
-/// end up to `wait`; returns its stdout and how long it took.
+/// Runs one Claude `Stop` hook for `actor` through the real hook command, allowing the process
+/// up to `wait`; returns its stdout and how long it took.
 async fn claude_stop_hook(
     fixture: &ProductFixture,
     actor: &ProductActor,
@@ -22714,12 +22660,11 @@ async fn claude_stop_hook(
     (String::from_utf8(output.stdout).unwrap(), started.elapsed())
 }
 
-/// OUTBOX-r3 §8.3: a Claude turn end with nothing requested releases at once; one with its own
-/// test still running is held in the hook until the run settles and continues the turn with the
-/// `test-finished` fact and the restate sentence, exactly once across five concurrent holds,
-/// while the short hook lane keeps pairing tool calls; the next turn end releases.
+/// Regression: IDE keeps no `Stop` hold. A Claude turn end releases at once with no output, with
+/// nothing requested and with its own test still running; a requested result is never continued
+/// into the turn as a `block` reason (Bridge owns wake).
 #[tokio::test]
-async fn outbox_claude_stop_hold_delivers_once_and_hooks_stay_free() {
+async fn claude_stop_hook_never_holds_or_blocks() {
     let fixture = ProductFixture::new(json!([]));
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "outbox-hold").await;
@@ -22745,196 +22690,17 @@ async fn outbox_claude_stop_hold_delivers_once_and_hooks_stay_free() {
             .is_some_and(|text| text.starts_with("tests #1: started")),
         "{run}"
     );
-    let holds = futures_join5(
-        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
-        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
-        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
-        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
-        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
-        async {
-            // While five holds wait, a native tool's Pre/Post pair still rides the hook lane.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let pre = actor
-                .claude_lifecycle_output(&fixture, "PreToolUse", "native-during-hold")
-                .await;
-            let post = actor
-                .claude_lifecycle_output(&fixture, "PostToolUse", "native-during-hold")
-                .await;
-            assert!(pre.status.success() && post.status.success());
-        },
-    )
-    .await;
-    let blocked = holds
-        .iter()
-        .filter(|(output, _)| !output.is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(blocked.len(), 1, "{holds:?}");
-    let block: Value = serde_json::from_str(blocked[0].0.trim()).unwrap();
-    assert_eq!(block["decision"], "block", "{block}");
-    let reason = block["reason"].as_str().unwrap();
-    assert!(
-        reason.starts_with("<agent-ide>\ntest-finished tests #1: "),
-        "{reason}"
+    let (during, took) = claude_stop_hook(&fixture, &actor, Duration::from_secs(10)).await;
+    assert_eq!(
+        during, "",
+        "a run in flight never holds or blocks the turn end"
     );
-    assert!(
-        reason.ends_with("then restate your complete final answer."),
-        "{reason}"
-    );
-    let (again, _) = claude_stop_hook(&fixture, &actor, Duration::from_secs(10)).await;
-    assert_eq!(again, "", "a fact is never held twice");
+    assert!(took < Duration::from_secs(3), "{took:?}");
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
-}
-
-/// Awaits five same-typed futures and one unit future concurrently, returning the five outputs.
-async fn futures_join5<T>(
-    a: impl std::future::Future<Output = T>,
-    b: impl std::future::Future<Output = T>,
-    c: impl std::future::Future<Output = T>,
-    d: impl std::future::Future<Output = T>,
-    e: impl std::future::Future<Output = T>,
-    side: impl std::future::Future<Output = ()>,
-) -> Vec<T> {
-    let (a, b, c, d, e, ()) = tokio::join!(a, b, c, d, e, side);
-    vec![a, b, c, d, e]
-}
-
-/// Runs one managed Claude call like [`managed_claude_call`] and returns the raw model text.
-async fn managed_claude_text(
-    mcp: &mut Mcp,
-    project: &Path,
-    next: &mut usize,
-    session: &str,
-    agent: Option<&str>,
-    name: &str,
-    arguments: Value,
-) -> String {
-    *next += 1;
-    let call = format!("managed-claude-{next}");
-    let pre = managed_claude_hook(
-        Some(project),
-        managed_claude_event("PreToolUse", session, agent, &call),
-    )
-    .await;
-    assert!(pre.status.success() && pre.stdout.is_empty(), "{pre:?}");
-    let reply = mcp
-        .exchange(
-            json!({"jsonrpc":"2.0","id":*next,"method":"tools/call","params":{
-                "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}
-            }}),
-        )
-        .await;
-    let post = managed_claude_hook(
-        Some(project),
-        managed_claude_event("PostToolUse", session, agent, &call),
-    )
-    .await;
-    assert!(post.status.success() && post.stderr.is_empty(), "{post:?}");
-    assert_claude_envelope(&reply).to_owned()
-}
-
-/// OUTBOX-r3 §10: after a daemon replacement each actor that was owed results gets one
-/// `lost-after-restart` fact naming only its own unresolved requests, on its first call; the
-/// next call and an actor that was owed nothing get none.
-#[tokio::test]
-async fn outbox_managed_claude_restart_reports_lost_results_once_per_actor() {
-    let fixture = ProductFixture::new(json!([]));
-    let worktrees = add_worktrees(&fixture, &["lost-child", "lost-idle"]);
-    let (child, idle) = (&worktrees[0], &worktrees[1]);
-    let runtime = managed_claude_runtime_path(&fixture.root);
-    let _guard = SharedClaudeDaemonGuard(runtime.clone());
-    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
-    let session = "lost-after-restart";
-    let mut next = 10;
-    let actors = [
-        (&fixture.root, None, "parent"),
-        (child, Some("agent-child"), "child"),
-        (idle, Some("agent-idle"), "idle"),
-    ];
-    for (root, agent, activation) in actors {
-        claude_start_actor(
-            &mut mcp,
-            root,
-            &mut next,
-            session,
-            agent,
-            json!({"activation_id":activation,"root":root}),
-        )
-        .await;
-    }
-    // Parent and child each leave with a started line (one run at a time: the parent's settles
-    // unseen just after its line); the idle actor is owed nothing.
-    for ((root, agent, _), command) in actors[..2].iter().zip(["sleep 6.5", "sleep 60"]) {
-        let started = managed_claude_text(
-            &mut mcp,
-            root,
-            &mut next,
-            session,
-            *agent,
-            "ide.test",
-            json!({"command":["/bin/sh","-c",command]}),
-        )
-        .await;
-        assert!(started.contains(": started"), "{agent:?}: {started}");
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    let stale = managed_claude_candidate_attachment(&fixture.root);
-    terminate_shared_claude_daemon(&runtime);
-    wait_for_healed_daemon(&fixture.root, &runtime, &stale).await;
-    let read = json!({"path":"src/lib.rs","lines":"1-2"});
-    for (root, agent, own, other) in [
-        (&fixture.root, None, "tests #1", "tests #2"),
-        (child, Some("agent-child"), "tests #2", "tests #1"),
-    ] {
-        let first = managed_claude_text(
-            &mut mcp,
-            root,
-            &mut next,
-            session,
-            agent,
-            "ide.read",
-            read.clone(),
-        )
-        .await;
-        assert!(
-            first.starts_with(&format!(
-                "<agent-ide>\nlost-after-restart restart: the IDE restarted; results not \
-                 delivered before it may be lost: {own} (before restart)"
-            )),
-            "{agent:?}: {first}"
-        );
-        assert!(!first.contains(other), "{agent:?}: {first}");
-        let second = managed_claude_text(
-            &mut mcp,
-            root,
-            &mut next,
-            session,
-            agent,
-            "ide.read",
-            read.clone(),
-        )
-        .await;
-        assert!(
-            !second.contains("lost-after-restart"),
-            "{agent:?}: {second}"
-        );
-    }
-    let quiet = managed_claude_text(
-        &mut mcp,
-        idle,
-        &mut next,
-        session,
-        Some("agent-idle"),
-        "ide.read",
-        read,
-    )
-    .await;
-    assert!(!quiet.contains("lost-after-restart"), "{quiet}");
-    assert!(quiet.contains("pub fn"), "{quiet}");
-    mcp.close().await;
 }
 
 /// Runs one Claude-path call for `actor` with its native Pre/Post hooks and returns the raw
@@ -23010,127 +22776,12 @@ async fn outbox_compaction_clears_the_unchanged_read_memory() {
     daemon.wait().await.unwrap();
 }
 
-/// OUTBOX-r3 §11: `ide.stop` lists the facts no carrier handed over, once.
-#[tokio::test]
-async fn outbox_claude_stop_flushes_undelivered_facts() {
-    let fixture = ProductFixture::new(json!([]));
-    let mut daemon = fixture.daemon().await;
-    let mut actor = ProductActor::new(&fixture, "outbox-stop").await;
-    let started = actor
-        .call_claude(
-            &fixture,
-            "ide.start",
-            json!({"activation_id":"outbox-stop"}),
-        )
-        .await;
-    let (started, _) = actor.settle_claude(&fixture, started).await;
-    assert_eq!(started["kind"], "activation", "{started}");
-    let run = actor
-        .call_claude(
-            &fixture,
-            "ide.test",
-            json!({"command":["/bin/sh","-c","sleep 7; echo done"]}),
-        )
-        .await;
-    assert!(
-        run["text"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("tests #1: started")),
-        "{run}"
-    );
-    // No call or hook runs while the run settles, so its fact stays undelivered.
-    tokio::time::sleep(Duration::from_secs(9)).await;
-    actor.next += 1;
-    let call = format!("call-{}", actor.next);
-    actor.claude_lifecycle(&fixture, "PreToolUse", &call).await;
-    let reply = actor
-        .mcp
-        .exchange(
-            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
-            "name":"ide.stop","arguments":{},"_meta":{"claudecode/toolUseId":call}}}),
-        )
-        .await;
-    let text = assert_claude_envelope(&reply).to_owned();
-    assert!(!text.starts_with("complete"), "{text}");
-    assert_eq!(
-        text.matches("\ntest-finished tests #1: ").count(),
-        1,
-        "{text}"
-    );
-    assert!(text.contains("undelivered facts:"), "{text}");
-    actor.mcp.close().await;
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
-}
-
-/// OUTBOX-r3 §8.2: a Claude `ide.*` reply carries a finished run's `test-finished` fact once, at
-/// the start of what the model reads, with no plate test line; the call's own post hook and the
-/// next reply stay silent about it.
-#[tokio::test]
-async fn outbox_claude_reply_carries_a_finished_run_fact_once() {
-    let fixture = ProductFixture::new(json!([]));
-    let mut daemon = fixture.daemon().await;
-    let mut actor = ProductActor::new(&fixture, "outbox-claude").await;
-    let started = actor
-        .call_claude(&fixture, "ide.start", json!({"activation_id":"outbox"}))
-        .await;
-    let (started, _) = actor.settle_claude(&fixture, started).await;
-    assert_eq!(started["kind"], "activation", "{started}");
-    // An explicit command that outlives the inline window leaves its caller a started line.
-    let run = actor
-        .call_claude(
-            &fixture,
-            "ide.test",
-            json!({"command":["/bin/sh","-c","sleep 7; echo done"]}),
-        )
-        .await;
-    assert!(
-        run["text"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("tests #1: started")),
-        "{run}"
-    );
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let mut carried = Vec::new();
-    for _ in 0..2 {
-        actor.next += 1;
-        let call = format!("call-{}", actor.next);
-        actor.claude_lifecycle(&fixture, "PreToolUse", &call).await;
-        let reply = actor
-            .mcp
-            .exchange(
-                json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
-                "name":"ide.inspect","arguments":{"kind":"problems"},
-                "_meta":{"claudecode/toolUseId":call}}}),
-            )
-            .await;
-        let text = assert_claude_envelope(&reply).to_owned();
-        let post = actor
-            .claude_lifecycle_output(&fixture, "PostToolUse", &call)
-            .await;
-        assert!(post.status.success() && post.stdout.is_empty(), "{post:?}");
-        carried.push(text);
-    }
-    assert!(
-        carried[0].starts_with("<agent-ide>\ntest-finished tests #1: "),
-        "{}",
-        carried[0]
-    );
-    assert!(!carried[0].contains("poll"), "{}", carried[0]);
-    assert!(!carried[1].contains("tests #1"), "{}", carried[1]);
-    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
-    actor.mcp.close().await;
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
-}
-
 /// A test run that is still running adds nothing to any later reply or plate: no running line, no
-/// elapsed seconds, no instruction. Its outcome then arrives once, as the terminal fact of
-/// M024-M026-TEST-FACT (counts, the failing test, the rerun line and the output reference), and a
-/// call after it carries nothing about the run.
+/// elapsed seconds, no instruction. Its outcome is then read explicitly through its handle as the
+/// terminal text of M024-M026-TEST-FACT (counts, the failing test, the rerun line and the output
+/// reference), and a call after it carries nothing about the run.
 #[tokio::test]
-async fn a_running_test_adds_no_plate_line_and_one_terminal_fact_follows() {
+async fn a_running_test_adds_no_plate_line_and_its_handle_reads_the_terminal_text() {
     let fixture = ProductFixture::new(json!([]));
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "running-no-plate").await;
@@ -23163,18 +22814,25 @@ async fn a_running_test_adds_no_plate_line_and_one_terminal_fact_follows() {
             );
         }
     }
-    let waited = actor
-        .call(&fixture, "ide.inspect", json!({"wait_ms":30000}))
-        .await;
-    let fact = text(&waited);
-    assert!(fact.starts_with("test-finished tests #1: "), "{fact}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let fact = loop {
+        let waited = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":"tests #1"}))
+            .await;
+        let fact = text(&waited);
+        if fact.contains("1 failed") {
+            break fact;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run never settled: {fact}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert!(fact.starts_with("tests #1: "), "{fact}");
     assert!(fact.contains("\n  FAIL tests::fails"), "{fact}");
     assert!(fact.contains("\n  rerun: "), "{fact}");
-    assert_eq!(
-        fact.matches("full output: ide.inspect ").count(),
-        1,
-        "{fact}"
-    );
+    assert_eq!(fact.matches("full output: ide.test ").count(), 1, "{fact}");
     assert!(!fact.contains("poll"), "{fact}");
     let after = actor
         .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
@@ -23700,7 +23358,10 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
             && text.contains("candidates .venv, .venv-py314"),
         "{text}"
     );
-    assert!(!text.contains("detail_ref"), "{text}");
+    assert!(
+        !batch_without_status_plate(text).contains("detail_ref"),
+        "{text}"
+    );
     let again = actor
         .call(
             &fixture,
@@ -23733,10 +23394,9 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
     daemon.wait().await.unwrap();
 }
 
-/// A repeated start that switches environments while a failed run's long `test-finished` fact is
-/// due still answers with its activation card: the environment notice leads the plate and the
-/// fact follows it, which together exceed the feed's 256-byte block yet must not make the facade
-/// refuse the reply.
+/// A repeated start that switches environments while a failed run has settled unread still
+/// answers with its activation card: the environment notice leads the plate, and the run's
+/// outcome rides neither the plate nor the reply (Bridge delivers it).
 #[tokio::test]
 async fn configured_product_environment_switch_plate_with_due_test_line_keeps_the_card() {
     use std::os::unix::fs::PermissionsExt;
@@ -23793,7 +23453,7 @@ async fn configured_product_environment_switch_plate_with_due_test_line_keeps_th
         )
         .await;
     assert_eq!(run["kind"], "test", "{run}");
-    // Let the failing run settle without polling it, so its `test-finished` fact stays due.
+    // Let the failing run settle without polling it.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let switched = actor
         .call_raw(
@@ -23812,8 +23472,11 @@ async fn configured_product_environment_switch_plate_with_due_test_line_keeps_th
         text.contains("python: environment now .venv-py314 (was .venv; selected)"),
         "{text}"
     );
-    // OUTBOX-r3 §4: the settled run arrives as its fact after the plate, never as a plate line.
-    assert!(text.contains("\ntest-finished tests #1: exit 1"), "{text}");
+    // OUTBOX-r4: the settled run never rides the plate or the reply of another call.
+    assert!(
+        !text.contains("test-finished") && !text.contains("tests #1"),
+        "{text}"
+    );
     assert!(
         text.contains("environment: python .venv-py314 (3.14.3, selected)"),
         "{text}"
@@ -23870,7 +23533,8 @@ async fn claude_start_actor(
     assert_eq!(reply["kind"], "activation", "{agent:?}: {reply}");
 }
 
-/// Reads the fixture's first lines for `agent` and requires that the read succeeded.
+/// Requires fresh fixture text for an authorization check; force bypasses only duplicate-body
+/// suppression, never host binding, source or workspace authority guards.
 async fn claude_read_ok(
     mcp: &mut Mcp,
     project: &Path,
@@ -23885,7 +23549,7 @@ async fn claude_read_ok(
         session,
         agent,
         "ide.read",
-        json!({"path":"src/lib.rs","lines":"1-2"}),
+        json!({"path":"src/lib.rs","lines":"1-2","force":true}),
     )
     .await;
     assert!(

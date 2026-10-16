@@ -16,7 +16,7 @@ use crate::lang::{Language, TestReport};
 mod batch;
 pub use batch::{BatchCommand, BatchLaunch, BatchPlan, BatchTarget};
 
-/// Maximum combined stdout and stderr retained for `ide.inspect`.
+/// Maximum combined stdout and stderr retained for `ide.test` output continuation.
 const MAX_OUTPUT: usize = 256 * 1024;
 /// Maximum output tail retained beside the paged full result.
 const OUTPUT_TAIL_BYTES: usize = 4 * 1024;
@@ -79,6 +79,8 @@ struct Job {
     completed_at: Option<tokio::time::Instant>,
     /// True after an explicit `status` request has retrieved the completed result.
     observed: bool,
+    /// Owner-requested cancellation, observed by the runner before releasing its process group.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Captured parser summary, bounded output, and whether the budget killed the child.
@@ -95,8 +97,10 @@ pub struct RunResult {
     pub output_paged: bool,
     /// Elapsed wall-clock process duration.
     pub elapsed: Duration,
-    /// True when the process was killed at its time budget.
+    /// True when the process was stopped by budget, owner cancellation or bounded pipe drain.
     pub stopped: bool,
+    /// True only when an explicit owner cancellation won before child completion.
+    pub cancelled: bool,
     /// Process exit code; absent after a budget kill, a signal, or a spawn failure.
     pub exit: Option<i32>,
     /// Budget configured for this process.
@@ -426,6 +430,7 @@ impl TestRuns {
         state.next_id = state.next_id.saturating_add(1);
         let id = state.next_id;
         let started = tokio::time::Instant::now();
+        let cancel = tokio_util::sync::CancellationToken::new();
         state.jobs.insert(
             id,
             Job {
@@ -436,6 +441,7 @@ impl TestRuns {
                 command: launch.rerun_command.clone(),
                 explicit_command: false,
                 started,
+                cancel: cancel.clone(),
                 result: None,
                 completed_at: None,
                 observed: false,
@@ -443,8 +449,15 @@ impl TestRuns {
         );
         let registry = self.0.clone();
         tokio::spawn(async move {
-            let mut result =
-                run_child_capped(launch.language, launch.budget, child, &root, launch.cap).await;
+            let mut result = run_child_cancellable(
+                launch.language,
+                launch.budget,
+                child,
+                &root,
+                launch.cap,
+                cancel,
+            )
+            .await;
             lease.settled();
             result.detail_ref = launch.detail_ref;
             result.command = launch.rerun_command;
@@ -467,6 +480,22 @@ impl TestRuns {
         StartResult::Started(id)
     }
 
+    /// Requests cancellation only for a run in this root and exact active owner generation.
+    /// Returns None for unknown/foreign jobs; Some(false) for a settled run and Some(true) for
+    /// a signalled running job. The result settles asynchronously after process-group reaping.
+    pub fn cancel(&self, root: &std::path::Path, id: u64, caller: &BindingRef) -> Option<bool> {
+        let state = self.0.lock().ok()?;
+        let job = state
+            .jobs
+            .get(&id)
+            .filter(|job| job.root == root && job.owner == caller.fingerprint())?;
+        if job.result.is_some() {
+            return Some(false);
+        }
+        job.cancel.cancel();
+        Some(true)
+    }
+
     /// Installs the hook called with each run's id once its result is recorded, replacing any
     /// earlier one; the hook runs on the run's settle task, outside the registry lock.
     pub fn on_settle(&self, hook: Arc<dyn Fn(u64) + Send + Sync>) {
@@ -479,19 +508,6 @@ impl TestRuns {
     /// while it runs or once it was pruned.
     pub fn settled_result(&self, id: u64) -> Option<RunResult> {
         self.0.lock().ok()?.jobs.get(&id)?.result.clone()
-    }
-
-    /// Marks a settled run collected: its outcome reached its owner `owner` (a delivered
-    /// `test-finished` fact), so `ide.stop` no longer lists it and it no longer pins idle exit.
-    /// Running, unknown or foreign runs are unchanged.
-    pub fn mark_observed(&self, id: u64, owner: &[u8; 32]) {
-        if let Ok(mut state) = self.0.lock()
-            && let Some(job) = state.jobs.get_mut(&id)
-            && job.result.is_some()
-            && &job.owner == owner
-        {
-            job.observed = true;
-        }
     }
 
     /// Marks `id` as an explicit command only when it belongs to `owner`; missing or foreign ids
@@ -530,6 +546,35 @@ impl TestRuns {
             detail_ref: job.detail_ref.clone(),
             explicit_command: job.explicit_command,
         })
+    }
+
+    /// Returns bounded newest-first summaries for retained runs of the same actor/channel and
+    /// worktree, across activation generations. This read does not observe, start or wait for jobs;
+    /// another actor or root never contributes a row. None means the registry is inaccessible,
+    /// not an empty measured history; an available registry returns Some, including an empty list.
+    pub fn history(&self, root: &std::path::Path, caller: &BindingRef) -> Option<Vec<String>> {
+        let channel = caller.channel_identity().fingerprint();
+        let state = self.0.lock().ok()?;
+        Some(
+            state
+                .jobs
+                .iter()
+                .rev()
+                .filter(|(_, job)| job.root == root && job.channel == channel)
+                .take(COMPLETED_PER_WORKTREE + 1)
+                .map(|(id, job)| {
+                    job.result.as_ref().map_or_else(
+                        || super::test_fact::running_line(*id),
+                        |result| {
+                            format!(
+                                "tests #{id}: {}",
+                                super::test_fact::terminal_fact(*id, result, false).summary
+                            )
+                        },
+                    )
+                })
+                .collect(),
+        )
     }
 
     /// Returns one daemon-global job's status for any generation of its starting actor and
@@ -934,6 +979,7 @@ async fn run_child(
 
 /// Runs one already-spawned child, enforcing its wall-clock budget and bounded pipe drain, and
 /// retains at most the last `cap` bytes of its combined output.
+#[cfg(test)]
 async fn run_child_capped(
     language: Language,
     budget: Duration,
@@ -941,14 +987,40 @@ async fn run_child_capped(
     root: &std::path::Path,
     cap: usize,
 ) -> RunResult {
+    run_child_cancellable(
+        language,
+        budget,
+        spawned,
+        root,
+        cap,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+/// Settles the same bounded runner after either exit, budget or owner cancellation; cancellation
+/// kills/reaps the entire group before releasing admission and preserves captured output.
+async fn run_child_cancellable(
+    language: Language,
+    budget: Duration,
+    spawned: Spawned,
+    root: &std::path::Path,
+    cap: usize,
+    cancel: tokio_util::sync::CancellationToken,
+) -> RunResult {
     let started = tokio::time::Instant::now();
     let (job, stdout, stderr) = spawned;
     let mut job = Some(job);
     let combined = Arc::new(tokio::sync::Mutex::new(VecDeque::with_capacity(MAX_OUTPUT)));
     let mut out_task = tokio::spawn(read_into_tail(Some(stdout), combined.clone(), cap));
     let mut err_task = tokio::spawn(read_into_tail(Some(stderr), combined.clone(), cap));
+    let mut cancelled = false;
     let exited = match job.as_mut() {
-        Some(running) => running.wait(budget).await,
+        Some(running) => tokio::select! {
+            biased;
+            exited = running.wait(budget) => exited,
+            _ = cancel.cancelled() => { cancelled = true; false },
+        },
         None => false,
     };
     // Past its budget the whole group is torn down and reaped before the pipes are drained.
@@ -1006,6 +1078,7 @@ async fn run_child_capped(
         output_paged: false,
         elapsed: started.elapsed(),
         stopped,
+        cancelled,
         exit: status.and_then(|status| status.code()),
         budget,
         detail_ref: String::new(),
@@ -1073,6 +1146,7 @@ fn failed_run(budget: Duration, output: String) -> RunResult {
         output_paged: false,
         elapsed: Duration::ZERO,
         stopped: false,
+        cancelled: false,
         exit: None,
         budget,
         detail_ref: String::new(),
@@ -1114,6 +1188,98 @@ mod runner_tests {
     //! Minimal process and parser checks for the test runner.
     use super::*;
     use crate::assistance::test_fact::terminal_fact;
+
+    /// History is actor/worktree scoped across generations; reads neither consume results nor
+    /// launch processes. Retained terminal/running rows are newest first.
+    #[test]
+    fn history_is_scoped_and_does_not_observe_results() {
+        let runs = TestRuns::default();
+        let root = PathBuf::from("/fixture/one");
+        let own = BindingRef::fixture("actor", "channel", 1);
+        let foreign = BindingRef::fixture("other", "channel", 1);
+        let job = |binding: &BindingRef, path: PathBuf, complete: bool| Job {
+            root: path,
+            owner: binding.fingerprint(),
+            channel: binding.channel_identity().fingerprint(),
+            detail_ref: "fixture-ref".into(),
+            command: vec!["fixture-command-never-executed".into()],
+            explicit_command: true,
+            started: tokio::time::Instant::now(),
+            result: complete.then(|| failed_run(Duration::from_secs(1), "failure".into())),
+            completed_at: complete.then(tokio::time::Instant::now),
+            observed: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        {
+            let mut state = runs.0.lock().unwrap();
+            state.jobs.insert(1, job(&own, root.clone(), true));
+            state.jobs.insert(2, job(&foreign, root.clone(), true));
+            state.jobs.insert(3, job(&own, root.clone(), false));
+            state
+                .jobs
+                .insert(4, job(&own, PathBuf::from("/fixture/two"), true));
+        }
+        let rows = runs.history(&root, &own).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], "tests #3: running");
+        assert!(rows[1].starts_with("tests #1:"));
+        assert!(!runs.0.lock().unwrap().jobs[&1].observed);
+        assert_eq!(
+            rows,
+            runs.history(&root, &BindingRef::fixture("actor", "channel", 2))
+                .unwrap()
+        );
+        assert!(
+            runs.history(&root, &BindingRef::fixture("absent", "channel", 1))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Owner cancellation refuses foreign roots/actors/generations, reaps a real child group,
+    /// settles once and reports cancellation rather than a fictitious time-budget expiry.
+    #[tokio::test]
+    async fn owner_cancel_reaps_and_settles_without_polling() {
+        let scratch = crate::scratch::ScratchDir::new("test-cancel");
+        let root = scratch.to_path_buf();
+        let runs = TestRuns::default();
+        let owner = BindingRef::fixture("owner", "channel", 1);
+        let settled = Arc::new(tokio::sync::Notify::new());
+        let note = settled.clone();
+        runs.on_settle(Arc::new(move |_| note.notify_one()));
+        assert!(matches!(
+            runs.start(
+                root.clone(),
+                vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+                crate::lang::testing::ALPHA,
+                Duration::from_secs(60),
+                "cancel-ref".into(),
+                &owner
+            ),
+            StartResult::Started(1)
+        ));
+        assert_eq!(
+            runs.cancel(&root, 1, &BindingRef::fixture("foreign", "channel", 1)),
+            None
+        );
+        assert_eq!(
+            runs.cancel(&root, 1, &BindingRef::fixture("owner", "channel", 2)),
+            None
+        );
+        assert_eq!(runs.cancel(&root.join("other"), 1, &owner), None);
+        assert_eq!(runs.cancel(&root, 1, &owner), Some(true));
+        tokio::time::timeout(Duration::from_secs(3), settled.notified())
+            .await
+            .unwrap();
+        let result = runs.settled_result(1).unwrap();
+        assert!(result.cancelled && result.stopped && result.report.incomplete);
+        assert!(
+            terminal_fact(1, &result, true)
+                .summary
+                .starts_with("cancelled")
+        );
+        assert_eq!(runs.cancel(&root, 1, &owner), Some(false));
+    }
 
     /// A pinned toolchain leads PATH without discarding the caller's explicit override.
     #[test]
@@ -1566,7 +1732,7 @@ mod runner_tests {
         result.environment_label = Some("two".into());
         assert_eq!(
             terminal_fact(1, &result, true).summary,
-            "1 passed, 0 failed, 0 s · env two"
+            "1 passed, 0 failed, 0 s (exit unknown) · env two"
         );
     }
 }

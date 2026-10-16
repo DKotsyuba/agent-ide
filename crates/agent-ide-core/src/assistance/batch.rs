@@ -1359,7 +1359,7 @@ pub(crate) fn unknown_batch_reply(operation_id: &str, paths: &[String]) -> PeerR
 /// `<K> files, <N> new errors, <M> new warnings`, `<K> files, clean` or `<K> files, diagnostics
 /// unknown`; the detail has one line per file (at most 16, then `+K more files`) and at most
 /// eight `new:` lines, cut to the fact budget. New problems make the fact a failure, and their
-/// compiler text makes it source-bearing so it rides only reply-shaped carriers.
+/// compiler text makes it source-bearing, so it is re-proved before it is handed to Bridge.
 pub(crate) fn edit_checked_draft(
     operation_id: &str,
     reference: &str,
@@ -1422,7 +1422,6 @@ pub(crate) fn edit_checked_draft(
         detail,
         detail_ref: Some(reference.to_owned()),
         failed: errors > 0,
-        holds_turn: true,
         source_bearing: !new_lines.is_empty(),
         fence_paths: fences,
     }
@@ -1443,7 +1442,7 @@ pub(crate) fn summarize_diagnostics(
     let mut new_lines = Vec::new();
     let (mut problems, mut problem_files, mut unknown, mut clean, mut elsewhere) =
         (0usize, 0usize, false, false, 0u32);
-    let mut pending = false;
+    let mut pending = None;
     for (_, diagnostics) in files {
         words.push(match diagnostics {
             EditDiagnostics::CurrentClean { project_errors } => {
@@ -1480,14 +1479,16 @@ pub(crate) fn summarize_diagnostics(
                 "unknown".to_owned()
             }
             EditDiagnostics::NotAnalysed { .. } => "not analysed".to_owned(),
-            EditDiagnostics::Pending { .. } => {
-                pending = true;
+            EditDiagnostics::Pending { detail_ref } => {
+                pending.get_or_insert(detail_ref.as_str());
                 "pending".to_owned()
             }
         });
     }
-    let summary = if pending {
-        "pending; the project check arrives by itself as an edit-checked fact".to_owned()
+    let summary = if let Some(reference) = pending {
+        format!(
+            "pending; project check retained under {reference}; Bridge delivers it automatically when configured"
+        )
     } else if problems > 0 {
         format!("{problems} new problems in {problem_files} files")
     } else if unknown {
@@ -1509,7 +1510,7 @@ pub(crate) const MAX_TEST_TARGETS: usize = 8;
 
 /// The closed target shape a `targets` entry must have, quoted in its refusal.
 const TARGET_SHAPE: &str = "an array of 1 to 8 targets, each exactly one of \
-{\"symbol\":\"src/a.rs#parse\"}, {\"path\":\"tests/cli.rs\"} or {\"pattern\":\"roles_\"}";
+{\"symbol\":\"src/a.rs#parse\"}, {\"path\":\"tests/cli.rs\"}, {\"pattern\":\"roles_\"} or {\"command\":[\"cargo\",\"check\"]}";
 
 /// One target of an `ide.test {targets}` request, in request order.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1520,6 +1521,8 @@ pub(crate) enum TestTargetSpec {
     Path(String),
     /// A raw filter for the language's runner.
     Pattern(String),
+    /// An explicit argv executed at the worktree root, without shell interpretation.
+    Command(Vec<String>),
 }
 
 impl TestTargetSpec {
@@ -1530,19 +1533,30 @@ impl TestTargetSpec {
             Self::Symbol(symbol) => format!("symbol {symbol}"),
             Self::Path(path) => format!("path {path}"),
             Self::Pattern(pattern) => format!("pattern {pattern}"),
+            Self::Command(argv) => format!("command {}", super::worker::display_argv(argv)),
         }
     }
 }
 
 /// Validates one `ide.test {targets, budget_s?}` request object.
 ///
-/// No single-target key (`symbol`, `path`, `pattern`), `command` (single-target only), `status`,
+/// No single-target selector (`symbol`, `path`, `pattern`, `command`), result/cancel query,
 /// `cwd` or `env` appears beside `targets`; `targets` holds 1 to [`MAX_TEST_TARGETS`] objects,
-/// each exactly one of `{symbol}`, `{path}` or `{pattern}`, validated as the single form validates
+/// each exactly one of `{symbol}`, `{path}`, `{pattern}` or `{command}`, validated as the single form validates
 /// that key together with the request's `budget_s`.
 pub(crate) fn validate_test_targets(object: &Map<String, Value>) -> Result<(), ParameterError> {
     if [
-        "symbol", "path", "pattern", "command", "status", "cwd", "env",
+        "symbol",
+        "path",
+        "pattern",
+        "command",
+        "status",
+        "result",
+        "cancel",
+        "history",
+        "detail_ref",
+        "cwd",
+        "env",
     ]
     .iter()
     .any(|field| object.contains_key(*field))
@@ -1550,7 +1564,7 @@ pub(crate) fn validate_test_targets(object: &Map<String, Value>) -> Result<(), P
         return Err(invalid_field(
             "targets",
             FieldRule::OneOf(
-                "used instead of symbol, path, pattern, command or status, never beside them",
+                "used instead of execution or result/history/output selectors, never beside them",
             ),
         ));
     }
@@ -1565,9 +1579,9 @@ pub(crate) fn validate_test_targets(object: &Map<String, Value>) -> Result<(), P
             .as_object()
             .filter(|entry| {
                 entry.len() == 1
-                    && entry
-                        .keys()
-                        .all(|key| matches!(key.as_str(), "symbol" | "path" | "pattern"))
+                    && entry.keys().all(|key| {
+                        matches!(key.as_str(), "symbol" | "path" | "pattern" | "command")
+                    })
             })
             .ok_or_else(shape)?;
         let mut single = entry.clone();
@@ -1596,6 +1610,13 @@ pub(crate) fn test_targets(parameters: &Value) -> Vec<TestTargetSpec> {
             TestTargetSpec::Path(path)
         } else if let Some(pattern) = text("pattern") {
             TestTargetSpec::Pattern(pattern)
+        } else if let Some(argv) = entry.get("command").and_then(Value::as_array) {
+            TestTargetSpec::Command(
+                argv.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            )
         } else {
             continue;
         };
@@ -1735,8 +1756,8 @@ mod tests {
             Err(ParameterError::InvalidObject)
         );
         assert!(
-            validate_call(AssistanceTool::Read, json!({"path":"a.md","force":true})).is_err(),
-            "force needs items"
+            validate_call(AssistanceTool::Read, json!({"path":"a.md","force":true})).is_ok(),
+            "legacy file reads normalize to the same force-aware items engine"
         );
         assert!(
             validate_call(
@@ -2272,7 +2293,7 @@ mod tests {
         assert_eq!(draft.kind, FactKind::EditChecked);
         assert_eq!(draft.subject, "edit op-7");
         assert_eq!(draft.summary, "3 files, 8 new errors, 0 new warnings");
-        assert!(draft.failed && draft.holds_turn && draft.source_bearing);
+        assert!(draft.failed && draft.source_bearing);
         assert_eq!(draft.detail_ref.as_deref(), Some("ref-9"));
         assert_eq!(draft.fence_paths, fences);
         let detail = draft.detail.clone().unwrap();
@@ -2354,7 +2375,7 @@ mod tests {
             json!({"targets":[{"pattern":"a"}],"symbol":"src/a.rs#f"}),
             json!({"targets":[{"pattern":"a"}],"command":["true"]}),
             json!({"targets":[{"pattern":"a","path":"tests/a.rs"}]}),
-            json!({"targets":[{"command":["true"]}]}),
+            json!({"targets":[{"command":[]}]}),
             json!({"targets":[{"path":"../outside.rs"}]}),
             json!({"targets":[{"pattern":"a"}],"budget_s":0}),
             json!({"targets":(0..9).map(|index| json!({"pattern":format!("p{index}")})).collect::<Vec<_>>()}),
@@ -2393,6 +2414,11 @@ mod tests {
         )];
         let (words, per_file, _) = summarize_diagnostics(&pending);
         assert!(words.starts_with("pending"), "{words}");
+        assert!(
+            words.contains("retained under ref-2")
+                && words.contains("Bridge delivers it automatically when configured"),
+            "{words}"
+        );
         assert_no_polling(&words);
         assert_no_unfinished_seconds(&words);
         for unfinished in ["tests #4: still running (12 s)", "pending for 3s"] {

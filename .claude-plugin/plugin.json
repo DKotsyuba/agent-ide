@@ -1,7 +1,7 @@
 {
   "name": "agent-ide",
   "version": "0.10.9",
-  "description": "Ten ide.* tools: source reads/edits, symbol cards or positional lookup, call chains and diagnostic inspection.",
+  "description": "Batch related ide.* discovery, source reads, atomic multi-file edits and tests; automatic Bridge completion.",
   "author": {
     "name": "DKotsyuba"
   },

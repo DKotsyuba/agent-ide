@@ -108,6 +108,20 @@ verifies it and publishes. Keep the bundle format, `install.sh`,
 `scripts/macos-acceptance.sh` and `scripts/validate-release-evidence.sh`
 unchanged unless a change is the point of the task.
 
+## Agent batch workflow
+
+Collect related targets before making tool calls. Use bounded batches: outline paths/glob,
+symbol/graph symbols, read items, one multi-file edit (Codex patch / Claude files), test
+targets, aggregate diff paths and known inspect detail_refs. Do not issue one call per
+file, symbol or tiny hunk when the related set fits a batch. Split only for advertised
+limits or newly discovered work. Start/stop are once-only lifecycle calls per worktree.
+
+Batch related production and test edits after reading the affected units. In Bridge mode
+graph/test acceptance is asynchronous even when cached. Keep the activation alive, end an
+idle turn and continue from automatic completion; never poll or finish/stop while waiting.
+This is workflow guidance, not extra permission or a claim of unsupported native wake.
+Preserve the safety invariants, required full gate and staged cutover qualification.
+
 ## Where the contract snapshot lives
 
 `schemas/tools.json` exports the real binary's `tools/list` array for Claude;
@@ -117,7 +131,7 @@ Both snapshots are generated from the rebuilt binary and contain the final ten n
 The complete project gate remains required before claiming this candidate is done.
 Both source catalogs have the same ten public names. Public `ide.context` is
 removed, including `tools/call`; only its private engine/transport remains. Source
-reads move to `ide.read {"path":"src/a.rs"}` and skeletons to `ide.outline`.
+reads move to `ide.read {"items":[{"path":"src/a.rs"}]}` and skeletons to `ide.outline`.
 `ide.symbol {"path":"src/a.rs","byte_offset":42}` resolves an exact UTF-8 use-site
 (definitions/references or explicit lexical/unavailable evidence, no whole-file dump).
 Offsets are semantic positions, never page cursors; split/out-of-file offsets refuse.
@@ -126,7 +140,7 @@ Offsets are semantic positions, never page cursors; split/out-of-file offsets re
 unknown diagnostics never mean zero, and unversioned counts remain provisional lower
 bounds. Continue long results with `detail_ref`. `ide.symbol` also gives a card with immediate
 callers/callees (all positive values mean direct neighbors). Use `ide.graph`
-`{"symbol":"src/a.rs#f","direction":"callers","depth":2}` for call chains when changing
+`{"symbols":["src/a.rs#f","src/b.rs#g"],"direction":"callers","depth":2}` for call chains when changing
 signatures/public behavior, refactoring shared functions, tracing indirect faults or
 investigating architecture/cross-language connections. Start depth 2, expand within 1–3
 only as needed: callers shows impact, callees shows execution/dependencies, both shows
