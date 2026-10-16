@@ -935,9 +935,12 @@ pub(crate) fn validate_edit_files(object: &Map<String, Value>) -> Result<(), Par
             .filter(|path| !path.is_empty() && path.len() <= 1024)
             .ok_or_else(shape)?;
         // One leading `/` is an absolute location copied from `grep -n`; the worker makes it
-        // worktree-relative and refuses a file outside the worktree.
-        let path = path.strip_prefix('/').unwrap_or(path);
-        if let Some(rule) = path_shape_rule(path) {
+        // worktree-relative and refuses a file outside the worktree. Only the shape check and the
+        // per-entry validation see the path without that slash; entries are compared as written
+        // (`/repo/a.rs` and `repo/a.rs` are different files), and the worker refuses entries that
+        // name one file once they are worktree-relative.
+        let shape_path = path.strip_prefix('/').unwrap_or(path);
+        if let Some(rule) = path_shape_rule(shape_path) {
             return Err(invalid_field("files", rule));
         }
         if !paths.insert(path) {
@@ -960,7 +963,7 @@ pub(crate) fn validate_edit_files(object: &Map<String, Value>) -> Result<(), Par
             Some(Value::Bool(create)) => *create,
             Some(_) => return Err(invalid_field("create", FieldRule::Boolean)),
         };
-        let mut single = json!({"operation_id": operation_id, "path": path});
+        let mut single = json!({"operation_id": operation_id, "path": shape_path});
         match (entry.get("changes"), entry.get("content")) {
             (Some(changes), None) if !create => {
                 let list = changes.as_array().ok_or_else(shape)?;
@@ -2024,6 +2027,25 @@ mod tests {
         ] {
             assert!(edit(bad.clone()).is_err(), "{bad}");
         }
+    }
+
+    /// Entry paths are compared as written: `/repo/a.md` and `repo/a.md` are different files and
+    /// both pass the facade, while the same spelling twice is refused. Whether an absolute and a
+    /// relative spelling name one worktree file is the worker's check.
+    #[test]
+    fn edit_files_compare_paths_as_written() {
+        assert!(
+            edit(json!({"operation_id":"op","files":[
+                {"path":"/repo/a.md","create":true,"content":"x"},
+                {"path":"repo/a.md","create":true,"content":"y"}]}))
+            .is_ok()
+        );
+        assert!(
+            edit(json!({"operation_id":"op","files":[
+                {"path":"/repo/a.md","create":true,"content":"x"},
+                {"path":"/repo/a.md","create":true,"content":"y"}]}))
+            .is_err()
+        );
     }
 
     #[test]

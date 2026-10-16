@@ -1054,6 +1054,53 @@ async fn absolute_locations_edit_inside_the_worktree_in_the_multi_file_form() {
     finished(actor, daemon, &fixture).await;
 }
 
+/// The multi-file form compares entry paths as written: an absolute in-worktree path and a
+/// relative path that only look alike (`/root/src/batch.rs` and `root/src/batch.rs`) are
+/// different files and are both edited, while an absolute and a relative spelling of the same
+/// file are a duplicate the worker refuses before anything is written.
+#[tokio::test]
+async fn multi_file_entries_are_compared_as_written_then_as_worktree_files() {
+    let (fixture, daemon, mut actor) = started("sre-abs-dup").await;
+    let root = fixture.root.join(FILE);
+    let lookalike = root
+        .display()
+        .to_string()
+        .trim_start_matches('/')
+        .to_owned();
+    let lookalike_file = fixture.root.join(&lookalike);
+    std::fs::create_dir_all(lookalike_file.parent().unwrap()).unwrap();
+    std::fs::write(&lookalike_file, "old\n").unwrap();
+    let body = "pub fn utility(x: u32) -> u32 {\n    x\n}";
+    let (reply, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"files":[
+            {"path":root.display().to_string(),"changes":[{"symbol":format!("{}:9", root.display()),"content":body}]},
+            {"path":lookalike,"content":"new\n"},
+        ]}),
+    )
+    .await;
+    assert_eq!(reply["state"], "edit_batch", "{text}");
+    assert!(text.starts_with("edit: applied"), "{text}");
+    assert!(!on_disk(&fixture).contains("Doubles"));
+    assert_eq!(std::fs::read_to_string(&lookalike_file).unwrap(), "new\n");
+    reset(&fixture);
+    let (reply, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"files":[
+            {"path":root.display().to_string(),"changes":[{"symbol":format!("{}:9", root.display()),"content":body}]},
+            {"path":FILE,"changes":[{"old":"a * 2","new":"a * 3"}]},
+        ]}),
+    )
+    .await;
+    assert_eq!(reply["state"], "error", "{text}");
+    assert_eq!(on_disk(&fixture), ORIGINAL);
+    finished(actor, daemon, &fixture).await;
+}
+
 /// A fixture whose `impl` closes after its last method: line 7 is the closing brace.
 const WITH_IMPL: &str =
     "pub struct S;\n\nimpl S {\n    pub fn a(&self) -> u32 {\n        1\n    }\n}\n";
