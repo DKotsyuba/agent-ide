@@ -59,32 +59,34 @@ That record keeps unadvertised protocol compatibility without model idle-wait ad
 
 Bytes of the exported compact arrays (`schemas/tools.json` 15,276, `schemas/tools-codex.json` 12,782) and
 of the literal sources. `facade.rs:N` is the `#[tool(name = …)]` attribute whose preceding doc
-comment is the description (the Codex `ide.edit` and `ide.read` overrides are at `facade.rs:5370-5385`).
+comment is the description (the Codex `ide.edit` and `ide.read` overrides are at `facade.rs:5371-5391`).
 
 | Source | Anchor | Claude / Codex bytes |
 |---|---|---|
-| Server paragraph | `facade.rs:5303` / `facade.rs:5306` | 499 / 514 |
-| `ide.start` description / schema | `facade.rs:5163`, `tool_schemas()[0]` | 353 / 688 |
-| `ide.diff` description / schema | `facade.rs:5176` | 261 / 686 |
-| `ide.outline` description / schema | `facade.rs:5189` | 275 / 592 |
-| `ide.read` description / schema | `facade.rs:5203` | 362 / 823 and 337 / 635 |
-| `ide.symbol` description / schema | `facade.rs:5217` | 336 / 1,158 |
-| `ide.graph` description / schema | `facade.rs:5232` | 445 / 960 |
-| `ide.test` description / schema | `facade.rs:5247` | 457 / 2,015 |
-| `ide.inspect` description / schema | `facade.rs:5261` | 341 / 795 |
-| `ide.stop` description / schema | `facade.rs:5275` | 236 / 203 |
-| `ide.edit` description / schema | `facade.rs:5290`, Codex `facade.rs:5378` | 424 / 2,605 and 409 / 339 |
-| Longest property description | `facade.rs:233` `tool_schemas()` | 142 (`ide.test`) |
+| Server paragraph | `facade.rs:5304` / `facade.rs:5307` | 499 / 514 |
+| `ide.start` description / schema | `facade.rs:5164`, `tool_schemas()[0]` | 353 / 688 |
+| `ide.diff` description / schema | `facade.rs:5177` | 261 / 686 |
+| `ide.outline` description / schema | `facade.rs:5190` | 275 / 592 |
+| `ide.read` description / schema | `facade.rs:5204` | 362 / 823 and 337 / 635 |
+| `ide.symbol` description / schema | `facade.rs:5218` | 336 / 1,158 |
+| `ide.graph` description / schema | `facade.rs:5233` | 445 / 960 |
+| `ide.test` description / schema | `facade.rs:5248` | 457 / 2,015 |
+| `ide.inspect` description / schema | `facade.rs:5262` | 341 / 795 |
+| `ide.stop` description / schema | `facade.rs:5276` | 236 / 203 |
+| `ide.edit` description / schema | `facade.rs:5291`, Codex `facade.rs:5379` | 424 / 2,605 and 409 / 339 |
+| Longest property description | `facade.rs:233` `tool_schemas()` | Claude 145 (`ide.edit` `changes` items), Codex 142 (`ide.test` `targets`) |
 | `ide.start` signature block | `signature_card.rs:16` | 641 |
 | Claude / Codex skill | `skills/agent-ide/SKILL.md`, `skills/codex/agent-ide/SKILL.md` | 4,126 / 4,051 |
-| Reply template | `assets/mcp/reply.jinja` | 24,226 |
+| Reply template | `assets/mcp/reply.jinja` | 24,298 |
 | Plugin manifests | `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json` | 254 / 1,019 |
 
 Owned reply measurements (independent review of candidate `0e15c0ef`, before to after): raw
 `ide.start` reply 1,889 to 1,315 B, outline line 213 to 211, one-item read 253 to 174, diff 400
 to 392 (repeat call 166), stop 152 to 76. The refusal rows of the next section are produced by the
-table test `content::refusal_table::every_rewritten_refusal_has_a_bounded_head_and_one_repair`,
-which prints E-002 and current bytes per row with `AGENT_IDE_PRINT_REFUSAL_TABLE=1`.
+table tests `content::refusal_table::every_rewritten_refusal_has_a_bounded_head_and_one_repair`
+(template branches) and `content::refusal_table::template_free_refusals_have_a_bounded_head_and_one_repair`
+(transport, reply-limit, stop and batch refusals), which print E-002 and current bytes per row with
+`AGENT_IDE_PRINT_REFUSAL_TABLE=1`.
 
 **Historical r5 draft inventory (not current measurements):** the Before/After figures and statuses in this table are the E-002 and r5-draft values; the current ten-tool state is stated in the paragraphs above.
 
@@ -146,10 +148,11 @@ which prints E-002 and current bytes per row with `AGENT_IDE_PRINT_REFUSAL_TABLE
 
 ## Refusal byte table (T-008)
 
-Every rewritten refusal branch of `reply.jinja`/`content.rs` (106 rows), rendered by the production projection. Old = E-002 (`eaeba10`) bytes, New = current text-only bytes. Each row is asserted by `content::refusal_table` to have a head of at most 160 B, exactly one `Repair:` line of at most 120 B naming one step, no internal reason code and any excerpt after the Repair line. Row `edit_refused` is the generic M-029 edit refusal; the batch-edit forms are pinned in `batch.rs` tests.
+Every rewritten refusal producer (122 rows): the 107 template branches of `reply.jinja`/`content.rs` rendered by the production projection, plus the 15 refusals that bypass the template (the `facade::transport_refusal` outcomes, the reply-limit and unidentified-stop texts, and the multi-file conflicting duplicate with the longest valid 128-byte `operation_id`). Old = E-002 (`eaeba10`) bytes, New = current text-only bytes. `content::refusal_table` asserts every row has a head of at most 160 B, exactly one `Repair:` line of at most 120 B naming one step, no internal reason code and any excerpt after the Repair line (`AGENT_IDE_PRINT_REFUSAL_TABLE=1` prints the rows). Durable edit refusals put the effect sentence first and a path label of at most 60 B (its tail) last; `content::tests::long_paths_keep_the_effect_of_every_durable_edit_refusal` pins a 203-byte path. Row `edit_refused` is the generic M-029 edit refusal; the batch-edit per-file forms are pinned in `batch.rs` tests.
 
 | Refusal | Old B | New B |
 |---|---|---|
+| host: outside_allowed_roots | 182 | 102 |
 | host: hooks_not_delivered | 169 | 88 |
 | host: invalid_metadata | 136 | 68 |
 | host: missing_field | 134 | 69 |
@@ -247,13 +250,28 @@ Every rewritten refusal branch of `reply.jinja`/`content.rs` (106 rows), rendere
 | execution_profile: spawn_request | 101 | 68 |
 | execution_profile: stdout_reserved | 147 | 97 |
 | execution_profile: reap_timed_out | 128 | 88 |
-| edit: stale_source | 180 | 92 |
+| edit: stale_source | 180 | 101 |
 | edit: stale_source (supplied source_ref) | 286 | 126 |
-| edit: conflicting_duplicate | 128 | 158 |
-| edit: unsafe_target | 149 | 118 |
-| edit: cancelled_no_effect | 126 | 110 |
-| edit: deadline_no_effect | 125 | 112 |
-| edit: capacity_no_effect | 125 | 113 |
-| edit: outcome_unknown | 133 | 125 |
-| edit: unavailable_before_dispatch | 171 | 137 |
-| **Total** | **17019** | **11814** |
+| edit: conflicting_duplicate | 128 | 157 |
+| edit: unsafe_target | 149 | 129 |
+| edit: cancelled_no_effect | 126 | 107 |
+| edit: deadline_no_effect | 125 | 109 |
+| edit: capacity_no_effect | 125 | 112 |
+| edit: outcome_unknown | 133 | 122 |
+| edit: unavailable_before_dispatch | 171 | 134 |
+| transport: invalid_parameters | 51 | 97 |
+| transport: host attachment | 81 | 75 |
+| transport: connection unavailable | 70 | 70 |
+| transport: timed out | 65 | 65 |
+| transport: busy | 133 | 107 |
+| transport: restarting | 128 | 115 |
+| transport: lost reply (ide.edit) | 111 | 101 |
+| transport: lost reply (ide.test) | 126 | 121 |
+| transport: lost reply (ide.start) | 131 | 115 |
+| transport: lost reply (other) | 99 | 73 |
+| transport: reconnect failed | 73 | 75 |
+| transport: incomplete | 71 | 68 |
+| transport: reply limit | 74 | 75 |
+| transport: stop unidentified | 148 | 93 |
+| batch: conflicting_duplicate (128-byte operation_id) | 230 | 157 |
+| **Total** | **18792** | **13329** |
