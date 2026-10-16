@@ -1503,7 +1503,9 @@ pub(crate) fn validate_normalized_call(
                 }
             }
             let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
-            if let Some(rule) = path_shape_rule(path) {
+            // One leading `/` is an absolute location copied from `grep -n`; the worker makes it
+            // worktree-relative and refuses a file outside the worktree.
+            if let Some(rule) = path_shape_rule(path.strip_prefix('/').unwrap_or(path)) {
                 return Err(invalid_field("path", rule));
             }
             let changes = object["changes"]

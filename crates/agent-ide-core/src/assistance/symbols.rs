@@ -4848,8 +4848,9 @@ fn window_guard(
 enum UnitMiss {
     /// No such unit (or a file other than the edit's).
     Unknown,
-    /// The window starts at `first`, beyond the unit's `length` lines.
-    Length { length: u32, first: u32 },
+    /// The window names line `beyond`, past the unit's `length` lines: its start, or an explicit
+    /// end that edits refuse instead of clamping (symbol-read-edit-v1 §3.2).
+    Length { length: u32, beyond: u32 },
 }
 
 /// The lines an address names in the edit's file: the unit, or the window inside it.
@@ -4893,6 +4894,14 @@ fn unit_range_of(
     }
     let (Some(map), Some(address)) = (map, parsed) else {
         return Err(UnitMiss::Unknown);
+        // Reads clamp a window end past the unit; an edit must lie inside the unit's extent.
+        Ok(resolved) if resolved.clamped => Err(UnitMiss::Length {
+            length: resolved.span.len(),
+            beyond: address
+                .window()
+                .and_then(|window| window.last)
+                .unwrap_or_default(),
+        }),
     };
     if address.file().is_some_and(|file| file != Path::new(path)) {
         return Err(UnitMiss::Unknown);
@@ -4901,16 +4910,17 @@ fn unit_range_of(
         Ok(resolved) => Ok(resolved.window.unwrap_or(resolved.span)),
         Err(lang::address::ResolveError::LineOutOfRange { length }) => Err(UnitMiss::Length {
             length,
-            first: address.window().map_or(1, |window| window.first),
+            beyond: address.window().map_or(1, |window| window.first),
         }),
         Err(_) => Err(UnitMiss::Unknown),
     }
 }
 
-/// The refusal sentence for a window that starts past its unit.
-fn window_sentence(number: usize, requested: &str, length: u32, first: u32) -> String {
+/// The refusal sentence for a window that starts or ends past its unit (`beyond` is the
+/// offending line number).
+fn window_sentence(number: usize, requested: &str, length: u32, beyond: u32) -> String {
     format!(
-        "change {number}: {requested} has {length} lines, not {first}; use a window inside \
+        "change {number}: {requested} has {length} lines, not {beyond}; use a window inside \
          1-{length}, or no window to replace the whole unit"
     )
 }
@@ -5063,8 +5073,9 @@ fn resolve_changes_with(
                             no_symbol(requested, &mut refusal);
                             continue;
                         }
-                        Err(UnitMiss::Length { length, first }) => {
-                            refusal.push(number, window_sentence(number, requested, length, first));
+                        Err(UnitMiss::Length { length, beyond }) => {
+                            refusal
+                                .push(number, window_sentence(number, requested, length, beyond));
                             continue;
                         }
                     };
@@ -5172,8 +5183,8 @@ fn resolve_changes_with(
                 let scope = match within {
                     Some(within) => match unit_range(within) {
                         Ok(range) => Some(range),
-                        Err(UnitMiss::Length { length, first }) => {
-                            refusal.push(number, window_sentence(number, within, length, first));
+                        Err(UnitMiss::Length { length, beyond }) => {
+                            refusal.push(number, window_sentence(number, within, length, beyond));
                             continue;
                         }
                         Err(UnitMiss::Unknown) => {

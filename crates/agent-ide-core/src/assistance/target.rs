@@ -259,11 +259,13 @@ impl Worker<'_> {
         let (map, lexical): (Arc<AddressMap>, Option<Lexical>) =
             Box::pin(self.address_map(job, &observed, &bytes)).await?;
         let source = observed_text(&observed, &bytes)?;
+        // A location past the file's last line has no unit; every line up to it, including the
+        // closing line of a container that follows its last member, has exactly one.
+        let total = crate::lang::line_count(source);
         if let Requested::Line { line, .. } = &request
-            && *line > map.units().last().map_or(0, |unit| unit.span.end)
+            && *line > total
         {
             let authority = self.finish_symbol_job(job, binding, &observed).await?;
-            let total = crate::lang::line_count(source);
             let text = format!(
                 "{}: file has {total} lines; nothing at {line}\n",
                 file.display()

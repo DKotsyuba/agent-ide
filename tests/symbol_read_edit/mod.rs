@@ -942,6 +942,114 @@ async fn lines_edits_echo_and_locations_address_units_and_regions() {
 /// A file with a small function and a `big` one whose numbered text is larger than one reply
 /// page. Unit lines of `big`: 1 is its header, 2-6001 the repeated `let`, 6002-6003 its tail.
 #[cfg(feature = "test-seams")]
+/// A window that ends past its unit is refused on edits (symbol-read-edit-v1 §3.2) although the
+/// same window is clamped on reads; the refusal names the unit's length and writes nothing.
+#[tokio::test]
+async fn an_edit_window_past_the_unit_is_refused_not_clamped() {
+    let (fixture, daemon, mut actor) = started("sre-clamp").await;
+    for request in [
+        json!({"symbol":"src/batch.rs#utility:4-999","content":"    a * 9\n}"}),
+        json!({"operation_id":"clamp-changes","path":FILE,"changes":[{"symbol":"src/batch.rs#utility:4-999","content":"    a * 9\n}"}]}),
+        json!({"symbol":"src/batch.rs#utility:4-999","old":"a * 2","new":"a * 9"}),
+    ] {
+        let (_, text) = call(&mut actor, &fixture, "ide.edit", request.clone()).await;
+        assert!(
+            text.contains("src/batch.rs#utility:4-999 has 5 lines, not 999"),
+            "{request}: {text}"
+        );
+        assert_eq!(on_disk(&fixture), ORIGINAL, "{request}");
+    }
+    // An end inside the unit and an open end still work, and a read of the same window clamps.
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbol":"src/batch.rs#utility:4-999"}),
+    )
+    .await;
+    assert!(text.contains("lines 4-5 of 5"), "{text}");
+    finished(actor, daemon, &fixture).await;
+}
+
+/// An absolute `path:line` inside the worktree edits like the relative one in both scopes: the
+/// whole unit that holds the line (E1) and exact old text scoped to it (E3); a file outside the
+/// worktree is refused before anything is resolved (symbol-read-edit-v1 §1).
+#[tokio::test]
+async fn absolute_locations_edit_inside_the_worktree_only() {
+    let (fixture, daemon, mut actor) = started("sre-abs").await;
+    let absolute = format!("{}:9", fixture.root.join(FILE).display());
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":absolute,"content":"pub fn utility(x: u32) -> u32 {\n    x\n}"}),
+    )
+    .await;
+    assert!(
+        text.contains("src/batch.rs#utility (L6-8)  replaced (5 lines → 3)"),
+        "{text}"
+    );
+    assert!(!on_disk(&fixture).contains("Doubles"));
+    reset(&fixture);
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":absolute,"old":"a * 2","new":"a * 3"}),
+    )
+    .await;
+    assert!(text.contains("replaced"), "{text}");
+    assert_eq!(on_disk(&fixture), ORIGINAL.replace("a * 2", "a * 3"));
+    reset(&fixture);
+    let outside = std::env::temp_dir().join("outside-the-worktree.rs");
+    let (reply, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":format!("{}:1", outside.display()),"content":"x"}),
+    )
+    .await;
+    // The envelope oracle makes this refusal an MCP error; no file appears outside the worktree.
+    assert_eq!(reply["state"], "error", "{text}");
+    assert!(!outside.exists());
+    assert_eq!(on_disk(&fixture), ORIGINAL);
+    finished(actor, daemon, &fixture).await;
+}
+
+/// A fixture whose `impl` closes after its last method: line 7 is the closing brace.
+const WITH_IMPL: &str =
+    "pub struct S;\n\nimpl S {\n    pub fn a(&self) -> u32 {\n        1\n    }\n}\n";
+
+/// A `path:line` on the closing line of a container that follows its last member reads that
+/// container; only a line past the file's last line answers "nothing at" (§2.1).
+#[tokio::test]
+async fn a_location_on_a_closing_container_line_reads_the_container() {
+    let fixture = batch_edit_fixture(WITH_IMPL);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = batch_started_actor(&fixture, "sre-close", FILE).await;
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbol":"src/batch.rs:7"}),
+    )
+    .await;
+    assert!(
+        text.contains("your line 7 is line 5") && !text.contains("nothing at"),
+        "{text}"
+    );
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbol":"src/batch.rs:8"}),
+    )
+    .await;
+    assert!(text.contains("file has 7 lines; nothing at 8"), "{text}");
+    finished(actor, daemon, &fixture).await;
+}
+
 fn paged_source() -> String {
     format!(
         "pub fn small() -> u32 {{\n    1\n}}\n\npub fn big() -> u32 {{\n{}    7\n}}\n",

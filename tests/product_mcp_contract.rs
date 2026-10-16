@@ -744,6 +744,7 @@ fn assert_compact_envelope(reply: &Value) {
             } else if !(header.starts_with("read: ")
                 || header.starts_with("no such ")
                 || header.starts_with("file has ")
+                || header.contains(": file has ")
                 || header.starts_with("not a readable text file")
                 || header.contains(" has no code symbols; ")
                 || header.ends_with("  (empty file)"))

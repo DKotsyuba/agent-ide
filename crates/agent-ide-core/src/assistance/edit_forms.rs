@@ -101,17 +101,17 @@ fn normalize_entries(object: &mut Map<String, Value>) {
     }
 }
 
-/// The file part of `symbol` (`src/a.rs` of `src/a.rs#Foo`), when it has one.
+/// The file part of `symbol` (`src/a.rs` of `src/a.rs#Foo`, `/repo/src/a.rs` of
+/// `/repo/src/a.rs:9`), when it has one.
 fn file_of(symbol: &str) -> Option<String> {
     if let Some((file, _)) = symbol.split_once('#') {
         return Some(file.to_owned()).filter(|file| !file.is_empty());
     }
-    // A relative `path:line` location (what grep prints) names its file too; it addresses the
-    // unit or region holding the line, resolved against the file's map by the worker.
+    // A `path:line` location (what grep prints) names its file too, relative or absolute; it
+    // addresses the unit or region holding the line. The worker makes an absolute in-worktree
+    // file relative (and refuses one outside the worktree) before it resolves anything.
     match crate::lang::address::Address::parse(symbol) {
-        Ok(crate::lang::address::Parsed::Location { file, .. }) if !file.is_absolute() => {
-            Some(file.display().to_string())
-        }
+        Ok(crate::lang::address::Parsed::Location { file, .. }) => Some(file.display().to_string()),
         _ => None,
     }
 }
@@ -220,6 +220,16 @@ mod tests {
         assert_eq!(
             normalized(json!({"symbol":"src/a.rs:9","content":"z"})),
             json!({"path":"src/a.rs","changes":[{"symbol":"src/a.rs:9","content":"z"}]})
+        );
+        // An absolute `path:line` names its absolute file in both edit scopes; the worker makes
+        // it worktree-relative.
+        assert_eq!(
+            normalized(json!({"symbol":"/repo/src/a.rs:9","content":"z"})),
+            json!({"path":"/repo/src/a.rs","changes":[{"symbol":"/repo/src/a.rs:9","content":"z"}]})
+        );
+        assert_eq!(
+            normalized(json!({"symbol":"/repo/src/a.rs:9","old":"x","new":"y"})),
+            json!({"path":"/repo/src/a.rs","changes":[{"old":"x","new":"y","within":"/repo/src/a.rs:9"}]})
         );
         assert_eq!(
             normalized(json!({"path":"a.rs","lines":"1-2","source_ref":"s","content":"z"})),

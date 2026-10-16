@@ -5712,16 +5712,70 @@ impl<'a> Worker<'a> {
         ))
     }
 
-    /// Executes one managed-Codex full-content edit through Changes receipts and Workspace permits.
+    /// Rewrites the absolute in-worktree files of an edit's targets to worktree-relative ones,
+    /// so a location copied from `grep -n` or a compiler (`/repo/src/a.rs:130`, symbol-read-edit-v1
+    /// section 1) edits like `src/a.rs:130`.
     ///
-    /// The source reference must name a completed same-binding Context detail whose exact source
-    /// observation still matches `path`; a full-file call without one is a creation request
-    /// handled by `create_file`. A new durable prepare is the only route to Workspace; an
-    /// exact prepared receipt recovered after ambiguity returns unknown and is never dispatched
-    /// again. Known effects are followed by source observation and a deadline-bounded provider
-    /// diagnostic refresh attached to the same reply only when it matches that post-read source;
-    /// provider failure never changes a known filesystem outcome or implies cleanliness. The
-    /// current host must prove this path readable before Workspace opens it during preparation.
+    /// The rewritten strings are `path`, `symbol` and each `changes` entry's `symbol` and
+    /// `within`; a string that does not start with `/` is left as is. An absolute file outside
+    /// the binding's worktree refuses with `outside_allowed_roots` before anything is resolved or
+    /// written. Idempotent, so a resumed job sees the same relative targets.
+    async fn relativize_edit_targets(&mut self, job: &mut Job) -> Result<(), FailureCode> {
+        let mut targets: Vec<&mut Value> = Vec::new();
+        if let Some(object) = job.parameters.as_object_mut() {
+            for (key, value) in object.iter_mut() {
+                match key.as_str() {
+                    "path" | "symbol" => targets.push(value),
+                    "changes" => {
+                        for entry in value.as_array_mut().into_iter().flatten() {
+                            for (key, value) in entry.as_object_mut().into_iter().flatten() {
+                                if matches!(key.as_str(), "symbol" | "within") {
+                                    targets.push(value);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        targets.retain(|target| target.as_str().is_some_and(|text| text.starts_with('/')));
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let binding = job.invocation.binding_ref().clone();
+        let root = self
+            .authority(&binding)
+            .await?
+            .worktree()
+            .worktree_path()
+            .to_path_buf();
+        for target in targets {
+            let inside = Path::new(target.as_str().unwrap_or_default())
+                .strip_prefix(&root)
+                .map_err(|_| FailureCode::OutsideAllowedRoots)?
+                .to_string_lossy()
+                .into_owned();
+            *target = Value::String(inside);
+        }
+        Ok(())
+    }
+
+    /// Executes one `ide.edit` call: a Codex `patch`, a multi-file `files` call, a one-file
+    /// `changes` call, a `symbol` or `lines` call, a whole-file `content` write, or the strict
+    /// full-file form that names a retained `source_ref`.
+    ///
+    /// A whole-file call without `source_ref` writes the file itself, creating it when missing
+    /// and replacing its current bytes otherwise (`create_file`); a supplied (deprecated)
+    /// `source_ref` must name a completed same-binding detail whose exact source observation
+    /// still matches `path`, else the call is refused `stale_source`. Absolute in-worktree
+    /// targets are made worktree-relative first (`relativize_edit_targets`). A new durable
+    /// prepare is the only route to Workspace; an exact prepared receipt recovered after
+    /// ambiguity returns unknown and is never dispatched again. The reply leaves as soon as the
+    /// write is observed, with `diagnostics: pending` while the provider check is unknown; the
+    /// check continues under the retained result and arrives as a fact, and a provider failure
+    /// never changes a known filesystem outcome or implies cleanliness. The current host must
+    /// prove this path readable before Workspace opens it during preparation.
     async fn edit(
         &mut self,
         job: &mut Job,
@@ -5790,9 +5844,11 @@ impl<'a> Worker<'a> {
             return self.edit_files(job).await;
         }
         if job.parameters.get("changes").is_some() {
+            self.relativize_edit_targets(job).await?;
             return self.edit_changes(job).await;
         }
         if job.parameters.get("symbol").is_some() || job.parameters.get("lines").is_some() {
+            self.relativize_edit_targets(job).await?;
             return self.edit_by_symbol(job).await;
         }
         if job.parameters.get("source_ref").is_none() {
