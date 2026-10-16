@@ -705,7 +705,7 @@ impl Worker<'_> {
         }
         // The unchanged answer (batch-api-v1 §2): an `items` block whose bytes this session
         // already received in the same context epoch becomes one line, unless `force` asks for
-        // the text. Its file stays covered by the reply's `source_ref`.
+        // the text. Its file is still retained as an edit base.
         let epoch = (form == batch::ReadForm::Items
             && job.parameters.get("force").and_then(Value::as_bool) != Some(true))
         .then(|| self.context_epoch(&binding))
@@ -729,8 +729,8 @@ impl Worker<'_> {
             }
             _ => vec![false; items.len()],
         };
-        // Which files' blocks were delivered decides both the `source_ref` line's file list and
-        // which observations stay retained as edit bases.
+        // Which files' blocks were delivered decides the reply's trailing note and which
+        // observations stay retained as edit bases.
         let reference = job.reference.clone();
         let fits = |text: &str| {
             content::fits(
@@ -745,11 +745,7 @@ impl Worker<'_> {
             )
         };
         let source_line = |delivered: &[usize]| {
-            let names: Vec<String> = delivered
-                .iter()
-                .map(|&index| files[index].0.display().to_string())
-                .collect();
-            // Text read of a file no IDE language analyzes: say so once, ahead of the reference.
+            // Text read of a file no IDE language analyzes: say so once, at the end of the reply.
             let note = if delivered
                 .iter()
                 .any(|&index| Lang::for_path(&files[index].0).is_none())
@@ -759,7 +755,6 @@ impl Worker<'_> {
                 ""
             };
             // No file-version reference is printed: the current text is the freshness check.
-            let _ = names;
             note.to_owned()
         };
         let files_named = items
@@ -2923,7 +2918,7 @@ fn whole_file_text(file: &Path, title: &str, source: &str) -> String {
     }
 }
 
-/// Reply line a text read of a file no IDE language analyzes ends with, ahead of `source_ref`.
+/// Reply line a text read of a file no IDE language analyzes ends with.
 const NO_ANALYSIS_NOTE: &str = "note: no code analysis for this format; showing its text only\n";
 
 /// Item line of a batch read whose file is binary or could not be read as text.
@@ -4894,6 +4889,11 @@ fn unit_range_of(
     }
     let (Some(map), Some(address)) = (map, parsed) else {
         return Err(UnitMiss::Unknown);
+    };
+    if address.file().is_some_and(|file| file != Path::new(path)) {
+        return Err(UnitMiss::Unknown);
+    }
+    match map.resolve(&address) {
         // Reads clamp a window end past the unit; an edit must lie inside the unit's extent.
         Ok(resolved) if resolved.clamped => Err(UnitMiss::Length {
             length: resolved.span.len(),
@@ -4902,11 +4902,6 @@ fn unit_range_of(
                 .and_then(|window| window.last)
                 .unwrap_or_default(),
         }),
-    };
-    if address.file().is_some_and(|file| file != Path::new(path)) {
-        return Err(UnitMiss::Unknown);
-    }
-    match map.resolve(&address) {
         Ok(resolved) => Ok(resolved.window.unwrap_or(resolved.span)),
         Err(lang::address::ResolveError::LineOutOfRange { length }) => Err(UnitMiss::Length {
             length,

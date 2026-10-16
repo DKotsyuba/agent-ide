@@ -368,7 +368,8 @@ fn close_hunk(open: &mut Option<(Hunk, usize)>, hunks: &mut Vec<Hunk>) -> Result
 /// source. A source containing `\r\n` keeps that ending on every line a hunk writes.
 ///
 /// The output keeps the source's final-newline state, except that a hunk that is end-anchored or
-/// inserts at the end and adds lines makes the result end with `\n`.
+/// inserts at the end and adds lines makes the result end with `\n`. A CRLF source whose last
+/// line has no terminator keeps it unterminated: no bare `\r` is left at the end of the result.
 ///
 /// # Errors
 ///
@@ -425,6 +426,10 @@ pub(crate) fn apply_hunks(source: &str, hunks: &[Hunk]) -> Result<Applied, Miss>
     let mut text = out.join("\n");
     if ends_with_newline && !out.is_empty() {
         text.push('\n');
+    } else if crlf && !source.ends_with('\r') && text.ends_with('\r') {
+        // The source's last line had no terminator at all, so a line written there gets none
+        // either (the `\r` added above belongs to a `\r\n` that does not exist).
+        text.pop();
     }
     Ok(Applied { text, changed })
 }
@@ -750,6 +755,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(applied.text, "a\r\nB\r\nB2\r\nc\r\n");
+    }
+
+    /// Checks that a CRLF file whose last line has no terminator keeps it unterminated, with no
+    /// bare `\r` left behind by the replacement.
+    #[test]
+    fn crlf_file_without_a_final_newline_stays_unterminated() {
+        let applied = apply_hunks("a\r\nb", &[hunk(None, &["b"], &["B"], false)]).unwrap();
+        assert_eq!(applied.text, "a\r\nB");
+        let middle = apply_hunks("a\r\nb", &[hunk(None, &["a"], &["A"], false)]).unwrap();
+        assert_eq!(middle.text, "A\r\nb");
     }
 
     /// Checks that an add-only hunk with an `@@` anchor goes after the anchor line, not at the
