@@ -1,5 +1,9 @@
 //! Executable MCP roundtrips for static discovery, separated ingress, and finite daemon routing.
 
+/// Compact test results and explicit output-page product checks.
+#[path = "result_economy/mod.rs"]
+mod result_economy;
+
 use std::{
     os::unix::{ffi::OsStrExt, fs::DirBuilderExt, fs::PermissionsExt},
     path::{Path, PathBuf},
@@ -632,6 +636,7 @@ fn refusal_shape_holds(text: &str) -> bool {
 /// may legitimately occur in the compact block, while the complete typed value remains separate.
 /// A reply-delivered host's terminal reply may lead with the due status plate (T28B); the plate is
 /// stripped from the text before the state comparison and must lead the structured copy's text too.
+/// Nonterminal edit progress carries confirmed paths and stage rather than an edit outcome.
 fn assert_compact_envelope(reply: &Value) {
     let result = reply["result"].as_object().expect("tool result object");
     let content = result["content"].as_array().expect("content array");
@@ -688,6 +693,7 @@ fn assert_compact_envelope(reply: &Value) {
                 || text.starts_with("tests: could not start ")
                 || text.starts_with("tests: no tests in ")
                 || text.starts_with("tests: no retained runs")
+                || text.starts_with("output page ")
                 || text.starts_with("page ")
                 || (structured["detail_ref"].is_string() && !body.is_empty()),
             "{reply}"
@@ -756,13 +762,19 @@ fn assert_compact_envelope(reply: &Value) {
             }
         }
         // Unlabelled replies (harness-reply-v1 R2): the text is the delivery itself.
+        ("complete", Some("edit_progress")) => {
+            assert!(
+                text.contains("committed:") && text.contains("stage:"),
+                "{reply}"
+            );
+        }
         ("complete", Some("activation" | "diff" | "stop")) => {
             assert!(!body.is_empty(), "{reply}")
         }
         ("unavailable", _) => assert!(text.contains("\nRepair: "), "{reply}"),
         ("pending", _) => assert!(
             text.contains("Result retained under")
-                && text.contains("Bridge delivers it automatically when configured."),
+                && text.contains("Bridge delivers it automatically."),
             "{reply}"
         ),
         // A durable edit refusal is a head sentence and one Repair line; an applied edit leads
@@ -6607,6 +6619,562 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     daemon.wait().await.unwrap();
 }
 
+/// Replays cold matrix request shapes against actual configured providers and prints the
+/// exclusive journaled stages. Each fixture owns its provider cache and home; no warm semantic
+/// call precedes the measured request. Source/write assertions also protect the public result.
+#[tokio::test]
+#[ignore = "requires accepted Rust and TypeScript provider environment"]
+async fn cold_matrix_reply_shapes_journal_stage_timings() {
+    for edit in [false, true] {
+        let fixture = if edit {
+            ProductFixture::new(json!([accepted_typescript_provider()]))
+        } else {
+            symbol_test_fixture()
+        };
+        let count = if edit { 9 } else { 5 };
+        let mut items = Vec::new();
+        let mut files = Vec::new();
+        for index in 0..count {
+            let path = format!("src/cold_{index}.{}", if edit { "ts" } else { "rs" });
+            let content = if edit {
+                format!("export const value{index} = 1;\n")
+            } else {
+                format!("pub fn value{index}() -> i32 {{ 1 }}\n")
+            };
+            std::fs::write(fixture.root.join(&path), &content).unwrap();
+            items.push(json!({"path":path,"lines":"1-1"}));
+            files.push(json!({"path":path,"changes":[{"old":"= 1", "new":"= 2"}]}));
+        }
+        if edit {
+            std::fs::write(
+                fixture.root.join("tsconfig.json"),
+                "{\"compilerOptions\":{\"types\":[]},\"include\":[\"src/*.ts\"]}",
+            )
+            .unwrap();
+        }
+        let home = provider_home(&fixture);
+        let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+        let mut actor = ProductActor::new(&fixture, "cold-matrix-shape").await;
+        let started = actor.call(&fixture, "ide.start", json!({})).await;
+        assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+        let began = std::time::Instant::now();
+        let reply = if edit {
+            actor
+                .call(&fixture, "ide.edit", json!({"files":files}))
+                .await
+        } else {
+            actor
+                .call(&fixture, "ide.read", json!({"items":items}))
+                .await
+        };
+        assert_ne!(reply["state"], "pending", "bare inline handle: {reply}");
+        if !edit {
+            assert_eq!(reply["kind"], "read", "{reply}");
+            assert!(
+                reply["text"].as_str().unwrap().contains("value4"),
+                "{reply}"
+            );
+        }
+        eprintln!(
+            "cold matrix {} inline {:?}: {}",
+            if edit { "edit-9" } else { "read-5" },
+            began.elapsed(),
+            reply
+        );
+        let reference = reply["detail_ref"]
+            .as_str()
+            .or_else(|| reply["source_ref"].as_str())
+            .unwrap()
+            .to_owned();
+        let mut settled = actor.settle(&fixture, reply).await;
+        // This diagnostic qualification explicitly recovers the independently pending check;
+        // the useful write receipt above already completed in its initial request.
+        if edit
+            && (settled["kind"] == "edit_progress"
+                || settled["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("diagnostics: pending")))
+        {
+            settled = actor
+                .call(
+                    &fixture,
+                    "ide.inspect",
+                    json!({"detail_ref":reference,"wait_s":30}),
+                )
+                .await;
+        }
+        let events = std::fs::read_dir(home.join(".agent-ide/logs"))
+            .unwrap()
+            .flatten()
+            .flat_map(|entry| agent_ide::errorlog::read_events(&entry.path()))
+            .collect::<Vec<_>>();
+        let stages = events
+            .iter()
+            .filter(|event| {
+                event.correlation.as_deref() == Some(&reference)
+                    && event
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.starts_with("stage: "))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !stages.is_empty(),
+            "missing stages for {reference}: {events:?}"
+        );
+        if !edit {
+            assert!(
+                stages.iter().any(|event| event
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("stage: provider_wait;"))
+                    && event.duration_ms == Some(0)),
+                "plain reads awaited a provider: {stages:?}"
+            );
+            assert_eq!(settled["kind"], "read", "{settled}");
+        }
+        for event in stages {
+            eprintln!(
+                "cold matrix stage {} {}ms",
+                event.detail.as_deref().unwrap(),
+                event.duration_ms.unwrap()
+            );
+        }
+        if edit {
+            for index in 0..count {
+                assert!(
+                    std::fs::read_to_string(fixture.root.join(format!("src/cold_{index}.ts")))
+                        .unwrap()
+                        .contains("= 2"),
+                    "{settled}"
+                );
+            }
+        } else {
+            assert!(
+                settled["text"].as_str().unwrap().contains("value4"),
+                "{settled}"
+            );
+        }
+        actor.call(&fixture, "ide.stop", json!({})).await;
+        actor.mcp.close().await;
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+    }
+}
+
+/// Plain source is useful on the initial call with no provider, a cold configured provider,
+/// and a live provider that never answers. Source outlines stay independent; an explicit
+/// semantic request starts the hung fixture before source is read again without recovery.
+#[tokio::test]
+async fn plain_source_does_not_wait_for_absent_cold_or_hung_providers() {
+    use std::os::unix::fs::PermissionsExt;
+    for configured in [false, true] {
+        let fixture = ProductFixture::new(json!([]));
+        let marker = fixture.base.join("plain-provider-started");
+        if configured {
+            let program = fixture.base.join("plain-provider");
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\nprintf '%s\n' $$ >> '{}'\nexec /bin/sleep 30\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"hung-plain-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"plain-provider-cache"}]));
+        }
+        let mut held_provider = None;
+        let items = (0..5)
+            .map(|index| {
+                let path = format!("src/plain_{index}.rs");
+                std::fs::write(
+                    fixture.root.join(&path),
+                    format!("pub fn plain{index}() -> i32 {{ {index} }}\n"),
+                )
+                .unwrap();
+                if index % 2 == 0 {
+                    json!({"path":path,"lines":"1-1"})
+                } else {
+                    json!({"path":path})
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut daemon = fixture
+            .daemon_with_home(Some(&provider_home(&fixture)))
+            .await;
+        let mut actor = ProductActor::new(&fixture, "plain-provider-independent").await;
+        let started = actor.call(&fixture, "ide.start", json!({})).await;
+        assert_eq!(started["kind"], "activation", "{started}");
+        assert!(
+            started["text"].as_str().unwrap().contains("rust module"),
+            "qualify actual production module mode: {started}"
+        );
+        eprintln!("T1 effective_mode=rust-module");
+        let began = std::time::Instant::now();
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            actor.call(&fixture, "ide.read", json!({"items":items,"force":true})),
+        )
+        .await
+        .expect("plain source must not spend the inline window waiting for a provider");
+        assert_eq!(read["kind"], "read", "{read}");
+        assert!(
+            read["text"].as_str().unwrap().contains("pub fn plain4()"),
+            "{read}"
+        );
+        assert!(!marker.exists(), "plain read started a language provider");
+        eprintln!(
+            "T1 configured={configured} cold request_to_usable_ms={} progress=0 recovery_requests=0 source_files=5",
+            began.elapsed().as_millis()
+        );
+        let outline = tokio::time::timeout(
+            Duration::from_secs(5),
+            actor.call(&fixture, "ide.outline", json!({"path":"src/lib.rs"})),
+        )
+        .await
+        .expect("available source outline is synchronous");
+        assert_eq!(outline["kind"], "outline", "{outline}");
+        assert!(
+            outline["text"].as_str().unwrap().contains("value"),
+            "{outline}"
+        );
+        if configured {
+            assert!(
+                !marker.exists(),
+                "source outline started an unnecessary semantic provider"
+            );
+            let _semantic = actor
+                .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+                .await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the explicit semantic request starts the never-ready provider fixture");
+            let pid: libc::pid_t = std::fs::read_to_string(&marker)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            held_provider = Some(ProcessIdentity::of(pid).expect("owned provider exists").0);
+            let began = std::time::Instant::now();
+            let before = actor.next;
+            let read = tokio::time::timeout(
+                Duration::from_secs(5),
+                actor.call(&fixture, "ide.read", json!({"items":items,"force":true})),
+            )
+            .await
+            .expect("live hung provider must not delay source");
+            assert_eq!(read["kind"], "read", "{read}");
+            assert!(
+                read["text"].as_str().unwrap().contains("pub fn plain4()"),
+                "{read}"
+            );
+            assert_eq!(actor.next, before + 1, "ordinary source needs one request");
+            eprintln!(
+                "T1 hung request_to_usable_ms={} progress=0 recovery_requests=0 source_files=5",
+                began.elapsed().as_millis()
+            );
+        }
+        let ranges = actor
+            .call(
+                &fixture,
+                "ide.read",
+                json!({"path":"src/lib.rs","ranges":["1-1","2-2"],"force":true}),
+            )
+            .await;
+        assert_eq!(ranges["kind"], "read", "{ranges}");
+        assert!(
+            ranges["text"].as_str().unwrap().contains("pub fn caller()"),
+            "{ranges}"
+        );
+        if configured {
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap().lines().count(),
+                1,
+                "readiness retries must not relaunch the same granted provider"
+            );
+        }
+        let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+        assert_eq!(stopped["kind"], "stop", "{stopped}");
+        if let Some(provider) = held_provider {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while provider.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("stop must reap the initializing provider, including zombies");
+        }
+
+        actor.mcp.close().await;
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+    }
+}
+
+/// A durable batch receipt is useful while the first check is held. Exact pending retries keep
+/// the same source/check identity without rewriting; bounded diagnostic recovery preserves that
+/// receipt, and releasing the explicit check gate settles the independently retained result.
+#[tokio::test]
+async fn edit_progress_and_bounded_inspect_preserve_committed_files() {
+    let fixture = ProductFixture::new(json!([]));
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "stage-progress").await;
+    let start = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
+    let parameters = json!({"operation_id":"committed-before-check","files":[
+        {"path":"src/lib.rs","changes":[{"old":"{ 7 }","new":"{ 8 }"}]}]});
+    let began = std::time::Instant::now();
+    let before = actor.next;
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        actor.call(&fixture, "ide.edit", parameters.clone()),
+    )
+    .await
+    .expect("a committed receipt must not consume the eight-second inline window");
+    assert_eq!(reply["state"], "edit_batch", "{reply}");
+    assert_eq!(reply["files"][0]["state"], "replaced", "{reply}");
+    assert!(
+        reply["text"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostics: pending"),
+        "{reply}"
+    );
+    assert_eq!(
+        actor.next,
+        before + 1,
+        "normal committed edits need one request"
+    );
+    eprintln!(
+        "T2 batch request_to_usable_ms={} progress=0 recovery_requests=0",
+        began.elapsed().as_millis()
+    );
+    let reference = reply["source_ref"].as_str().unwrap().to_owned();
+    let modified = std::fs::metadata(fixture.root.join("src/lib.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let retry = actor.call(&fixture, "ide.edit", parameters).await;
+    assert_eq!(
+        retry["source_ref"], reference,
+        "pending retry must reuse source/check identity: {retry}"
+    );
+    assert_eq!(
+        retry["files"][0]["state"], "replaced",
+        "same retained receipt: {retry}"
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.root.join("src/lib.rs"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        modified,
+        "lost/delayed receipt recovery must not write again"
+    );
+    let recovered = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+        .await;
+    assert_eq!(recovered["source_ref"], reference, "{recovered}");
+    for parameters in [
+        json!({"detail_ref":reference,"wait_s":1}),
+        json!({"detail_refs":[reference,reference],"wait_s":1}),
+    ] {
+        let began = std::time::Instant::now();
+        let pending = actor.call(&fixture, "ide.inspect", parameters).await;
+        assert!(
+            began.elapsed() >= Duration::from_millis(900)
+                && began.elapsed() < Duration::from_secs(2),
+            "{:?}: {pending}",
+            began.elapsed()
+        );
+        assert!(
+            pending["text"]
+                .as_str()
+                .unwrap()
+                .contains("diagnostics: pending"),
+            "{pending}"
+        );
+    }
+    release_checks_gate(&fixture);
+    let settled = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":reference,"wait_s":30}),
+        )
+        .await;
+    assert_eq!(settled["state"], "edit_batch", "{settled}");
+    assert_eq!(settled["source_ref"], reference, "{settled}");
+    assert!(
+        !settled["text"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostics: pending"),
+        "{settled}"
+    );
+    let events = std::fs::read_dir(home.join(".agent-ide/logs"))
+        .unwrap()
+        .flatten()
+        .flat_map(|entry| agent_ide::errorlog::read_events(&entry.path()))
+        .collect::<Vec<_>>();
+    let useful = events
+        .iter()
+        .filter(|event| {
+            event.correlation.as_deref() == Some(&reference)
+                && event
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("usable_result;"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        useful.len(),
+        1,
+        "one journaled usable receipt per request: {events:?}"
+    );
+    assert!(useful[0].duration_ms.unwrap() < 5000, "{useful:?}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A hung semantic provider cannot delay a durable one-file receipt. Its retained source can
+/// authorize the next write while checks are held; exact pending retries do not apply twice.
+#[tokio::test]
+async fn committed_single_edit_receipt_survives_hung_provider_and_chains_source() {
+    let fixture = ProductFixture::new(json!([]));
+    let program = fixture.base.join("hung-edit-provider");
+    let marker = fixture.base.join("hung-edit-provider-started");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf '%s' $$ > '{}'\nexec /bin/sleep 30\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"hung-edit-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"hung-edit-provider-cache"}]));
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "single-receipt").await;
+    let start = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/lib.rs","force":true}),
+        )
+        .await;
+    let parameters = json!({"operation_id":"single-before-check","path":"src/lib.rs",
+        "source_ref":read["detail_ref"],"content":"pub fn value() -> i32 { 8 }\n"});
+    let began = std::time::Instant::now();
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(5),
+        actor.call(&fixture, "ide.edit", parameters.clone()),
+    )
+    .await
+    .expect("post-commit provider enrichment must not delay the receipt");
+    assert_eq!(receipt["state"], "edit", "{receipt}");
+    assert_eq!(receipt["result"]["outcome"], "replaced", "{receipt}");
+    assert_eq!(receipt["diagnostics"]["state"], "pending", "{receipt}");
+    assert!(
+        !marker.exists(),
+        "post-write receipt started an unnecessary semantic provider"
+    );
+    eprintln!(
+        "T2 single request_to_usable_ms={} progress=0 recovery_requests=0",
+        began.elapsed().as_millis()
+    );
+    let reference = receipt["result"]["source_ref"].as_str().unwrap().to_owned();
+    assert_eq!(receipt["diagnostics"]["detail_ref"], reference, "{receipt}");
+    let retry = actor.call(&fixture, "ide.edit", parameters).await;
+    assert_eq!(retry["result"]["source_ref"], reference, "{retry}");
+    let next_parameters = json!({"operation_id":"single-next","path":"src/lib.rs",
+        "source_ref":reference,"content":"pub fn value() -> i32 { 9 }\n"});
+    let chained = actor
+        .call(&fixture, "ide.edit", next_parameters.clone())
+        .await;
+    assert_eq!(
+        chained["result"]["outcome"], "replaced",
+        "a pending receipt is a usable edit base: {chained}"
+    );
+    release_checks_gate(&fixture);
+    let next_ref = chained["result"]["source_ref"].as_str().unwrap();
+    let settled = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":next_ref,"wait_s":30}),
+        )
+        .await;
+    assert_ne!(settled["diagnostics"]["state"], "pending", "{settled}");
+    let modified = std::fs::metadata(fixture.root.join("src/lib.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let terminal_retry = actor
+        .call(&fixture, "ide.edit", next_parameters.clone())
+        .await;
+    assert_eq!(
+        terminal_retry["result"]["outcome"], "replaced",
+        "{terminal_retry}"
+    );
+    assert_eq!(
+        terminal_retry["result"]["source_ref"], next_ref,
+        "terminal recovery retains the committed source identity: {terminal_retry}"
+    );
+
+    assert_eq!(
+        std::fs::metadata(fixture.root.join("src/lib.rs"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        modified,
+        "terminal recovery must not write again"
+    );
+    let mut conflict_parameters = next_parameters.clone();
+    conflict_parameters["content"] = json!("pub fn different() {}\n");
+    let conflict = actor.call(&fixture, "ide.edit", conflict_parameters).await;
+    assert_eq!(
+        conflict["result"]["outcome"], "conflicting_duplicate",
+        "different payload cannot reuse this id: {conflict}"
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.root.join("src/lib.rs"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        modified
+    );
+    let native = "pub fn native() {}\n";
+    std::fs::write(fixture.root.join("src/lib.rs"), native).unwrap();
+    let stale = actor.call(&fixture, "ide.edit", next_parameters).await;
+    assert_eq!(
+        stale["code"], "source_unavailable",
+        "a stale receipt cannot pretend fresh source authority: {stale}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        native
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// OUTBOX-r4 §8.6: when an edit's project check outlasts the inline wait, the edit answers with
 /// its write and `diagnostics: pending` (never a whole-reply `pending`), and the edit's own
 /// reference later returns the settled reply — never the silent `inspect:internal` a
@@ -6736,11 +7304,19 @@ async fn pending_and_batch_replies_never_invite_polling() {
                    "files":[{"path":"src/lib.rs","changes":[{"lines":"1-1","content":"pub fn value() -> i32 { 7 }"}]}]}),
         )
         .await;
+    assert_eq!(edit["state"], "edit_batch", "{edit}");
+    assert_eq!(edit["outcome"], "applied", "{edit}");
+    assert_eq!(
+        edit["files"],
+        json!([{"path":"src/lib.rs","state":"replaced"}]),
+        "{edit}"
+    );
+    assert!(edit["source_ref"].as_str().is_some(), "{edit}");
     assert!(
-        edit["text"].as_str().is_some_and(|text| {
-            text.contains("diagnostics: pending; project check retained under")
-                && text.contains("Bridge delivers it automatically when configured")
-        }),
+        edit["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("diagnostics: pending")
+                && text.contains("project check retained under")),
         "{edit}"
     );
     seen.push(edit);
@@ -8506,10 +9082,8 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
             .is_some_and(|text| text.contains("src/lib.rs")),
         "{outline}"
     );
-    // A lexical context answer is a degraded success that retains a result; inspecting that
-    // result after the call's own degraded mark was consumed reports it degraded again, names
-    // the call that queued it as `origin`, and is typed as delivered.
-    // The source is too large for one reply, so the cut names the `detail_ref` that continues it.
+    // A complete source read retains a result; inspection keeps its completed outcome, names
+    // the originating call and is typed as delivered. This source requires continuation pages.
     std::fs::write(
         fixture.root.join("context-pages.txt"),
         "padding padding padding\n".repeat(20_000),
@@ -8580,13 +9154,13 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     assert_eq!(context.role.as_deref(), Some("writer"));
     assert_eq!(context.form.as_deref(), Some("kind"));
     assert_eq!(context.eligible, Some(true));
-    // With no language server configured, the outline answers from source: a degraded success
-    // marked by the daemon itself, not by the reply text.
+    // Exact source structure completes the requested outline without semantic provider work.
+    // The journal records completion rather than a degraded semantic fallback.
     let outline = events
         .iter()
         .find(|event| event.method == "outline" && event.request.is_some())
         .unwrap_or_else(|| panic!("an outline dispatch line: {raw}"));
-    assert_eq!(outline.outcome, "degraded", "{outline:?}");
+    assert_eq!(outline.outcome, "completed", "{outline:?}");
     assert_eq!(outline.language.as_deref(), Some("rust"));
     assert_eq!(outline.form.as_deref(), Some("path"));
     let lexical_context = events
@@ -9806,7 +10380,7 @@ async fn configured_product_test_command_uses_cwd_env_and_parses_wrapped_pytest_
     let text = command["text"].as_str().unwrap();
     assert!(text.starts_with("tests #"), "{text}");
     assert!(
-        text.contains("exit 1") && text.contains("output (tail):\ngit diff output"),
+        text.contains("exit 1") && text.contains("output (tail):\n    git diff output"),
         "{text}"
     );
     assert!(
@@ -9979,7 +10553,7 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     assert_eq!(
         start_text.trim_end(),
         "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); the result \
-         is retained under its reference; Bridge delivers it automatically when configured",
+         is retained under its reference; Bridge delivers it automatically",
         "{start_text}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -10037,7 +10611,11 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     };
     assert_eq!(verbose_result["detail_ref"], verbose_ref);
     let mut page = actor
-        .call(&fixture, "ide.inspect", json!({"detail_ref":verbose_ref}))
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":format!("{verbose_ref}/output/1")}),
+        )
         .await;
     assert_eq!(
         page["continuation"], true,
@@ -10048,7 +10626,7 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
             .call(
                 &fixture,
                 "ide.inspect",
-                json!({"detail_ref":verbose_result["detail_ref"]}),
+                json!({"detail_ref":page["detail_ref"]}),
             )
             .await;
     }
@@ -10209,7 +10787,7 @@ async fn configured_product_test_status_repeats_after_output_is_paged() {
         run["text"]
             .as_str()
             .unwrap()
-            .contains("output (tail):\nretained-output"),
+            .contains("output (tail):\n    retained-output"),
         "{run}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -10596,7 +11174,7 @@ async fn configured_product_cold_rust_symbol_and_graph_never_answer_pending() {
         if text.starts_with("approximate: ") {
             assert!(
                 text.contains(
-                    "the precise answer is retained under its reference; Bridge delivers it automatically when configured"
+                    "the precise answer is retained under its reference; Bridge delivers it automatically"
                 ),
                 "{text}"
             );
@@ -11350,8 +11928,8 @@ async fn settle_edit_check(
     edit
 }
 
-/// Starts one actor over `fixture` and warms the analyzer until `path`'s outline answers from
-/// the live server, so no later reply carries the loading-time `outline: from source` note.
+/// Starts one actor over `fixture` and warms its Rust function's semantic provider.
+/// `path` names a Rust fixture with a `fn` declaration; source outlines do not start providers.
 async fn batch_started_actor(
     fixture: &ProductFixture,
     name: &'static str,
@@ -11362,7 +11940,7 @@ async fn batch_started_actor(
         .call(fixture, "ide.start", json!({"activation_id":name}))
         .await;
     assert_eq!(actor.settle(fixture, started).await["kind"], "activation");
-    batch_wait_semantic_outline(&mut actor, fixture, path).await;
+    batch_wait_semantic_provider(&mut actor, fixture, path).await;
     actor
 }
 
@@ -11378,22 +11956,30 @@ fn batch_without_status_plate(text: &str) -> &str {
     }
 }
 
-/// Waits until `path`'s outline answers from the live server, not the loading-time source
-/// outline, so symbol-addressed edits never carry the `outline: from source` note.
-async fn batch_wait_semantic_outline(
+/// Explicitly warms the semantic provider for tests that require live symbol/rename behavior.
+/// `path` names a Rust fixture containing a function declaration. Query its name, since a
+/// comment/whitespace position has no semantic identifier and cannot start a provider.
+/// Source outlines do not start providers; the existing sixty-second ceiling bounds readiness.
+async fn batch_wait_semantic_provider(
     actor: &mut ProductActor,
     fixture: &ProductFixture,
     path: &str,
 ) {
+    let source = std::fs::read_to_string(fixture.root.join(path)).unwrap();
+    let offset = source.find("fn ").expect("Rust function fixture") + 3;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let outline = actor
-            .call(fixture, "ide.outline", json!({"path":path}))
+            .call(
+                fixture,
+                "ide.symbol",
+                json!({"path":path,"byte_offset":offset}),
+            )
             .await;
         let settled = actor.settle(fixture, outline).await;
-        assert_eq!(settled["kind"], "outline", "{settled}");
+        assert_eq!(settled["kind"], "symbol", "{settled}");
         let text = settled["text"].as_str().unwrap_or_default();
-        if !text.contains("outline: from source") {
+        if text.contains("mode: semantic") {
             return;
         }
         assert!(
@@ -11420,6 +12006,737 @@ fn batch_diagnostics_segment(edit: &Value) -> String {
         ),
         other => panic!("unexpected diagnostics state {other}: {edit}"),
     }
+}
+
+/// Full-file, line, change, file-list and address edits share canonical containment for native
+/// absolute spellings; every outside/symlink escape refuses without changing source bytes.
+#[tokio::test]
+async fn configured_product_edit_native_absolute_shapes_share_containment() {
+    let content = "pub fn first() -> i32 {\n    1\n}\n";
+    let fixture = batch_edit_fixture(content);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "native-edit-shapes", "src/batch.rs").await;
+    let outside = fixture.base.join("shape-outside.rs");
+    std::fs::write(&outside, content).unwrap();
+    std::os::unix::fs::symlink(&fixture.base, fixture.root.join("src/shape-escape")).unwrap();
+    let paths = [
+        format!("{}/src/./batch.rs", fixture.root.display()),
+        format!("{}/src/../src/batch.rs", fixture.root.display()),
+        format!("{}//src//batch.rs", fixture.root.display()),
+        outside.display().to_string(),
+        format!(
+            "{}/src/shape-escape/../shape-denied.rs",
+            fixture.root.display()
+        ),
+    ];
+    for (index, path) in paths.into_iter().enumerate() {
+        let symbol = format!("{path}#first");
+        let calls = [
+            json!({"path":path,"content":content}),
+            json!({"path":path,"lines":"1-3","content":content}),
+            json!({"path":path,"changes":[{"old":"1","new":"1"}]}),
+            json!({"files":[{"path":path,"content":content}]}),
+            json!({"symbol":symbol,"content":content}),
+            json!({"path":path,"changes":[{"symbol":symbol,"content":content}]}),
+            json!({"path":path,"changes":[{"old":"1","new":"1","within":symbol}]}),
+        ];
+        for (form, mut parameters) in calls.into_iter().enumerate() {
+            parameters["operation_id"] = json!(format!("native-shape-{index}-{form}"));
+            let reply = batch_call_with_text(&mut actor, &fixture, "ide.edit", parameters).await;
+            let (reply, text) = batch_settle_with_text(&mut actor, &fixture, reply).await;
+            if index < 3 {
+                assert!(
+                    matches!(reply["state"].as_str(), Some("edit" | "edit_batch")),
+                    "{reply}: {text}"
+                );
+            } else {
+                assert_eq!(reply["code"], "edit_refused", "{reply}: {text}");
+                assert!(text.contains("outside the worktree"), "{reply}: {text}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/batch.rs")).unwrap(),
+                content
+            );
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), content);
+            assert!(!fixture.base.join("shape-denied.rs").exists());
+        }
+        if index < 3 {
+            let read = actor
+                .call(&fixture, "ide.read", json!({"path":"src/batch.rs"}))
+                .await;
+            let read = actor.settle(&fixture, read).await;
+            let reference = read["detail_ref"].as_str().expect("fresh source reference");
+            let reply = actor
+                .call(
+                    &fixture,
+                    "ide.edit",
+                    json!({
+                        "operation_id":format!("native-shape-source-{index}"),"path":path,
+                        "source_ref":reference,"content":content
+                    }),
+                )
+                .await;
+            let reply = actor.settle(&fixture, reply).await;
+            assert_eq!(reply["state"], "edit", "{reply}");
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/batch.rs")).unwrap(),
+                content
+            );
+        }
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A complete batch fences existing and future filesystem aliases (including parent aliases)
+/// before an otherwise valid first source changes; distinct future creates still succeed.
+#[tokio::test]
+async fn configured_product_edit_batch_native_aliases_refuse_before_source_writes() {
+    let content = "pub fn first() -> i32 {\n    1\n}\n";
+    let fixture = batch_edit_fixture(content);
+    std::fs::write(fixture.root.join("src/Existing.rs"), content).unwrap();
+    std::fs::write(fixture.root.join("src/é.rs"), content).unwrap();
+    let insensitive = std::fs::metadata(fixture.root.join("src/existing.rs")).is_ok();
+    let normalization_insensitive = std::fs::metadata(fixture.root.join("src/e\u{301}.rs")).is_ok();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "batch-native-aliases", "src/batch.rs").await;
+    for (case, pair, collides, reason) in [
+        (
+            "existing",
+            ["src/Existing.rs", "src/existing.rs"],
+            insensitive,
+            "repeated_file:",
+        ),
+        (
+            "future",
+            ["src/Planned/New.rs", "src/planned/new.rs"],
+            insensitive,
+            "repeated_file:",
+        ),
+        (
+            "parent",
+            ["src/Future", "src/future/child.rs"],
+            insensitive,
+            "future_file_parent:",
+        ),
+        (
+            "unicode",
+            ["src/new-é.rs", "src/new-e\u{301}.rs"],
+            normalization_insensitive,
+            "repeated_file:",
+        ),
+        (
+            "unicode-parent",
+            ["src/Parent-é", "src/Parent-e\u{301}/child.rs"],
+            normalization_insensitive,
+            "future_file_parent:",
+        ),
+    ] {
+        if !collides {
+            continue;
+        }
+        for reversed in [false, true] {
+            let mut aliases = pair.map(|path| json!({"path":path,"content":"pub fn alias() {}\n"}));
+            if reversed {
+                aliases.reverse();
+            }
+            let files = vec![
+                json!({"path":"src/batch.rs","content":"pub fn must_not_write() {}\n"}),
+                aliases[0].clone(),
+                aliases[1].clone(),
+            ];
+            let reply = batch_call_with_text(
+                &mut actor,
+                &fixture,
+                "ide.edit",
+                json!({
+                    "operation_id":format!("native-alias-{case}-{reversed}"),"files":files
+                }),
+            )
+            .await;
+            let (reply, text) = batch_settle_with_text(&mut actor, &fixture, reply).await;
+            assert_eq!(reply["code"], "edit_refused", "{reply}: {text}");
+            assert!(text.contains(reason), "{reply}: {text}");
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/batch.rs")).unwrap(),
+                content
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/Existing.rs")).unwrap(),
+                content
+            );
+            assert!(!fixture.root.join("src/Planned").exists());
+            assert!(!fixture.root.join("src/Future").exists());
+            assert!(!fixture.root.join("src/new-é.rs").exists());
+            assert!(!fixture.root.join("src/Parent-é").exists());
+        }
+    }
+    let reply = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"native-distinct-future","files":[
+                {"path":"src/distinct/one.rs","create":true,"content":"pub fn one() {}\n"},
+                {"path":"src/distinct/two.rs","create":true,"content":"pub fn two() {}\n"}
+            ]
+        }),
+    )
+    .await;
+    let (reply, text) = batch_settle_with_text(&mut actor, &fixture, reply).await;
+    assert_eq!(reply["state"], "edit_batch", "{reply}: {text}");
+    assert!(text.contains("applied 2 of 2 files"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/distinct/one.rs")).unwrap(),
+        "pub fn one() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/distinct/two.rs")).unwrap(),
+        "pub fn two() {}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Replays absolute apply_patch headers and create-parent failures through the product binary.
+///
+/// Canonical in-worktree absolute headers and nested creates must apply. An absolute outside path
+/// or a symlink escape returns the outside-root reason. For file-list edits, an unwritable parent
+/// or outside target refuses the entire batch before either of its other files is written.
+#[tokio::test]
+async fn configured_product_edit_normalizes_absolute_patch_paths_and_preflights_batches() {
+    let batch = "pub fn first() -> i32 {\n    1\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "edit-path-preflight", "src/batch.rs").await;
+    let absolute_update = fixture.root.join("src/batch.rs");
+    let absolute_nested = fixture.root.join("src/new/deeper/added.rs");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-    1\n+    2\n*** Add File: {}\n+pub fn nested() {{}}\n*** End Patch",
+        absolute_update.display(),
+        absolute_nested.display()
+    );
+    let patched = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"absolute-patch","patch":patch.clone()}),
+    )
+    .await;
+    let (patched, patched_text) = batch_settle_with_text(&mut actor, &fixture, patched).await;
+    assert_eq!(patched["state"], "edit_batch", "{patched}");
+    assert!(batch_without_status_plate(&patched_text).starts_with("edit: applied 2 of 2 files"));
+    assert_eq!(
+        std::fs::read_to_string(&absolute_nested).unwrap(),
+        "pub fn nested() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&absolute_update).unwrap(),
+        "pub fn first() -> i32 {\n    2\n}\n"
+    );
+
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&absolute_update).unwrap());
+    let replay = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"absolute-patch","patch":patch}),
+        )
+        .await;
+    let replay = actor.settle(&fixture, replay).await;
+    assert_eq!(replay["outcome"], "applied", "{replay}");
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&absolute_update).unwrap()),
+        inode,
+        "a same-id patch never replaces the file twice"
+    );
+    let conflict = actor.call(&fixture, "ide.edit", json!({"operation_id":"absolute-patch","patch":"*** Begin Patch\n*** Add File: src/conflict.rs\n+pub fn conflict() {}\n*** End Patch"})).await;
+    let conflict = actor.settle(&fixture, conflict).await;
+    assert_eq!(conflict["outcome"], "conflicting_duplicate", "{conflict}");
+    assert!(!fixture.root.join("src/conflict.rs").exists());
+
+    let alias = fixture.base.join("worktree-alias");
+    std::os::unix::fs::symlink(&fixture.root, &alias).unwrap();
+    let aliased_file = alias.join("src/batch.rs");
+    let alias_patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-    2\n+    3\n*** End Patch",
+        aliased_file.display()
+    );
+    let edited_alias = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"absolute-canonical-alias","patch":alias_patch}),
+    )
+    .await;
+    let (edited_alias, edited_alias_text) =
+        batch_settle_with_text(&mut actor, &fixture, edited_alias).await;
+    assert_eq!(edited_alias["state"], "edit_batch", "{edited_alias}");
+    assert!(
+        batch_without_status_plate(&edited_alias_text).starts_with("edit: applied 1 of 1 files"),
+        "{edited_alias_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&absolute_update).unwrap(),
+        "pub fn first() -> i32 {\n    3\n}\n"
+    );
+
+    let outside = fixture.base.join("symlink-outside.rs");
+    std::fs::write(&outside, "pub fn outside() {}\n").unwrap();
+    let escape = fixture.root.join("src/symlink-escape.rs");
+    std::os::unix::fs::symlink(&outside, &escape).unwrap();
+    let escape_patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n+pub fn injected() {{}}\n*** End Patch",
+        escape.display()
+    );
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"absolute-symlink-escape","patch":escape_patch}),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("use a worktree-relative path"),
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "pub fn outside() {}\n"
+    );
+
+    let outside = fixture.base.join("outside.rs");
+    let outside_patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n+pub fn outside() {{}}\n*** End Patch",
+        outside.display()
+    );
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"outside-patch","patch":outside_patch}),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("use a worktree-relative path"),
+        "{refused_text}; structured={refused}"
+    );
+    assert!(!outside.exists());
+
+    let locked = fixture.root.join("src/locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let first = fixture.root.join("src/first-must-not-write.rs");
+    let locked_file = locked.join("blocked.rs");
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"unwritable-batch",
+            "files":[
+                {"path":"src/first-must-not-write.rs","content":"pub fn first() {}\n"},
+                {"path":locked_file.display().to_string(),"content":"pub fn blocked() {}\n"}
+            ]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("src/locked/blocked.rs"),
+        "{refused}"
+    );
+    assert!(
+        !first.exists(),
+        "the batch must be refused before the first file write"
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let outside_file = fixture.base.join("outside-batch.rs");
+    let first = fixture.root.join("src/first-must-not-write-either.rs");
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"outside-batch",
+            "files":[
+                {"path":"src/first-must-not-write-either.rs","content":"pub fn first() {}\n"},
+                {"path":outside_file.display().to_string(),"content":"pub fn outside() {}\n"}
+            ]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("use a worktree-relative path"),
+        "{refused_text}; structured={refused}"
+    );
+    assert!(!first.exists());
+    assert!(!outside_file.exists());
+
+    // Every public path form reaches the same normalization, including whole-file content.
+    let absolute_content = "pub fn first() -> i32 {\n    4\n}\n";
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-whole-file", "path":absolute_update.display().to_string(),
+                "content":absolute_content
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let created = actor.call(&fixture, "ide.edit", json!({
+        "operation_id":"absolute-whole-create", "path":fixture.root.join("src/plain/deep/created.rs").display().to_string(),
+        "content":"pub fn created() {}\n"
+    })).await;
+    let created = actor.settle(&fixture, created).await;
+    assert_eq!(created["result"]["outcome"], "created", "{created}");
+    assert!(fixture.root.join("src/plain/deep/created.rs").is_file());
+
+    for (operation, path, old, new) in [
+        (
+            "absolute-files",
+            absolute_update.display().to_string(),
+            "4",
+            "5",
+        ),
+        ("relative-files", "src/batch.rs".to_owned(), "5", "6"),
+    ] {
+        let edited = actor.call(&fixture, "ide.edit", json!({"operation_id":operation,"files":[{"path":path,"changes":[{"old":old,"new":new}]}]})).await;
+        let edited = actor.settle(&fixture, edited).await;
+        assert_eq!(edited["state"], "edit_batch", "{edited}");
+    }
+    let location = format!("{}:2", absolute_update.display());
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"absolute-location","symbol":location,"old":"6","new":"7"}),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["state"], "edit", "{edited}");
+    assert!(
+        std::fs::read_to_string(&absolute_update)
+            .unwrap()
+            .contains("7")
+    );
+
+    let read = actor
+        .call(&fixture, "ide.read", json!({"path":"src/batch.rs"}))
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-with-source", "path":absolute_update.display().to_string(),
+                "source_ref":read["detail_ref"], "content":"pub fn first() -> i32 {\n    8\n}\n"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-lines", "path":absolute_update.display().to_string(),
+                "lines":"2-2", "content":"    9"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let symbol = format!("{}#first", absolute_update.display());
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-symbol", "symbol":symbol,
+                "content":"pub fn first() -> i32 { 10 }\n"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited = actor.call(&fixture, "ide.edit", json!({
+        "operation_id":"absolute-nested-symbol", "path":absolute_update.display().to_string(),
+        "changes":[{"symbol":symbol,"content":"pub fn first() -> i32 { 11 }\n"}]
+    })).await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-within", "path":absolute_update.display().to_string(),
+                "changes":[{"old":"11","new":"12","within":symbol}]
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let before_duplicate = std::fs::read(&absolute_update).unwrap();
+    let refused = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"absolute-relative-duplicate","files":[
+                {"path":absolute_update.display().to_string(),"content":"pub fn duplicate() {}\n"},
+                {"path":"src/batch.rs","content":"pub fn duplicate() {}\n"}
+            ]}),
+        )
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(std::fs::read(&absolute_update).unwrap(), before_duplicate);
+    for (index, path) in [
+        fixture
+            .root
+            .join("src/../src/batch.rs")
+            .display()
+            .to_string(),
+        format!("{}//src/batch.rs", fixture.root.display()),
+        fixture.root.join("src/./batch.rs").display().to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {path}\n@@\n-    12\n+    12\n*** End Patch"
+        );
+        let edited = actor
+            .call(
+                &fixture,
+                "ide.edit",
+                json!({"operation_id":format!("absolute-shape-{index}"),"patch":patch}),
+            )
+            .await;
+        let edited = actor.settle(&fixture, edited).await;
+        assert_eq!(edited["outcome"], "applied", "{edited}");
+    }
+
+    // The future file surface is checked in both orders before even a directory is created.
+    for reversed in [false, true] {
+        let mut files = vec![
+            json!({"path":"src/future-parent","create":true,"content":"parent\n"}),
+            json!({"path":"src/future-parent/child.rs","create":true,"content":"pub fn child() {}\n"}),
+        ];
+        if reversed {
+            files.reverse();
+        }
+        let refused = batch_call_with_text(
+            &mut actor,
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":format!("future-parent-{reversed}"),"files":files}),
+        )
+        .await;
+        let (refused, text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+        assert_eq!(refused["code"], "edit_refused", "{refused}");
+        assert!(text.contains("future_file_parent:"), "{text}");
+        assert!(!fixture.root.join("src/future-parent").exists());
+    }
+    let unsafe_parent = fixture.root.join("src/outside-parent");
+    std::os::unix::fs::symlink(&fixture.base, &unsafe_parent).unwrap();
+    // Resolving `..` before a symlink would incorrectly hide this actual canonical escape.
+    let escaped = unsafe_parent.join("../must-not-create.rs");
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: {}\n+pub fn denied() {{}}\n*** End Patch",
+        escaped.display()
+    );
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"symlink-before-parent-dotdot","patch":patch}),
+    )
+    .await;
+    let (refused, text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(text.contains("outside the worktree"), "{text}");
+    let escaped_symbol = format!(
+        "{}#outside",
+        fixture.root.join("src/symlink-escape.rs").display()
+    );
+    let refused = actor.call(&fixture, "ide.edit", json!({"operation_id":"absolute-symbol-symlink-escape","symbol":escaped_symbol,"content":"pub fn denied() {}\n"})).await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+
+    for (index, target, reason) in [
+        (
+            0,
+            "src/outside-parent/deeper/new.rs".to_owned(),
+            "unsafe_parent:",
+        ),
+        (1, "src/symlink-escape.rs".to_owned(), "unsafe_target:"),
+        (
+            2,
+            format!("src/missing/{}/new.rs", "x".repeat(256)),
+            "name_too_long:",
+        ),
+    ] {
+        let refused = batch_call_with_text(&mut actor, &fixture, "ide.edit", json!({"operation_id":format!("predictable-path-{index}"),"files":[
+            {"path":"src/no-parent-effects/deeper/new.rs","create":true,"content":"pub fn untouched() {}\n"},
+            {"path":target,"content":"pub fn denied() {}\n"}
+        ]})).await;
+        let (refused, text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+        assert_eq!(refused["code"], "edit_refused", "{refused}");
+        assert!(text.contains(reason), "{text}");
+        assert!(!fixture.root.join("src/no-parent-effects").exists());
+    }
+
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A real daemon crash after the first patch write reports unknown, keeps the batch receipt,
+/// and resumes from proven candidate/base digests without replacing the first file twice.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn configured_product_batch_patch_crash_recovers_from_receipt_digests() {
+    let fixture = batch_edit_fixture("pub fn first() -> i32 { 1 }\n");
+    std::fs::write(
+        fixture.root.join("src/second.rs"),
+        "pub fn second() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    let (fault, _) = fault_flag(&fixture, "batch_edit_after_write_1", true);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = batch_started_actor(&fixture, "batch-patch-crash", "src/batch.rs").await;
+    let arguments = json!({"operation_id":"patch-crash-recovery","patch":
+        "*** Begin Patch\n*** Update File: src/batch.rs\n@@\n-pub fn first() -> i32 { 1 }\n+pub fn first() -> i32 { 2 }\n*** Update File: src/second.rs\n@@\n-pub fn second() -> i32 { 1 }\n+pub fn second() -> i32 { 2 }\n*** End Patch"});
+    let lost = actor.call(&fixture, "ide.edit", arguments.clone()).await;
+    let lost = actor.settle(&fixture, lost).await;
+    assert_eq!(lost["outcome"], "outcome_unknown", "{lost}");
+    let first = fixture.root.join("src/batch.rs");
+    let second = fixture.root.join("src/second.rs");
+    let committed_first = std::fs::read_to_string(&first).unwrap();
+    let original_second = std::fs::read_to_string(&second).unwrap();
+    assert!(committed_first.contains('2'));
+    assert!(
+        original_second.contains('1'),
+        "the multi-file commit was interrupted after only its first write"
+    );
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap());
+    assert_crash_only_exit(&mut daemon, &fixture).await;
+    actor.mcp.close().await;
+
+    let mut replacement = fixture.daemon().await;
+    let mut again = batch_started_actor(&fixture, "batch-patch-recovery", "src/batch.rs").await;
+    let recovered = again.call(&fixture, "ide.edit", arguments.clone()).await;
+    let recovered = again.settle(&fixture, recovered).await;
+    assert_eq!(recovered["outcome"], "applied", "{recovered}");
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), committed_first);
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap()),
+        inode
+    );
+    assert!(std::fs::read_to_string(&second).unwrap().contains('2'));
+    // A settled replay preserves newer native bytes and refuses a current-source claim.
+    std::fs::write(&first, "// native after recovery\n").unwrap();
+    let native_metadata = std::fs::metadata(&first).unwrap();
+    let second_bytes = std::fs::read(&second).unwrap();
+    let replay = again.call(&fixture, "ide.edit", arguments).await;
+    let replay = again.settle(&fixture, replay).await;
+    assert_eq!(replay["code"], "source_unavailable", "{replay}");
+    assert!(replay.get("source_ref").is_none(), "{replay}");
+    assert_eq!(
+        std::fs::metadata(&first).unwrap().modified().unwrap(),
+        native_metadata.modified().unwrap()
+    );
+    assert_eq!(std::fs::read(&second).unwrap(), second_bytes);
+    assert_eq!(
+        std::fs::read_to_string(&first).unwrap(),
+        "// native after recovery\n"
+    );
+    again.call(&fixture, "ide.stop", json!({})).await;
+    again.mcp.close().await;
+    replacement.kill().await.unwrap();
+    replacement.wait().await.unwrap();
+}
+
+/// A native edit between validation and the second write produces an honest partial receipt.
+/// Repeating the patch preserves those newer bytes and never rewrites its first committed file.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn configured_product_batch_patch_stale_member_keeps_partial_and_native_bytes() {
+    let fixture = batch_edit_fixture("pub fn first() -> i32 { 1 }\n");
+    std::fs::write(
+        fixture.root.join("src/second.rs"),
+        "pub fn second() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    let (fault, _) = fault_flag(&fixture, "batch_edit_before_write_2", true);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = batch_started_actor(&fixture, "batch-patch-partial", "src/batch.rs").await;
+    let arguments = json!({"operation_id":"patch-stale-partial","patch":
+        "*** Begin Patch\n*** Update File: src/batch.rs\n@@\n-pub fn first() -> i32 { 1 }\n+pub fn first() -> i32 { 2 }\n*** Update File: src/second.rs\n@@\n-pub fn second() -> i32 { 1 }\n+pub fn second() -> i32 { 2 }\n*** End Patch"});
+    let partial = actor.call(&fixture, "ide.edit", arguments.clone()).await;
+    let partial = actor.settle(&fixture, partial).await;
+    assert_eq!(partial["outcome"], "partial", "{partial}");
+    assert_eq!(
+        partial["files"][1]["reason"], "changed_after_validation",
+        "{partial}"
+    );
+    let first = fixture.root.join("src/batch.rs");
+    let second = fixture.root.join("src/second.rs");
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap());
+    let native = std::fs::read_to_string(&second).unwrap();
+    assert!(native.ends_with("native\n"));
+    let replay = actor.call(&fixture, "ide.edit", arguments).await;
+    let replay = actor.settle(&fixture, replay).await;
+    assert_eq!(replay["outcome"], "partial", "{replay}");
+    assert_eq!(std::fs::read_to_string(&second).unwrap(), native);
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap()),
+        inode
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
 }
 
 /// Case 1: `old` text that matches nothing refuses the whole batch naming the change and quoting
@@ -11926,23 +13243,35 @@ async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existin
     )
     .await;
     let (applied, applied_text) = batch_settle_with_text(&mut actor, &fixture, applied).await;
-    assert_eq!(
-        batch_without_status_plate(&applied_text),
-        format!(
-            "edit: replaced; path src/broken.rs; {}\n  src/broken.rs:2 (L2)  replaced \
-             (1 lines → 1)\nnote: src/broken.rs already had a syntax error (line 5) before this \
-             edit; edit applied",
-            batch_diagnostics_segment(&applied)
-        ),
+    let applied_text = batch_without_status_plate(&applied_text);
+    assert!(
+        applied_text.starts_with("edit: replaced; path src/broken.rs; diagnostics: "),
         "{applied_text}"
     );
+    assert!(applied_text.ends_with("  src/broken.rs:2 (L2)  replaced (1 lines → 1)\nnote: src/broken.rs already had a syntax error (line 5) before this edit; edit applied"), "{applied_text}");
     assert!(
         matches!(
             applied["diagnostics"]["state"].as_str(),
-            Some("not_analysed" | "unknown")
+            Some("not_analysed" | "unknown" | "current_reported")
         ),
         "an undeclared file is never claimed clean: {applied}"
     );
+    if applied["diagnostics"]["state"] == "current_reported" {
+        assert!(
+            applied["diagnostics"]["delta"]
+                .as_str()
+                .unwrap()
+                .contains("project check did not analyse this file"),
+            "{applied}"
+        );
+        assert!(
+            !applied["diagnostics"]["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{applied}"
+        );
+    }
     assert_eq!(
         std::fs::read(fixture.root.join("src/broken.rs")).unwrap(),
         b"pub fn helper() -> i32 {\n    2\n}\n\npub fn target( -> i32 {\n    helper()\n}\n"
@@ -13942,22 +15271,9 @@ async fn warm_rust_inline_replies(timed: bool) {
         .await;
     assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
 
-    // Warm the analyzer to a server answer: the first outline replies from the lexical
-    // outline while the workspace loads, so warmth is proven by the marker's absence.
-    loop {
-        let reply = actor
-            .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
-            .await;
-        let settled = actor.settle(&fixture, reply).await;
-        let text = settled["text"].as_str().unwrap_or_default();
-        if settled["kind"] == "outline" && !text.contains("outline: from source") {
-            break;
-        }
-        assert!(
-            settled["kind"] == "outline" || settled["code"] == "provider_loading",
-            "{settled}"
-        );
-    }
+    // The measured calls start after an explicit semantic-ready barrier; source outlines
+    // remain synchronous and deliberately do not initialize a provider.
+    batch_wait_semantic_provider(&mut actor, &fixture, "src/lib.rs").await;
     for (tool, params) in [
         ("ide.outline", json!({"path":"src/lib.rs"})),
         (
@@ -14734,7 +16050,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
         assert!(
             text.starts_with("approximate: rust-analyzer is still indexing;")
                 && text.contains(
-                    "the precise answer is retained under its reference; Bridge delivers it automatically when configured"
+                    "the precise answer is retained under its reference; Bridge delivers it automatically"
                 ),
             "{reply}"
         );
@@ -15842,7 +17158,7 @@ async fn configured_product_activation_reply_includes_the_project_card() {
     assert!(text.contains("\nlayout: src/ 1"), "{text}");
     assert!(text.contains("\ndocs: README.md"), "{text}");
     assert!(
-        text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it; its result is retained under its reference and Bridge delivers it when configured"),
+        text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it; its result is retained under its reference and Bridge delivers it"),
         "{text}"
     );
     // start-index-state §1: the call-signature block ends the reply, after the card and its
@@ -16167,8 +17483,8 @@ async fn configured_product_returns_real_rust_semantic_context() {
 /// Exercises the accepted exclusive Pyright process through the five-tool Codex product loop.
 ///
 /// The test requires launcher-owned executable and Node identities. It proves a `.py` session
-/// reaches semantic definition/reference and the currently rendered diagnostic state, then proves
-/// a corrected retry is fresh before returning a diff and reaping the owned child.
+/// reaches semantic definition/reference and the currently rendered diagnostic state, explicitly
+/// waiting for the provider's first real error report, then proves a corrected retry is fresh before returning a diff and reaping the owned child.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
@@ -16194,14 +17510,26 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     let start = actor.settle(&fixture, start).await;
     assert_eq!(start["kind"], "activation", "{start}");
     let source = std::fs::read_to_string(&path).unwrap();
-    let response = actor
-        .call(
-            &fixture,
-            "ide.symbol",
-            json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
-        )
-        .await;
-    let response = actor.settle(&fixture, response).await;
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let response = loop {
+        let response = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
+            )
+            .await;
+        let response = actor.settle(&fixture, response).await;
+        let text = response["text"].as_str().unwrap_or_default();
+        if text.contains("mode: semantic") && text.contains("diagnostics: 1") {
+            break response;
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "Pyright did not reach semantic error readiness: {response}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(response["kind"], "symbol", "{response}");
     assert!(
         response["text"]
@@ -18246,14 +19574,26 @@ async fn configured_product_claude_returns_real_pyright_semantic_context_diff_an
     assert!(feedback.is_empty());
 
     let source = std::fs::read_to_string(&path).unwrap();
-    let pending = actor
-        .call_claude(
-            &fixture,
-            "ide.symbol",
-            json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
-        )
-        .await;
-    let (context, _) = actor.settle_claude(&fixture, pending).await;
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let context = loop {
+        let pending = actor
+            .call_claude(
+                &fixture,
+                "ide.symbol",
+                json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
+            )
+            .await;
+        let (context, _) = actor.settle_claude(&fixture, pending).await;
+        let text = context["text"].as_str().unwrap_or_default();
+        if text.contains("mode: semantic") && text.contains("diagnostics: 1") {
+            break context;
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "Claude Pyright did not reach semantic error readiness: {context}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     let text = context["text"].as_str().unwrap();
     assert_eq!(context["kind"], "symbol", "{context}");
     assert!(text.contains("mode: semantic"), "{context}");
@@ -18388,7 +19728,7 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
     }
     // The positional query legitimately returns lexical evidence while indexing. This test
     // proves real cross-crate semantics, so wait for the same existing live-outline barrier.
-    batch_wait_semantic_outline(&mut actor, &fixture, "src/lib.rs").await;
+    batch_wait_semantic_provider(&mut actor, &fixture, "src/lib.rs").await;
     let bytes = std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap();
     let offset = bytes.rfind("shared_value()").unwrap();
     let response = actor
@@ -18870,6 +20210,35 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
 #[tokio::test]
 async fn configured_product_context_settles_promptly_when_provider_exits_before_bind() {
     use std::os::unix::fs::PermissionsExt;
+    /// Re-queries only an explicit Loading positional result within the existing20s bound;
+    /// initialize can finish after an honest lexical reply without an unsolicited second answer.
+    async fn settle_failed_provider(
+        actor: &mut ProductActor,
+        fixture: &ProductFixture,
+        reply: Value,
+    ) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut reply = actor.settle(fixture, reply).await;
+        while reply["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("semantic provider is still loading"))
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "provider failure was not observed: {reply}"
+            );
+            let next = actor
+                .call(
+                    fixture,
+                    "ide.symbol",
+                    json!({"path":"src/lib.rs","byte_offset":48}),
+                )
+                .await;
+            reply = actor.settle(fixture, next).await;
+        }
+        reply
+    }
+
     let fixture = ProductFixture::new(json!([]));
     let program = fixture.base.join("exit-before-bind-provider");
     let marker = fixture.base.join("exit-before-bind-marker");
@@ -18909,7 +20278,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
         "{pending}"
     );
     let began = tokio::time::Instant::now();
-    let settled = actor.settle(&fixture, pending).await;
+    let settled = settle_failed_provider(&mut actor, &fixture, pending).await;
     let elapsed = began.elapsed();
     assert!(
         elapsed < Duration::from_secs(20),
@@ -18956,7 +20325,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
         matches!(refreshed["state"].as_str(), Some("pending" | "complete")),
         "{refreshed}"
     );
-    let refreshed = actor.settle(&fixture, refreshed).await;
+    let refreshed = settle_failed_provider(&mut actor, &fixture, refreshed).await;
     assert_eq!(refreshed["state"], "complete", "{refreshed}");
     assert!(
         refreshed["text"]
@@ -24647,6 +26016,8 @@ async fn failed_stop_is_retried_by_the_daemon_without_another_call() {
 
 /// Batch forms (batch-api-v1) against the real daemon, sharing this file's fixtures.
 mod batch_api;
+/// Post-review receipt, fallback and usable-accounting regressions.
+mod sr_receipts;
 
 /// Boundary tests of `symbol-read-edit-v1` against the real daemon, sharing this file's fixtures.
 mod symbol_read_edit;

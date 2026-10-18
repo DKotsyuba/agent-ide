@@ -608,7 +608,7 @@ impl PresentationReceipt {
                     _ => "No write occurred.",
                 };
                 let diagnostics = detail_ref.as_ref().map_or_else(String::new, |reference| {
-                    format!(" Diagnostics pending; result retained under {reference}; Bridge delivers it automatically when configured.")
+                    format!(" Diagnostics pending; result retained under {reference}; Bridge delivers it automatically.")
                 });
                 format!(
                     "edit: {word}; path {path}; operation_id {operation_id}\n\
@@ -2080,7 +2080,7 @@ mod tests {
                 },
                 "pending",
                 // OUTBOX-r4 §8.7: the check stays retained and Bridge delivery is conditional.
-                "result retained under diagnostic-detail; Bridge delivers it automatically when configured",
+                "result retained under diagnostic-detail; Bridge delivers it automatically",
             ),
         ];
         for (diagnostics, state, next_tool) in cases {
@@ -2608,7 +2608,7 @@ mod tests {
             "edit: renamed; path src/lib.rs; operation_id private-operation-id\n\
              Presentation degraded (presentation_failed). Do not repeat the mutation to repair \
              this response. Diagnostics pending; result retained under diag-detail; Bridge \
-             delivers it automatically when configured."
+             delivers it automatically."
         );
         assert_ne!(rendered.is_error, Some(true));
 

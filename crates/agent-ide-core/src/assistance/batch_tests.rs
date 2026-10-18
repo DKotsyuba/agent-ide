@@ -442,12 +442,11 @@ impl Worker<'_> {
 }
 
 /// The first line of a started several-target run: `tests #N: started — <n> targets in <r> runs
-/// (budget <b> s); the result is retained under its reference; Bridge delivers it automatically
-/// when configured`.
+/// (budget <b> s); the result is retained under its reference; Bridge delivers it automatically`.
 fn started_line(id: u64, targets: usize, runs: usize, budget: Duration) -> String {
     format!(
         "tests #{id}: started — {targets} targets in {runs} runs (budget {} s); the result \
-         is retained under its reference; Bridge delivers it automatically when configured",
+         is retained under its reference; Bridge delivers it automatically",
         budget.as_secs()
     )
 }
@@ -564,7 +563,7 @@ mod tests {
         assert_eq!(
             started,
             "tests #4: started — 3 targets in 2 runs (budget 300 s); the result is retained under \
-             its reference; Bridge delivers it automatically when configured"
+             its reference; Bridge delivers it automatically"
         );
         crate::assistance::batch::assert_no_polling(&started);
         let running = running_line(4);

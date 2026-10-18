@@ -962,14 +962,14 @@ fn render_servers(card: &ProjectCard) -> String {
 /// ([`outline_while_loading`](crate::lang::LanguageSupport::outline_while_loading)) claims that
 /// outline, read and edit answer from source and that symbol and graph answer approximately at
 /// once; every other language's first result is retained under its reference and delivered by
-/// Bridge when configured.
+/// Bridge.
 pub fn not_started_state(language: Language) -> &'static str {
     if language.support().outline_while_loading() {
         "not started; outline, read and edit answer from source; the first symbol or graph call \
          starts it and answers approximately at once"
     } else {
         "not started; the first symbol or graph call starts it; its result is retained under its \
-         reference and Bridge delivers it when configured"
+         reference and Bridge delivers it"
     }
 }
 
@@ -981,7 +981,7 @@ pub fn warming_state(language: Language) -> &'static str {
         "warming; symbol and graph answer approximately until ready"
     } else {
         "warming; symbol and graph results are retained under their references and Bridge \
-         delivers them when configured"
+         delivers them"
     }
 }
 
@@ -1183,9 +1183,9 @@ mod tests {
         assert_eq!(
             render_servers(&card),
             "servers: alpha not started; the first symbol or graph call starts it; its result is \
-             retained under its reference and Bridge delivers it when configured · beta not \
+             retained under its reference and Bridge delivers it · beta not \
              started; the first symbol or graph call starts it; its result is retained under its \
-             reference and Bridge delivers it when configured"
+             reference and Bridge delivers it"
         );
     }
 
@@ -1249,7 +1249,7 @@ mod tests {
         assert_eq!(
             warming_state(other),
             "warming; symbol and graph results are retained under their references and Bridge \
-             delivers them when configured"
+             delivers them"
         );
         assert_eq!(READY_STATE, "ready");
         assert_eq!(

@@ -53,11 +53,10 @@ const NEGATED_POLL: [&str; 5] = [
 /// lowercase and matched after whitespace is collapsed: waiting advice, the file-version
 /// reference, labelled replies and `Next:` lines, the old truncation trailers, the retired
 /// `ide.context` read habit and line-first examples.
-const STALE_FORMS: [&str; 18] = [
+const STALE_FORMS: [&str; 17] = [
     "wait_ms",
     "source_ref",
     "nothing else to do",
-    "wait once",
     "next: use",
     "complete activation",
     "complete context",

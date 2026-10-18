@@ -2,10 +2,14 @@
 //!
 //! Phase 1 observes and validates every file and builds every candidate without writing; any
 //! refusal answers `edit_refused` naming each failed file and change, with nothing written and no
-//! receipt kept. Phase 2 records a durable digest receipt ([`crate::changes::batch`]) and writes
-//! the files in request order through Workspace's stale-safe write, which re-checks each file's
-//! bytes against its base immediately before installing it; the first file that changed meanwhile
-//! or fails stops the commit, and the reply says exactly which files were written. After the last
+//! receipt kept. Before the receipt or first file write, every destination is descriptor-
+//! preflighted without worktree effects; native aliases, future-file/parent conflicts and unsafe or unwritable parents
+//! refuse the whole batch. Missing create parents are made beneath the worktree after admission.
+//! Phase 2 records a durable digest
+//! receipt ([`crate::changes::batch`]) and writes the files in request order through Workspace's
+//! stale-safe write, which re-checks each file's bytes against its base immediately before installing
+//! it; the first file that changes meanwhile or fails stops the commit, and the reply says exactly
+//! which files were written. After the last
 //! write of the call one project check runs per affected checked language, and the reply groups
 //! its diagnostics per file. A retry with the same `operation_id` and request resumes from the
 //! receipt: written files stay, unwritten files are written only while their bytes still equal the
@@ -167,10 +171,14 @@ fn settled_reply(
 impl Worker<'_> {
     /// `ide.edit {operation_id, files}`: one logical change across several files.
     ///
-    /// A new operation validates every file first and writes nothing on any refusal
-    /// (`edit_refused`, every failed file and change named, the `operation_id` left unused). It
-    /// then records the durable receipt and commits file by file; see the module documentation
-    /// for the stop, resume and check rules. The same `operation_id` with the same request
+    /// A new operation validates every file and preflights every destination before it writes
+    /// source bytes or creates destination parents. Private empty scratch probes qualify unresolved
+    /// names on the same filesystem; an unavailable oracle refuses the affected future group.
+    /// A refusal answers `edit_refused`, names every failed file and change, and leaves
+    /// the `operation_id` unused. Missing create parents are made safely inside the worktree; an
+    /// unsafe or unwritable target refuses the whole batch. It then records the durable receipt
+    /// and commits file by file; see the module documentation for the stop, resume and check
+    /// rules. The same `operation_id` with the same request
     /// resumes (or, when settled, answers with every file written earlier); with a different
     /// request it answers `edit: conflicting_duplicate` and writes nothing. The reply is a
     /// complete `edit_batch` result whose text opens with `edit: applied …` or `edit: partial …`;
@@ -181,6 +189,10 @@ impl Worker<'_> {
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
+        if let Some(detail) = repeated_file(&job.parameters) {
+            job.failure_detail = Some(detail);
+            return Err(FailureCode::EditRefused);
+        }
         let (operation_id, files) =
             batch::edit_files_request(&job.parameters).ok_or(FailureCode::Internal)?;
         let digest = batch::edit_request_digest(&job.parameters);
@@ -204,10 +216,55 @@ impl Worker<'_> {
         }
         let mut planned = Vec::with_capacity(files.len());
         let mut refusals = Vec::new();
-        for (index, file) in files.iter().enumerate() {
-            match self.plan_file(job, &binding, index, file, None).await? {
-                Ok(plan) => planned.push(plan),
-                Err(sentence) => refusals.push(sentence),
+        let authority = self.authority(&binding).await?;
+        let paths: Vec<_> = files.iter().map(|file| Path::new(&file.path)).collect();
+        for (index, reason) in
+            crate::workspace::edit::preflight_edit_paths(authority.worktree(), &paths)
+        {
+            refusals.push(format!(
+                "file {} {}: {reason}",
+                index + 1,
+                files[index].path
+            ));
+        }
+        if refusals.is_empty() {
+            for (index, file) in files.iter().enumerate() {
+                match self.plan_file(job, &binding, index, file, None).await? {
+                    Ok(plan) => planned.push(plan),
+                    Err(sentence) => refusals.push(sentence),
+                }
+            }
+        }
+        // Every path and candidate is admitted before creating parents. Resolve the whole
+        // admitted batch as well, so a real parent-creation or metadata failure precedes source writes.
+        if refusals.is_empty() {
+            let active = self.shared.active(&binding)?;
+            for (index, plan) in planned.iter().enumerate() {
+                let source =
+                    match crate::workspace::edit::EditSourceRef::from_observation(&plan.base) {
+                        Ok(source) => source,
+                        Err(outcome) => {
+                            refusals.push(format!(
+                                "file {} {}: stale_source ({outcome:?}); reread the file",
+                                index + 1,
+                                plan.path
+                            ));
+                            continue;
+                        }
+                    };
+                if let Err(outcome) = self
+                    .workspace
+                    .prepare_edit(
+                        &authority,
+                        &active,
+                        operation_id.clone(),
+                        plan.path.clone().into(),
+                        source,
+                    )
+                    .await
+                {
+                    refusals.push(format!("file {} {}: destination_preparation_failed ({outcome:?}); check current bytes, parent permissions and metadata", index + 1, plan.path));
+                }
             }
         }
         if !refusals.is_empty() {
@@ -289,6 +346,29 @@ impl Worker<'_> {
         let committed = self
             .commit_files(job, binding, operation_id, files, &existing, planned)
             .await?;
+        // Durable write history is not proof that the candidate files still exist unchanged.
+        if existing.settled
+            && committed
+                .reports
+                .iter()
+                .all(|report| report.state.written())
+            && !self
+                .shared
+                .committed_edit_proof_current(
+                    &self.workspace,
+                    binding,
+                    &job.reference,
+                    &committed.authority,
+                    &committed.sources,
+                )
+                .await
+        {
+            return Ok((
+                historical_edit_source_unavailable(),
+                Some(committed.authority),
+                None,
+            ));
+        }
         // A settled operation answers the diagnostics its settled check recorded.
         if let Some(stored) = existing.diagnostics.as_deref()
             && committed
@@ -340,7 +420,7 @@ impl Worker<'_> {
                 )));
             }
             let candidate = self
-                .format_candidate(&observed, Path::new(&path), content.clone())
+                .format_candidate(job, &observed, Path::new(&path), content.clone())
                 .await;
             return Ok(Ok(Planned {
                 path,
@@ -443,6 +523,7 @@ impl Worker<'_> {
     /// `not reached`. No error after the first write leaves this function: each becomes the
     /// file's state, so the caller can always say exactly what was written. A fully written
     /// operation is settled; an unknown write keeps the binding unsettled for the handover guard.
+    /// The job's exclusive commit interval is timed and only confirmed writes enter progress.
     async fn commit_files(
         &mut self,
         job: &mut Job,
@@ -452,6 +533,7 @@ impl Worker<'_> {
         receipt: &BatchReceipt,
         mut planned: Vec<Option<Planned>>,
     ) -> Result<Committed, FailureCode> {
+        let _timing = progress::Progress::enter(&job.progress, "commit");
         let authority = self.authority(binding).await?;
         let receipts = self.edits.batches();
         let mut reports: Vec<FileReport> = Vec::with_capacity(files.len());
@@ -471,6 +553,9 @@ impl Worker<'_> {
                 continue;
             }
             if row.written {
+                if let Ok(mut progress) = job.progress.lock() {
+                    progress.committed.push(file.path.clone());
+                }
                 if let Ok((observed, _)) = self.observe(binding, file.path.clone().into()).await
                     && observed.bytes().map(|bytes| *bytes.digest()) == Some(row.candidate)
                 {
@@ -495,6 +580,9 @@ impl Worker<'_> {
                         continue;
                     };
                     if observed.bytes().map(|bytes| *bytes.digest()) == Some(row.candidate) {
+                        if let Ok(mut progress) = job.progress.lock() {
+                            progress.committed.push(file.path.clone());
+                        }
                         sources.push(observed);
                         let _ = receipts.mark_written(operation_id, index).await;
                         reports.push(report(
@@ -567,6 +655,9 @@ impl Worker<'_> {
                 | Written::CapacityNoEffect => (FileState::NotWritten(NotWritten::IoError), None),
             };
             if let Some(read) = read {
+                if let Ok(mut progress) = job.progress.lock() {
+                    progress.committed.push(plan.path.clone());
+                }
                 let _ = receipts.mark_written(operation_id, index).await;
                 if let Some(observed) = self
                     .post_write_source(
@@ -708,7 +799,7 @@ impl Worker<'_> {
     /// Triggers the one project check of the written files — one check generation per affected
     /// checked language — and parks the job until it lands or its deadline passes; without a
     /// project feed, without written files of a checked language, or without time left, it
-    /// answers at once.
+    /// answers at once. The job's progress changes to the check stage before that decision.
     async fn schedule_batch_check(
         &mut self,
         job: &mut Job,
@@ -716,6 +807,9 @@ impl Worker<'_> {
         operation_id: &str,
         committed: Committed,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if let Ok(mut progress) = job.progress.lock() {
+            progress.switch(Some("check"));
+        }
         let Committed {
             reports,
             sources,
@@ -726,7 +820,8 @@ impl Worker<'_> {
         let deadline = job
             .deadline
             .checked_sub(EDIT_SETTLEMENT_RESERVE)
-            .map(|deadline| deadline.min(tokio::time::Instant::now() + EDIT_CHECK_WAIT));
+            .map(|deadline| deadline.min(tokio::time::Instant::now() + EDIT_CHECK_WAIT))
+            .filter(|deadline| *deadline > tokio::time::Instant::now());
         let mut stages = Vec::new();
         let mut unchecked = Vec::new();
         let mut generations: BTreeMap<String, Option<u64>> = BTreeMap::new();
@@ -757,6 +852,11 @@ impl Worker<'_> {
                 ));
                 continue;
             };
+            if let Some(reason) = self.known_check_unavailable(&authority, &report.path) {
+                unchecked.push((report.path.clone(), EditDiagnostics::NotAnalysed { reason }));
+                job.check_scheduled = true;
+                continue;
+            }
             // One generation per language: the first written file of the language triggers it,
             // the rest of that language read the same check.
             let generation = *generations
@@ -785,7 +885,8 @@ impl Worker<'_> {
                 authority: authority.clone(),
                 path: report.path.clone(),
                 fallback: EditDiagnostics::Unknown {},
-                generation,
+                generation: Some(generation),
+                provider_pending: false,
                 worktree: worktree.clone(),
                 wanted: report.path.trim_start_matches("./").to_owned(),
                 // A file written by an earlier call has no pre-write record: the latest check
@@ -818,24 +919,43 @@ impl Worker<'_> {
         self.finish_batch_check(job, check).await
     }
 
-    /// Answers a parked multi-file edit once every per-file check result is known, or with
-    /// `unknown` diagnostics at its deadline or on cancellation; otherwise parks it again for a
-    /// quarter second. The answer retains every written file's post-write observation, so the
-    /// reply's `source_ref` is an edit base for each.
+    /// Answers a parked multi-file edit once its per-file checks settle; cancellation/deadline
+    /// closes missing results as `not_analysed` with the actual lifecycle cause. Otherwise parks
+    /// for a quarter second. Retains the captured post-write observations; capture may be partial,
+    /// so a source reference never proves every committed file was observed. Accepted check work
+    /// still receives one terminal Bridge fact, subject to the complete-source publication proof.
     pub(super) async fn finish_batch_check(
         &mut self,
         job: &mut Job,
         mut check: BatchCheck,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
-        let expired = *job.cancel.borrow() || tokio::time::Instant::now() >= check.deadline;
+        let cancelled = *job.cancel.borrow();
+        let expired = cancelled || tokio::time::Instant::now() >= check.deadline;
+        let source_current = check.stages.is_empty()
+            || self
+                .shared
+                .committed_edit_proof_current(
+                    &self.workspace,
+                    job.invocation.binding_ref(),
+                    &job.reference,
+                    &check.authority,
+                    &check.sources,
+                )
+                .await;
         let mut diagnostics = Vec::with_capacity(check.stages.len() + check.unchecked.len());
         for stage in &check.stages {
             let JobStage::EditAwaitingCheck { path, .. } = stage else {
                 continue;
             };
+            if !source_current {
+                diagnostics.push((path.clone(), EditDiagnostics::NotAnalysed { reason: "edit diagnostics superseded: committed source changed or capture is incomplete".into() }));
+                continue;
+            }
             match self.check_diagnostics(stage) {
                 Some(found) => diagnostics.push((path.clone(), found)),
-                None if expired => diagnostics.push((path.clone(), EditDiagnostics::Unknown {})),
+                None if expired => diagnostics.push((path.clone(), EditDiagnostics::NotAnalysed {
+                    reason: if cancelled { "project check cancelled after the edit committed" } else { "project check unavailable: matching diagnostics did not finish before the deadline" }.into(),
+                })),
                 None => {
                     self.reply_batch_early(job, &mut check);
                     job.stage = Some(JobStage::EditBatchAwaitingCheck(Box::new(check)));
@@ -878,10 +998,10 @@ impl Worker<'_> {
     }
 
     /// Answers a multi-file edit whose project check is still running with `diagnostics:
-    /// pending` at once, right after the writes (symbol-read-edit-v1 §3.3), as the one-file edit
-    /// does.
+    /// pending` after the writes (symbol-read-edit-v1 §3.3), independently of provider readiness.
+    /// The retained receipt and every post-write source are usable while the check is pending.
     ///
-    /// Only a caller still waiting is answered, only once, and only when the session ledger can
+    /// A live caller is answered only once, after retention, when the session ledger can
     /// track the check as in-flight work under the job's reference: the job stays parked on its
     /// check, and [`Self::finish_batch_check`] then hands one `edit-checked` fact for the whole
     /// operation to Bridge. Otherwise nothing changes and the final reply carries the diagnostics.
@@ -889,12 +1009,8 @@ impl Worker<'_> {
         if check.answered_early {
             return;
         }
-        let waiting = job
-            .stop_reply
-            .as_ref()
-            .is_some_and(|sender| !sender.is_closed());
         let binding = job.invocation.binding_ref().clone();
-        if !waiting || !self.shared.outbox.is_open(&binding) {
+        if !self.shared.outbox.is_open(&binding) {
             return;
         }
         if !self.shared.outbox.begin_work(&job.reference, &binding) {
@@ -920,12 +1036,12 @@ impl Worker<'_> {
             &check.reports,
             &pending,
         );
+        self.shared
+            .retain_edit_receipt(job, &reply, &check.authority, check.sources.clone());
+        check.answered_early = true;
         if let Some(sender) = job.stop_reply.take() {
-            if sender.send(reply).is_err() {
-                let _ = self.shared.outbox.take_work(&job.reference);
-                return;
-            }
-            check.answered_early = true;
+            // A lost receipt does not cancel the accepted check or its terminal delivery.
+            let _ = sender.send(reply);
         }
     }
 
@@ -941,7 +1057,7 @@ impl Worker<'_> {
         operation_id: &str,
     ) -> Result<Option<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>)>, FailureCode>
     {
-        let receipt = self.rename_receipt(job, operation_id).await?;
+        let receipt = self.batch_receipt(job, operation_id).await?;
         let digest = batch::rename_request_digest(&job.parameters);
         match receipt {
             Some(existing) if existing.request_digest != digest => {
@@ -958,6 +1074,23 @@ impl Worker<'_> {
                 let committed = self
                     .commit_files(job, binding, operation_id, &files, &existing, planned)
                     .await?;
+                if !self
+                    .shared
+                    .committed_edit_proof_current(
+                        &self.workspace,
+                        binding,
+                        &job.reference,
+                        &committed.authority,
+                        &committed.sources,
+                    )
+                    .await
+                {
+                    return Ok(Some((
+                        historical_edit_source_unavailable(),
+                        Some(committed.authority),
+                        None,
+                    )));
+                }
                 Ok(Some(self.partial_rename(job, operation_id, committed)))
             }
             _ => Ok(None),
@@ -984,7 +1117,7 @@ impl Worker<'_> {
         note: String,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let digest = batch::rename_request_digest(&job.parameters);
-        let receipt = match self.rename_receipt(job, operation_id).await? {
+        let receipt = match self.batch_receipt(job, operation_id).await? {
             Some(existing) if existing.request_digest != digest => {
                 let authority = self.authority(binding).await.ok();
                 return Ok((
@@ -1068,8 +1201,8 @@ impl Worker<'_> {
         let Committed {
             reports,
             mut sources,
+            mut preexisting,
             authority,
-            ..
         } = committed;
         let last = reports.last().ok_or(FailureCode::Internal)?;
         let outcome = match last.state {
@@ -1077,15 +1210,70 @@ impl Worker<'_> {
             FileState::Unchanged => ChangesEditOutcome::Unchanged,
             _ => ChangesEditOutcome::Replaced,
         };
-        let diagnostics = self.file_diagnostics(job, binding, &last.path).await;
+        let mut diagnostics = EditDiagnostics::Unknown {};
         let result = EditResult {
             operation_id: operation_id.to_owned(),
             path: last.path.clone(),
             outcome,
             source_ref: Some(job.reference.clone()),
         };
-        let first = (!sources.is_empty()).then(|| sources.remove(0));
+        let refreshed = sources
+            .iter()
+            .position(|source| source.path().to_str() == Some(&last.path))
+            .map(|index| sources.remove(index));
         self.shared.add_edit_sources(&job.reference, sources);
+        job.format_note = Some(note.clone());
+        let provider_pending = match self.ready_edit_provider_fallback(job, &last.path).await {
+            Ok(ready) => ready,
+            Err(reason) => {
+                diagnostics = EditDiagnostics::NotAnalysed {
+                    reason: reason.to_owned(),
+                };
+                false
+            }
+        };
+        let unavailable = if job
+            .deadline
+            .checked_sub(EDIT_SETTLEMENT_RESERVE)
+            .is_none_or(|deadline| deadline <= tokio::time::Instant::now())
+        {
+            Some("no time was left in this call for the project check".into())
+        } else {
+            self.known_check_unavailable(&authority, &last.path)
+        };
+        if let Some(reason) = &unavailable {
+            diagnostics = super::unchecked_file_diagnostics(&diagnostics, Some(reason));
+            job.check_scheduled = true;
+        }
+        if let Some(stage) = self.edit_check_stage(
+            job,
+            &authority,
+            &last.path,
+            result.clone(),
+            refreshed.clone(),
+            (
+                diagnostics.clone(),
+                preexisting.remove(&last.path).unwrap_or_default(),
+                provider_pending,
+                unavailable.is_none(),
+            ),
+        ) {
+            match self.check_diagnostics(&stage) {
+                Some(checked) => {
+                    diagnostics = if self.edit_check_sources_current(job, &stage).await {
+                        checked
+                    } else {
+                        EditDiagnostics::NotAnalysed { reason: "edit diagnostics superseded: committed source changed or capture is incomplete".into() }
+                    }
+                }
+                None => {
+                    self.reply_edit_early(job, &stage);
+                    job.stage = Some(stage);
+                    job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    return Err(FailureCode::ProviderLoading);
+                }
+            }
+        }
         Ok((
             PeerReply::Edit {
                 result,
@@ -1094,7 +1282,7 @@ impl Worker<'_> {
                 operation: Some("renamed".to_owned()),
             },
             Some(authority),
-            first,
+            refreshed,
         ))
     }
 
@@ -1124,8 +1312,8 @@ impl Worker<'_> {
         (reply, Some(authority), first)
     }
 
-    /// Loads the receipt of a rename's operation id after making sure its schema exists.
-    async fn rename_receipt(
+    /// Loads an edit or rename receipt by operation id after making sure its schema exists.
+    pub(super) async fn batch_receipt(
         &mut self,
         job: &mut Job,
         operation_id: &str,
@@ -1143,49 +1331,6 @@ impl Worker<'_> {
             job.failure_detail = Some("edit:batch_receipt_unreadable".to_owned());
             FailureCode::Internal
         })
-    }
-
-    /// The language server's diagnostics for one just-written file, as a one-file edit reports
-    /// them without waiting for the project check: `unknown` when no exact provider answer
-    /// arrives before the edit's diagnostic deadline.
-    async fn file_diagnostics(
-        &mut self,
-        job: &mut Job,
-        binding: &BindingRef,
-        path: &str,
-    ) -> EditDiagnostics {
-        let Ok((observed, bytes)) = self.observe(binding, path.into()).await else {
-            return EditDiagnostics::Unknown {};
-        };
-        let Some(deadline) = edit_diagnostic_deadline(job.deadline) else {
-            return EditDiagnostics::Unknown {};
-        };
-        let original = std::mem::replace(&mut job.deadline, deadline);
-        let result = self
-            .semantic_context(
-                job,
-                &observed,
-                &bytes,
-                crate::intelligence::context::ContextQuery::File,
-            )
-            .await;
-        job.deadline = original;
-        match result {
-            Ok(Some(provider)) => {
-                let map = if provider.diagnostics.diagnostics.is_empty() {
-                    None
-                } else {
-                    self.optional_address_map(job, &observed, &bytes).await
-                };
-                EditDiagnostics::from_snapshot(
-                    path.trim_start_matches("./"),
-                    &provider.context,
-                    &provider.diagnostics,
-                    map.as_deref(),
-                )
-            }
-            _ => EditDiagnostics::Unknown {},
-        }
     }
 }
 

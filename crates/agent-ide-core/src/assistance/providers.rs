@@ -768,6 +768,42 @@ impl Worker<'_> {
         Some(live.wait_ready(Duration::ZERO).await)
     }
 
+    /// Reads an edit snapshot only from the binding's already-owned, alive session. This never
+    /// opens/replaces a provider or borrows another owner's source authority. File synchronization
+    /// enqueues document notifications without waiting for diagnostic pushes; `budget` bounds the
+    /// existing module query. Missing sessions yield `None`; authorization/request failures retain
+    /// their closed I/O error so the job can settle its accepted diagnostic obligation honestly.
+    pub(super) async fn owned_edit_diagnostics(
+        &mut self,
+        binding: &BindingRef,
+        authority: &AuthorityStamp,
+        observed: &SourceObservation,
+        bytes: &[u8],
+        budget: Duration,
+    ) -> std::io::Result<Option<ProviderContext>> {
+        let Some(index) = self
+            .session_server(observed.path())
+            .and_then(|server| self.providers.slot_of(server).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(live) = self.providers.slots[index]
+            .backend
+            .as_mut()
+            .and_then(|backend| backend.live_session(binding))
+            .filter(|live| live.is_alive())
+        else {
+            return Ok(None);
+        };
+        live.session
+            .authorize_source(authority, observed)
+            .map_err(|_| std::io::Error::other("provider source authority changed"))?;
+        live.session
+            .edit_diagnostics(observed, bytes, budget)
+            .await
+            .map(Some)
+    }
+
     /// Returns the language server whose live session answers `path`, for capability checks.
     pub(super) fn session_server(&self, path: &Path) -> Option<&'static dyn LanguageServer> {
         self.providers.session_server(path)

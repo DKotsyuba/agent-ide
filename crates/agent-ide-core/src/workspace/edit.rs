@@ -1,6 +1,7 @@
 //! Descriptor-held, one-use replacement for a single authorized source file.
 
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -146,8 +147,9 @@ impl CurrentEditTarget {
     ///
     /// Present files must be regular, singly linked, owned by the effective user, free of special
     /// mode bits, and valid UTF-8; descriptor-readable xattrs are preserved. A missing final
-    /// component is eligible only when every parent already exists as a real directory. Any
-    /// mismatch or metadata that cannot be read is returned before write.
+    /// component may create missing parent directories beneath the worktree, then requires every
+    /// parent to be a real writable directory. Any mismatch or unreadable metadata is returned
+    /// before the target file is written. Batch callers resolve every target before the first write.
     pub fn resolve(
         authority: &AuthorityStamp,
         path: &Path,
@@ -156,7 +158,8 @@ impl CurrentEditTarget {
         Self::resolve_scope(authority.worktree(), authority.epoch(), path, source_ref)
     }
 
-    /// Applies shared scope/reference validation before the descriptor-safe final-component walk.
+    /// Validates scope/reference before the descriptor-safe walk. An observed absence may create
+    /// parents; batch callers must complete read-only admission before resolving any target.
     fn resolve_scope(
         worktree: &WorktreeRef,
         authority_epoch: u64,
@@ -170,7 +173,13 @@ impl CurrentEditTarget {
         {
             return Err(EditOutcome::StaleSource);
         }
+        if source_ref.bytes().is_none() {
+            create_edit_parents(worktree, path)?;
+        }
         let (parent, name) = open_parent(worktree, path)?;
+        if !parent_is_writable(&parent) {
+            return Err(EditOutcome::UnsafeTarget);
+        }
         match open_final(parent.as_raw_fd(), &name) {
             Ok(mut file) => {
                 let metadata = safe_metadata(&file)?;
@@ -378,6 +387,371 @@ fn replace_if_current_with_checkpoint(
 /// Validates the public edit path as relative UTF-8 in addition to Workspace's raw path rules.
 fn valid_edit_path(path: &Path) -> bool {
     valid_relative_path(path) && path.to_str().is_some()
+}
+
+/// Device and inode read from a retained descriptor, used only within one preflight attempt.
+type EditNativeIdentity = [u64; 2];
+
+/// One admitted destination's native anchor and unresolved name components, with no path grant.
+struct EditDestination {
+    /// Deepest existing no-follow directory; retained through native name comparison.
+    parent: File,
+    /// Device/inode of that retained parent, so alternate parent spellings share one anchor.
+    anchor: EditNativeIdentity,
+    /// Missing suffix, or the existing target's final component, all already validated as UTF-8.
+    suffix: Vec<Vec<u8>>,
+    /// Existing regular target's device/inode; `None` means its final component is absent.
+    file: Option<EditNativeIdentity>,
+}
+
+/// Captures descriptor identity and owns a copy of validated suffix components without writing.
+/// Metadata failure refuses admission; `file` is present only for a safely opened regular target.
+fn edit_destination(
+    parent: File,
+    suffix: &[&[u8]],
+    file: Option<EditNativeIdentity>,
+) -> Result<EditDestination, &'static str> {
+    let metadata = parent
+        .metadata()
+        .map_err(|_| "parent_unavailable: cannot identify the existing directory")?;
+    Ok(EditDestination {
+        parent,
+        anchor: [metadata.dev(), metadata.ino()],
+        suffix: suffix.iter().map(|part| part.to_vec()).collect(),
+        file,
+    })
+}
+
+/// Checks a destination and every existing parent without changing the worktree or source bytes.
+///
+/// `path` must be a bounded relative UTF-8 file path beneath `worktree`. Missing suffixes are
+/// admitted only below a writable real directory, with every component within the filesystem's
+/// name limit. Existing targets must satisfy replacement metadata rules. Static refusal reasons
+/// distinguish invalid paths, unsafe parents/targets, unavailable roots and unwritable parents.
+/// This is admission evidence only: later descriptor resolution rechecks authority and races.
+pub(crate) fn preflight_edit_path(worktree: &WorktreeRef, path: &Path) -> Result<(), &'static str> {
+    preflight_edit_destination(worktree, path).map(|_| ())
+}
+
+/// Performs the same read-only destination admission as `preflight_edit_path`, retaining native
+/// identity and unresolved suffixes for whole-batch comparisons. Missing parents are never made.
+fn preflight_edit_destination(
+    worktree: &WorktreeRef,
+    path: &Path,
+) -> Result<EditDestination, &'static str> {
+    if !valid_edit_path(path) {
+        return Err(
+            "invalid_path: use a nonempty worktree-relative file path without dot or parent components",
+        );
+    }
+    let mut parent = super::observation::open_root_directory(worktree.worktree_path())
+        .map_err(|_| "root_unavailable: reactivate the worktree")?;
+    if let Some(expected) = worktree.native_root_identity()
+        && super::observation::native_directory_identity(&parent)
+            .map_err(|_| "root_unavailable: cannot identify the worktree")?
+            != expected
+    {
+        return Err("root_identity_changed: reactivate the worktree");
+    }
+    let parts: Vec<&[u8]> = path
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .collect();
+    // SAFETY: parent is an owned, open directory descriptor; fpathconf does not modify it.
+    let name_limit = unsafe { libc::fpathconf(parent.as_raw_fd(), libc::_PC_NAME_MAX) };
+    if name_limit < 0 {
+        return Err("path_unavailable: cannot determine the filesystem name limit");
+    }
+    if parts.iter().any(|part| part.len() > name_limit as usize) {
+        return Err("name_too_long: shorten the file or parent name");
+    }
+    for (index, part) in parts[..parts.len() - 1].iter().enumerate() {
+        match super::observation::open_directory(parent.as_raw_fd(), OsStr::from_bytes(part)) {
+            Ok(descriptor) => {
+                // SAFETY: open_directory returned a new descriptor owned solely by this File.
+                parent = unsafe { File::from_raw_fd(descriptor) };
+            }
+            Err(ObservationError::Missing) => {
+                return if parent_is_writable(&parent) {
+                    edit_destination(parent, &parts[index..], None)
+                } else {
+                    Err("parent_not_writable: permit directory creation in the existing parent")
+                };
+            }
+            Err(ObservationError::SymlinkEscape) => {
+                return Err(
+                    "unsafe_parent: use real directories without symlinks or file components",
+                );
+            }
+            Err(_) => return Err("parent_unavailable: check directory access permissions"),
+        }
+    }
+    if !parent_is_writable(&parent) {
+        return Err("parent_not_writable: permit replacement or creation in the parent directory");
+    }
+    let file = match open_final(parent.as_raw_fd(), parts.last().expect("validated path")) {
+        Ok(file) => {
+            let metadata = safe_metadata(&file).map_err(
+                |_| "unsafe_target: use an owned singly linked regular file with preservable metadata",
+            )?;
+            Some([metadata.device, metadata.inode])
+        }
+        Err(EditOutcome::StaleSource) => None,
+        Err(_) => {
+            return Err(
+                "unsafe_target: check target permissions and remove symlink or special-file aliases",
+            );
+        }
+    };
+    edit_destination(parent, &parts[parts.len() - 1..], file)
+}
+
+/// Preflights a facade-bounded batch before any destination-parent creation or source write.
+///
+/// Returns zero-based offending entries and actionable reasons, or an empty vector. Existing
+/// aliases compare no-follow device/inode identities. Multiple unresolved destinations with one
+/// native anchor compare exact kernel name lookups in private, empty scratch on the same volume
+/// and with matching case semantics. The existing scratch owner cleans up when comparison ends;
+/// no source bytes are copied. An unavailable/mismatched oracle refuses that future group, while
+/// single future destinations and distinct existing files need no scratch. Later source races
+/// still require the ordinary descriptor/freshness checks; this is not crash atomicity.
+pub(crate) fn preflight_edit_paths(
+    worktree: &WorktreeRef,
+    paths: &[&Path],
+) -> Vec<(usize, &'static str)> {
+    let destinations: Vec<_> = paths
+        .iter()
+        .map(|path| preflight_edit_destination(worktree, path))
+        .collect();
+    let mut refusals: Vec<_> = destinations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, result)| result.as_ref().err().map(|reason| (index, *reason)))
+        .collect();
+    if !refusals.is_empty() {
+        return refusals;
+    }
+    let destinations: Vec<_> = destinations
+        .into_iter()
+        .map(|entry| entry.expect("every destination was admitted"))
+        .collect();
+    for (left_index, left) in destinations.iter().enumerate() {
+        for (right_index, right) in destinations.iter().enumerate().skip(left_index + 1) {
+            if left.file.is_some() && left.file == right.file {
+                refusals.push((
+                    right_index,
+                    "repeated_file: another entry names the same filesystem destination",
+                ));
+            } else if left.anchor == right.anchor {
+                if left.suffix.starts_with(&right.suffix) {
+                    refusals.push((
+                        right_index,
+                        "future_file_parent: another target needs this file path as a directory",
+                    ));
+                } else if right.suffix.starts_with(&left.suffix) {
+                    refusals.push((
+                        left_index,
+                        "future_file_parent: another target needs this file path as a directory",
+                    ));
+                }
+            }
+        }
+    }
+    if !refusals.is_empty() {
+        refusals.sort_unstable_by_key(|(index, _)| *index);
+        refusals.dedup_by_key(|(index, _)| *index);
+        return refusals;
+    }
+    let mut groups: BTreeMap<EditNativeIdentity, Vec<usize>> = BTreeMap::new();
+    for (index, destination) in destinations
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.file.is_none())
+    {
+        groups.entry(destination.anchor).or_default().push(index);
+    }
+    for indices in groups.values().filter(|group| group.len() > 1) {
+        let entries: Vec<_> = indices.iter().map(|index| &destinations[*index]).collect();
+        let native = match probe_future_edit_names(worktree, &entries) {
+            Ok(native) => native,
+            Err(reason) => {
+                refusals.push((indices[0], reason));
+                continue;
+            }
+        };
+        for (left_index, left) in native.iter().enumerate() {
+            for (right_index, right) in native.iter().enumerate().skip(left_index + 1) {
+                let left_final = left.last().expect("validated suffix is nonempty");
+                let right_final = right.last().expect("validated suffix is nonempty");
+                if left_final == right_final {
+                    refusals.push((
+                        indices[right_index],
+                        "repeated_file: another entry names the same filesystem destination",
+                    ));
+                } else if left.contains(right_final) {
+                    refusals.push((
+                        indices[right_index],
+                        "future_file_parent: another target needs this file path as a directory",
+                    ));
+                } else if right.contains(left_final) {
+                    refusals.push((
+                        indices[left_index],
+                        "future_file_parent: another target needs this file path as a directory",
+                    ));
+                }
+            }
+        }
+    }
+    refusals.sort_unstable_by_key(|(index, _)| *index);
+    refusals.dedup_by_key(|(index, _)| *index);
+    refusals
+}
+
+/// Resolves only empty validated name components in the existing private temporary owner.
+/// Scratch must be outside the worktree, freshly owned with mode0700, and qualified against every
+/// anchor's volume/case rules. Each returned row lists native directory identities for its suffix;
+/// the kernel therefore decides case and Unicode equivalence without a custom text comparator.
+fn probe_future_edit_names(
+    worktree: &WorktreeRef,
+    destinations: &[&EditDestination],
+) -> Result<Vec<Vec<EditNativeIdentity>>, &'static str> {
+    let owner = super::git::snapshot::SnapshotDirectory::for_worktree(worktree)
+        .map_err(|_| "preflight_unavailable: select a writable temporary directory outside the worktree for future-name comparison")?;
+    let root = super::observation::open_root_directory(owner.path())
+        .map_err(|_| "preflight_unavailable: cannot retain the private filename probe directory")?;
+    let metadata = root
+        .metadata()
+        .map_err(|_| "preflight_unavailable: cannot identify filename probe ownership")?;
+    // SAFETY: geteuid has no arguments, borrows no memory and performs no mutation.
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o700 {
+        return Err(
+            "preflight_unavailable: filename probe requires a fresh private owned directory",
+        );
+    }
+    if destinations
+        .iter()
+        .any(|destination| !same_edit_name_semantics(&destination.parent, &root))
+    {
+        return Err(
+            "preflight_unavailable: temporary and destination directories must share the same volume and case semantics",
+        );
+    }
+    let mut identities = Vec::with_capacity(destinations.len());
+    for destination in destinations {
+        let mut parent = root
+            .try_clone()
+            .map_err(|_| "preflight_unavailable: cannot retain filename probe descriptor")?;
+        let mut row = Vec::with_capacity(destination.suffix.len());
+        for part in &destination.suffix {
+            let name = nul_name(part);
+            // SAFETY: parent is an owned private directory descriptor and name is a validated,
+            // live NUL-terminated single component. Only empty scratch directories are created.
+            let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr().cast(), 0o700) };
+            if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                return Err(
+                    "preflight_unavailable: filesystem could not compare the future filename components",
+                );
+            }
+            let descriptor =
+                super::observation::open_directory(parent.as_raw_fd(), OsStr::from_bytes(part))
+                    .map_err(|_| "preflight_unavailable: filename probe lookup failed")?;
+            // SAFETY: open_directory returned a new owned descriptor; File closes it exactly once.
+            parent = unsafe { File::from_raw_fd(descriptor) };
+            let metadata = parent
+                .metadata()
+                .map_err(|_| "preflight_unavailable: filename probe identity is unavailable")?;
+            row.push([metadata.dev(), metadata.ino()]);
+        }
+        identities.push(row);
+    }
+    Ok(identities)
+}
+
+/// Qualifies a scratch oracle against the actual retained parent on macOS: equal device proves
+/// the same volume and _PC_CASE_SENSITIVE must be known and equal. No source or temp bytes change.
+#[cfg(target_os = "macos")]
+fn same_edit_name_semantics(destination: &File, scratch: &File) -> bool {
+    let (Ok(destination_metadata), Ok(scratch_metadata)) =
+        (destination.metadata(), scratch.metadata())
+    else {
+        return false;
+    };
+    // SAFETY: both descriptors are live owned directories; fpathconf only reads their properties.
+    let destination_case =
+        unsafe { libc::fpathconf(destination.as_raw_fd(), libc::_PC_CASE_SENSITIVE) };
+    // SAFETY: scratch remains a live owned directory for this read-only property query.
+    let scratch_case = unsafe { libc::fpathconf(scratch.as_raw_fd(), libc::_PC_CASE_SENSITIVE) };
+    destination_metadata.dev() == scratch_metadata.dev()
+        && matches!(destination_case, 0 | 1)
+        && destination_case == scratch_case
+}
+
+/// Other targets have no qualified per-directory filename-semantics query in this macOS product;
+/// ambiguous future batches fail admission rather than guessing case or Unicode equivalence.
+#[cfg(not(target_os = "macos"))]
+fn same_edit_name_semantics(_destination: &File, _scratch: &File) -> bool {
+    false
+}
+
+/// Creates missing parents with mode 0755 beneath the authorized root without following links.
+/// Already-created empty parents may remain when a later component or file operation fails.
+fn create_edit_parents(worktree: &WorktreeRef, path: &Path) -> Result<(), EditOutcome> {
+    if !valid_edit_path(path) {
+        return Err(EditOutcome::StaleSource);
+    }
+    let mut parent = super::observation::open_root_directory(worktree.worktree_path())
+        .map_err(map_observation)?;
+    if let Some(expected) = worktree.native_root_identity()
+        && super::observation::native_directory_identity(&parent).map_err(map_observation)?
+            != expected
+    {
+        return Err(EditOutcome::UnsafeTarget);
+    }
+    let parts: Vec<&[u8]> = path
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .collect();
+    for part in &parts[..parts.len() - 1] {
+        let component = OsStr::from_bytes(part);
+        match super::observation::open_directory(parent.as_raw_fd(), component) {
+            Ok(descriptor) => {
+                // SAFETY: open_directory returned a new descriptor owned solely by this File.
+                parent = unsafe { File::from_raw_fd(descriptor) };
+            }
+            Err(ObservationError::Missing) => {
+                let name = nul_name(part);
+                // SAFETY: name is NUL-terminated and parent is an owned directory descriptor.
+                let created =
+                    unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr().cast(), 0o755) };
+                if created != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                    return Err(EditOutcome::UnsafeTarget);
+                }
+                let descriptor = super::observation::open_directory(parent.as_raw_fd(), component)
+                    .map_err(map_observation)?;
+                // SAFETY: open_directory returned a new descriptor owned solely by this File.
+                parent = unsafe { File::from_raw_fd(descriptor) };
+            }
+            Err(error) => return Err(map_observation(error)),
+        }
+    }
+    Ok(())
+}
+
+/// Checks current W_OK/X_OK access to the retained directory as this effective user.
+/// This advisory permission check does not prevent later I/O errors or filesystem races.
+fn parent_is_writable(parent: &File) -> bool {
+    let dot = nul_name(b".");
+    // SAFETY: dot is NUL-terminated and parent is an owned directory descriptor.
+    unsafe {
+        libc::faccessat(
+            parent.as_raw_fd(),
+            dot.as_ptr().cast(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        ) == 0
+    }
 }
 
 /// Opens and retains the final parent directory plus the raw final component.
@@ -854,7 +1228,199 @@ mod tests {
         EditSourceRef::from_observation(&observation).expect("edit source")
     }
 
-    /// Proves replacement and creation return exact post-read bytes without creating parents.
+    /// Preflight admits future directories without creating them and gives actionable reasons
+    /// for invalid paths, long future names, unsafe existing parents and denied creation access.
+    #[test]
+    fn preflight_is_read_only_and_checks_all_future_parent_components() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temporary("preflight");
+        let authority = authority(&root);
+        let worktree = authority.worktree();
+        assert_eq!(
+            preflight_edit_path(worktree, Path::new("missing/deeper/new.rs")),
+            Ok(())
+        );
+        assert!(!root.join("missing").exists());
+        for invalid in ["", "../outside.rs", "nested/../outside.rs", "./new.rs"] {
+            assert!(
+                preflight_edit_path(worktree, Path::new(invalid))
+                    .unwrap_err()
+                    .starts_with("invalid_path:")
+            );
+        }
+        let long = format!("missing/{}/new.rs", "x".repeat(256));
+        assert!(
+            preflight_edit_path(worktree, Path::new(&long))
+                .unwrap_err()
+                .starts_with("name_too_long:")
+        );
+        assert!(!root.join("missing").exists());
+        fs::write(root.join("file.rs"), "old").expect("seed file");
+        assert!(
+            preflight_edit_path(worktree, Path::new("file.rs/child.rs"))
+                .unwrap_err()
+                .starts_with("unsafe_parent:")
+        );
+        symlink(root.parent().expect("outside parent"), root.join("escape")).expect("symlink");
+        assert!(
+            preflight_edit_path(worktree, Path::new("escape/child.rs"))
+                .unwrap_err()
+                .starts_with("unsafe_parent:")
+        );
+        fs::create_dir(root.join("locked")).expect("locked dir");
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o500))
+            .expect("deny creation");
+        let reason =
+            preflight_edit_path(worktree, Path::new("locked/missing/child.rs")).unwrap_err();
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+        assert!(reason.starts_with("parent_not_writable:"), "{reason}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Native descriptor and future-name admission detects case/Unicode aliases and file/parent
+    /// conflicts in both orders without worktree effects; genuinely distinct names stay admitted.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn batch_preflight_compares_native_existing_and_future_destinations() {
+        let root = temporary("native-alias");
+        let authority = authority(&root);
+        let worktree = authority.worktree();
+        fs::write(root.join("Existing.rs"), "old").expect("existing target");
+        fs::write(root.join("é.rs"), "unicode").expect("unicode target");
+        let insensitive = fs::metadata(root.join("existing.rs")).is_ok();
+        let normalization_insensitive = fs::metadata(root.join("e\u{301}.rs")).is_ok();
+        for reversed in [false, true] {
+            let mut existing = [Path::new("Existing.rs"), Path::new("existing.rs")];
+            if reversed {
+                existing.reverse();
+            }
+            let refusals = preflight_edit_paths(worktree, &existing);
+            if insensitive {
+                assert!(
+                    refusals
+                        .iter()
+                        .any(|(_, reason)| reason.starts_with("repeated_file:")),
+                    "{refusals:?}"
+                );
+            } else {
+                assert!(refusals.is_empty(), "{refusals:?}");
+            }
+            for (pair, collides, reason) in [
+                (
+                    ["New/Child.rs", "new/child.rs"],
+                    insensitive,
+                    "repeated_file:",
+                ),
+                (
+                    ["Future", "future/child.rs"],
+                    insensitive,
+                    "future_file_parent:",
+                ),
+                (
+                    ["new-é.rs", "new-e\u{301}.rs"],
+                    normalization_insensitive,
+                    "repeated_file:",
+                ),
+                (
+                    ["Parent-é", "Parent-e\u{301}/child.rs"],
+                    normalization_insensitive,
+                    "future_file_parent:",
+                ),
+            ] {
+                let mut paths = pair.map(Path::new);
+                if reversed {
+                    paths.reverse();
+                }
+                let refusals = preflight_edit_paths(worktree, &paths);
+                if collides {
+                    assert!(
+                        refusals
+                            .iter()
+                            .any(|(_, detail)| detail.starts_with(reason)),
+                        "{pair:?}: {refusals:?}"
+                    );
+                } else {
+                    assert!(refusals.is_empty(), "{pair:?}: {refusals:?}");
+                }
+                for path in pair {
+                    assert!(!root.join(path).exists(), "{path}");
+                }
+            }
+        }
+        let distinct = [Path::new("one/deep/new.rs"), Path::new("two/deep/new.rs")];
+        assert!(preflight_edit_paths(worktree, &distinct).is_empty());
+        assert!(!root.join("one").exists());
+        assert!(!root.join("two").exists());
+        assert_eq!(fs::read(root.join("Existing.rs")).unwrap(), b"old");
+        assert_eq!(fs::read(root.join("é.rs")).unwrap(), b"unicode");
+        let directory = super::super::observation::open_root_directory(&root).unwrap();
+        assert!(same_edit_name_semantics(&directory, &directory));
+        fs::remove_dir_all(root).expect("cleanup owned fixture");
+    }
+
+    /// When the configured temporary parent lies inside the authority root, the existing owner
+    /// refuses the unresolved group precisely before scratch, destination parents or source writes.
+    /// Existing-only and single-future batches do not need that oracle and remain usable.
+    #[test]
+    fn batch_preflight_unavailable_oracle_has_no_worktree_effects() {
+        let root = temporary("no-oracle");
+        let temp = fs::canonicalize(std::env::temp_dir()).expect("canonical temporary parent");
+        let authority = authority(&temp);
+        let relative = root
+            .strip_prefix(&temp)
+            .expect("owned child of task temporary parent");
+        fs::write(root.join("present.rs"), "old").expect("existing target");
+        let first = relative.join("one/new.rs");
+        let second = relative.join("two/new.rs");
+        let present = relative.join("present.rs");
+        let refusals = preflight_edit_paths(authority.worktree(), &[&present, &first, &second]);
+        assert!(
+            refusals
+                .iter()
+                .any(|(_, reason)| reason.starts_with("preflight_unavailable:")),
+            "{refusals:?}"
+        );
+        assert_eq!(fs::read(root.join("present.rs")).unwrap(), b"old");
+        assert!(!root.join("one").exists());
+        assert!(!root.join("two").exists());
+        assert!(preflight_edit_paths(authority.worktree(), &[&present, &first]).is_empty());
+        assert!(!root.join("one").exists());
+        fs::remove_dir_all(root).expect("cleanup owned fixture");
+    }
+
+    /// A real permission change after admission causes a before-effect I/O refusal, preserving
+    /// the target bytes; preflight does not promise immunity to later filesystem changes.
+    #[test]
+    fn io_failure_after_preflight_preserves_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temporary("io-after-preflight");
+        fs::create_dir(root.join("parent")).expect("parent");
+        let path = PathBuf::from("parent/file.rs");
+        fs::write(root.join(&path), "old").expect("seed");
+        let authority = authority(&root);
+        preflight_edit_path(authority.worktree(), &path).expect("initial admission");
+        let source = source_ref(&authority, &path, Some(b"old"));
+        let target = CurrentEditTarget::resolve(&authority, &path, source.clone()).expect("target");
+        fs::set_permissions(root.join("parent"), fs::Permissions::from_mode(0o500))
+            .expect("deny write");
+        let outcome = replace_if_current(
+            EditPermit::new("io-failure", path.clone()).expect("permit"),
+            target,
+            &source,
+            b"new",
+            || true,
+            || true,
+        );
+        fs::set_permissions(root.join("parent"), fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+        assert_eq!(outcome, EditOutcome::UnsafeTarget);
+        assert_eq!(fs::read(root.join(&path)).expect("read"), b"old");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Proves replacement and creation return exact post-read bytes and safely create missing
+    /// parents beneath the worktree without following links.
     #[test]
     fn creates_and_replaces_only_one_descriptor_confined_file() {
         let root = temporary("effects");
@@ -896,13 +1462,21 @@ mod tests {
             0o600
         );
 
-        let absent_parent = PathBuf::from("absent/child.rs");
-        let missing = source_ref(&authority, &absent_parent, None);
-        assert!(matches!(
-            CurrentEditTarget::resolve(&authority, &absent_parent, missing),
-            Err(EditOutcome::StaleSource | EditOutcome::UnsafeTarget)
-        ));
-        assert!(!root.join("absent").exists());
+        let nested_path = PathBuf::from("absent/deeper/child.rs");
+        let missing = source_ref(&authority, &nested_path, None);
+        let target = CurrentEditTarget::resolve(&authority, &nested_path, missing.clone())
+            .expect("missing parents created beneath worktree");
+        assert!(root.join("absent/deeper").is_dir());
+        let outcome = replace_if_current(
+            EditPermit::new("nested-create", nested_path.clone()).expect("permit"),
+            target,
+            &missing,
+            b"nested",
+            || true,
+            || true,
+        );
+        assert!(matches!(outcome, EditOutcome::Created(ref read) if read.contents() == b"nested"));
+        assert_eq!(fs::read(root.join(&nested_path)).expect("read"), b"nested");
         fs::remove_dir_all(root).expect("cleanup");
     }
 

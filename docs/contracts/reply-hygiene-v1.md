@@ -46,13 +46,14 @@ tests #N: <summary>
   (+K more failed tests in the full output)
   <one line per target of a several-target run, at most 160 bytes each>
   rerun: <command>
-  full output: ide.inspect <detail_ref>
+  full output: ide.test {"detail_ref":"<detail_ref>/output/1"}
 ```
 
 | Case | `summary` (one line, at most 256 bytes) |
 |---|---|
-| counts parsed | `P passed, F failed, S s` |
-| stopped at its budget | `stopped at budget B s — P passed, F failed so far` |
+| counts parsed | `P passed, F failed, S s (exit C)` |
+| stopped at its budget | `stopped at budget B s — P passed, F failed so far (exit C)`; unavailable counts are labelled `test counts unavailable` |
+| owner cancellation | `cancelled — P passed, F failed so far (exit C)`; unobserved counts or exit remain explicitly unavailable |
 | non-zero exit, no counts | `no test results (exit C), S s — runner said: <excerpt, at most 200 bytes>` |
 | no recognised summary (only the exit status is known, whatever the status) | `exit C, S s` (`exit unknown` after a signal); `detail` adds `output (tail):` and at most 10 lines and 1024 bytes of the output tail |
 
@@ -68,22 +69,25 @@ Rules (each one is a unit test):
 2. `rerun:` is always present. The command is the exact rerun line the reply carries today
    (`cd <dir> && env NAME=VALUE … <argv>` when the run had a directory or environment), cut with
    `…` at 300 bytes on a character boundary.
-3. `full output: ide.inspect <detail_ref>` is present exactly when `owns_detail` and the run has a
-   retained output.
-4. `summary` plus `detail` is at most 1536 bytes, the `test-finished` body limit of
+3. `full output: ide.test {"detail_ref":"<detail_ref>/output/1"}` is present exactly when
+   `owns_detail` and the run has retained output. The original reference reads the compact
+   completion. Only explicit numbered output references deliver logs, once per page; repeats
+   return a one-line pointer. Successful reply handoff advances the cursor; the last retains
+   the bounded capture until its detail expires. Explicit `ide.test {"output":"<ref>/output/N"}`
+   restores a body after context loss without changing that cursor or running tests again.
+4. `summary` plus `detail` is at most 3584 bytes, the `test-finished` body limit of
    session-outbox-v1 (§2, §3.4). When the text is longer, first drop the quoted output lines,
-   then the target lines from the end, then the message lines from the last `FAIL` entry
-   backwards, then drop entries from the end (the `+K` count grows). Summary,
-   `rerun:` and `full output:` are never dropped: they take at most 256 + 308 + about 100 bytes,
-   which leaves about 870 bytes for `FAIL` entries.
+   then the message lines from the last `FAIL` entry backwards, then drop entries from the end
+   (the `+K` count grows). Every bounded target outcome, summary, `rerun:` and `full output:`
+   survives. Target labels are shortened before their exit/skipped/unavailable outcome.
 5. Every cut is on a UTF-8 character boundary. Control characters in runner-provided names,
    messages and excerpts are removed.
 6. No imperative sentence, no `poll`, and no elapsed seconds of a *running* run appear anywhere in
    the text (section 2).
-7. The text of a fact equals the settled reply body for runs with parsed counts. For
-   `exit C, S s` runs the reply body keeps its bounded output tail of up to 4 KiB (today's
-   behaviour) and the fact carries the shorter tail above. The only other difference is the
-   outbox's own hand-off sanitation of `<` and `>`.
+7. The text of a fact equals the settled reply body for every run, including
+   `exit C, S s` runs without parsed counts. Both use the bounded tail above; the retained
+   output remains recoverable separately. The only difference is the outbox's own hand-off
+   sanitation of `<` and `>`.
 8. Delivery is Bridge's: IDE hands the fact over once and keeps no delivery state; a run counts as
    collected for the `ide.stop` uncollected list only when its owner reads it explicitly, and a
    plate or hook never renders a test line.
@@ -92,7 +96,7 @@ Rules (each one is a unit test):
 
 | Line | Text |
 |---|---|
-| started (reply only) | `tests #N: started — <argv> [(K tests selected)] (budget B s); the result is retained under its reference; Bridge delivers it automatically when configured` (the wording of session-outbox-v1 §8.7 for a pending result) |
+| started (reply only) | `tests #N: started — <argv> [(K tests selected)] (budget B s); the result is retained under its reference; Bridge delivers it automatically` (the wording of session-outbox-v1 §8.7 for a pending result) |
 | second start while one is active | `tests #N: still running` |
 | `ide.test {status}` or inspect of `tests #N`, run still active | `tests #N: running` |
 | the same, run settled | the terminal text of rule 7 |
@@ -115,7 +119,7 @@ Further rules:
 - **No seconds on something unfinished.** A line about a running, pending or still-active job never
   contains a seconds count. A finished job's duration is an outcome and is allowed.
 - **Data, not orders.** Facts and plates state what happened. The permitted references are a
-  `rerun:` command, `full output: ide.inspect <ref>` and a `detail_ref` handle. Sentences addressed
+  `rerun:` command, `full output: ide.test {"detail_ref":"<ref>/output/1"}` and a `detail_ref` handle. Sentences addressed
   to the agent belong to the owner of that surface.
 - **Wording ownership.** M-026: `pending` and edit `diagnostics: pending`. M-025:
   `provider_loading`, warming and approximate-answer notices. M-027: batch reply lines. M-024:

@@ -370,10 +370,11 @@ impl LanguageSupport for RustSupport {
     /// Counts are the sum of every `test result:` summary; a target whose `running N tests`
     /// header has no summary (crash, signal, budget) contributes its `test … ok|FAILED|ignored`
     /// lines instead and makes the report `incomplete`, as does output with no summary at all
-    /// (e.g. a compile error). Failures follow the order of the `FAILED` lines; each takes its
-    /// location and message from the `---- <name> stdout ----` block: the first
-    /// `panicked at <file>:<line>:<col>:` line and up to four message lines after it (an
-    /// assertion's `left:`/`right:` values included) joined with ` | `, or else the block's first
+    /// (e.g. a compile error). Failures follow `FAILED` lines or the final `failures:` list.
+    /// Location and message come from a captured `---- <name> stdout ----` block or a matching
+    /// uncaptured thread panic in either stream: the first `panicked at <file>:<line>:<col>:`
+    /// line and up to four subsequent message lines joined with ` | `. An unrelated caught
+    /// thread panic never creates a failure. A captured block without a panic uses its first
     /// non-empty line. Only the post-1.73 panic format carries a location.
     fn parse_test_output(&self, stdout: &str, stderr: &str) -> TestReport {
         let text = format!("{stdout}\n{stderr}");
@@ -384,7 +385,34 @@ impl LanguageSupport for RustSupport {
         let mut failed_names = Vec::new();
         let mut blocks: HashMap<&str, Located> = HashMap::new();
         let mut block_order = Vec::new();
+        let mut failure_list = false;
         for (index, line) in lines.iter().enumerate() {
+            if *line == "failures:" {
+                failure_list = true;
+                continue;
+            }
+            if failure_list {
+                let name = line.trim();
+                if line.starts_with("    ") && !name.is_empty() {
+                    if !failed_names.iter().any(|failed| failed == name) {
+                        failed_names.push(name.to_owned());
+                    }
+                    continue;
+                }
+                if !name.is_empty() {
+                    failure_list = false;
+                }
+            }
+            if let Some(name) = line
+                .split_once("thread '")
+                .and_then(|(_, rest)| rest.split_once("' "))
+                .filter(|(_, rest)| rest.contains("panicked at "))
+                .map(|(name, _)| name)
+            {
+                blocks
+                    .entry(name)
+                    .or_insert_with(|| panic_of(&lines[index..]));
+            }
             if let Some(summary) = line.strip_prefix("test result: ") {
                 report.passed += count_before(summary, "passed");
                 report.failed += count_before(summary, "failed");
@@ -915,8 +943,9 @@ fn count_before(summary: &str, label: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Location and message of one `---- name stdout ----` block's lines (see
-/// [`RustSupport::parse_test_output`]).
+/// Returns the first panic's location and at most four message lines from a captured block or
+/// uncaptured output suffix; no panic yields the first nonempty line without a location.
+/// The caller associates it only with a reported failing test (see [`RustSupport::parse_test_output`]).
 fn panic_of(block: &[&str]) -> Located {
     for (index, line) in block.iter().enumerate() {
         let Some((_, at)) = line.split_once("panicked at ") else {
@@ -1692,6 +1721,39 @@ mod tests {
                 message: "assertion `left == right` failed | left: 1 | right: 2".to_owned(),
             }]
         );
+    }
+
+    /// Uncaptured panic output keeps the named failure, location and message in combined or
+    /// split streams; an unrelated caught helper panic never becomes another failed test.
+    #[test]
+    fn parses_nocapture_failure_without_a_stdout_block() {
+        let summary = "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let panic = "thread 'tests::bad' (12345) panicked at src/lib.rs:12:9:\nresult-economy failure message\n\n";
+        let combined = format!(
+            "running 2 tests\ntest tests::good ... ok\ntest tests::bad ... \n{panic}FAILED\n\nfailures:\n    tests::bad\n\n{summary}"
+        );
+        let stdout = format!(
+            "running 2 tests\ntest tests::good ... ok\ntest tests::bad ... FAILED\n\nfailures:\n    tests::bad\n\n{summary}"
+        );
+        let old_panic = panic.replace(" (12345)", "");
+        let stderr = format!(
+            "{old_panic}thread 'caught_helper' panicked at src/helper.rs:1:1:\nhandled helper panic\n\n"
+        );
+        for (stdout, stderr) in [(combined.as_str(), ""), (stdout.as_str(), stderr.as_str())] {
+            let report = RustSupport.parse_test_output(stdout, stderr);
+            assert_eq!(
+                (report.passed, report.failed, report.incomplete),
+                (1, 1, false)
+            );
+            assert_eq!(
+                report.failures,
+                vec![TestFailure {
+                    name: "tests::bad".to_owned(),
+                    location: Some((PathBuf::from("src/lib.rs"), 12)),
+                    message: "result-economy failure message".to_owned(),
+                }]
+            );
+        }
     }
 
     #[test]

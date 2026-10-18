@@ -12,7 +12,7 @@
 //! The same job then keeps running in precise mode, re-checking the server every 300 ms for up to
 //! [`PRECISE_BUDGET`], and is registered with the session outbox (the worker's shared state),
 //! which retains its final reply or failure under its reference and hands a `job-ready` fact to
-//! Bridge when configured. At most [`MAX_DEFERRED_PER_SESSION`] such jobs run per
+//! Bridge. At most [`MAX_DEFERRED_PER_SESSION`] such jobs run per
 //! session; beyond that the approximate answer says the precise answer is not scheduled and the
 //! job ends at its next retry, while a non-exact language keeps the 0.10.8 wait.
 
@@ -235,7 +235,7 @@ impl Worker<'_> {
             text: format!(
                 "approximate: {server} is still indexing; usages and callers below are name \
                  matches from source, marked ~; the precise answer is retained under its reference; \
-                 Bridge delivers it automatically when configured\n{text}"
+                 Bridge delivers it automatically\n{text}"
             ),
             definition: file,
         })

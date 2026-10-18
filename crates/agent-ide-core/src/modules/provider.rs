@@ -17,6 +17,7 @@ use std::{
     future::Future,
     io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -204,6 +205,8 @@ struct Hosted {
     live: LiveSession,
     /// The provider child, killed on drop; it shares the module's process group.
     _child: tokio::process::Child,
+    /// Owns the bounded stderr reader; dropping a pending or hosted provider aborts that reader.
+    _stderr: tokio::task::JoinSet<()>,
 }
 
 /// Serves a language's support and its hosted provider.
@@ -218,6 +221,9 @@ pub struct ProviderServer<B: ProviderBuilder> {
     settings: Value,
     /// The hosted provider, started on first demand.
     hosted: Option<Hosted>,
+    /// The one granted initialization future owns its child and I/O until completion or drop.
+    /// Readiness polls borrow it within the existing short budget; timeout never restarts it.
+    starting: Option<Pin<Box<dyn Future<Output = io::Result<Hosted>> + Send>>>,
     /// The provider was started once and is gone; this instance never starts another.
     spent: bool,
     /// Why the one start failed, answered again by every later provider request.
@@ -254,6 +260,7 @@ impl<B: ProviderBuilder> ProviderServer<B> {
             grant: None,
             settings: Value::Null,
             hosted: None,
+            starting: None,
             spent: false,
             start_failure: None,
             stderr: Arc::default(),
@@ -277,7 +284,9 @@ impl<B: ProviderBuilder> ProviderServer<B> {
         .map_err(|_| io::Error::other("module working directory is not absolute"))
     }
 
-    /// The live session, started once from the grant; a spent provider is never replaced.
+    /// Returns the initialized session, polling its one retained startup for at most 100 ms.
+    /// A warming provider returns `WouldBlock` without dropping its initialization future; start
+    /// failures stay retained and a spent provider is never replaced by this module instance.
     async fn session(&mut self) -> io::Result<&mut Session> {
         if self
             .hosted
@@ -287,71 +296,103 @@ impl<B: ProviderBuilder> ProviderServer<B> {
             self.hosted = None;
             self.spent = true;
         }
+        if self.hosted.is_none() && self.starting.is_none() && !self.spent {
+            let grant = self
+                .grant
+                .clone()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no provider granted"))?;
+            if let Err(error) = self.start(grant) {
+                self.start_failure = Some((error.kind(), error.to_string()));
+            }
+        }
+        if let Some(starting) = self.starting.as_mut() {
+            let started = tokio::time::timeout(Duration::from_millis(100), starting.as_mut())
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "provider initialization pending")
+                })?;
+            self.starting = None;
+            match started {
+                Ok(hosted) => {
+                    self.hosted = Some(hosted);
+                    self.spent = false;
+                }
+                Err(error) => self.start_failure = Some((error.kind(), error.to_string())),
+            }
+        }
         if self.spent {
             return Err(match &self.start_failure {
                 Some((kind, message)) => io::Error::new(*kind, message.clone()),
                 None => io::Error::new(io::ErrorKind::BrokenPipe, "provider exited"),
             });
         }
-        if self.hosted.is_none() {
-            let grant = self
-                .grant
-                .clone()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no provider granted"))?;
-            self.spent = true;
-            let started = self.start(grant).await;
-            if let Err(error) = &started {
-                self.start_failure = Some((error.kind(), error.to_string()));
-            }
-            started?;
-        }
-        Ok(&mut self.hosted.as_mut().expect("started above").live.session)
+        Ok(&mut self
+            .hosted
+            .as_mut()
+            .expect("initialized above")
+            .live
+            .session)
     }
 
-    /// Plans, admits and starts the granted provider and opens its session.
-    async fn start(&mut self, grant: ProviderGrant) -> io::Result<()> {
-        {
-            let (settings, plan) = self.builder.plan(&self.root, &self.settings)?;
-            let command = grant.admit(&self.root, &plan)?;
-            let mut child = crate::execution::spawn_granted_provider(&command)
-                .map_err(|error| io::Error::other(format!("{error:?}")))?;
-            let (Some(stdin), Some(stdout), Some(mut stderr)) =
-                (child.stdin.take(), child.stdout.take(), child.stderr.take())
-            else {
-                return Err(io::Error::other("provider pipes missing"));
-            };
-            let retained = self.stderr.clone();
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut buffer = [0u8; 8192];
-                while let Ok(read) = stderr.read(&mut buffer).await
-                    && read > 0
-                {
-                    let mut retained = retained
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    retained.extend_from_slice(&buffer[..read]);
-                    let excess = retained.len().saturating_sub(PROVIDER_STDERR);
-                    retained.drain(..excess);
-                }
-            });
-            let live = LiveSession::open(
+    /// Admits and starts the granted child once, retaining its initialization future rather than
+    /// blocking `hello` or restarting after a readiness timeout. Initialization failure kills and
+    /// reaps the direct child; dropping the module drops its child and aborts its stderr/driver I/O,
+    /// while the core retains responsibility for reaping the module's entire process group.
+    fn start(&mut self, grant: ProviderGrant) -> io::Result<()> {
+        if self.spent || self.hosted.is_some() || self.starting.is_some() {
+            return Ok(());
+        }
+        self.spent = true;
+        let (settings, plan) = self.builder.plan(&self.root, &self.settings)?;
+        let command = grant.admit(&self.root, &plan)?;
+        let worktree = self.worktree()?;
+        let mut child = crate::execution::spawn_granted_provider(&command)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        let (Some(stdin), Some(stdout), Some(mut stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            return Err(io::Error::other("provider pipes missing"));
+        };
+        let retained = self.stderr.clone();
+        let mut stderr_tasks = tokio::task::JoinSet::new();
+        stderr_tasks.spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buffer = [0u8; 8192];
+            while let Ok(read) = stderr.read(&mut buffer).await
+                && read > 0
+            {
+                let mut retained = retained
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                retained.extend_from_slice(&buffer[..read]);
+                let excess = retained.len().saturating_sub(PROVIDER_STDERR);
+                retained.drain(..excess);
+            }
+        });
+        self.starting = Some(Box::pin(async move {
+            match LiveSession::open(
                 stdout,
                 stdin,
-                self.worktree()?,
+                worktree,
                 LOCAL_EPOCH,
                 LOCAL_GENERATION,
                 settings,
                 Duration::from_millis(grant.request_timeout_ms.clamp(1, 60_000)),
             )
-            .await?;
-            self.spent = false;
-            self.hosted = Some(Hosted {
-                live,
-                _child: child,
-            });
-            // A started provider is spent once it dies: mark it now, clear above on death.
-        }
+            .await
+            {
+                Ok(live) => Ok(Hosted {
+                    live,
+                    _child: child,
+                    _stderr: stderr_tasks,
+                }),
+                Err(error) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    Err(error)
+                }
+            }
+        }));
         Ok(())
     }
 
@@ -559,7 +600,14 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                     )))
                 }
                 SemanticQuery::Readiness {} => {
-                    self.session().await?;
+                    match self.session().await {
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            return Ok(encode(&Readiness::Warming));
+                        }
+                        other => {
+                            other?;
+                        }
+                    }
                     // The core's own wait: its request budget less the answer margin it added.
                     let budget = Duration::from_millis(
                         request.budget_ms.saturating_sub(READINESS_MARGIN_MS),
@@ -581,7 +629,19 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                 SemanticQuery::Diagnostics { source } => {
                     let (observation, bytes) = self.observe(&source, request)?;
                     let session = self.session().await?;
+                    // Hosted sessions are native: File context only synchronizes notifications,
+                    // never semantic RPC or a wait for diagnostic pushes.
+                    let context = session
+                        .context(&observation, &bytes, ContextQuery::File)
+                        .await?;
                     let mut snapshot = session.diagnostics();
+                    if snapshot.document_version.is_some()
+                        && snapshot.document_version != context.document_version
+                    {
+                        snapshot.source = None;
+                        snapshot.readiness = DiagnosticReadiness::Unknown;
+                        snapshot.freshness = Freshness::Unknown;
+                    }
                     let encoding = session.capabilities().position_encoding.clone();
                     self.builder.diagnostics(&mut snapshot);
                     Ok(encode(&self.diagnostics(
@@ -915,7 +975,9 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
         declaration
     }
 
-    /// Keeps the granted provider launch and the language settings for the first demand.
+    /// Admits one granted launch and retains its owned startup without waiting for LSP initialize.
+    /// `hello` declares module capabilities, never provider readiness; existing readiness queries
+    /// report Warming until that startup completes, or retain its actual failure without relaunch.
     fn hello(&mut self, offer: &HelloOffer) -> impl Future<Output = Result<(), String>> + Send {
         let provider = offer.config.provider.clone().unwrap_or(Value::Null);
         let outcome = match provider
@@ -924,23 +986,24 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
             .map(serde_json::from_value::<ProviderGrant>)
         {
             Some(Ok(grant)) => {
-                self.grant = Some(grant);
-                self.settings = provider.get("settings").cloned().unwrap_or(Value::Null);
-                Ok(true)
+                if self.grant.as_ref().is_some_and(|existing| {
+                    existing != &grant
+                        || self.settings != provider.get("settings").cloned().unwrap_or(Value::Null)
+                }) {
+                    Err("provider grant cannot change within an instance".to_owned())
+                } else {
+                    self.grant = Some(grant.clone());
+                    self.settings = provider.get("settings").cloned().unwrap_or(Value::Null);
+                    if let Err(error) = self.start(grant) {
+                        self.start_failure = Some((error.kind(), error.to_string()));
+                    }
+                    Ok(())
+                }
             }
             Some(Err(error)) => Err(format!("invalid provider grant: {error}")),
-            None => Ok(false),
+            None => Ok(()),
         };
-        async move {
-            // A granted provider starts (and initializes) before `hello` is answered, as the
-            // in-process session starts within its open: a later readiness query or request
-            // never pays the start. A start failure does not refuse `hello`; it is answered
-            // typed by every provider request.
-            if outcome? {
-                let _ = self.session().await;
-            }
-            Ok(())
-        }
+        async move { outcome }
     }
 
     /// Provider capabilities through the hosted session, the rest through the support adapter.
@@ -958,7 +1021,7 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
         Ok(match self.provider_answer(&request).await {
             // The answer carries the hosted provider's own readiness, never a blanket ready.
             Ok(value) => {
-                let readiness = self.hosted.as_ref().map_or(Readiness::Ready, |hosted| {
+                let readiness = self.hosted.as_ref().map_or(Readiness::Warming, |hosted| {
                     hosted.live.session.module_readiness_of()
                 });
                 Answer {
@@ -972,6 +1035,9 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
                     },
                     ..Answer::result(value)
                 }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Answer::error(ErrorCode::Warming, "provider initialization pending")
             }
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
                 Answer::error(ErrorCode::InvalidRequest, error.to_string())
@@ -1003,6 +1069,103 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
 #[cfg(test)]
 mod grant_tests {
     use super::*;
+
+    /// Records any unexpected relaunch in tests of an already-owned provider startup.
+    struct RefusingBuilder(Arc<std::sync::atomic::AtomicUsize>);
+    impl ProviderBuilder for RefusingBuilder {
+        /// Counts and refuses a new launch; tests install the already-owned startup directly.
+        fn plan(
+            &self,
+            _worktree: &Path,
+            _settings: &Value,
+        ) -> io::Result<(ProviderSettings, ProviderLaunchPlan)> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(io::Error::other("unexpected new provider launch"))
+        }
+    }
+    /// Reports release of a held startup future's owned resources.
+    struct StartupDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StartupDrop {
+        /// Marks that cancellation or module teardown released the startup.
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    /// A held initialize reports Warming, survives request cancellation, and retains its eventual
+    /// failure without planning a second child. The channel proves the actual held checkpoint.
+    #[tokio::test]
+    async fn retained_provider_start_survives_cancel_and_keeps_failure() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        crate::lang::testing::install();
+        let plans = Arc::new(AtomicUsize::new(0));
+        let mut server = ProviderServer::new(
+            SupportServer::new(crate::lang::testing::ALPHA, "1.0"),
+            RefusingBuilder(plans.clone()),
+        );
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = StartupDrop(dropped.clone());
+        let (started, begun) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        server.spent = true;
+        server.starting = Some(Box::pin(async move {
+            let _guard = guard;
+            let _ = started.send(());
+            let _ = released.await;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recorded initialization refusal",
+            ))
+        }));
+        let request = Incoming {
+            fence: Default::default(),
+            capability: Capability::Semantic,
+            budget_ms: 600,
+            payload: encode(&SemanticQuery::Readiness {}),
+            attachments: Vec::new(),
+        };
+        assert_eq!(
+            server.provider_answer(&request).await.unwrap(),
+            encode(&Readiness::Warming)
+        );
+        begun.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), server.session())
+                .await
+                .is_err()
+        );
+        assert!(server.starting.is_some() && !dropped.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        for _ in 0..2 {
+            let failure = server.session().await.err().expect("retained failure");
+            assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(failure.to_string(), "recorded initialization refusal");
+        }
+        assert_eq!(plans.load(Ordering::Relaxed), 0);
+        assert!(server.starting.is_none() && dropped.load(Ordering::Acquire));
+    }
+    /// Module teardown drops the held initialization future; actual child/group reaping is also
+    /// checked through the shipping binary, so no detached startup survives its owner.
+    #[tokio::test]
+    async fn dropping_pending_provider_start_releases_its_owned_future() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        crate::lang::testing::install();
+        let mut server = ProviderServer::new(
+            SupportServer::new(crate::lang::testing::ALPHA, "1.0"),
+            RefusingBuilder(Arc::new(AtomicUsize::new(0))),
+        );
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = StartupDrop(dropped.clone());
+        server.spent = true;
+        server.starting = Some(Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<io::Result<Hosted>>().await
+        }));
+        let failure = server.session().await.err().expect("startup still warming");
+        assert_eq!(failure.kind(), io::ErrorKind::WouldBlock);
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(server);
+        assert!(dropped.load(Ordering::Acquire));
+    }
 
     /// A context answer waits for diagnostics only when its language does, at most 3 s and never
     /// past the request's remaining budget less the answer margin.

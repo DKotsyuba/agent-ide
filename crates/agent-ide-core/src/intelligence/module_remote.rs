@@ -823,6 +823,41 @@ impl Session {
         })
     }
 
+    /// Reads the existing module Diagnostics DTO for one exact post-write source, without a
+    /// context request that waits for provider pushes. The sealed producer binds the report only
+    /// after source synchronization and rejects a mismatched published document version.
+    pub(super) async fn module_edit_diagnostics(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+        budget: Duration,
+    ) -> io::Result<crate::intelligence::server::ProviderContext> {
+        let text = self.module_source(observation, bytes)?.to_owned();
+        let (source, attachments) = source_ref(observation, &text);
+        let evidence: DiagnosticsEvidence = self
+            .module_call_within(
+                budget,
+                Capability::Semantic,
+                encode(&SemanticQuery::Diagnostics { source }),
+                attachments,
+            )
+            .await?;
+        self.module_bind_diagnostics(&evidence, observation, &text);
+        let diagnostics = self.diagnostics();
+        let mut result = context::lexical_context(
+            observation,
+            bytes,
+            ContextQuery::File,
+            "post-edit diagnostics snapshot",
+        )?;
+        result.generation = Some(self.generation);
+        result.document_version = diagnostics.document_version;
+        Ok(crate::intelligence::server::ProviderContext {
+            context: result,
+            diagnostics,
+        })
+    }
+
     /// The module form of [`Session::context`]: a lexical result over the core's own observation
     /// with only the module's provider evidence overlaid, and diagnostics bound only when the
     /// module saw the same revision.

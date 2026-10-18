@@ -560,6 +560,9 @@ async fn outline_answers_several_paths_or_a_bounded_glob() {
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    // The huge input exceeds the bounded lexical scanner; test its ready-provider pagination.
+    // Cold/absent/hung source behavior has a separate regression.
+    batch_wait_semantic_provider(&mut actor, &fixture, "src/lib.rs").await;
 
     let (paths, text) = settled_call(
         &mut actor,
@@ -1106,7 +1109,7 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
             .map(|(_, words)| words.to_owned())
     };
     // The first reply may be the immediate `pending` one (the check stays retained and is
-    // Bridge-delivered when configured); the
+    // Bridge-delivered); the
     // retry then answers the settled diagnostics, which are never pending.
     let first_pending = summary(&text).is_some_and(|words| words.starts_with("pending"));
     if first_pending {
@@ -1194,7 +1197,23 @@ async fn slow_multi_file_edit_check_answers_at_once_with_pending_diagnostics() {
     .await;
     assert_eq!(
         edit["state"], "edit_batch",
-        "the check never parks the reply: {edit} {text}"
+        "a committed edit returns its durable receipt: {edit} {text}"
+    );
+    assert_eq!(edit["files"][0]["state"], "replaced", "{edit}");
+    assert_eq!(edit["files"][1]["state"], "replaced", "{edit}");
+    assert!(text.contains("diagnostics: pending"), "{text}");
+    let reference = edit["source_ref"].as_str().unwrap();
+    let next = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"slow-batch-next",
+        "path":"src/a.rs","source_ref":reference,"content":"pub fn f() -> i32 {\n    3\n}\n"}),
+        )
+        .await;
+    assert_eq!(
+        next["result"]["outcome"], "replaced",
+        "every pending batch source is retained: {next}"
     );
     assert!(
         text.starts_with("edit: applied 2 of 2 files; diagnostics: pending"),
@@ -1205,10 +1224,7 @@ async fn slow_multi_file_edit_check_answers_at_once_with_pending_diagnostics() {
         text.contains("diagnostics: pending; project check retained under"),
         "{text}"
     );
-    assert!(
-        text.contains("Bridge delivers it automatically when configured"),
-        "{text}"
-    );
+    assert!(text.contains("Bridge delivers it automatically"), "{text}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -1247,10 +1263,7 @@ async fn rename_stopped_midway_reports_each_file_and_the_same_operation_id_finis
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    let warmup = actor
-        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
-        .await;
-    assert_eq!(actor.settle(&fixture, warmup).await["kind"], "outline");
+    batch_wait_semantic_provider(&mut actor, &fixture, "src/lib.rs").await;
     let rename = json!({"operation_id":"rename-op","op":"rename","symbol":"src/lib.rs#helper","new_name":"assist"});
 
     let (reply, text) = settled_edit(&mut actor, &fixture, rename.clone()).await;
@@ -1376,7 +1389,7 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
     assert!(
         text.starts_with(
             "tests #1: started — 5 targets in 3 runs (budget 120 s); the result is retained under \
-             its reference; Bridge delivers it automatically when configured\n"
+             its reference; Bridge delivers it automatically\n"
         ),
         "{text}"
     );

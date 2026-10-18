@@ -27,7 +27,7 @@ The kind set is closed. Adding a kind is a contract revision.
 
 | Kind | Producer | Subject form | Source-bearing | Body |
 |---|---|---|---|---|
-| `test-finished` | test run settlement; text `M024-M026-TEST-FACT` r3 (`terminal_fact`) | `tests #N` | no | `summary` (<= 256 bytes) + `detail`, together <= 1536 bytes: counts, <= 8 `FAIL` entries, `rerun:` (<= 300 bytes), `full output: ide.inspect <ref>` |
+| `test-finished` | test run settlement; shared `terminal_fact` | `tests #N` | no | `summary` (<= 256 bytes) + `detail`, together <= 3584 bytes: counts, <= 8 `FAIL` entries, target exits, `rerun:` (<= 300 bytes), explicit `<ref>/output/1` route |
 | `edit-checked` | edit project check; single- and multi-file | `edit <operation_id>` | no | §3.3 |
 | `job-ready` | a job registered with `defer` (§3.2): a reply that went `pending`, a pending batch job, a precise answer after an approximate one, an accepted graph job | `<tool> <target>` or `batch <detail_ref>: items i,j` | yes for context/outline/read/symbol/graph/diff answers; no for edit, start, test | the job's final reply or final failure |
 | `lost-after-restart` | session re-activation after a daemon replacement | `restart` | no | §10 |
@@ -54,7 +54,7 @@ pub trait SessionOutbox: Send + Sync {
 ```
 
 `FactDraft` carries `kind`, `subject` (<= 128 bytes, one line), `summary` (<= 256 bytes, one
-line), `detail` (summary + detail <= 2048 bytes; 1536 for `test-finished`; 32 KiB for a
+line), `detail` (summary + detail <= 2048 bytes; 3584 for `test-finished`; 32 KiB for a
 source-bearing `job-ready` handed to Bridge), `detail_ref`, `failed`, `source_bearing` and up to 16
 `fence_paths`. `DeferSpec` carries `tool`, `target` (<= 120 bytes; subject = `"<tool> <target>"`)
 and `fence_paths`. `JobEpoch` is the fence the worker captured when the job **started executing**
@@ -82,8 +82,12 @@ edit-checked edit <operation_id>: <K> files, <N> new errors, <M> new warnings
   new: <path>:<line>: <message>                        (at most 8 lines, message <= 160 bytes, sanitized)
 ```
 
-The summary says `clean` when nothing is new and `unknown (check did not finish)` at the
-`EDIT_CHECK_WAIT` deadline. Fence: the written files with their post-write digests. The whole
+The summary says `clean` only for completed analysed checks with no new problems. A known
+unavailable environment is reported inline before check acceptance and creates no check wake.
+Every accepted check settles through Bridge, including later unavailable, cancelled, superseded
+or failed checks; those terminal reasons never imply a clean check. Transient failed attempts
+remain visible to the accepted waiter even if the ordinary problem feed retains an older usable
+report. Fence: the checked operation's generation and written files with post-write digests. The whole
 fact stays <= 2048 bytes. Labelled data only: no imperative sentences, no `poll`, no elapsed
 seconds of unfinished work. Untrusted runner/checker text is sanitized (control characters become
 spaces; `<` and `>` become `?`).
@@ -111,20 +115,30 @@ there is no session fact list to read.
 
 `ide.test {"status": N}` and `ide.inspect "tests #N"` stay: an on-demand read of one run. A running
 run answers `tests #N: running` (no elapsed seconds, no poll hint); a settled run answers the
-`test-finished` body. Neither is taught as a way to wait.
+`test-finished` body. Neither is taught as a way to wait. The original result reference always
+returns that compact completion. Only explicit `<ref>/output/N` references deliver full-log
+pages; continuations name the next numbered page. Repeating a delivered page returns a single
+pointer line to the compact result. Successful reply handoff advances the cursor, and the last
+page keeps the bounded capture until the owning detail expires. Explicit
+`ide.test {"output":"<ref>/output/N"}` restores any retained page after context loss without
+moving the ordinary cursor. It uses the same ownership/access proof and refuses malformed,
+foreign, expired, wrong-tool and out-of-range references.
 
 ### 8.6 `ide.edit` and its project check
 
-`ide.edit` answers right after its write settles: when the session ledger can track the check, the
-reply carries `diagnostics: pending` at once without waiting for the project check, and the check
-continues up to `EDIT_CHECK_WAIT` (90 s). Its outcome, or `unknown` at that deadline, stays retained
-under the reply's reference and becomes one `edit-checked` fact (§3.3) handed to Bridge when
-configured. A check that cannot be tracked is waited for as before.
+`ide.edit` can answer after its write with `diagnostics: pending` when its completion is tracked.
+A known unavailable environment answers inline with its reason, without a redundant check wake.
+Checks continue up to `EDIT_CHECK_WAIT` (90 s); every outcome stays under the original reference.
+Every accepted check produces a terminal fact (§3.3). Later unanalysed/unavailable outcomes
+carry their cause, cancellation and deadline closure stay explicit, and a newer checked source
+generation supersedes the old waiter rather than verifying its edit. An owed report that ends
+unknown produces a failed `job-ready` notice stating the edit settled but checks did not finish;
+terminal job errors also remain completion facts.
 
 ### 8.7 Reply wording
 
 Reply texts name no polling call. Pending, edit-check and test-start replies say the result is
-retained under its reference and that Bridge delivers it automatically when configured. Without
+retained under its reference and that Bridge delivers it automatically. Without
 Bridge delivery (`docs/assistance-launcher.md`) the retained result is read explicitly with its
 reference.
 

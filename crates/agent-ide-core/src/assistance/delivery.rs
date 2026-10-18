@@ -8,7 +8,11 @@
 //! is synchronous bookkeeping under short locks, except the detached Bridge publication; nothing
 //! awaits while a lock is held.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeSet,
+    path::{Component, PathBuf},
+    sync::Arc,
+};
 
 use serde_json::Value;
 
@@ -387,7 +391,7 @@ fn edit_checked_fact(
                 false,
             ),
             None,
-            false,
+            true,
         ),
         EditDiagnostics::Unknown {} | EditDiagnostics::Pending { .. } => {
             ("1 file, diagnostics unknown".to_owned(), None, false)
@@ -413,11 +417,255 @@ fn edit_checked_fact(
     }
 }
 
+/// Normalizes only harmless current-directory components of an admitted relative edit path.
+/// Empty, absolute, root, prefix and parent-traversing inputs have no usable source identity.
+fn normalized_edit_path(path: &std::path::Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+/// Re-proves one owned edit-proof snapshot for recovery or detached publication. A primary is
+/// mandatory; normalized expected paths must be nonempty and exactly covered by digest-bearing
+/// primary/extra captures in the same authority/worktree/epoch. Every capture is freshly
+/// authorized/reread; failure returns false. The caller establishes ownership of the reference
+/// before taking this snapshot. No ledger mutation, writes or task detachment occurs here.
+pub(super) async fn reprove_edit_sources(
+    workspace: &crate::workspace::durable::DurableWorkspace<'_>,
+    bindings: &std::sync::Mutex<super::HostBindingGuard>,
+    binding: &BindingRef,
+    authority: &super::AuthorityStamp,
+    expected: &BTreeSet<PathBuf>,
+    primary: &super::SourceObservation,
+    extra: &[super::SourceObservation],
+) -> bool {
+    let Some(expected) = expected
+        .iter()
+        .map(|path| normalized_edit_path(path))
+        .collect::<Option<BTreeSet<_>>>()
+    else {
+        return false;
+    };
+    if expected.is_empty() || extra.len() + 1 != expected.len() {
+        return false;
+    }
+    let captured = std::iter::once(primary)
+        .chain(extra)
+        .map(|source| {
+            (source.bytes().is_some()
+                && source.worktree() == authority.worktree()
+                && source.authority_epoch() == authority.epoch())
+            .then(|| normalized_edit_path(source.path()))
+            .flatten()
+        })
+        .collect::<Option<BTreeSet<_>>>();
+    if captured.as_ref() != Some(&expected) {
+        return false;
+    }
+    for source in std::iter::once(primary).chain(extra) {
+        if super::reprove_disclosure(
+            workspace,
+            bindings,
+            binding,
+            Some(authority),
+            Some(source),
+            None,
+        )
+        .await
+        .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+impl Shared {
+    /// Returns the exact expected committed path set retained with this result, independent of
+    /// successful source capture. Missing/poisoned/empty/unsafe state is unproven (`None`). Only
+    /// harmless current-directory components are normalized; absolute/root/parent/prefix paths
+    /// refuse. This performs no I/O and grants no authority: the caller must establish binding,
+    /// reauthorize and compare every captured path/digest before using it as clean-check proof.
+    pub(super) fn committed_edit_paths(&self, reference: &str) -> Option<BTreeSet<PathBuf>> {
+        let progress = self
+            .ledger
+            .lock()
+            .ok()?
+            .details
+            .get(reference)?
+            .progress
+            .clone();
+        let progress = progress.lock().ok()?;
+        let paths = progress
+            .committed
+            .iter()
+            .map(|path| normalized_edit_path(std::path::Path::new(path)))
+            .collect::<Option<BTreeSet<_>>>()?;
+        (!paths.is_empty()).then_some(paths)
+    }
+
+    /// Proves a complete current edit source set for an already-owned result reference. The
+    /// expected paths come only from retained committed effects; every capture must have a digest,
+    /// match this authority/worktree/epoch, and cover exactly that nonempty set without duplicates.
+    /// Reauthorization and source rereads run outside all ledger locks; missing/poisoned state
+    /// or any failed proof returns false. This neither rewrites nor changes
+    /// historical receipts and is shared by current-result recovery and checked-fact publication.
+    pub(super) async fn committed_edit_proof_current(
+        &self,
+        workspace: &crate::workspace::durable::DurableWorkspace<'_>,
+        binding: &BindingRef,
+        reference: &str,
+        authority: &crate::workspace::authority::AuthorityStamp,
+        sources: &[crate::workspace::observation::SourceObservation],
+    ) -> bool {
+        let Some(expected) = self.committed_edit_paths(reference) else {
+            return false;
+        };
+        let owned = || {
+            self.ledger.lock().is_ok_and(|ledger| {
+                ledger
+                    .details
+                    .get(reference)
+                    .is_some_and(|detail| detail.binding == *binding)
+            })
+        };
+        if !owned() || sources.len() != expected.len() {
+            return false;
+        }
+        let Some((primary, extra)) = sources.split_first() else {
+            return false;
+        };
+        if !reprove_edit_sources(
+            workspace,
+            &self.bindings,
+            binding,
+            authority,
+            &expected,
+            primary,
+            extra,
+        )
+        .await
+        {
+            return false;
+        }
+        owned()
+    }
+
+    /// Retains the committed receipt and exact post-write sources before returning it to a caller.
+    /// This does not settle the independently accepted check or publish a terminal fact. A prior
+    /// progress deferral is replaced by that check's existing in-flight registration, so a lost
+    /// initial reply cannot cause a duplicate job-ready fact or repeat a write.
+    pub(super) fn retain_edit_receipt(
+        &self,
+        job: &Job,
+        reply: &PeerReply,
+        authority: &crate::workspace::authority::AuthorityStamp,
+        sources: Vec<crate::workspace::observation::SourceObservation>,
+    ) {
+        if let Ok(mut ledger) = self.ledger.lock()
+            && let Some(detail) = ledger.details.get_mut(&job.reference)
+            && detail.binding == *job.invocation.binding_ref()
+        {
+            let mut sources = sources.into_iter();
+            detail.reply = reply.clone();
+            detail.authority = Some(authority.clone());
+            detail.source = sources.next();
+            detail.extra_sources = sources.collect();
+            detail.native_epoch = job.native_epoch;
+            detail.line_movement = super::reply_line_movement(reply);
+            if let Ok(mut progress) = detail.progress.lock() {
+                progress.check_pending = true;
+                progress.usable_reply(
+                    job.tool,
+                    &job.reference,
+                    self.request_of(&job.reference).as_deref(),
+                    reply,
+                    detail.source.is_some(),
+                );
+            }
+            ledger.deferred.remove(&job.reference);
+        }
+        if self.committed_edit_paths(&job.reference).is_none() {
+            crate::errorlog::record(
+                crate::errorlog::Method::Daemon,
+                crate::errorlog::Outcome::Incomplete,
+                crate::errorlog::Fields {
+                    correlation: Some(&job.reference),
+                    detail: Some("edit_receipt: committed path proof unavailable"),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// Whether a retained committed receipt still has an accepted check to settle. Poisoned or
+    /// missing state is never treated as a pending receipt; ordinary inspection still reauthorizes.
+    pub(super) fn edit_check_pending(&self, reference: &str) -> bool {
+        let progress = self.ledger.lock().ok().and_then(|ledger| {
+            ledger
+                .details
+                .get(reference)
+                .map(|detail| detail.progress.clone())
+        });
+        progress
+            .is_some_and(|progress| progress.lock().is_ok_and(|progress| progress.check_pending))
+    }
+}
+
+/// Closes a check that owed a terminal result but could not produce matching diagnostics.
+/// The edit already settled; this failed job notice never claims the write failed or vanished.
+pub(super) fn incomplete_check_fact(reference: &str, operation_id: &str) -> FactDraft {
+    FactDraft {
+        kind: FactKind::JobReady,
+        subject: bounded(&format!("edit {operation_id}"), MAX_SUBJECT_BYTES, false),
+        summary: "edit settled; checks unavailable: matching diagnostics did not finish".into(),
+        detail: None,
+        detail_ref: Some(reference.to_owned()),
+        failed: true,
+        source_bearing: false,
+        fence_paths: Vec::new(),
+    }
+}
+
+/// Selects a terminal edit completion without discarding required failures.
+/// This runs only after accepted work was registered: even an unavailable check must settle it.
+/// An unknown matching result closes its outstanding wait with a failed job notice.
+/// Every other terminal job outcome still produces a fact so an early caller is not stranded.
+fn edit_completion_fact(reference: &str, reply: &PeerReply) -> FactDraft {
+    match reply {
+        PeerReply::Edit {
+            result,
+            diagnostics: EditDiagnostics::Unknown {},
+            ..
+        } => incomplete_check_fact(reference, &result.operation_id),
+        PeerReply::Edit {
+            result,
+            diagnostics,
+            ..
+        } => edit_checked_fact(reference, result, diagnostics),
+        _ => job_fact(
+            reference,
+            reply,
+            &DeferSpec {
+                tool: AssistanceTool::Edit,
+                target: reference.to_owned(),
+                fence_paths: Vec::new(),
+            },
+        ),
+    }
+}
+
 impl Worker<'_> {
     /// Answers an edit whose project check is still running with `diagnostics: pending` at once,
     /// right after the write is observed, without waiting for the check (symbol-read-edit-v1 §3.3).
     ///
-    /// Only a caller still waiting is answered, and only when the session ledger can track the
+    /// A live caller is answered after the receipt is retained, when the session ledger tracks the
     /// check as in-flight work under the job's reference: the job stays parked on its check and
     /// its settlement hands one `edit-checked` fact to Bridge ([`Shared::job_settled`]). The write
     /// is counted before the registration, so the fact's fence epoch includes its own edit.
@@ -426,12 +674,8 @@ impl Worker<'_> {
         let JobStage::EditAwaitingCheck { result, .. } = stage else {
             return;
         };
-        let waiting = job
-            .stop_reply
-            .as_ref()
-            .is_some_and(|sender| !sender.is_closed());
         let binding = job.invocation.binding_ref().clone();
-        if !waiting || !self.shared.outbox.is_open(&binding) {
+        if self.shared.edit_check_pending(&job.reference) || !self.shared.outbox.is_open(&binding) {
             return;
         }
         if result.outcome.has_post_source() {
@@ -451,10 +695,25 @@ impl Worker<'_> {
                 .filter(|_| result.outcome.has_post_source()),
             operation: edit_operation(&job.parameters),
         };
-        if let Some(sender) = job.stop_reply.take()
-            && sender.send(reply).is_err()
+        let JobStage::EditAwaitingCheck {
+            refreshed,
+            authority,
+            ..
+        } = stage
+        else {
+            return;
+        };
+        let mut sources: Vec<_> = refreshed.iter().cloned().collect();
+        if let Ok(ledger) = self.shared.ledger.lock()
+            && let Some(detail) = ledger.details.get(&job.reference)
         {
-            let _ = self.shared.outbox.take_work(&job.reference);
+            sources.extend(detail.extra_sources.iter().cloned());
+        }
+        self.shared
+            .retain_edit_receipt(job, &reply, authority, sources);
+        if let Some(sender) = job.stop_reply.take() {
+            // The check remains owed even if the transport receiver already left.
+            let _ = sender.send(reply);
         }
     }
 }
@@ -486,6 +745,14 @@ impl SessionOutbox for Shared {
         let Some(detail) = ledger.details.get(reference) else {
             return false;
         };
+        if detail
+            .progress
+            .lock()
+            .is_ok_and(|progress| progress.check_pending)
+        {
+            // The durable receipt is ready; its independently held check owns terminal delivery.
+            return false;
+        }
         let owner = detail.binding.clone();
         // The state the job started from (OUTBOX §3.1); a job still queued has not started, so
         // the session's state now is the closest earlier bound.
@@ -549,7 +816,10 @@ impl Shared {
     /// under its reference and nothing else delivers it. A fact that carries source or names an
     /// authority is re-proved on the detached task right before publication and is replaced by an
     /// explicit superseded result when access or freshness changed. A retired binding emits
-    /// nothing. Returns whether at least one local Bridge handoff was reserved and spawned; an
+    /// nothing. EditChecked additionally requires the complete independent committed path set
+    /// and a digest-bearing primary plus every secondary capture, proved by the shared edit
+    /// source helper; authority alone and a captured subset cannot claim a clean check.
+    /// Returns whether at least one local Bridge handoff was reserved and spawned; an
     /// accepted or uncertain async publication is never retried through another carrier.
     pub(super) fn push_or_transfer(&self, recipients: &[BindingRef], draft: FactDraft) -> bool {
         let bridge = self.bridge.lock().ok().and_then(|bridge| bridge.clone());
@@ -574,7 +844,8 @@ impl Shared {
                 }
                 continue;
             };
-            let source_proof = if draft.source_bearing || draft.detail.is_some() {
+            let check_result = draft.kind == FactKind::EditChecked;
+            let source_proof = if check_result || draft.source_bearing || draft.detail.is_some() {
                 draft.detail_ref.as_ref().and_then(|reference| {
                     self.ledger.lock().ok().and_then(|ledger| {
                         ledger
@@ -586,6 +857,7 @@ impl Shared {
                                     detail.authority.clone(),
                                     detail.source.clone(),
                                     detail.diff_provenance.clone(),
+                                    detail.extra_sources.clone(),
                                 )
                             })
                     })
@@ -593,6 +865,17 @@ impl Shared {
             } else {
                 None
             };
+            // Ownership was established by the retained row above. Read the independent full
+            // committed set only after releasing its ledger lock; absent/poisoned state fails
+            // the check claim and never falls back to the captured subset itself.
+            let expected_edit_paths = (check_result && source_proof.is_some())
+                .then(|| {
+                    draft
+                        .detail_ref
+                        .as_ref()
+                        .and_then(|reference| self.committed_edit_paths(reference))
+                })
+                .flatten();
             let workspace = self
                 .publication_workspace
                 .lock()
@@ -616,22 +899,51 @@ impl Shared {
                 // without an authority retain the already checked active-binding boundary.
                 let has_authority = source_proof
                     .as_ref()
-                    .is_some_and(|(authority, _, _)| authority.is_some());
-                if draft.source_bearing || has_authority {
+                    .is_some_and(|(authority, _, _, _)| authority.is_some());
+                if check_result || draft.source_bearing || has_authority {
                     let permitted =
-                        if let (Some(workspace), Some((Some(authority), source, paths))) =
+                        if let (Some(workspace), Some((Some(authority), source, paths, extras))) =
                             (workspace, source_proof)
                         {
-                            super::reprove_disclosure(
-                                &workspace,
-                                &bindings,
-                                &binding,
-                                Some(&authority),
-                                source.as_ref(),
-                                paths.as_ref(),
-                            )
-                            .await
-                            .is_ok()
+                            if check_result {
+                                match (expected_edit_paths, source) {
+                                    (Some(expected), Some(primary)) => {
+                                        reprove_edit_sources(
+                                            &workspace, &bindings, &binding, &authority, &expected,
+                                            &primary, &extras,
+                                        )
+                                        .await
+                                    }
+                                    _ => false,
+                                }
+                            } else {
+                                let mut permitted = super::reprove_disclosure(
+                                    &workspace,
+                                    &bindings,
+                                    &binding,
+                                    Some(&authority),
+                                    source.as_ref(),
+                                    paths.as_ref(),
+                                )
+                                .await
+                                .is_ok();
+                                for extra in &extras {
+                                    if !permitted {
+                                        break;
+                                    }
+                                    permitted = super::reprove_disclosure(
+                                        &workspace,
+                                        &bindings,
+                                        &binding,
+                                        Some(&authority),
+                                        Some(extra),
+                                        None,
+                                    )
+                                    .await
+                                    .is_ok();
+                                }
+                                permitted
+                            }
                         } else {
                             false
                         };
@@ -691,6 +1003,11 @@ impl Shared {
         reply: &PeerReply,
         deferred: Option<(DeferSpec, JobEpoch)>,
     ) {
+        if let Some(status) = self.test_runs.started_run(reference, owner)
+            && let Some(result) = status.result.as_ref()
+        {
+            self.retain_test_output(status.id, owner, result);
+        }
         let held = self.outbox.take_work(reference);
         if let PeerReply::Edit { result, .. } = reply
             && result.outcome.has_post_source()
@@ -709,19 +1026,11 @@ impl Shared {
             self.push_or_transfer(std::slice::from_ref(owner), draft);
             return;
         }
-        if let (
-            Some(work),
-            PeerReply::Edit {
-                result,
-                diagnostics,
-                ..
-            },
-        ) = (held, reply)
-        {
-            self.push_or_transfer(
-                std::slice::from_ref(&work.owner),
-                edit_checked_fact(reference, result, diagnostics),
-            );
+        if let Some(work) = held {
+            let draft = edit_completion_fact(reference, reply);
+            let mut recipients = vec![work.owner];
+            recipients.extend(work.subscribers);
+            self.push_or_transfer(&recipients, draft);
         }
     }
 
@@ -879,6 +1188,55 @@ mod tests {
             call_target(AssistanceTool::Read, &serde_json::json!({ "path": long })).len(),
             MAX_TARGET_BYTES
         );
+    }
+
+    /// Every accepted check settles, including postacceptance unavailable diagnostics; known
+    /// unavailable checks never register work and therefore never reach this publication path.
+    #[test]
+    fn unavailable_checks_do_not_hide_required_terminal_failures() {
+        let result = EditResult {
+            operation_id: "availability".into(),
+            path: "src/lib.rs".into(),
+            outcome: crate::changes::edit::EditOutcome::Replaced,
+            source_ref: None,
+        };
+        let unchecked = PeerReply::Edit {
+            result: result.clone(),
+            diagnostics: EditDiagnostics::NotAnalysed {
+                reason: "checks unavailable: missing cargo home".into(),
+            },
+            note: None,
+            operation: None,
+        };
+        let unavailable = edit_completion_fact("edit-ref", &unchecked);
+        assert!(unavailable.summary.contains("missing cargo home"));
+        assert!(unavailable.validate().is_ok());
+        let reply = PeerReply::Edit {
+            result,
+            diagnostics: EditDiagnostics::CurrentClean { project_errors: 0 },
+            note: None,
+            operation: None,
+        };
+        assert_eq!(
+            edit_completion_fact("edit-ref", &reply).kind,
+            FactKind::EditChecked
+        );
+        let mut timeout = reply.clone();
+        if let PeerReply::Edit { diagnostics, .. } = &mut timeout {
+            *diagnostics = EditDiagnostics::Unknown {};
+        }
+        assert_eq!(
+            edit_completion_fact("edit-ref", &timeout).kind,
+            FactKind::JobReady
+        );
+        let fatal = PeerReply::Error {
+            code: super::super::super::reply::FailureCode::Internal,
+            detail: None,
+        };
+        let fact = edit_completion_fact("edit-ref", &fatal);
+        assert!(fact.failed);
+        assert_eq!(fact.kind, FactKind::JobReady);
+        assert_eq!(fact.validate(), Ok(()));
     }
 
     /// A settled run becomes a `test-finished` draft that is exactly M-024's terminal text, valid
@@ -1120,6 +1478,7 @@ mod worker_tests {
         handle.shared.ledger.lock().unwrap().details.insert(
             reference.to_owned(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply,
                 selection: (
@@ -1500,7 +1859,7 @@ mod worker_tests {
         let (sent, received) = tokio::sync::oneshot::channel();
         let server = std::thread::spawn(move || {
             let mut bodies = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(3)))
@@ -1549,6 +1908,12 @@ mod worker_tests {
                 "SOURCE_MUST_NOT_LEAK",
                 true,
             ),
+            (
+                FactKind::EditChecked,
+                "clean check",
+                "OLD_CLEAN_MUST_NOT_LEAK",
+                false,
+            ),
         ] {
             assert!(handle.shared.push_or_transfer(
                 std::slice::from_ref(&owner),
@@ -1589,6 +1954,11 @@ mod worker_tests {
             !bodies
                 .iter()
                 .any(|body| body.contains("SOURCE_MUST_NOT_LEAK"))
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|body| body.contains("OLD_CLEAN_MUST_NOT_LEAK"))
         );
     }
 

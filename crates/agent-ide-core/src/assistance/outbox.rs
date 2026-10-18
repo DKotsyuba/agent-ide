@@ -24,8 +24,8 @@ pub const MAX_SUBJECT_BYTES: usize = 128;
 pub const MAX_SUMMARY_BYTES: usize = 256;
 /// Longest fact text: summary plus detail, in UTF-8 bytes (OUTBOX §3.3).
 pub const MAX_FACT_BYTES: usize = 2048;
-/// Longest `test-finished` summary plus detail, in UTF-8 bytes (`M024-M026-TEST-FACT` r3).
-pub const MAX_TEST_FACT_BYTES: usize = 1536;
+/// Longest compact `test-finished` body, retaining every bounded target outcome below 4 KiB.
+pub const MAX_TEST_FACT_BYTES: usize = 3584;
 /// Largest self-contained source result handed to Bridge; remains below wire/native limits.
 pub const MAX_SOURCE_FACT_BYTES: usize = 32 * 1024;
 /// Most fenced paths one fact or deferred job may name (OUTBOX §3.1).
@@ -401,7 +401,7 @@ mod tests {
         BindingRef::fixture(actor, "channel-a", 1)
     }
 
-    /// Validation enforces each OUTBOX §3 budget, including the 1536-byte test-fact limit.
+    /// Validation enforces each OUTBOX §3 budget, including the 3584-byte test-fact limit.
     #[test]
     fn drafts_are_validated_against_the_contract_budgets() {
         assert_eq!(test_draft().validate(), Ok(()));
@@ -414,7 +414,11 @@ mod tests {
         let mut draft = test_draft();
         draft.detail = Some("y".repeat(MAX_TEST_FACT_BYTES));
         assert_eq!(draft.validate(), Err(DraftError::Detail));
+        draft.detail = Some("y".repeat(MAX_TEST_FACT_BYTES - draft.summary.len()));
+        assert_eq!(draft.validate(), Ok(()));
         draft.kind = FactKind::JobReady;
+        assert_eq!(draft.validate(), Err(DraftError::Detail));
+        draft.detail = Some("y".repeat(MAX_FACT_BYTES - draft.summary.len()));
         assert_eq!(
             draft.validate(),
             Ok(()),

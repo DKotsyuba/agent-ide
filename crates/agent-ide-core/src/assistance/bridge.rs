@@ -1189,10 +1189,11 @@ mod tests {
 
     /// A route removed after reservation but before publication is definite no-effect: the
     /// prepared intent retires, no transport call occurs and the caller keeps restart-loss work.
+    /// Keep the scratch label short so socket paths fit macOS SUN_LEN under isolated TMPDIRs.
     #[tokio::test]
     async fn route_retired_before_publication_is_definite_no_effect() {
         use std::os::unix::{fs::PermissionsExt, net::UnixListener};
-        let scratch = crate::scratch::ScratchDir::new("bridge-retired-before-publish");
+        let scratch = crate::scratch::ScratchDir::new("br-retired");
         let config = BridgeConfig {
             registration_socket: scratch.join("adapter.sock"),
             core_socket: scratch.join("core.sock"),

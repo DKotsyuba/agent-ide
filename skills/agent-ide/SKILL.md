@@ -1,64 +1,50 @@
 ---
 name: agent-ide
-description: Batch source discovery, reads, atomic edits and tests. In Bridge mode graph/test completion arrives automatically; end an idle turn and never poll.
+description: Task-based Agent IDE workflow, compatible batches, native fallback and automatic async delivery.
 ---
 
 # Agent IDE
 
-Call `ide.start` once per agent/worktree. Paths are relative. An address is
-`src/a.rs#Type/method`; `:3-5` selects a symbol window; `src/a.rs#@imports` is a region.
-Ten tools: start, stop, outline, symbol, graph, read, edit, test, diff, inspect.
+The tool descriptions define each call; this skill holds the rules. Call `ide.start` first.
 
-## Batch workflow
+## One bounded batch per topic
 
-Collect the related set first. Use one bounded batch per phase, rather than one call per
-file/symbol/hunk. Batch outline paths/glob, symbol/graph symbols, read items, edits and test
-targets. Review changed paths in one diff; fetch known detail_refs together only when needed.
-Start/stop are once-per-task lifecycle calls.
+Collect the related set, then send one call per phase instead of one per file, symbol or hunk.
+Split only at an advertised limit or for newly found work.
 
-1. Discover related changes together. `ide.symbol` gives a card and **direct** neighbors.
-   Positive callers/callees values never request deeper traversal. For a precise UTF-8
-   use-site use `path` + `byte_offset`.
-2. For shared signatures, indirect faults or wider impact:
+1. Choose the needed information: a known address goes directly to `ide.read`, needed structure
+   to `ide.outline` paths/glob, definitions/references to `ide.symbol` symbols. No preliminary
+   outline or graph is required. For needed call chains:
    `ide.graph {"symbols":["src/a.rs#Store/get","src/b.rs#load"],"direction":"callers","depth":2}`.
-   Callers show impact, callees show dependencies, both shows both sides. Depth is 1–3;
-   `tests:true` expands tests. In Bridge mode graph always accepts an asynchronous job,
-   including a warm cache; acceptance is not the graph. Approximate/lexical edges and
-   unavailable coverage remain explicit, never exact negative evidence.
-3. Read related code together:
-   `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"docs/b.md","offset":1,"limit":80}]}`
-   (path ranges only for non-code text).
-   In an observed context epoch, unchanged delivered items return an acknowledgement.
-   Reuse prior code; `force:true` handles lost context or an intentional reread. Unknown
-   context keeps suppression off.
-4. Apply related production/tests edits in one atomic call:
-   `ide.edit {"files":[{"path":"src/a.rs","changes":[{"symbol":"src/a.rs#Store/get","content":"fn get(&self) {}"}]},{"path":"src/b.rs","changes":[{"symbol":"src/b.rs#load","content":"fn load() {}"}]}]}`.
-   Files also accept scoped old/new changes or {path,create:true,content}.
-   Optional `operation_id` makes retries safe. A refusal writes nothing; use its current
-   source. Successful writes and the later project-check result are separate.
-5. Launch related tests/checks together:
-   `ide.test {"targets":[{"symbol":"src/a.rs#parse"},{"command":["cargo","check"]}],"budget_s":120}`.
-   One run ID, ordered steps, one budget and per-target outcomes. Commands use root cwd.
-   Unavailable counts are not passing tests.
+2. Read: `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"docs/b.md","offset":1,"limit":80}]}`.
+3. Edit production code and tests together:
+   `ide.edit {"files":[{"path":"src/a.rs","changes":[{"symbol":"src/a.rs#Store/get","content":"fn get(&self) {}"}]},{"path":"tests/b.rs","create":true,"content":"fn t() {}"}]}`.
+4. Test: `ide.test {"targets":[{"symbol":"src/a.rs#parse"},{"command":["cargo","check"]}],"budget_s":120}`.
 
-## Passive completion
+## No duplicate work
 
-In Bridge mode graph/test/deferred-check results arrive automatically. Continue independent
-work; otherwise **end the current model turn** and keep activation/run alive. Never poll,
-sleep, self-message, call `finish` or `ide.stop` while waiting. Bridge wakes a qualified live
-receiver. Delivery failure does not permit another IDE carrier or fabricated wake support.
+- Reuse sufficient delivered source, check results and diffs. Additional or native reads/tests
+  need a named gap, changed source, refusal or unavailability; required independent or broader
+  verification remains valid.
+  An acknowledgement for an unchanged item means: use the copy you hold; `force:true` only after
+  lost context. Do not re-read your own successful edit; an edit reply that names committed files
+  is the write, so skip ls or git status checks.
+- Do not refetch sufficient passed logs or delivered pages. Explicit output recovery after
+  context loss is valid. Unavailable test counts are not a pass.
+- `ide.diff` is optional after an equivalent reviewed Git diff. Group independent compatible
+  protocol calls; preserve dependencies. Any needed final diff completes before `ide.stop`.
 
-`ide.test {"result":3}` reads a saved result; `ide.test {"history":true}` lists retained runs;
-`ide.test {"detail_ref":"…"}` continues output. History is actor/channel/worktree scoped,
-across activations, up to ten minutes/four completed runs in this daemon; restart loses it.
-`ide.test {"cancel":3}` cancels your current-generation run; completion follows group cleanup.
-Ending a turn does not cancel work. Extra pages use `ide.graph {"detail_ref":"…"}` or
-`ide.read {"detail_ref":"…"}`; stale source may require recomputation.
+## Pending results
 
-`ide.inspect` remains for diagnostics/problems and starts no checks. Never poll with it.
-Unknown never means clean. `ide.diff` is optional for incremental/paged changes; Git diff is
-valid. Call `ide.stop` at task end, after collecting required outcomes.
+A `pending` reply or retained result is not a failure. Plain file reads answer synchronously.
+A committed edit receipt identifies actual written files independently of background checks;
+zero-commit `edit_progress` is unresolved. Bridge automatically delivers accepted async results.
+Continue independent work or end the turn while retaining the task/session. Never poll, sleep,
+repeat the original call, finish or `ide.stop` with required work still owed. One bounded
+`ide.inspect` with the reply's `detail_ref` and `wait_s` (1..30) is recovery only, never an
+ordinary read/edit step.
 
-Discover missing tools once. Try a refusal's Repair once; if the tool is unavailable, still refused
-or gives no Repair, continue with native tools. Verify uncertain writes before another mutation.
-Preserve freshness; never invent graph coverage, test counts or delivery success.
+## Failures
+
+Try a refusal's Repair once; if the tool stays refused or unavailable, continue with native tools
+and name the call. Verify an uncertain write before another mutation.

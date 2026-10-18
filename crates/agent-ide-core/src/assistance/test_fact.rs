@@ -16,7 +16,7 @@ const MAX_SUMMARY_BYTES: usize = 256;
 
 /// Longest `summary` plus `detail` of one fact: the `test-finished` body limit of the session
 /// outbox contract.
-const MAX_FACT_BYTES: usize = 1536;
+const MAX_FACT_BYTES: usize = 3584;
 
 /// Most `FAIL` entries a fact lists; the rest are counted in one `+K more` line.
 const MAX_FAILURES: usize = 8;
@@ -73,8 +73,9 @@ impl TerminalFact {
 }
 
 /// The sentence that ends a started line: the long run stays retained under its reference and
-/// Bridge delivers it automatically only when configured (session outbox contract §8.7).
-const RESULT_ARRIVES: &str = "; the result is retained under its reference; Bridge delivers it automatically when configured";
+/// Bridge delivers it automatically (session outbox contract §8.7).
+const RESULT_ARRIVES: &str =
+    "; the result is retained under its reference; Bridge delivers it automatically";
 
 /// Renders the reply to a successful `ide.test` start of run `id`: the command the run executes
 /// (`command`, already shell-quoted for display), the optional count of selected tests
@@ -121,16 +122,18 @@ struct Entry {
 /// any output).
 ///
 /// The summary is chosen from the run's state, first match wins:
-/// - the budget killed the run: `stopped at budget B s — P passed, F failed so far`;
+/// - owner cancellation: `cancelled — P passed, F failed so far (exit C)`;
+/// - the budget killed the run: `stopped at budget B s — P passed, F failed so far (exit C)`;
+///   either state says `test counts unavailable` or `exit unavailable` when not observed;
 /// - no recognised summary, so only the exit status is known: `exit C, S s`, followed by the
 ///   last output lines;
 /// - a non-zero exit with no counted test: `no test results (exit C), S s — runner said: …`;
-/// - otherwise `P passed, F failed, S s`.
+/// - otherwise `P passed, F failed, S s (exit C)`, or explicit unknown exit after a signal.
 ///
 /// The detail lists at most [`MAX_FAILURES`] failing tests, one line per target of a
 /// several-target run (cut at [`MAX_TARGET_LINE_BYTES`]), then the rerun command (cut at
 /// [`MAX_RERUN_BYTES`]) and the full-output reference. When the whole text would exceed
-/// [`MAX_FACT_BYTES`], quoted output lines go first, then target lines from the end, then message
+/// [`MAX_FACT_BYTES`], quoted output lines go first, then message
 /// lines from the last entry backwards, then entries from the end (the `+K more` count grows);
 /// the summary, the rerun line and the reference are never dropped. The result depends only on
 /// the arguments: no clock, no I/O.
@@ -148,7 +151,7 @@ pub(crate) fn terminal_fact(_id: u64, result: &RunResult, owns_detail: bool) -> 
     let mut shown = entries.len().min(MAX_FAILURES);
     let mut messages = shown;
     let mut tail_lines = tail.len();
-    let mut target_lines = targets.len();
+    let target_lines = targets.len();
     loop {
         let mut lines = Vec::new();
         for (index, entry) in entries.iter().take(shown).enumerate() {
@@ -176,18 +179,14 @@ pub(crate) fn terminal_fact(_id: u64, result: &RunResult, owns_detail: bool) -> 
         }
         lines.extend(closing.iter().cloned());
         let detail = lines.join("\n");
-        if summary.len() + detail.len() <= MAX_FACT_BYTES
-            || (shown == 0 && tail_lines == 0 && target_lines == 0)
-        {
+        if summary.len() + detail.len() <= MAX_FACT_BYTES || (shown == 0 && tail_lines == 0) {
             return TerminalFact { summary, detail };
         }
         // Shrink in contract order: quoted output first (it is the least specific), then the
-        // target lines from the end, then the message lines from the last entry backwards, then
-        // whole entries from the end.
+        // message lines from the last entry backwards, then whole entries from the end.
+        // Per-target exit outcomes are required and are never dropped.
         if tail_lines > 0 {
             tail_lines -= 1;
-        } else if target_lines > 0 {
-            target_lines -= 1;
         } else if messages > 0 {
             messages -= 1;
         } else {
@@ -204,17 +203,20 @@ pub(super) fn summary_text(result: &RunResult) -> String {
     let report = &result.report;
     let seconds = result.elapsed.as_secs();
     let counted = report.passed != 0 || report.failed != 0;
+    let partial_counts = if summary_absent(result) {
+        "test counts unavailable".to_owned()
+    } else {
+        format!("{} passed, {} failed so far", report.passed, report.failed)
+    };
+    let exit = result
+        .exit
+        .map_or_else(|| "unavailable".to_owned(), |code| code.to_string());
     let mut base = if result.cancelled {
-        format!(
-            "cancelled — {} passed, {} failed so far",
-            report.passed, report.failed
-        )
+        format!("cancelled — {partial_counts} (exit {exit})")
     } else if result.stopped {
         format!(
-            "stopped at budget {} s — {} passed, {} failed so far",
+            "stopped at budget {} s — {partial_counts} (exit {exit})",
             result.budget.as_secs(),
-            report.passed,
-            report.failed
         )
     } else if summary_absent(result) {
         let exit = result
@@ -243,8 +245,21 @@ pub(super) fn summary_text(result: &RunResult) -> String {
     clean(&base, MAX_SUMMARY_BYTES)
 }
 
-/// Renders one indented line per target of a several-target run, each cut to
-/// [`MAX_TARGET_LINE_BYTES`]; a single-target run has none.
+/// Formats one one-based target (1–8) while keeping its terminal outcome intact. Labels and
+/// outcomes are separate inputs, so colons in commands or failure reasons cannot change the
+/// boundary. Untrusted text is sanitized and long labels yield space to the bounded outcome.
+pub(super) fn target_outcome(index: usize, label: &str, outcome: &str) -> String {
+    let head = format!("target {index} ");
+    let outcome = clean(outcome, MAX_TARGET_LINE_BYTES - 32);
+    let label = clean(
+        label,
+        MAX_TARGET_LINE_BYTES - head.len() - outcome.len() - 2,
+    );
+    format!("{head}{label}: {outcome}")
+}
+
+/// Indents the retained target outcomes, defensively sanitizing/clipping older or synthetic
+/// rows to the same per-line budget. Production rows come from [`target_outcome`].
 pub(super) fn target_lines(result: &RunResult) -> Vec<String> {
     result
         .targets
@@ -263,7 +278,7 @@ pub(super) fn closing_lines(result: &RunResult, owns_detail: bool) -> Vec<String
     if owns_detail && (!result.output.is_empty() || result.output_paged) {
         closing.push(format!(
             "  full output: ide.test {}",
-            serde_json::json!({"detail_ref":result.detail_ref})
+            serde_json::json!({"detail_ref":format!("{}/output/1", result.detail_ref)})
         ));
     }
     closing
@@ -427,11 +442,11 @@ mod tests {
         assert_eq!(fact.summary, "3 passed, 0 failed, 12 s (exit 0)");
         assert_eq!(
             fact.detail,
-            "  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3\"}"
+            "  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3/output/1\"}"
         );
         assert_eq!(
             fact.reply_text(3),
-            "tests #3: 3 passed, 0 failed, 12 s (exit 0)\n  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3\"}"
+            "tests #3: 3 passed, 0 failed, 12 s (exit 0)\n  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3/output/1\"}"
         );
         assert_in_contract(&fact);
     }
@@ -447,7 +462,7 @@ mod tests {
         assert_eq!(fact.summary, "2 passed, 1 failed, 12 s (exit 101)");
         assert_eq!(
             fact.detail,
-            "  FAIL tests::fails\n       src/a.rs:40  assertion failed\n  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3\"}"
+            "  FAIL tests::fails\n       src/a.rs:40  assertion failed\n  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3/output/1\"}"
         );
         assert_in_contract(&fact);
     }
@@ -477,7 +492,7 @@ mod tests {
         assert!(fact.detail.contains("  rerun: cargo test"), "{fact:?}");
         assert!(
             fact.detail
-                .ends_with("  full output: ide.test {\"detail_ref\":\"ref-3\"}"),
+                .ends_with("  full output: ide.test {\"detail_ref\":\"ref-3/output/1\"}"),
             "{fact:?}"
         );
     }
@@ -514,7 +529,7 @@ mod tests {
         let fact = terminal_fact(2, &result, true);
         assert_eq!(
             fact.summary,
-            "stopped at budget 120 s — 4 passed, 1 failed so far"
+            "stopped at budget 120 s — 4 passed, 1 failed so far (exit unavailable)"
         );
         assert!(fact.detail.starts_with("  FAIL tests::slow"), "{fact:?}");
         assert_in_contract(&fact);
@@ -651,13 +666,12 @@ mod tests {
         assert_eq!(
             started_line(4, "cargo test --lib", Some("3 tests selected"), 120),
             "tests #4: started — cargo test --lib (3 tests selected) (budget 120 s); \
-             the result is retained under its reference; Bridge delivers it automatically when \
-             configured"
+             the result is retained under its reference; Bridge delivers it automatically"
         );
         assert_eq!(
             started_line(5, "make test", None, 30),
             "tests #5: started — make test (budget 30 s); the result is retained under its \
-             reference; Bridge delivers it automatically when configured"
+             reference; Bridge delivers it automatically"
         );
         for line in [
             running_line(4),
@@ -676,9 +690,9 @@ mod tests {
     }
 
     /// A several-target run lists one line per target between the failures and the rerun line;
-    /// when space runs out the target lines go before any failure does.
+    /// all target outcomes survive a crowded failure list.
     #[test]
-    fn target_lines_sit_before_the_rerun_line_and_yield_to_failures() {
+    fn target_lines_sit_before_the_rerun_line_and_survive_failures() {
         let mut result = run(3, 1, vec![failure("tests::fails", 4, "boom")]);
         result.targets = vec![
             "target 1 symbol a.rs#f: run 1 — 2 passed, 0 failed".to_owned(),
@@ -687,7 +701,7 @@ mod tests {
         let fact = terminal_fact(8, &result, true);
         assert_eq!(
             fact.detail,
-            "  FAIL tests::fails\n       src/a.rs:4  boom\n  target 1 symbol a.rs#f: run 1 — 2 passed, 0 failed\n  target 2 path b.rs: run 1 — 1 passed, 1 failed\n  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3\"}"
+            "  FAIL tests::fails\n       src/a.rs:4  boom\n  target 1 symbol a.rs#f: run 1 — 2 passed, 0 failed\n  target 2 path b.rs: run 1 — 1 passed, 1 failed\n  rerun: cargo test\n  full output: ide.test {\"detail_ref\":\"ref-3/output/1\"}"
         );
         assert_in_contract(&fact);
         let failures = (0..8)
@@ -706,7 +720,42 @@ mod tests {
         let fact = terminal_fact(8, &crowded, true);
         assert_in_contract(&fact);
         assert_eq!(fact.detail.matches("  FAIL ").count(), 8, "{fact:?}");
-        assert!(fact.detail.matches("\n  target ").count() < 8, "{fact:?}");
+        assert_eq!(fact.detail.matches("\n  target ").count(), 8, "{fact:?}");
+    }
+
+    /// Target labels containing colons cannot consume the outcome's exit or unrunnable state.
+    #[test]
+    fn target_outcomes_survive_long_colon_bearing_labels() {
+        let label = "command tool: argument ".repeat(40);
+        let counted = target_outcome(1, &label, "run 1 — 2 passed, 1 failed (exit 101)");
+        assert!(counted.len() <= MAX_TARGET_LINE_BYTES);
+        assert!(counted.ends_with("run 1 — 2 passed, 1 failed (exit 101)"));
+        let skipped = target_outcome(2, &label, "not runnable: no matching runner");
+        assert!(skipped.ends_with(": not runnable: no matching runner"));
+    }
+
+    /// Cancellation or budget expiry before any parsed summary reports absent counts/exits;
+    /// parsed zero counts and observed process exits remain distinguishable.
+    #[test]
+    fn unparsed_stopped_runs_never_invent_counts_or_exits() {
+        let mut result = run(0, 0, Vec::new());
+        result.report.incomplete = true;
+        result.stopped = true;
+        result.exit = None;
+        for cancelled in [false, true] {
+            result.cancelled = cancelled;
+            let fact = terminal_fact(1, &result, true);
+            assert!(fact.summary.contains("test counts unavailable"), "{fact:?}");
+            assert!(fact.summary.contains("exit unavailable"), "{fact:?}");
+            assert!(!fact.summary.contains("0 passed"), "{fact:?}");
+        }
+        result.cancelled = false;
+        result.stopped = false;
+        result.report.incomplete = false;
+        result.exit = Some(7);
+        assert!(summary_text(&result).contains("exit 7"));
+        result.exit = Some(0);
+        assert!(summary_text(&result).contains("0 passed, 0 failed"));
     }
 
     /// The same run always renders the same text.

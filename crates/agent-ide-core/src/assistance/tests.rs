@@ -18,6 +18,8 @@ pub use batch::{BatchCommand, BatchLaunch, BatchPlan, BatchTarget};
 
 /// Maximum combined stdout and stderr retained for `ide.test` output continuation.
 const MAX_OUTPUT: usize = 256 * 1024;
+/// Explicit prefix when the bounded combined runner capture discarded earlier bytes.
+pub(super) const OUTPUT_CUT: &str = "[cut]\n";
 /// Maximum output tail retained beside the paged full result.
 const OUTPUT_TAIL_BYTES: usize = 4 * 1024;
 /// Completed results stay queryable for ten minutes unless observed earlier.
@@ -88,8 +90,8 @@ struct Job {
 pub struct RunResult {
     /// Counts and failures explicitly parsed from runner output.
     pub report: TestReport,
-    /// Last at most 256 KiB of combined stdout and stderr; once paged, only its bounded runner
-    /// line.
+    /// Last at most 256 KiB of combined stdout/stderr, prefixed `[cut]` inside that cap when
+    /// earlier bytes were discarded. Once paged, this copy keeps only its bounded runner line.
     pub output: String,
     /// `true` once the owner's retained detail took over the whole output as its pages and this
     /// copy shrank to the runner line; later replies then point at that detail instead of
@@ -741,13 +743,11 @@ pub(super) fn output_tail(output: &str) -> String {
     output[start..].to_owned()
 }
 
-/// Reports whether a run lacks a recognized summary with test counts and was not budget-stopped.
-/// Explicit commands and selected runners both use this to return the exit status and output tail.
+/// Reports whether no test counts were parsed, including cancelled or budget-stopped runs.
+/// Zero defaults from an incomplete parser never become observed test counts. Explicit commands
+/// and selected runners use this to retain lifecycle status with an honest output tail.
 pub fn summary_absent(result: &RunResult) -> bool {
-    !result.stopped
-        && result.report.incomplete
-        && result.report.passed == 0
-        && result.report.failed == 0
+    result.report.incomplete && result.report.passed == 0 && result.report.failed == 0
 }
 
 /// Runs one command with inherited environment, bounded output, a process-group budget kill,
@@ -1012,8 +1012,19 @@ async fn run_child_cancellable(
     let (job, stdout, stderr) = spawned;
     let mut job = Some(job);
     let combined = Arc::new(tokio::sync::Mutex::new(VecDeque::with_capacity(MAX_OUTPUT)));
-    let mut out_task = tokio::spawn(read_into_tail(Some(stdout), combined.clone(), cap));
-    let mut err_task = tokio::spawn(read_into_tail(Some(stderr), combined.clone(), cap));
+    let truncated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut out_task = tokio::spawn(read_into_tail(
+        Some(stdout),
+        combined.clone(),
+        cap,
+        truncated.clone(),
+    ));
+    let mut err_task = tokio::spawn(read_into_tail(
+        Some(stderr),
+        combined.clone(),
+        cap,
+        truncated.clone(),
+    ));
     let mut cancelled = false;
     let exited = match job.as_mut() {
         Some(running) => tokio::select! {
@@ -1049,7 +1060,12 @@ async fn run_child_cancellable(
         status = finished.finish().await.ok();
     }
     let bytes = combined.lock().await.iter().copied().collect::<Vec<_>>();
-    let output = String::from_utf8_lossy(&bytes).into_owned();
+    let raw = String::from_utf8_lossy(&bytes);
+    let output = retained_output(
+        &raw,
+        cap,
+        truncated.load(std::sync::atomic::Ordering::Relaxed),
+    );
     // A language module that cannot parse leaves the run with no counts, marked incomplete.
     let parse =
         |language: Language| crate::modules::calls::parse_test_output(language, root, &output, "");
@@ -1157,11 +1173,29 @@ fn failed_run(budget: Duration, output: String) -> RunResult {
     }
 }
 
-/// Reads one pipe to EOF, appending into a shared combined tail buffer.
+/// Bounds the captured UTF-8 tail, preserving an explicit cut marker after upstream truncation.
+/// `cap` includes the marker; lossy UTF-8 expansion is bounded too. No I/O or parser work occurs.
+pub(super) fn retained_output(text: &str, cap: usize, truncated: bool) -> String {
+    let cut = truncated || text.len() > cap;
+    let marker = if cut {
+        &OUTPUT_CUT[..cap.min(OUTPUT_CUT.len())]
+    } else {
+        ""
+    };
+    let mut start = text.len().saturating_sub(cap.saturating_sub(marker.len()));
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{marker}{}", &text[start..])
+}
+
+/// Reads one pipe to EOF into a combined bounded tail; atomically marks any discarded prefix.
+/// `truncated` is shared by both pipe readers and remains observable after cancellation/drain.
 async fn read_into_tail<R: tokio::io::AsyncRead + Unpin>(
     reader: Option<R>,
     retained: Arc<tokio::sync::Mutex<VecDeque<u8>>>,
     cap: usize,
+    truncated: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let Some(mut reader) = reader else {
         return;
@@ -1175,6 +1209,7 @@ async fn read_into_tail<R: tokio::io::AsyncRead + Unpin>(
                 let mut retained = retained.lock().await;
                 retained.extend(&chunk[..count]);
                 if retained.len() > cap {
+                    truncated.store(true, std::sync::atomic::Ordering::Relaxed);
                     let excess = retained.len() - cap;
                     retained.drain(..excess);
                 }
@@ -1188,6 +1223,21 @@ mod runner_tests {
     //! Minimal process and parser checks for the test runner.
     use super::*;
     use crate::assistance::test_fact::terminal_fact;
+
+    /// Truncated captures keep an explicit marker inside their byte cap even with UTF-8 tails;
+    /// exact-sized and empty captures remain unmodified, including a zero-byte configured cap.
+    #[test]
+    fn retained_capture_marks_truncation_without_exceeding_utf8_cap() {
+        assert_eq!(retained_output("abcdef", 6, false), "abcdef");
+        assert_eq!(retained_output("", 0, false), "");
+        for cap in 0..40 {
+            let text = retained_output(&"é".repeat(30), cap, true);
+            assert!(text.len() <= cap);
+            if cap >= OUTPUT_CUT.len() {
+                assert!(text.starts_with(OUTPUT_CUT));
+            }
+        }
+    }
 
     /// History is actor/worktree scoped across generations; reads neither consume results nor
     /// launch processes. Retained terminal/running rows are newest first.
@@ -1365,7 +1415,7 @@ mod runner_tests {
             StartResult::Started(3)
         ));
         let capped = settle(3).await;
-        assert_eq!(capped.output, format!("{}\n", "y".repeat(9)));
+        assert_eq!(capped.output, "[cut]\nyyy\n");
         let _ = std::fs::remove_dir_all(&root);
     }
 
