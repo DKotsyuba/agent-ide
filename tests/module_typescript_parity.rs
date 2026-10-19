@@ -1140,3 +1140,151 @@ async fn typescript_test_runners_match_in_process_answers() {
         assert!(all.contains("no tests in src/plain.ts"), "{runner}:\n{all}");
     }
 }
+
+/// The configured checks Node (nodeA from `AGENT_IDE_NODE`) resolves and executes the project's
+/// tests in BOTH hosting modes even when a conflicting ambient `node` (nodeB stub writing a
+/// sentinel) leads the daemon's `PATH`: the test passes via nodeA, the nodeB sentinel is
+/// absent, the process tree contains no stub, and the test file itself records
+/// `process.execPath` (nodeA) and spawns a bare-`node` child whose `execPath` is also nodeA.
+/// An `npx vitest` selection refuses in both routes with the environment cause and never
+/// spawns any runner.
+#[ignore = "requires accepted AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER"]
+#[tokio::test]
+async fn configured_node_wins_over_ambient_and_npx_refuses() {
+    let mut fixture = node_fixture(true);
+    let sentinel = fixture.base.join("nodeB-ran");
+    let ambient_bin = fixture.base.join("ambient-bin");
+    std::fs::create_dir_all(&ambient_bin).unwrap();
+    let stub = ambient_bin.join("node");
+    let sentinel_path = sentinel.display().to_string();
+    std::fs::write(
+        &stub,
+        format!("#!/bin/sh\ntouch '{sentinel_path}'\necho 'ambient nodeB ran' >&2\nexit 1\n"),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let exec_recording = fixture.base.join("execPath-primary.txt");
+    let child_recording = fixture.base.join("execPath-child.txt");
+    let exec_recording_str = exec_recording.display().to_string();
+    let child_recording_str = child_recording.display().to_string();
+    // The primary writeFileSync uses a JSON-quoted path (valid JS string literal regardless
+    // of special characters in the approved TMPDIR).
+    let exec_recording_json =
+        serde_json::to_string(&exec_recording_str).expect("recording path is a string");
+    let child_recording_json =
+        serde_json::to_string(&child_recording_str).expect("recording path is a string");
+    // The child script is built as a plain JS string, then JSON-quoted THE ENTIRE SCRIPT so
+    // it splices into the spawnSync argv array as one properly escaped JS string literal —
+    // no quote nesting issues at any language boundary.
+    let child_script =
+        format!("require('fs').writeFileSync({child_recording_json}, process.execPath)");
+    let child_script_json = serde_json::to_string(&child_script).expect("child script is a string");
+    let test_source = format!(
+        r#"import test from 'node:test';
+import {{ spawnSync }} from 'node:child_process';
+import {{ writeFileSync }} from 'node:fs';
+test('records exec paths', () => {{
+  writeFileSync({exec_recording}, process.execPath);
+  const child = spawnSync('node', ['-e', {child_script}]);
+  if (child.status !== 0) throw new Error('child failed: ' + child.stderr);
+}});
+"#,
+        exec_recording = exec_recording_json,
+        child_script = child_script_json,
+    );
+    put_test_file(&fixture, "test/exec-path.test.mjs", &test_source);
+
+    let ambient_prepend = format!(
+        "{}:{}",
+        ambient_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let real_node = std::env::var("AGENT_IDE_NODE").unwrap();
+
+    for mode_env in [
+        vec![],           // module mode (default)
+        vec![IN_PROCESS], // native mode
+    ] {
+        let mut env = vec![("PATH", ambient_prepend.as_str())];
+        env.extend_from_slice(&mode_env);
+        let _daemon = Daemon::start(&fixture, &env).await;
+        let mut session = Session::start(&fixture).await;
+
+        let _ = std::fs::remove_file(&exec_recording);
+        let _ = std::fs::remove_file(&child_recording);
+
+        let (reply, text) = run_tests(
+            &mut session,
+            &fixture,
+            json!({"path":"test/exec-path.test.mjs"}),
+        )
+        .await;
+        assert!(
+            text.contains("1 passed, 0 failed,") && text.contains("(exit 0)"),
+            "test must report a parsed terminal pass with exit 0 in {:?}: {text}\n{reply:?}",
+            mode_env,
+        );
+
+        let primary = std::fs::read_to_string(&exec_recording).unwrap();
+        assert_eq!(
+            Path::new(&primary).canonicalize().unwrap(),
+            Path::new(&real_node).canonicalize().unwrap(),
+            "primary execPath must be the configured nodeA in {:?}",
+            mode_env,
+        );
+        let child = std::fs::read_to_string(&child_recording).unwrap();
+        assert_eq!(
+            Path::new(&child).canonicalize().unwrap(),
+            Path::new(&real_node).canonicalize().unwrap(),
+            "child execPath must be the configured nodeA in {:?}",
+            mode_env,
+        );
+        assert!(
+            !sentinel.exists(),
+            "ambient nodeB must never execute in {:?}: {} exists",
+            mode_env,
+            sentinel.display(),
+        );
+
+        let package_path = fixture.root.join("package.json");
+        let mut package: Value =
+            serde_json::from_str(&std::fs::read_to_string(&package_path).unwrap()).unwrap();
+        package["devDependencies"] = serde_json::json!({"vitest": "1.0.0"});
+        std::fs::write(&package_path, package.to_string()).unwrap();
+        let (refusal, refusal_text) = run_tests(
+            &mut session,
+            &fixture,
+            json!({"path":"test/exec-path.test.mjs"}),
+        )
+        .await;
+        let all_text = refusal_text
+            + refusal
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+        assert!(
+            all_text.contains("not bound to the configured Node"),
+            "expected the exact npx runner Environment refusal in {:?}: {all_text}",
+            mode_env,
+        );
+        assert!(
+            !sentinel.exists(),
+            "the npx refusal must not spawn any runner in {:?}",
+            mode_env,
+        );
+        package["devDependencies"] = serde_json::json!({});
+        std::fs::write(&package_path, package.to_string()).unwrap();
+        session.close(&fixture).await;
+    }
+    let _ = std::fs::remove_dir_all(&fixture.base);
+}
+
+/// Writes a test file into the fixture's worktree, creating parents.
+fn put_test_file(fixture: &Fixture, relative: &str, content: &str) {
+    let path = fixture.root.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
