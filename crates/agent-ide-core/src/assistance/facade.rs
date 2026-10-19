@@ -281,11 +281,11 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false, "minProperties": 1,
                 "properties": {
-                    "kind": {"type":"string", "enum":["problems", "diagnostics"]},
-                    "wait_s": {"type":"integer", "minimum":1, "maximum":30, "description":"Completion seconds."},
-                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES},
-                    "language": {"type":"string", "enum":checked_language_ids()},
-                    "offset": {"type":"integer", "minimum":0, "maximum":MAX_PROBLEM_OFFSET},
+                    "kind": {"type":"string", "enum":["problems", "diagnostics"], "description":"Exclusive query mode; omit for retained references."},
+                    "wait_s": {"type":"integer", "minimum":1, "maximum":30, "description":"Only with detail_ref(s): completion seconds."},
+                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Only with kind:diagnostics."},
+                    "language": {"type":"string", "enum":checked_language_ids(), "description":"Only with kind:problems; omit for diagnostics."},
+                    "offset": {"type":"integer", "minimum":0, "maximum":MAX_PROBLEM_OFFSET, "description":"Only with kind:problems; continue from next_offset."},
                     "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES},
                     "detail_refs": {"type": "array", "minItems": 1, "maxItems": super::outbox::MAX_DETAIL_REFS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}}
                 }
@@ -916,6 +916,29 @@ pub(crate) fn validate_normalized_call(
         let object = parameters
             .as_object()
             .ok_or(ParameterError::InvalidObject)?;
+        if object.get("kind").and_then(Value::as_str) == Some("diagnostics") {
+            for field in ["language", "offset"] {
+                if object.contains_key(field) {
+                    return Err(invalid_field(field, FieldRule::RequiresProblemsKind));
+                }
+            }
+        }
+        if object.get("kind").and_then(Value::as_str) == Some("problems")
+            && object.contains_key("path")
+        {
+            return Err(invalid_field(
+                "path",
+                FieldRule::OneOf("used only with kind:diagnostics"),
+            ));
+        }
+        for field in ["detail_ref", "detail_refs", "wait_s", "wait_ms"] {
+            if object.contains_key(field) {
+                return Err(invalid_field(
+                    field,
+                    FieldRule::OneOf("used in the retained-reference form without kind"),
+                ));
+            }
+        }
         let allowed: &[&str] = match object.get("kind").and_then(Value::as_str) {
             Some("problems") => &["kind", "language", "offset"],
             Some("diagnostics") => &["kind", "path"],
@@ -5316,7 +5339,7 @@ impl StdioFacade {
             .await
     }
 
-    /// End this activation once, at task end; edited files stay, uncollected test runs are listed.
+    /// End this activation once, at task end; edited files stay, retained test outcomes and running commands are listed.
     #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn stop(
@@ -5949,6 +5972,58 @@ fn per_host_catalogs_differ_only_by_the_declared_subset() {
         fold_inspect_problems(AssistanceTool::Inspect, &json!({"detail_ref": "x"})),
         AssistanceTool::Inspect
     );
+}
+
+/// Inspect mode restrictions are advertised and a known problem-only field names its required mode.
+#[test]
+fn inspect_mode_restrictions_are_explicit_in_catalog_and_refusal() {
+    let inspect = tool_schemas()
+        .into_iter()
+        .find(|tool| tool.tool == AssistanceTool::Inspect)
+        .unwrap();
+    for field in ["language", "offset"] {
+        let description = inspect.input_schema["properties"][field]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(description.contains("problems"), "{field}: {description}");
+    }
+    let error = validate_call(
+        AssistanceTool::Inspect,
+        json!({"kind":"diagnostics","path":"a.rs","language":"rust"}),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.message(AssistanceTool::Inspect),
+        "Argument \"language\" requires \"kind\":\"problems\"."
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Inspect,
+            json!({"kind":"diagnostics","path":"a.rs"})
+        )
+        .is_ok()
+    );
+    for (arguments, expected) in [
+        (json!({"kind":"problems","path":"a.rs"}), "kind:diagnostics"),
+        (
+            json!({"kind":"diagnostics","path":"a.rs","offset":0}),
+            "problems",
+        ),
+        (
+            json!({"kind":"diagnostics","path":"a.rs","wait_s":1}),
+            "without kind",
+        ),
+        (
+            json!({"kind":"diagnostics","path":"a.rs","invented":true}),
+            "Unknown argument",
+        ),
+    ] {
+        let error = validate_call(AssistanceTool::Inspect, arguments).unwrap_err();
+        assert!(
+            error.message(AssistanceTool::Inspect).contains(expected),
+            "{error:?}"
+        );
+    }
 }
 
 /// Private catalog cache lifetime in milliseconds for modern MCP requests (SEP-2549).

@@ -2337,24 +2337,10 @@ impl WorkerHandle {
     /// cancelled and removed while other sessions' jobs stay queued.
     pub async fn stop(&self, invocation: ValidatedInvocation, attachment: &str) -> PeerReply {
         let binding = invocation.binding_ref().clone();
-        // Captured before `observe_binding` marks every run of this binding read, so the stop
-        // reply can still name the runs whose results no caller ever collected.
-        let never_read = self.shared.test_runs.uncollected(&binding.fingerprint());
-        let mut uncollected = never_read
-            .iter()
-            .take(8)
-            .map(|(id, argv, running)| {
-                format!(
-                    "#{} {}{}",
-                    id,
-                    display_argv(argv),
-                    if *running { " (still running)" } else { "" }
-                )
-            })
-            .collect::<Vec<_>>();
-        if never_read.len() > 8 {
-            uncollected.push(format!("(+{} more)", never_read.len() - 8));
-        }
+        // Capture terminal results before stop retires observation state and output details.
+        // Bridge delivery is not an explicit fetch, so give the result here instead of
+        // suggesting that an automatically delivered result must be fetched again.
+        let uncollected = self.shared.test_runs.stop_summaries(&binding.fingerprint());
         self.shared
             .test_runs
             .observe_binding(&binding.fingerprint());
@@ -7432,9 +7418,9 @@ impl<'a> Worker<'a> {
 
     /// Revokes a recoverable receipt after host stop; absent grants are explicitly harmless.
     ///
-    /// The reply also names the test runs this binding started but never collected — passed in by
-    /// the stop submitter before it marked them read — because a stopped agent otherwise reports
-    /// results it never saw (ag-20260930-210040 +403…+465 s).
+    /// The reply includes bounded terminal facts or running states captured by the stop
+    /// submitter before retiring observation and output details. A prior Bridge handoff does
+    /// not prove consumption and never requires an artificial reactivation to fetch a result.
     async fn revoke(
         &mut self,
         binding: &BindingRef,
@@ -9139,8 +9125,9 @@ pub(super) fn rerun_text(result: &super::tests::RunResult) -> String {
 ///
 /// `revoked` says whether an active grant was released; otherwise nothing was active (no grant was
 /// ever held, or its authority was already released — starting just to stop would be waste).
-/// `uncollected` names the test runs the binding started and never read, each still answering
-/// `ide.inspect`.
+/// `uncollected` contains bounded own-run snapshots not explicitly fetched: actual terminal
+/// results or an honest running state. No delivery acknowledgement is inferred and no new
+/// activation is needed to consume the result included in this reply.
 /// The text states what happened and never invites the agent to wait or ask again.
 pub(super) fn stop_text(revoked: bool, uncollected: &[String]) -> String {
     let mut text = if revoked {
@@ -9149,10 +9136,7 @@ pub(super) fn stop_text(revoked: bool, uncollected: &[String]) -> String {
         "nothing active for this binding; its workspace authority was already released".to_owned()
     };
     if !uncollected.is_empty() {
-        text.push_str(
-            "\nuncollected test runs: no explicit IDE read was recorded; Bridge may already have delivered. \
-             Start a read-only activation, then ide.test {\"history\":true} lists retained runs:",
-        );
+        text.push_str("\ntest runs at stop:");
         for run in uncollected {
             text.push_str("\n  ");
             text.push_str(run);
@@ -12560,6 +12544,74 @@ mod stop_retry_tests {
                 }
                 Err(code) => panic!("edit {reference} failed: {code:?}"),
             }
+        }
+    }
+
+    /// A real multi-file Codex patch exposes normalized paths while its real formatter is
+    /// pending, before any commit; the fixture never plants requested paths in Progress.
+    #[tokio::test]
+    async fn codex_patch_progress_names_files_before_format_completes() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::create_dir(fixture.root.join("sub")).unwrap();
+        std::fs::write(fixture.root.join("fmt.toml"), "gamma formatter marker\n").unwrap();
+        git_commit(&fixture.root, "patch progress fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        activate_worktree(&mut worker, "line-actor", "patch-progress-start").await;
+        let invocation = production_call(&worker, "line-actor", "patch-progress");
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+sym card\n+MARK\n+end\n*** Add File: sub/b.gamma\n+sym card\n+MARK\n+end\n*** End Patch\n",
+            fixture.root.join("a.gamma").display()
+        );
+        let (mut job, _cancel) = tool_job(
+            &fixture.root,
+            invocation,
+            "patch-progress",
+            AssistanceTool::Edit,
+            serde_json::json!({"operation_id":"patch-progress-op","patch":patch}),
+        );
+        let progress = job.progress.clone();
+        let edit = worker.edit(&mut job);
+        tokio::pin!(edit);
+        let requested = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                let state = std::future::Future::poll(edit.as_mut(), cx);
+                let observed = progress.lock().unwrap();
+                if observed
+                    .active
+                    .as_ref()
+                    .is_some_and(|(stage, _)| *stage == "format")
+                {
+                    assert!(observed.committed.is_empty());
+                    return std::task::Poll::Ready(observed.requested.clone());
+                }
+                match state {
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                    std::task::Poll::Ready(result) => {
+                        panic!("edit did not expose format: {result:?}")
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let result = edit.await;
+        assert!(
+            matches!(result, Ok((PeerReply::EditBatch { .. }, _, _))),
+            "{result:?}"
+        );
+        assert_eq!(requested, ["a.gamma", "sub/b.gamma"]);
+        for path in ["a.gamma", "sub/b.gamma"] {
+            assert!(
+                std::fs::read_to_string(fixture.root.join(path))
+                    .unwrap()
+                    .contains("MARK")
+            );
         }
     }
 

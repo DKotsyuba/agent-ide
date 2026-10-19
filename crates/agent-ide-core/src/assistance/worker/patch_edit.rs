@@ -22,7 +22,8 @@ impl Worker<'_> {
     /// delete/move refusal). Absolute file headers are normalized beneath the active worktree
     /// before an `Update File` is observed; an outside path refuses with a worktree-relative
     /// repair hint. A missing file or unmatched hunk is refused as `edit_refused` with
-    /// `patch refused, nothing written: …` plus the nearest text and one repair line. On success
+    /// `patch refused, nothing written: …` plus the nearest text and one repair line. Normalized
+    /// admitted paths enter progress before formatting; they never imply committed writes. On success
     /// the call is rewritten to the equivalent `files` request and delegated to
     /// [`Self::edit_files`], so its reply, receipt and project check are that pipeline's. Existing
     /// receipts compare the original patch first; written/candidate-equal files are not re-hunked,
@@ -86,6 +87,12 @@ impl Worker<'_> {
         let files = self
             .patch_files(job, &binding, parsed, existing.as_ref())
             .await?;
+        if let Ok(mut progress) = job.progress.lock() {
+            progress.requested = files
+                .iter()
+                .filter_map(|file| file.get("path").and_then(Value::as_str).map(str::to_owned))
+                .collect();
+        }
         job.parameters = json!({"operation_id": operation_id, "patch": patch, "files": files});
         self.edit_files(job).await
     }

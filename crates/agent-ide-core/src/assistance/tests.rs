@@ -79,7 +79,8 @@ struct Job {
     result: Option<RunResult>,
     /// Monotonic completion time for the bounded result lifetime.
     completed_at: Option<tokio::time::Instant>,
-    /// True after an explicit `status` request has retrieved the completed result.
+    /// True after an explicit result read or retirement by stop; Bridge handoff alone is not
+    /// evidence that the model consumed a result.
     observed: bool,
     /// Owner-requested cancellation, observed by the runner before releasing its process group.
     cancel: tokio_util::sync::CancellationToken,
@@ -665,6 +666,39 @@ impl TestRuns {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Captures at most eight own runs not explicitly read, for the stopping reply.
+    ///
+    /// Settled runs carry their actual bounded terminal fact; live runs say running. Bridge
+    /// handoff is not treated as proof of consumption. No run is marked observed here; stop
+    /// retires the binding separately. Full-output references are omitted because their
+    /// activation-scoped ledger is released by stop. Lock failure yields explicit unavailable
+    /// state rather than implying that no run needs reporting.
+    pub fn stop_summaries(&self, binding: &[u8; 32]) -> Vec<String> {
+        let Ok(state) = self.0.lock() else {
+            return vec!["test run state unavailable".to_owned()];
+        };
+        let mut own = state
+            .jobs
+            .iter()
+            .filter(|(_, job)| &job.owner == binding && (job.result.is_none() || !job.observed));
+        let mut summaries = own
+            .by_ref()
+            .take(8)
+            .map(|(id, job)| match &job.result {
+                Some(result) => super::test_fact::terminal_fact(*id, result, false).reply_text(*id),
+                None => format!(
+                    "tests #{id}: running — {}",
+                    super::worker::display_argv(&job.command)
+                ),
+            })
+            .collect::<Vec<_>>();
+        let more = own.count();
+        if more > 0 {
+            summaries.push(format!("(+{more} more)"));
+        }
+        summaries
     }
 
     /// Returns the output detail references of every retained run; the worker never evicts them,
@@ -1702,6 +1736,70 @@ mod runner_tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(runs.uncollected(&binding).is_empty());
+    }
+
+    /// Stop reports a real failed result without an extra fetch, foreign access or an invalid output link.
+    #[tokio::test]
+    async fn stop_summaries_preserve_settled_failure_without_explicit_read() {
+        let runs = TestRuns::default();
+        let owner = BindingRef::fixture("stop-result-owner", "stop-result-channel", 1);
+        let other = BindingRef::fixture("stop-result-other", "stop-other-channel", 1);
+        let id = match runs.start(
+            std::env::temp_dir().to_path_buf(),
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'retained-failure-sentinel\\n'; exit 7".into(),
+            ],
+            crate::lang::testing::ALPHA,
+            Duration::from_secs(10),
+            "stop-result-detail".into(),
+            &owner,
+        ) {
+            StartResult::Started(id) => id,
+            _ => panic!("the command must start"),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while runs.settled_result(id).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "command must settle"
+            );
+            tokio::task::yield_now().await;
+        }
+        let summaries = runs.stop_summaries(&owner.fingerprint()).join("\n");
+        assert!(summaries.contains("exit 7"), "{summaries}");
+        assert!(
+            summaries.contains("retained-failure-sentinel"),
+            "{summaries}"
+        );
+        assert!(
+            !summaries.contains("full output:"),
+            "a stopped activation has no output ledger"
+        );
+        assert!(runs.stop_summaries(&other.fingerprint()).is_empty());
+        assert_eq!(
+            runs.uncollected(&owner.fingerprint()).len(),
+            1,
+            "snapshotting is not a delivery acknowledgement"
+        );
+        // Exercise the live-state renderer independently of OS scheduling.
+        let result = runs
+            .0
+            .lock()
+            .unwrap()
+            .jobs
+            .get_mut(&id)
+            .unwrap()
+            .result
+            .take();
+        let pending = runs.stop_summaries(&owner.fingerprint()).join("\n");
+        assert!(pending.contains("running"), "{pending}");
+        assert!(!pending.contains("exit 7"), "{pending}");
+        runs.0.lock().unwrap().jobs.get_mut(&id).unwrap().result = result;
+
+        runs.observe_binding(&owner.fingerprint());
+        assert!(runs.stop_summaries(&owner.fingerprint()).is_empty());
     }
 
     /// A run its owner's `ide.stop` observed neither stays uncollected after it settles nor keeps

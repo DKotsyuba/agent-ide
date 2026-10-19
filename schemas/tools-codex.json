@@ -125,6 +125,7 @@
           "type": "array"
         },
         "kind": {
+          "description": "Exclusive query mode; omit for retained references.",
           "enum": [
             "problems",
             "diagnostics"
@@ -132,6 +133,7 @@
           "type": "string"
         },
         "language": {
+          "description": "Only with kind:problems; omit for diagnostics.",
           "enum": [
             "rust",
             "python",
@@ -140,13 +142,15 @@
           "type": "string"
         },
         "offset": {
+          "description": "Only with kind:problems; continue from next_offset.",
           "type": "integer"
         },
         "path": {
+          "description": "Only with kind:diagnostics.",
           "type": "string"
         },
         "wait_s": {
-          "description": "Completion seconds.",
+          "description": "Only with detail_ref(s): completion seconds.",
           "type": "integer"
         }
       },
@@ -266,7 +270,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "End this activation once, at task end; edited files stay, uncollected test runs are listed.",
+    "description": "End this activation once, at task end; edited files stay, retained test outcomes and running commands are listed.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

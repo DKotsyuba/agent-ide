@@ -48,7 +48,8 @@ const TOTAL_TIME: &str = "Total time";
 
 /// Runs a root `tsconfig.json` or `jsconfig.json` under the shared confinement seam.
 ///
-/// Instances own immutable tool paths and a timeout. Each run checks config/tool admission,
+/// Instances own operator tool defaults and a timeout. A declared project compiler is selected
+/// from its prepared local package only when its bytes match the qualified compiler. Each run checks config/tool admission,
 /// writes only to its private cache, and reports `Unavailable` when coverage cannot be proved.
 pub struct TypeScriptChecker {
     /// Process execution seam, shared with the other project checkers.
@@ -87,6 +88,159 @@ impl TypeScriptChecker {
     pub fn without_staging(mut self) -> Self {
         self.stages = false;
         self
+    }
+
+    /// Selects a declared project's prepared compiler, or the operator's compiler when the
+    /// manifest declares none. Missing, denied and unqualified project tools never fall back.
+    /// Reads only regular admitted files: a bounded root package manifest and the exact
+    /// already-qualified compiler library bytes. No manager, install or dependency mutation runs.
+    /// The adapter separately validates declared version ranges against the actual runtime.
+    fn project_cli(&self, request: &CheckRequest) -> Result<PathBuf, ProblemSnapshot> {
+        let unavailable = |reason, detail: &str| {
+            ProblemSnapshot::unavailable_with_detail(
+                crate::LANGUAGE,
+                reason,
+                request.input_generation,
+                0,
+                Some(detail.to_owned()),
+            )
+        };
+        let denied = |path: &Path| {
+            path.ancestors()
+                .any(|part| request.read_denies.iter().any(|deny| deny.matches(part)))
+        };
+        let manifest = request.worktree.join("package.json");
+        if denied(&manifest) {
+            return Err(unavailable(
+                UnavailableReason::ReadRestricted,
+                "project environment manifest is read restricted",
+            ));
+        }
+        let metadata = match fs::symlink_metadata(&manifest) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(self.tsc_cli.clone());
+            }
+            Err(_) => {
+                return Err(unavailable(
+                    UnavailableReason::ReadRestricted,
+                    "project environment manifest cannot be read",
+                ));
+            }
+        };
+        if !regular_allowed(&manifest, &request.read_denies) {
+            return Err(unavailable(
+                UnavailableReason::ReadRestricted,
+                "project environment manifest must be a regular admitted file",
+            ));
+        }
+        if metadata.len() > 1024 * 1024 {
+            return Err(unavailable(
+                UnavailableReason::Fatal,
+                "project environment manifest exceeds the 1 MiB input bound",
+            ));
+        }
+        let bytes = fs::read(&manifest).map_err(|_| {
+            unavailable(
+                UnavailableReason::ReadRestricted,
+                "project environment manifest cannot be read",
+            )
+        })?;
+        let package: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+            unavailable(
+                UnavailableReason::Fatal,
+                "project environment package.json is invalid",
+            )
+        })?;
+        if !package.is_object() {
+            return Err(unavailable(
+                UnavailableReason::Fatal,
+                "project environment package.json must be an object",
+            ));
+        }
+        let groups = [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ];
+        if groups
+            .iter()
+            .any(|group| package.get(group).is_some_and(|value| !value.is_object()))
+        {
+            return Err(unavailable(
+                UnavailableReason::Fatal,
+                "project environment dependency declarations must be objects",
+            ));
+        }
+        if !groups.iter().any(|group| {
+            package
+                .get(group)
+                .and_then(|value| value.get("typescript"))
+                .is_some()
+        }) {
+            return Ok(self.tsc_cli.clone());
+        }
+        let cli = request.worktree.join("node_modules/typescript/lib/tsc.js");
+        let library = cli.with_file_name("typescript.js");
+        for tool in [&cli, &library] {
+            if denied(tool) {
+                return Err(unavailable(
+                    UnavailableReason::ReadRestricted,
+                    "project TypeScript compiler is read restricted",
+                ));
+            }
+            match fs::symlink_metadata(tool) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(unavailable(
+                        UnavailableReason::ToolMissing,
+                        "project declares TypeScript but its compiler is not prepared; no global fallback",
+                    ));
+                }
+                Err(_) => {
+                    return Err(unavailable(
+                        UnavailableReason::ReadRestricted,
+                        "project TypeScript compiler cannot be read",
+                    ));
+                }
+                Ok(_) => {}
+            }
+            if !regular_allowed(tool, &request.read_denies) {
+                return Err(unavailable(
+                    UnavailableReason::ReadRestricted,
+                    "project TypeScript compiler must be regular and link-free",
+                ));
+            }
+        }
+        let (_, digest, length) = crate::backend::TYPESCRIPT_CLOSURE_V1
+            .iter()
+            .find(|(name, _, _)| *name == "typescript.js")
+            .expect("compiled TypeScript closure includes its compiler");
+        let metadata = fs::metadata(&library).map_err(|_| {
+            unavailable(
+                UnavailableReason::ReadRestricted,
+                "project TypeScript compiler cannot be read",
+            )
+        })?;
+        if metadata.len() != *length {
+            return Err(unavailable(
+                UnavailableReason::Fatal,
+                "project compiler is not the qualified TypeScript 5.9.3; use native project checks until qualified",
+            ));
+        }
+        let bytes = fs::read(&library).map_err(|_| {
+            unavailable(
+                UnavailableReason::ReadRestricted,
+                "project TypeScript compiler cannot be read",
+            )
+        })?;
+        if blake3::hash(&bytes).to_hex().as_str() != *digest {
+            return Err(unavailable(
+                UnavailableReason::Fatal,
+                "project compiler bytes differ from qualified TypeScript 5.9.3; no global fallback",
+            ));
+        }
+        Ok(cli)
     }
 
     /// Describes one CLI run with writes restricted to `request.cache_dir`.
@@ -211,8 +365,19 @@ impl Checker for TypeScriptChecker {
                     generation,
                 );
             }
-            let spec = self.run_spec(&request, &config);
-            if [&self.node, &self.tsc_cli].iter().any(|tool| {
+            let tsc_cli = match self.project_cli(&request) {
+                Ok(cli) => cli,
+                Err(snapshot) => return snapshot,
+            };
+            let effective = Self {
+                runner: self.runner.clone(),
+                node: self.node.clone(),
+                tsc_cli,
+                timeout: self.timeout,
+                stages: self.stages,
+            };
+            let spec = effective.run_spec(&request, &config);
+            if [&self.node, &effective.tsc_cli].iter().any(|tool| {
                 tool.ancestors()
                     .any(|part| request.read_denies.iter().any(|deny| deny.matches(part)))
             }) {
@@ -223,7 +388,7 @@ impl Checker for TypeScriptChecker {
                 );
             }
             if !regular_allowed(&self.node, &request.read_denies)
-                || !regular_allowed(&self.tsc_cli, &request.read_denies)
+                || !regular_allowed(&effective.tsc_cli, &request.read_denies)
             {
                 return ProblemSnapshot::unavailable(
                     crate::LANGUAGE,

@@ -222,6 +222,35 @@ configuration is rejected on any malformed value.
   - A language subsection absent means that language is never checked and never appears in the
     `<agent-ide>` block.
 
+### Matching the project compiler and runtime
+
+A wrapper's inherited PATH does not select the background TypeScript compiler. Declare
+`project_checks.typescript.node` and `tsc_cli` explicitly; the latter should name the prepared
+project's own `node_modules/typescript/lib/tsc.js`, not an unrelated global installation.
+Both paths must be absolute and normalized. Run native checks from the same worktree with
+that Node and compiler, the same root tsconfig and the same dependency snapshot. Resolve
+package-manager shims before comparing the actual tools; a global version recorded in a
+manifest does not prove what a project-first PATH executes.
+
+The current confined adapter supports TypeScript5.9.3 and the semantic provider has its own
+separate release-qualified5.9.3 bundle. Pointing a check at6.x does not qualify that provider:
+an unsupported compiler is unavailable with an explicit version-mismatch cause, never a
+clean zero and never a silent fallback. Changing supported versions requires separate adapter
+and provider qualification. For a project requiring `^5.9.2`, a prepared5.9.3 dependency is
+compatible; a6.x seed from another checkout is not the same project environment.
+
+For reproducible launches, prepare dependencies from the intended project's lock or qualified
+snapshot; compare native/project/IDE compiler version and library bytes, the actual Node,
+working directory and configuration before admitting model work. Keep the selected identities
+in the run evidence. A mismatch must stop preparation rather than ask the agent to change
+project configuration to satisfy a different compiler.
+
+Checks rebuild a safe allowlisted environment and retain their read-only/no-network profile.
+They intentionally do not copy ambient credentials, writable HOME, arbitrary shell hooks,
+package-manager auto-installation or another process's complete environment. Explicit
+`ide.test command` has its own cwd/env; use the project's exact prepared command there.
+Matching semantic inputs does not mean removing confinement or inheriting every shell value.
+
 Every check process runs confined through one `sandbox-exec` profile: default-deny, no network,
 read-only access to the admitted worktree, reads limited to the declared toolchain directories and
 system paths, and write access only to the check's private cache directory and private temporary

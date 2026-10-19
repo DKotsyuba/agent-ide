@@ -20,10 +20,17 @@ const cli = process.env.CHECK_TSC_CLI;
 let ts;
 try {
   ts = require(path.join(path.dirname(cli), "typescript.js"));
-  if (ts.version !== "5.9.3" || typeof ts.executeCommandLine !== "function" ||
+  if (ts.version !== "5.9.3") {
+    /** @type {string} Bounded numeric compiler identity; never echo arbitrary module text. */
+    const version = typeof ts.version === "string" && /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/.test(ts.version) ? ts.version : "unknown";
+    process.stderr.write(`error: TypeScript checker supports 5.9.3; configured compiler: ${version}. Match the project toolchain before admission.\n`);
+    process.exit(1);
+  }
+  if (typeof ts.executeCommandLine !== "function" ||
       typeof ts.matchFiles !== "function" || typeof ts.getFileMatcherPatterns !== "function" ||
       typeof ts.getRegexFromPattern !== "function" ||
-      typeof ts.fileExtensionIsOneOf !== "function") throw new Error("unsupported compiler");
+      typeof ts.fileExtensionIsOneOf !== "function" || typeof ts.Version !== "function" ||
+      typeof ts.VersionRange?.tryParse !== "function") throw new Error("unsupported compiler");
 } catch { process.exit(1); }
 /** @type {typeof ts.sys.readFile} Pinned decoder, including BOM and UTF-16 handling. */
 const originalReadFile = ts.sys.readFile.bind(ts.sys);
@@ -267,8 +274,55 @@ const system = Object.assign(ts.sys, {
   exit(code) { process.exitCode = readRestricted ? 77 : code; },
 });
 
+/**
+ * Check a declared range with the qualified compiler's own version-range implementation.
+ * @param {string} label Fixed nonsecret requirement name, never manifest text.
+ * @param {unknown} requested Optional project constraint; absent means no constraint.
+ * @param {string} installed Actual bounded compiler or Node version.
+ * @returns {boolean} Whether the declaration allows this runtime. Invalid/unsupported ranges
+ * fail closed with a bounded environment cause; they never select or install another tool.
+ */
+function versionAllowed(label, requested, installed) {
+  if (requested === undefined) return true;
+  const range = typeof requested === "string" && requested.trim().length > 0 && requested.length <= 512
+    ? ts.VersionRange.tryParse(requested.trim()) : undefined;
+  if (range && range.test(new ts.Version(installed))) return true;
+  process.stderr.write(`error: project environment ${label} requirement is unsupported or does not allow installed ${installed}; prepare a matching toolchain.\n`);
+  return false;
+}
+
+/**
+ * Validate root package/runtime declarations against the tools actually running this check.
+ * @returns {boolean} True for compatible declarations (including absent optional files), false
+ * for malformed manifests, mismatches, unsupported pins or denied reads. All reads use the
+ * existing guarded System; no manager, shell, install, environment mutation or fallback runs.
+ */
+function projectEnvironmentMatches() {
+  const source = system.readFile(path.join(process.cwd(), "package.json"));
+  if (readRestricted) return false;
+  let project = {};
+  try {
+    if (source !== undefined) project = JSON.parse(source);
+    if (!project || typeof project !== "object" || Array.isArray(project)) throw new Error("manifest");
+  } catch {
+    process.stderr.write("error: project environment package.json is not a valid object; repair the manifest before checking.\n");
+    return false;
+  }
+  for (const group of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+    if (!versionAllowed("TypeScript", project[group]?.typescript, ts.version)) return false;
+  }
+  if (!versionAllowed("Node engines", project.engines?.node, process.versions.node)) return false;
+  for (const name of [".nvmrc", ".node-version"]) {
+    const pin = system.readFile(path.join(process.cwd(), name));
+    if (readRestricted) return false;
+    if (pin !== undefined) return versionAllowed("Node pin", pin.trim().replace(/^v(?=\d)/, ""), process.versions.node);
+  }
+  return true;
+}
+
 try {
-  ts.executeCommandLine(system, () => {}, process.argv.slice(2));
+  if (projectEnvironmentMatches()) ts.executeCommandLine(system, () => {}, process.argv.slice(2));
+  else process.exitCode = readRestricted ? 77 : 1;
   if (readRestricted) process.exitCode = 77;
 } catch {
   process.exitCode = readRestricted ? 77 : 1;

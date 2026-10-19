@@ -10,6 +10,12 @@ use super::reply::{
 };
 use crate::changes::edit::EditOutcome;
 
+/// Serialized source-response budget, including framing and an optional structured copy.
+/// Eight KiB stays below the recorded single-call outer 10k-token truncation boundary even for
+/// dense text; callers aggregating several replies must still budget their outer envelope.
+/// Producers use this same bound before advancing source pages or recording delivered blocks.
+const MAX_SOURCE_REPLY_BYTES: usize = 8 * 1024;
+
 /// Build-embedded MiniJinja source projecting every closed [`PeerReply`] state into its compact
 /// model-facing text; the template owns the presentation so daemon code never formats reply text.
 const REPLY_TEMPLATE: &str = include_str!("../../../../assets/mcp/reply.jinja");
@@ -73,7 +79,7 @@ pub(crate) fn render_with_call(
 ) -> Option<CallToolResult> {
     loop {
         let rendered = project(&reply, status, envelope, tool_name, test_status_id)?;
-        if call_tool_result_fits(&rendered) {
+        if reply_fits(&reply, &rendered) {
             return Some(rendered);
         }
         if !reply.shrink_text() {
@@ -87,8 +93,7 @@ pub(crate) fn render_with_call(
 /// This predicate never shrinks text. Diff pagination measures whole hunks, exact line parts,
 /// oversized-line notices and the actual continuation trailer before advancing its cursor.
 pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
-    project(reply, None, envelope, None, None)
-        .is_some_and(|rendered| call_tool_result_fits(&rendered))
+    project(reply, None, envelope, None, None).is_some_and(|rendered| reply_fits(reply, &rendered))
 }
 
 /// Reports whether one unchanged reply fits the final MCP carrier with `status` attached whole.
@@ -98,7 +103,7 @@ pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
 /// call that cuts it.
 pub(crate) fn fits_with_status(reply: &PeerReply, status: &str, envelope: Envelope) -> bool {
     project(reply, Some(status), envelope, None, None)
-        .is_some_and(|rendered| call_tool_result_fits(&rendered))
+        .is_some_and(|rendered| reply_fits(reply, &rendered))
 }
 
 /// Projects one unchanged reply into compact content plus, per `envelope`, the complete typed
@@ -515,6 +520,20 @@ fn render_text(context: &serde_json::Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// Applies the source budget to the complete rendered carrier before the ordinary transport
+/// ceiling. Other result kinds retain their existing budget. No source is cut by this predicate.
+fn reply_fits(reply: &PeerReply, rendered: &CallToolResult) -> bool {
+    call_tool_result_fits(rendered)
+        && (!matches!(
+            reply,
+            PeerReply::Complete {
+                kind: ResultKind::Read,
+                ..
+            }
+        ) || serde_json::to_vec(rendered)
+            .is_ok_and(|bytes| bytes.len() <= MAX_SOURCE_REPLY_BYTES))
+}
+
 /// Returns whether the serialized final MCP carrier stays below the Assistance reply ceiling.
 pub(crate) fn call_tool_result_fits(rendered: &CallToolResult) -> bool {
     serde_json::to_vec(rendered).is_ok_and(|bytes| bytes.len() <= MAX_REPLY_BYTES - MCP_RESERVE)
@@ -638,6 +657,34 @@ mod refusal_table;
 
 #[cfg(test)]
 mod tests {
+
+    /// Source fitting includes the complete serialized MCP carrier, before any delivery ledger
+    /// can claim the body was served; a batch larger than the observed outer budget must page.
+    #[test]
+    fn read_reply_budget_includes_the_complete_carrier() {
+        let reply = PeerReply::Complete {
+            kind: ResultKind::Read,
+            text: "0123456789".repeat(1200),
+            detail_ref: Some("source-budget-ref".into()),
+            truncated: false,
+            continuation: false,
+        };
+        assert!(!fits(&reply, Envelope::TextOnly));
+        assert!(!fits(&reply, Envelope::WithStructured));
+        let small = PeerReply::Complete {
+            kind: ResultKind::Read,
+            text: "1\tconst answer = 42;\n".into(),
+            detail_ref: Some("source-budget-ref".into()),
+            truncated: false,
+            continuation: false,
+        };
+        assert!(fits(&small, Envelope::TextOnly));
+        assert!(fits_with_status(
+            &small,
+            "<agent-ide>checking</agent-ide>",
+            Envelope::TextOnly
+        ));
+    }
     use super::*;
     use crate::assistance::reply::{EditDiagnostics, MissingPeer, ResultKind};
     use crate::changes::edit::{EditOutcome, EditReceiptError, EditResult};

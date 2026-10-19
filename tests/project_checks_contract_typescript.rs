@@ -757,6 +757,171 @@ async fn pinned_adapter_output(request: &CheckRequest) -> RunOutput {
     }
 }
 
+/// Real qualified compiler bytes are selected from the prepared project rather than a global
+/// fallback. The fake process runner captures the actual RunSpec; no compiler install occurs.
+#[tokio::test]
+#[ignore = "requires local qualified TypeScript 5.9.3 compiler bytes"]
+async fn real_qualified_project_compiler_is_selected_without_global_fallback() {
+    agent_ide::languages::install();
+    let root = project("project-compiler-selection", "tsconfig.json");
+    let source = root.join("a.ts");
+    std::fs::write(&source, "export const a = 1;\n").unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"devDependencies":{"typescript":"^5.9.2"}}"#,
+    )
+    .unwrap();
+    let project_cli = root.join("node_modules/typescript/lib/tsc.js");
+    std::fs::create_dir_all(project_cli.parent().unwrap()).unwrap();
+    std::fs::write(&project_cli, "CLI is not executed by the library adapter").unwrap();
+    let library = project_cli.with_file_name("typescript.js");
+    std::fs::copy(
+        "/Users/pluto/.nvm/versions/node/v24.4.0/lib/node_modules/typescript/lib/typescript.js",
+        &library,
+    )
+    .unwrap();
+    let node = root.join("node");
+    let global_cli = root.join("global/lib/tsc.js");
+    std::fs::write(&node, "node").unwrap();
+    std::fs::create_dir_all(global_cli.parent().unwrap()).unwrap();
+    std::fs::write(&global_cli, "global CLI").unwrap();
+    let runner = Arc::new(FakeRunner::new(vec![Ok(report(&[&source], "", 0))]));
+    let checker = TypeScriptChecker::new(runner.clone(), node, global_cli, Duration::from_secs(10));
+    let request = CheckRequest {
+        worktree: root.clone(),
+        cache_dir: root.join("cache"),
+        input_generation: 1,
+        read_denies: Vec::new(),
+    };
+    assert_eq!(
+        checker.check(request.clone()).await.state,
+        CheckState::Ready
+    );
+    let specs = runner.specs();
+    assert_eq!(specs.len(), 1);
+    assert!(
+        specs[0]
+            .env
+            .iter()
+            .any(|(key, value)| key == "CHECK_TSC_CLI"
+                && value == &project_cli.display().to_string())
+    );
+    let denied = checker
+        .check(CheckRequest {
+            read_denies: vec![ReadDeny::Path(library.clone())],
+            ..request.clone()
+        })
+        .await;
+    assert_eq!(
+        denied.state,
+        CheckState::Unavailable(UnavailableReason::ReadRestricted)
+    );
+    assert_eq!(runner.specs().len(), 1);
+    std::fs::write(library, "unqualified compiler bytes").unwrap();
+    let unsupported = checker.check(request.clone()).await;
+    assert_eq!(
+        unsupported.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert!(
+        unsupported
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("qualified")
+    );
+    assert_eq!(runner.specs().len(), 1);
+    std::fs::remove_file(project_cli).unwrap();
+    let missing = checker.check(request).await;
+    assert_eq!(
+        missing.state,
+        CheckState::Unavailable(UnavailableReason::ToolMissing)
+    );
+    assert_eq!(
+        runner.specs().len(),
+        1,
+        "missing project tools must not select global tools"
+    );
+}
+
+/// The real qualified adapter honors declared project compiler/runtime constraints before
+/// reporting clean source; unsupported selectors and denied manifests never silently fall back.
+#[tokio::test]
+#[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
+async fn real_pinned_manifest_environment_constraints() {
+    agent_ide::languages::install();
+    for (name, typescript, node_pin, engine, ready) in [
+        ("valid", "^5.9.2", None, ">=24 <25", true),
+        ("ts-major", "^6", None, ">=24 <25", false),
+        ("node-pin", "^5.9.2", Some("99.0.0"), ">=24 <25", false),
+        ("node-alias", "^5.9.2", Some("lts/*"), ">=24 <25", false),
+        ("ts-range", "workspace:*", None, ">=24 <25", false),
+        ("node-engine", "^5.9.2", None, ">=99", false),
+    ] {
+        let root = project(&format!("manifest-{name}"), "tsconfig.json");
+        std::fs::write(root.join("a.ts"), "export const a: number = 1;\n").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            serde_json::json!({
+                "devDependencies": {"typescript": typescript}, "engines": {"node": engine}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        if let Some(pin) = node_pin {
+            std::fs::write(root.join(".node-version"), pin).unwrap();
+        }
+        let request = CheckRequest {
+            worktree: root.clone(),
+            cache_dir: root.join("cache"),
+            input_generation: 1,
+            read_denies: Vec::new(),
+        };
+        let output = pinned_adapter_output(&request).await;
+        let snapshot = parsed(&root, "tsconfig.json", &output);
+        if ready {
+            assert_eq!(
+                snapshot.state,
+                CheckState::Ready,
+                "{name}: {:?}",
+                snapshot.detail
+            );
+            assert_eq!(snapshot.errors, 0);
+        } else {
+            assert_eq!(
+                snapshot.state,
+                CheckState::Unavailable(UnavailableReason::Fatal),
+                "{name}"
+            );
+            assert!(
+                snapshot
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("project environment"),
+                "{name}: {:?}",
+                snapshot.detail
+            );
+        }
+    }
+    let root = project("manifest-denied", "tsconfig.json");
+    std::fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"devDependencies":{"typescript":"^5.9.2"}}"#,
+    )
+    .unwrap();
+    let output = pinned_adapter_output(&CheckRequest {
+        worktree: root.clone(),
+        cache_dir: root.join("cache"),
+        input_generation: 1,
+        read_denies: vec![ReadDeny::Path(root.join("package.json"))],
+    })
+    .await;
+    assert_eq!(output.status, Some(77));
+    assert!(output.stdout.is_empty());
+}
+
 /// Selected denied inputs and an alias outside all read grants fail without publishing text.
 #[tokio::test]
 #[ignore = "requires the local pinned Node v24.4.0 and TypeScript 5.9.3"]
