@@ -617,8 +617,9 @@ pub const RECIPES: &[EffectRecipe] = &[
 pub fn configured_effect(
     argv: &[String],
     config: &agent_ide_core::modules::contract::ModuleConfig,
+    cwd: &Path,
 ) -> Result<Option<EffectRequest>, agent_ide_core::lang::LangError> {
-    crate::environment::admit_effects(&config_worktree(config), config)?;
+    crate::environment::admit_effects(cwd, config)?;
     // The same runner-shape refusal the native argv route enforces: `npx`-runner test shapes
     // execute the project's Node runtime through an operator `npx` this request does not
     // configure. `node --test` shapes run the configured Node slot; the Prettier formatter
@@ -627,13 +628,6 @@ pub fn configured_effect(
         return Err(agent_ide_core::lang::LangError::Environment(cause));
     }
     Ok(interactive_effect(argv))
-}
-
-/// The worktree this request's configuration names: the admitted boundary the environment
-/// facts are resolved against. A request without one has no project environment to obstruct
-/// effect planning.
-fn config_worktree(config: &agent_ide_core::modules::contract::ModuleConfig) -> PathBuf {
-    config.worktree.clone().unwrap_or_default()
 }
 
 /// The recipe request of a formatter or probe argument vector the in-process support builds
@@ -995,6 +989,27 @@ impl CheckerServer {
             crate::LANGUAGE,
             query.selections,
         );
+        // The confined checker's Node bytes guard: a same-path replaced Node cannot execute
+        // under stale accepted facts. The binding uses configured_tools, which resolves the
+        // actual checker Node and its accepted digest from the request's module_config; a
+        // legitimate foreign provider or unbound operator Node is not verified (the guard is
+        // business-unavailable, not a protocol fault).
+        if let Some(tools) = crate::environment::configured_tools(&query.module_config) {
+            if let Some(cause) = crate::environment::verify_configured_node(
+                &tools.node,
+                tools.node_digest.as_deref(),
+                &query.request.read_denies,
+            ) {
+                let snapshot = agent_ide_core::checks::ProblemSnapshot::unavailable_with_detail(
+                    crate::LANGUAGE,
+                    agent_ide_core::checks::UnavailableReason::EnvMissing,
+                    query.request.input_generation,
+                    0,
+                    Some(cause),
+                );
+                return Ok(agent_ide_core::modules::payload::encode(&snapshot));
+            }
+        }
         let config = TypeScriptChecks
             .parse_config(query.config)
             .map_err(|error| ServeError::Protocol(error.to_string()))?;

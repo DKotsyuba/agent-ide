@@ -40,48 +40,65 @@ use agent_ide_core::modules::contract::ModuleConfig;
 
 use crate::checks::{CompilerFact, ProjectTypeScriptChecksConfig, compiler_fact};
 
-/// The operator-accepted tools of this request, from the launcher sections the core carries,
-/// with the accepted facts bound to the actually selected checker Node: the measured identity
-/// and digest of the provider declaration travel only when the provider's accepted executable
-/// is the same file this request's checks section configures.
+/// The operator-accepted tools of this request, from whichever launcher section carries them:
+/// the confined check's Node and TypeScript CLI, or the provider OPTION `node` when no check
+/// section configures tools. The measured identity and digest travel only when they belong to
+/// the actually selected Node executable.
 pub struct ConfiguredTools {
-    /// The accepted confined-check Node executable.
+    /// The selected Node executable.
     pub node: PathBuf,
-    /// The accepted confined-check TypeScript CLI module.
-    pub tsc_cli: PathBuf,
-    /// The measured Node identity, when the accepted provider declaration names the same Node
-    /// executable this request's checks configure; otherwise unknown.
+    /// The accepted TypeScript CLI module, when the checks section configures one.
+    pub tsc_cli: Option<PathBuf>,
+    /// The measured Node identity, when the accepted provider declaration states it for the
+    /// selected Node.
     pub node_identity: Option<String>,
     /// The accepted Node binary digest, bound like [`Self::node_identity`].
     pub node_digest: Option<String>,
 }
 
-/// Parses [`ConfiguredTools`] from the request's launcher sections; `None` when no
-/// `project_checks` section configures this language's tools.
+/// Parses [`ConfiguredTools`] from the request's launcher sections. The Node comes from the
+/// checks section when one configures tools, else from the provider OPTION `node` (a
+/// provider-only semantic launch is still a valid Node source for raw consumers). The
+/// TypeScript CLI requires the checks section; `None` tsc means the environment cannot prove
+/// a compiler for `tsc` claims.
 fn configured_tools(config: &ModuleConfig) -> Option<ConfiguredTools> {
-    let checks: ProjectTypeScriptChecksConfig =
-        serde_json::from_value(config.checks.clone()?).ok()?;
+    let checks = config.checks.as_ref().and_then(|section| {
+        serde_json::from_value::<ProjectTypeScriptChecksConfig>(section.clone()).ok()
+    });
     let provider = config.provider.as_ref();
     // The accepted Node is the provider OPTION `node` (the common `executable` is the bridge);
-    // its facts travel only when it is the same file this request's checks configure.
+    // its facts travel only when it is the same file this request's checks configure (or when
+    // no checks section selects a different one).
     let accepted_node = provider.and_then(|provider| provider.get("node"));
-    let same_node = accepted_node
-        .and_then(|node| node.get("path"))
-        .and_then(Value::as_str)
-        .is_some_and(|path| Path::new(path) == checks.node());
+    let (node, same_node) = match &checks {
+        Some(checks) => {
+            let node = checks.node().to_path_buf();
+            let same = accepted_node
+                .and_then(|n| n.get("path"))
+                .and_then(Value::as_str)
+                .is_some_and(|path| Path::new(path) == checks.node());
+            (node, same)
+        }
+        None => {
+            let path = accepted_node
+                .and_then(|n| n.get("path"))
+                .and_then(Value::as_str)?;
+            (PathBuf::from(path), true)
+        }
+    };
     let fact = |field: &str| {
         same_node
             .then(|| {
                 accepted_node
-                    .and_then(|node| node.get(field))
+                    .and_then(|n| n.get(field))
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             })
             .flatten()
     };
     Some(ConfiguredTools {
-        node: checks.node().to_path_buf(),
-        tsc_cli: checks.tsc_cli().to_path_buf(),
+        node,
+        tsc_cli: checks.as_ref().map(|checks| checks.tsc_cli().to_path_buf()),
         node_identity: fact("identity"),
         node_digest: fact("blake3"),
     })
@@ -224,10 +241,13 @@ fn node_pin_conflict(
 /// Why the configured consumers must not run for `worktree` under this request's denies, or
 /// `None` when they may: the compiler fact's refusal, then the Node pin's.
 fn obstruction(worktree: &Path, tools: &ConfiguredTools, denies: &[ReadDeny]) -> Option<String> {
-    match compiler_fact(worktree, &tools.tsc_cli, denies) {
-        Ok(_) => node_pin_conflict(worktree, tools, denies),
-        Err((_, cause)) => Some(cause),
-    }
+    // Without a configured TypeScript CLI (provider-only launch) the compiler fact cannot be
+    // evaluated: no compiler obstruction, but the Node pin still applies.
+    let compiler_cause = tools
+        .tsc_cli
+        .as_ref()
+        .and_then(|tsc_cli| compiler_fact(worktree, tsc_cli, denies).err());
+    compiler_cause.or_else(|| node_pin_conflict(worktree, tools, denies))
 }
 
 /// The worktree's environment as a [`ResolvedEnv`]: the compiler fact (`CompilerFact`) names, with
@@ -244,11 +264,14 @@ pub fn environment(
     denies: &[ReadDeny],
 ) -> ResolvedEnv {
     let cause = tools.and_then(|tools| obstruction(worktree, tools, denies));
-    let fact = tools.filter(|_| cause.is_none()).map(|tools| {
-        match compiler_fact(worktree, &tools.tsc_cli, denies) {
-            Ok(fact) => Ok(fact),
-            Err((_, cause)) => Err(cause),
-        }
+    let fact = tools.filter(|_| cause.is_none()).and_then(|tools| {
+        tools
+            .tsc_cli
+            .as_ref()
+            .map(|tsc_cli| match compiler_fact(worktree, tsc_cli, denies) {
+                Ok(fact) => Ok(fact),
+                Err((_, cause)) => Err(cause),
+            })
     });
     let chosen = match &fact {
         Some(Ok(CompilerFact::Operator(cli))) => Some(EnvCandidate {
@@ -324,16 +347,43 @@ pub fn admit_effects(worktree: &Path, config: &ModuleConfig) -> Result<(), LangE
         return Ok(());
     };
     // One shared guard for every claimed consumer: a known compiler/pin obstruction, an
-    // authoritative pin whose compatibility cannot be verified (no measured Node identity),
-    // or configured Node bytes that no longer match the accepted declaration — a card
-    // warning or a stale digest is not compatibility proof for a raw Node run.
+    // authoritative pin whose compatibility cannot be verified (no measured Node identity, or
+    // a range/alias expression no accepted version establishes), or configured Node bytes
+    // that no longer match the accepted declaration — a card warning or a stale digest is not
+    // compatibility proof for a raw Node run.
     let cause = obstruction(worktree, &tools, &config.read_denies).or_else(|| {
         let pin = node_pin(worktree, &config.read_denies)?;
-        tools.node_identity.is_none().then(|| {
+        let unverifiable = || {
             format!(
-                "node pin {pin} cannot be verified: the configured Node has no measured \
-                 identity in this request — IDE commands refuse an unverifiable pin; align \
-                 the launcher Node or adjust the pin"
+                "node pin {pin} cannot be verified against the configured Node in this \
+                 request — IDE commands refuse an unverifiable pin; align the launcher Node \
+                 or adjust the pin"
+            )
+        };
+        let Some(identity) = tools.node_identity.as_deref() else {
+            return Some(unverifiable());
+        };
+        let Some(admitted) = measured_version(identity) else {
+            return Some(unverifiable());
+        };
+        let Some(components) = plain_version(&pin) else {
+            // A range or alias expression no accepted version establishes: raw commands
+            // refuse rather than running a Node the pin may reject.
+            return Some(format!(
+                "node pin {pin} is a range/alias this request cannot prove against the \
+                 configured Node — IDE commands refuse an unproven pin; use native tooling \
+                 (the adapter validates ranges for confined checks) or align the pin"
+            ));
+        };
+        let satisfied = components.len() <= admitted.len()
+            && components
+                .iter()
+                .zip(admitted.iter())
+                .all(|(declared, admitted)| declared == admitted);
+        (!satisfied).then(|| {
+            format!(
+                "node pin {pin} does not match the configured Node — IDE commands refuse the \
+                 mismatch; use the project's own runtime or align the launcher Node"
             )
         })
     });
@@ -344,7 +394,7 @@ pub fn admit_effects(worktree: &Path, config: &ModuleConfig) -> Result<(), LangE
     // same-path replacement must refuse before any claimed child runs, exactly like a
     // changed compiler.
     if let Some(digest) = &tools.node_digest {
-        match node_content_hash(&tools.node, &config.read_denies) {
+        match agent_ide_core::lang::environment::hash_input(&tools.node, &config.read_denies) {
             None => {
                 return Err(LangError::Environment(
                     "the configured Node could not be read for verification — IDE commands \
@@ -352,7 +402,7 @@ pub fn admit_effects(worktree: &Path, config: &ModuleConfig) -> Result<(), LangE
                         .to_owned(),
                 ));
             }
-            Some(current) if current.to_hex().as_str() != digest.as_str() => {
+            Some(current) if !current.to_hex().eq_ignore_ascii_case(digest.as_str()) => {
                 return Err(LangError::Environment(
                     "the configured Node's bytes changed since acceptance — IDE commands \
                      refuse the modified executable; restore the accepted Node or re-provision \
@@ -364,12 +414,6 @@ pub fn admit_effects(worktree: &Path, config: &ModuleConfig) -> Result<(), LangE
         }
     }
     Ok(())
-}
-
-/// Whole-content BLAKE3 of the configured Node executable, under the request's read excludes;
-/// `None` when it cannot be read.
-fn node_content_hash(path: &Path, denies: &[ReadDeny]) -> Option<blake3::Hash> {
-    agent_ide_core::lang::environment::hash_input(path, denies)
 }
 
 /// Activation of `program` under this request's configured tools, resolved before any
@@ -399,26 +443,36 @@ pub fn command_env(
         return Ok(None);
     };
     admit_effects(worktree, config)?;
-    let compiler = match compiler_fact(worktree, &tools.tsc_cli, &config.read_denies) {
-        Ok(fact) => fact,
-        Err((_, cause)) => return Err(LangError::Environment(cause)),
-    };
-    let environment = match &compiler {
-        CompilerFact::Project { cli, .. } | CompilerFact::Operator(cli) if program == "tsc" => {
-            agent_ide_core::lang::environment::CommandEnv {
-                argv_prefix: vec![
-                    tools.node.clone().into_os_string(),
-                    cli.clone().into_os_string(),
-                ],
-                ..Default::default()
-            }
-        }
-        _ => agent_ide_core::lang::environment::CommandEnv {
-            argv_prefix: vec![tools.node.clone().into_os_string()],
+    if program == "tsc" {
+        let Some(tsc_cli) = &tools.tsc_cli else {
+            return Err(LangError::Environment(
+                "no configured TypeScript CLI in this request; the tsc compiler cannot be \
+                 proven — configure the checks section or use native tsc"
+                    .to_owned(),
+            ));
+        };
+        let compiler = match compiler_fact(worktree, tsc_cli, &config.read_denies) {
+            Ok(fact) => fact,
+            Err((_, cause)) => return Err(LangError::Environment(cause)),
+        };
+        let cli = match &compiler {
+            CompilerFact::Project { cli, .. } | CompilerFact::Operator(cli) => cli.clone(),
+        };
+        return Ok(Some(agent_ide_core::lang::environment::CommandEnv {
+            argv_prefix: vec![tools.node.clone().into_os_string(), cli.into_os_string()],
+            // The configured Node's directory leads PATH so child processes spawned via
+            // bare `node` resolve the same runtime — the module slot's SlotDir parity.
+            path_prefix: tools.node.parent().map(Path::to_path_buf),
             ..Default::default()
-        },
-    };
-    Ok(Some(environment))
+        }));
+    }
+    // program == "node"
+    Ok(Some(agent_ide_core::lang::environment::CommandEnv {
+        argv_prefix: vec![tools.node.clone().into_os_string()],
+        // Same SlotDir parity: child `node`/`npx` resolve from the configured Node's directory.
+        path_prefix: tools.node.parent().map(Path::to_path_buf),
+        ..Default::default()
+    }))
 }
 
 /// Activation for the full argument vector under this request's configured tools. The
@@ -433,17 +487,17 @@ pub fn command_argv(
     config: &ModuleConfig,
 ) -> Result<Option<agent_ide_core::lang::environment::CommandEnv>, LangError> {
     if let [name] = argv {
-        if name != "node" {
-            return Ok(None);
+        if name == "node" {
+            let Some(tools) = configured_tools(config) else {
+                return Ok(None);
+            };
+            admit_effects(worktree, config)?;
+            return Ok(Some(agent_ide_core::lang::environment::CommandEnv {
+                argv_prefix: vec![tools.node.clone().into_os_string()],
+                ..Default::default()
+            }));
         }
-        let Some(tools) = configured_tools(config) else {
-            return Ok(None);
-        };
-        admit_effects(worktree, config)?;
-        return Ok(Some(agent_ide_core::lang::environment::CommandEnv {
-            argv_prefix: vec![tools.node.clone().into_os_string()],
-            ..Default::default()
-        }));
+        // Bare "tsc" and any other slot name falls through to the full-argv path below.
     }
     // One shared runner-shape refusal for both routes: an `npx vitest`/`npx jest` test run
     // executes the project's Node runtime through an operator `npx` this request does not
@@ -471,6 +525,34 @@ pub fn runner_shape_refusal(argv: &[String]) -> Option<String> {
          package manager's tool or run them natively"
             .to_owned()
     })
+}
+
+/// The Node bytes guard for the confined checker route: re-measures the configured Node
+/// against the accepted digest before the runner starts. `Ok(())` when no digest is bound
+/// (unbound/provider-only scope) or the bytes match; `Err(cause)` on missing/denied/changed.
+/// The confined checker calls this from its own `configured_checker`/`check_plan` seam so a
+/// same-path replaced Node cannot execute under stale accepted facts.
+pub fn verify_configured_node(
+    node: &Path,
+    accepted_digest: Option<&str>,
+    denies: &[ReadDeny],
+) -> Result<(), String> {
+    let Some(digest) = accepted_digest else {
+        return Ok(());
+    };
+    match agent_ide_core::lang::environment::hash_input(node, denies) {
+        None => Err(
+            "the configured Node could not be read for verification — IDE commands refuse; \
+             restore the accepted executable"
+                .to_owned(),
+        ),
+        Some(current) if current.to_hex().as_str() != digest.as_str() => Err(format!(
+            "the configured Node's bytes changed since acceptance — IDE commands refuse the \
+             modified executable; restore the accepted Node or re-provision the launcher \
+             declaration"
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
 /// The environments of `worktree` under this request's configured tools and read excludes:
@@ -524,7 +606,13 @@ fn identity_string(
     match tools {
         Some(tools) => {
             parts.push(format!("node={}", tools.node.display()));
-            parts.push(format!("tsc={}", tools.tsc_cli.display()));
+            parts.push(format!(
+                "tsc={}",
+                tools
+                    .tsc_cli
+                    .as_deref()
+                    .map_or_else(String::new, |path| path.display().to_string())
+            ));
             parts.push(format!(
                 "node-identity={}",
                 tools.node_identity.as_deref().unwrap_or_default()
@@ -541,11 +629,24 @@ fn identity_string(
                     .map_or_else(String::new, |hash| hash.to_string())
             ));
             // On-disk identity of the selected tools: a same-path mutated executable or
-            // compiler module moves the stamp even when the declaration is unchanged. The
-            // node's content identity is the admitted digest above; a swap preserving every
-            // stamp field is outside this seam and stays with admission-time measurement.
+            // compiler module moves the stamp and the measured content hash even when the
+            // declaration is unchanged — the guard refuses on the digest comparison, and the
+            // identity moves with the measured bytes.
             parts.push(format!("node-stamp={}", stamp(&tools.node)));
-            parts.push(format!("tsc-stamp={}", stamp(&tools.tsc_cli)));
+            parts.push(format!(
+                "tsc-stamp={}",
+                tools.tsc_cli.as_deref().map(stamp).unwrap_or_default()
+            ));
+            // Current measured content of the selected TypeScript CLI: same-path replacement
+            // moves the identity even when the declaration is unchanged.
+            parts.push(format!(
+                "tsc-content={}",
+                tools
+                    .tsc_cli
+                    .as_deref()
+                    .and_then(|path| agent_ide_core::lang::environment::hash_input(path, denies))
+                    .map_or_else(String::new, |hash| hash.to_string())
+            ));
         }
         None => parts.push("configured=-".to_owned()),
     }
@@ -800,13 +901,16 @@ mod tests {
         assert!(env.warnings.is_empty(), "{:?}", env.warnings);
         assert!(command_env(&root, "node", &config).is_ok());
 
-        // Range expression: disclosed as unverified, never refused or interpreted.
+        // Range expression: the card keeps the winner with a disclosure, but raw claimed
+        // commands refuse — a range no accepted version proves (root's 24 vs >=999
+        // counterexample) must never silently run an unmatched runtime.
         put(&root, ".nvmrc", ">=20\n");
         let env = environment(&root, Some(&tools), &config, &[]);
         assert!(env.chosen.is_some());
         let warning = env.warnings.first().expect("the range is disclosed");
         assert!(warning.contains("cannot verify"), "{warning}");
-        assert!(command_env(&root, "node", &config).is_ok());
+        let refusal = command_env(&root, "node", &config).unwrap_err();
+        assert!(refusal.to_string().contains("range/alias"), "{refusal}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -902,16 +1006,14 @@ mod tests {
         put(&root, "tsconfig.json", "{}");
         let config = config_with(&node, &tsc);
         let tools = configured_tools(&config).unwrap();
-        // Sanity: the pristine fixture passes the bytes guard.
-        assert!(admit_effects(&root, &config).is_ok());
+        // The baseline identity is captured with the SAME config object before any mutation.
+        let before = environment(&root, Some(&tools), &config, &[]).identity;
         // Same path, same length, different bytes, declaration unchanged.
-        let len = std::fs::metadata(&node).unwrap().len();
-        std::fs::write(&node, vec![b'x'; len as usize]).unwrap();
-        assert_ne!(
-            std::fs::read(&node).unwrap().len(),
-            0,
-            "replacement wrote bytes"
-        );
+        let original = std::fs::read(&node).unwrap();
+        let mut replaced = original.clone();
+        replaced[0] ^= b'x';
+        std::fs::write(&node, &replaced).unwrap();
+        assert_ne!(std::fs::read(&node).unwrap(), original);
         let cause = admit_effects(&root, &config).unwrap_err();
         assert!(
             cause.to_string().contains("bytes changed since acceptance"),
@@ -919,19 +1021,18 @@ mod tests {
         );
         assert!(command_env(&root, "node", &config).is_err());
         assert!(command_env(&root, "tsc", &config).is_err());
-        // The identity moved too: current measured content participates.
-        let before = {
-            let pristine = config_with(&node, &tsc);
-            std::fs::write(&node, b"").unwrap();
-            let tools = configured_tools(&pristine).unwrap();
-            let id = environment(&root, Some(&tools), &pristine, &[]).identity;
-            std::fs::write(&node, vec![b'x'; len as usize]).unwrap();
-            id
-        };
+        // The current measured content participates in the identity: the replaced bytes move
+        // it, and restoring the original bytes moves it back.
+        let replaced_identity = environment(&root, Some(&tools), &config, &[]).identity;
         assert_ne!(
+            replaced_identity, before,
+            "replaced bytes move the identity"
+        );
+        std::fs::write(&node, &original).unwrap();
+        assert_eq!(
             environment(&root, Some(&tools), &config, &[]).identity,
             before,
-            "replaced bytes move the identity"
+            "restored bytes restore the identity"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -974,6 +1075,24 @@ mod tests {
         // not compatibility proof for a run that never reaches the adapter's validation.
         assert!(command_env(&root, "node", &config).is_err());
         assert!(command_env(&root, "tsc", &config).is_err());
+        assert!(admit_effects(&root, &config).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Root's counterexample: a bound configured Node (22.x measured) with a `>=999` range
+    /// pin must refuse raw claimed commands — the range can never be satisfied by the
+    /// admitted major, and a warning alone would let an unmatched runtime run.
+    #[test]
+    fn unsatisfiable_range_pin_refuses_raw_commands() {
+        let root = scratch("range-999");
+        let (node, tsc) = tools(&root);
+        put(&root, "package.json", "{\"dependencies\":{}}");
+        put(&root, "tsconfig.json", "{}");
+        put(&root, ".nvmrc", ">=999\n");
+        let config = config_with(&node, &tsc);
+        let refusal = command_env(&root, "node", &config).unwrap_err();
+        assert!(refusal.to_string().contains("range/alias"), "{refusal}");
+        assert!(refusal.to_string().contains(">=999"), "{refusal}");
         assert!(admit_effects(&root, &config).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
