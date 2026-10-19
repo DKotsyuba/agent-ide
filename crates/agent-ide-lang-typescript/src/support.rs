@@ -647,9 +647,20 @@ impl LanguageSupport for TypeScript {
         root: &Path,
         config: &agent_ide_core::modules::contract::ModuleConfig,
     ) -> Option<LanguageProject> {
-        let denied = |name: &str| {
+        // The gate matches the confined checker's own admission policy: a PRESENT input that
+        // is host-denied, or a link (the checker refuses links as "not regular and link-free"
+        // even unconfined), blocks detection — never a partial read through a linked or
+        // denied authoritative input. An absent optional input (the Node pin files) does not
+        // block; absence is normal.
+        let blocked = |name: &str| {
             let path = root.join(name);
-            config.read_denies.iter().any(|deny| deny.matches(&path))
+            let Ok(metadata) = path.symlink_metadata() else {
+                return false;
+            };
+            if metadata.file_type().is_symlink() {
+                return true;
+            }
+            !agent_ide_core::lang::environment::readable(&path, &config.read_denies)
         };
         if [
             "package.json",
@@ -659,7 +670,7 @@ impl LanguageSupport for TypeScript {
             ".node-version",
         ]
         .iter()
-        .any(|name| denied(name))
+        .any(|name| blocked(name))
         {
             return None;
         }
@@ -680,6 +691,23 @@ impl LanguageSupport for TypeScript {
         agent_ide_core::lang::LangError,
     > {
         crate::environment::command_env(worktree, program, config)
+    }
+
+    /// Activation with the actual argv ([`crate::environment::command_argv`]): the
+    /// single-name call is the Launcher `node` slot's resolution (the configured Node alone —
+    /// exactly what a program slot can carry), and a full argv honors explicit selectors per
+    /// program.
+    fn configured_command_argv(
+        &self,
+        worktree: &Path,
+        _cwd: &Path,
+        argv: &[String],
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Result<
+        Option<agent_ide_core::lang::environment::CommandEnv>,
+        agent_ide_core::lang::LangError,
+    > {
+        crate::environment::command_argv(worktree, argv, config)
     }
 
     /// A leading `//` comment, or the first text line of a leading `/** */` block.

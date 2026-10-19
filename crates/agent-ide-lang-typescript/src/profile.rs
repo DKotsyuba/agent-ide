@@ -40,7 +40,14 @@ const MAX_RESOLUTION_FILES: usize = 16;
 /// Maximum bytes represented by all project-resolution inputs for one document.
 const MAX_RESOLUTION_BYTES: u64 = MAX_RESOLUTION_INPUT_BYTES as u64;
 /// Exact filenames tsserver may consult while selecting the document's ancestor project.
-const RESOLUTION_FILENAMES: [&str; 6] = [
+/// `.nvmrc`, `.node-version`, `bun.lock` and `bun.lockb` are fingerprint-only members: they
+/// retire a session when the project's Node pin or bun lockfile changes, but are never parsed
+/// as project configuration (see [`parsed_input`]).
+const RESOLUTION_FILENAMES: [&str; 10] = [
+    ".node-version",
+    ".nvmrc",
+    "bun.lock",
+    "bun.lockb",
     "jsconfig.json",
     "package-lock.json",
     "package.json",
@@ -1163,12 +1170,15 @@ pub struct ObservedInputs {
     pub inputs: Vec<ReadInput>,
 }
 
-/// Whether `interpret_inputs` parses the file (every input but the Yarn and pnpm lockfiles, which
-/// are only fingerprinted).
+/// Whether `interpret_inputs` parses the file: every input but the fingerprint-only members
+/// (the Yarn and pnpm lockfiles, the Node pin files and both bun lockfiles — a binary lockfile
+/// or a plain version pin is retirement evidence, never project configuration).
 fn parsed_input(path: &Path) -> bool {
     !matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some("yarn.lock" | "pnpm-lock.yaml")
+        Some(
+            "yarn.lock" | "pnpm-lock.yaml" | ".nvmrc" | ".node-version" | "bun.lock" | "bun.lockb"
+        )
     )
 }
 
@@ -1364,6 +1374,12 @@ fn interpret(document: &Path, inputs: &[InputFile]) -> Result<InputsVerdict, Res
             continue;
         };
         seen.insert(input.path.clone());
+        // Fingerprint-only members (Node pin files, bun lockfiles) carry retirement evidence,
+        // never configuration: they join the identity but no shape/membership rule reads the
+        // empty projection their unparseable bytes would otherwise produce.
+        if !parsed_input(path) {
+            continue;
+        }
         let shape = shape(input, MembershipRequirement::Required)?;
         document_covered |= shape.includes_document;
         pending_references.extend(shape.references);
@@ -2215,6 +2231,12 @@ mod tests {
             ("package.json", b"{}".as_slice()),
             ("pnpm-lock.yaml", b"lock".as_slice()),
             ("yarn.lock", b"lock".as_slice()),
+            // Fingerprint-only members: present pins and bun lockfiles are observed as
+            // retirement evidence and never parsed as project configuration.
+            (".nvmrc", b"22.11.0\n".as_slice()),
+            (".node-version", b"22.11.0\n".as_slice()),
+            ("bun.lock", b"bun lock\n".as_slice()),
+            ("bun.lockb", [0u8, 1, 2, 3].as_slice()),
         ] {
             std::fs::write(fixture.root.join(name), bytes).unwrap();
         }
