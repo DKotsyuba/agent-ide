@@ -425,7 +425,7 @@ impl ProductDispatcher {
         // sharing the daemon's admission; ignored fallback-switch entries are journaled once.
         let modules = Arc::new(crate::modules::router::ModuleHost::new(
             dispatcher.admission.clone(),
-        ));
+        ).with_launcher(launcher.clone()));
         for line in modules.ignored_lines() {
             errorlog::record(
                 errorlog::Method::Daemon,

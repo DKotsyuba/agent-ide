@@ -1507,6 +1507,11 @@ fn provider_cache_key(
 }
 
 impl ProviderHost for Worker<'_> {
+    /// Copies this exact accepted provider and the current launcher's matching check facts.
+    fn module_config(&self, launch: &ProviderLaunch, worktree: &Path) -> crate::modules::contract::ModuleConfig {
+        self.shared.launcher.provider_module_config(launch, worktree)
+    }
+
     /// Delegates to the worker's boot-fenced authority check.
     fn authority<'a>(
         &'a self,

@@ -47,6 +47,9 @@ pub struct ModuleChecker {
     runner: Arc<dyn ConfinedRunner>,
     /// Total wall-clock ceiling of one check.
     timeout: Duration,
+    /// Immutable accepted factory facts; each run fills its own actual worktree before sending
+    /// them. Unknown provider evidence remains absent, never replaced with ambient paths.
+    configuration: super::contract::ModuleConfig,
     /// The module's `describe` answer for the section, asked once.
     described: tokio::sync::OnceCell<Described>,
 }
@@ -61,6 +64,7 @@ impl ModuleChecker {
         timeout: Duration,
     ) -> Self {
         Self {
+            configuration: super::contract::ModuleConfig {checks: Some(section.clone()), ..Default::default()},
             language,
             host,
             section,
@@ -68,6 +72,13 @@ impl ModuleChecker {
             timeout,
             described: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Supplies accepted immutable launcher facts before sharing this checker. Run requests clone
+    /// them and set the admitted worktree; no cached module hello becomes current authority.
+    pub fn with_config(mut self, config: super::contract::ModuleConfig) -> Self {
+        self.configuration = config;
+        self
     }
 
     /// The module's `describe` answer for the section as admission inputs: named programs,
@@ -108,6 +119,8 @@ impl ModuleChecker {
 
     /// Runs one check, or the typed failure of its module.
     async fn run(&self, request: &CheckRequest) -> Result<ProblemSnapshot, ModuleUnavailable> {
+        let mut configuration = self.configuration.clone();
+        configuration.worktree = Some(request.worktree.clone());
         let mut described = self.described(&request.worktree).await?.clone();
         described.launcher_roots.extend(recipe::environment_roots(
             self.language.name(),
@@ -130,6 +143,7 @@ impl ModuleChecker {
                     Capability::CheckPlan,
                     &request.worktree,
                     encode(&CheckPlanRequest {
+                        module_config: configuration,
                         request: request.clone(),
                         config: self.section.clone(),
                         timeout_ms: self.timeout.as_millis() as u64,

@@ -153,7 +153,8 @@ impl FakeModule {
                 ProjectQuery::CheckSelection { selector, .. } => {
                     encode(&Err::<(), String>(format!("unknown selector {selector}")))
                 }
-                ProjectQuery::CommandEnv { .. } | ProjectQuery::TestToolchain { .. } => json!(null),
+                ProjectQuery::CommandEnv { .. } => encode(&Ok::<Option<crate::lang::environment::CommandEnv>, LangError>(None)),
+                ProjectQuery::TestToolchain { .. } => json!(null),
             },
             Capability::AnalyzeSource => {
                 let query: AnalyzeSource = decode(payload)?;
@@ -228,7 +229,7 @@ impl FakeModule {
             }
             Capability::Syntax => match decode::<SyntaxQuery>(payload)? {
                 SyntaxQuery::Verdict { .. } => encode(&SyntaxVerdict::Clean),
-                SyntaxQuery::ProbePlan { .. } => encode(&Some(sample_effect("probe"))),
+                SyntaxQuery::ProbePlan { .. } => encode(&Ok::<_, LangError>(Some(sample_effect("probe")))),
             },
             Capability::Semantic => match decode::<SemanticQuery>(payload)? {
                 SemanticQuery::Context { source, .. } => encode(&ContextEvidence {
@@ -306,7 +307,7 @@ impl FakeModule {
             }
             Capability::FormatPlan => {
                 let _: FormatPlanRequest = decode(payload)?;
-                encode(&Some(sample_effect("format")))
+                encode(&Ok::<_, LangError>(Some(sample_effect("format"))))
             }
             Capability::TestPlan => match decode::<TestPlanQuery>(payload)? {
                 TestPlanQuery::Selection { .. } => {
@@ -647,6 +648,7 @@ pub fn sample_call(capability: Capability) -> Call {
     let mut attachments = Vec::new();
     let payload = match capability {
         Capability::Project => encode(&ProjectQuery::Detect {
+            config: Default::default(),
             root: "/w".into(),
             selections: Vec::new(),
         }),
@@ -699,6 +701,7 @@ pub fn sample_call(capability: Capability) -> Call {
             sources: Vec::new(),
         }),
         Capability::FormatPlan => encode(&FormatPlanRequest {
+            config: Default::default(),
             project: LanguageProject {
                 language: language(),
                 manifests: Vec::new(),
@@ -722,6 +725,7 @@ pub fn sample_call(capability: Capability) -> Call {
             })
         }
         Capability::CheckPlan => encode(&CheckPlanRequest {
+            module_config: Default::default(),
             request: check,
             config: json!({}),
             timeout_ms: 1000,

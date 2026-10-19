@@ -2766,6 +2766,13 @@ pub(super) fn module_failure(
     FailureCode::ProviderUnavailable
 }
 
+/// Records an actionable configured-environment refusal without starting a child or substituting
+/// ambient tools. Producer text is bounded; the renderer escapes labels and names native recovery.
+pub(super) fn environment_failure(job: &mut Job, error: &crate::lang::LangError) -> FailureCode {
+    job.failure_detail = Some(format!("environment: {}", super::test_text_line(&error.to_string(), 512)));
+    FailureCode::ProviderUnavailable
+}
+
 /// The typed language-module failure a job's stage names (`<language>: module_unavailable (…)`,
 /// as a backend records it), if its failure was one.
 pub(super) fn module_stage(job: &Job) -> Option<String> {
@@ -3253,7 +3260,7 @@ impl Worker<'_> {
             };
         let formatted = self
             .format_candidate(job, &observed, &file, candidate)
-            .await;
+            .await?;
         // Pre-write structural gate, shared with batches and file creation: a candidate that
         // does not parse is not written; a base that already failed is edited with a note.
         let gated = self
@@ -3687,7 +3694,7 @@ impl Worker<'_> {
         };
         let candidate = self
             .format_candidate(job, observed, &file, spliced.clone())
-            .await;
+            .await?;
         // Pre-write structural gate: a candidate that does not parse is not written; a file that
         // already failed the same check before the edit is still edited, with a note.
         let gated = self
@@ -3801,7 +3808,7 @@ impl Worker<'_> {
         } else {
             String::new()
         };
-        let candidate = self.format_candidate(job, &observed, &file, content).await;
+        let candidate = self.format_candidate(job, &observed, &file, content).await?;
         // The same pre-write structural gate as every edit: new content that does not parse is
         // not written (an empty base can never have carried a pre-existing error).
         let gated = self
@@ -3849,28 +3856,31 @@ impl Worker<'_> {
 
     /// Runs the project's stdin formatter over a candidate text, timing its exclusive interval
     /// on `job`. Returns the candidate unchanged when no formatter exists, it fails, or it exceeds
-    /// ten seconds. The admitted observation supplies the worktree; formatting writes no source.
+    /// ten seconds. An authoritative configured-environment refusal returns `ProviderUnavailable`
+    /// before admission/write and records the native recovery on `job`. The admitted observation
+    /// supplies the worktree; formatting writes no source.
     pub(super) async fn format_candidate(
         &mut self,
-        job: &Job,
+        job: &mut Job,
         observed: &SourceObservation,
         file: &Path,
         candidate: String,
-    ) -> String {
+    ) -> Result<String, FailureCode> {
         let _timing = progress::Progress::enter(&job.progress, "format");
         let Some(language) = Lang::for_path(file) else {
-            return candidate;
+            return Ok(candidate);
         };
         let root = observed.worktree().worktree_path().to_path_buf();
+        let config = self.shared.launcher.module_config(language, &root, &job.target);
         // A module that cannot plan the formatter leaves the candidate unformatted, exactly as a
         // formatter that fails.
-        let Ok(Some(project)) = crate::modules::calls::detect(language, &root).await else {
-            return candidate;
+        let Ok(Some(project)) = crate::modules::calls::detect(language, &root, &config).await else {
+            return Ok(candidate);
         };
-        let Ok(Some(argv)) =
-            crate::modules::calls::format_stdin_command(language, &root, &project, file).await
-        else {
-            return candidate;
+        let argv = match crate::modules::calls::format_stdin_command(language, &root, &project, file, &config).await {
+            Ok(Ok(Some(argv))) => argv,
+            Ok(Err(error)) => return Err(environment_failure(job, &error)),
+            _ => return Ok(candidate),
         };
         match run_stdin(
             &self.admission,
@@ -3882,9 +3892,9 @@ impl Worker<'_> {
         .await
         {
             Some(output) if output.status == Some(0) && !output.stdout.is_empty() => {
-                String::from_utf8(output.stdout).unwrap_or(candidate)
+                Ok(String::from_utf8(output.stdout).unwrap_or(candidate))
             }
-            _ => candidate,
+            _ => Ok(candidate),
         }
     }
 
@@ -3919,6 +3929,7 @@ impl Worker<'_> {
             );
         };
         let root = observed.worktree().worktree_path().to_path_buf();
+        let config = self.shared.launcher.module_config(language, &root, &job.target);
         let Ok(verdict) =
             crate::modules::calls::syntax_verdict(language, &root, file, source).await
         else {
@@ -3930,20 +3941,21 @@ impl Worker<'_> {
         if verdict != lang::SyntaxVerdict::Unchecked {
             return (verdict, None);
         }
-        let Ok(Some(project)) = crate::modules::calls::detect(language, &root).await else {
+        let Ok(Some(project)) = crate::modules::calls::detect(language, &root, &config).await else {
             return (
                 lang::SyntaxVerdict::Unchecked,
                 Some("no project detected for the language"),
             );
         };
         let configured = self.configured_probe_programs(job, language);
-        let Ok(Some(argv)) = crate::modules::calls::syntax_probe_command(
+        let Ok(Ok(Some(argv))) = crate::modules::calls::syntax_probe_command(
             language,
             &root,
             &project,
             &root,
             file,
             configured.as_ref(),
+            &config,
         )
         .await
         else {

@@ -20,7 +20,7 @@ use std::{
 };
 
 use super::{
-    contract::{Capability, ModuleUnavailable},
+    contract::{Capability, ModuleConfig, ModuleUnavailable},
     mode::Mode,
     payload::{
         AnalysisScopeRequest, AnalyzeSource, AnchorBatch, CheckSelectionAnswer, CommandEnvAnswer,
@@ -41,6 +41,12 @@ use crate::lang::{
 /// The daemon's module routing, installed once at startup.
 static HOST: OnceLock<Arc<ModuleHost>> = OnceLock::new();
 
+/// Immutable current facts for an operation without a selected job target. Daemon callers with
+/// a target pass its explicit launcher context instead. An absent host supplies no tool proof.
+pub fn module_config(language: Language, worktree: &Path) -> ModuleConfig {
+    HOST.get().map_or_else(|| ModuleConfig {worktree: Some(worktree.to_path_buf()), ..Default::default()}, |host| host.module_config(language, worktree))
+}
+
 /// Installs the daemon's module routing; later calls keep the first host.
 pub fn install(host: Arc<ModuleHost>) {
     let _ = HOST.set(host);
@@ -59,6 +65,7 @@ pub fn checker(
     section: &serde_json::Value,
     runner: Arc<dyn crate::checks::runner::ConfinedRunner>,
     timeout: std::time::Duration,
+    config: &ModuleConfig,
 ) -> Option<Arc<dyn crate::checks::Checker>> {
     let host = module(language)?.clone();
     Some(Arc::new(super::checker::ModuleChecker::new(
@@ -67,7 +74,7 @@ pub fn checker(
         section.clone(),
         runner,
         timeout,
-    )))
+    ).with_config(config.clone())))
 }
 
 /// The daemon's modes line for `languages` ([`ModuleHost::modes_line`]); `None` without a host
@@ -386,7 +393,7 @@ fn field<T>(value: Field<T>, default: T) -> T {
 /// `LanguageSupport::detect` with the stored selections, which the module applies before
 /// reading manifests: a detected environment (and the commands planned from it) always reflects
 /// the current `ide.start environment` choice, not the instance's last-seen one.
-pub async fn detect(language: Language, root: &Path) -> Routed<Option<LanguageProject>> {
+pub async fn detect(language: Language, root: &Path, config: &ModuleConfig) -> Routed<Option<LanguageProject>> {
     match module(language) {
         None => {
             let root = root.to_path_buf();
@@ -402,6 +409,7 @@ pub async fn detect(language: Language, root: &Path) -> Routed<Option<LanguagePr
                 root,
                 Capability::Project,
                 encode(&ProjectQuery::Detect {
+                    config: config.clone(),
                     root: root.to_path_buf(),
                     selections: environment::selections(root, language),
                 }),
@@ -416,12 +424,14 @@ pub async fn detect(language: Language, root: &Path) -> Routed<Option<LanguagePr
 pub async fn environments(
     language: Language,
     worktree: &Path,
+    config: &ModuleConfig,
 ) -> Routed<Vec<environment::ResolvedEnv>> {
     match module(language) {
         None => {
             let worktree = worktree.to_path_buf();
+            let config = config.clone();
             Ok(
-                tokio::task::spawn_blocking(move || language.support().environments(&worktree))
+                tokio::task::spawn_blocking(move || language.support().configured_environments(&worktree, &config))
                     .await
                     .unwrap_or_default(),
             )
@@ -432,6 +442,7 @@ pub async fn environments(
                 worktree,
                 Capability::Project,
                 encode(&ProjectQuery::Environments {
+                    config: config.clone(),
                     worktree: worktree.to_path_buf(),
                     selections: environment::selections(worktree, language),
                 }),
@@ -474,15 +485,17 @@ pub async fn command_env(
     worktree: &Path,
     cwd: &Path,
     program: &str,
-) -> Routed<Option<environment::CommandEnv>> {
+    config: &ModuleConfig,
+) -> Routed<CommandEnvAnswer> {
     match module(language) {
-        None => Ok(language.support().command_env(worktree, cwd, program)),
+        None => Ok(language.support().configured_command_env(worktree, cwd, program, config)),
         Some(host) => {
             host.request::<CommandEnvAnswer>(
                 language,
                 worktree,
                 Capability::Project,
                 encode(&ProjectQuery::CommandEnv {
+                    config: config.clone(),
                     worktree: worktree.to_path_buf(),
                     cwd: cwd.to_path_buf(),
                     program: program.to_owned(),
@@ -687,6 +700,7 @@ pub async fn test_run(
     project: &LanguageProject,
     target: &TestTarget,
     budget: std::time::Duration,
+    config: &ModuleConfig,
 ) -> Routed<Result<PlannedRun, LangError>> {
     let Some(host) = module(language) else {
         return Ok(language
@@ -704,6 +718,7 @@ pub async fn test_run(
             worktree,
             Capability::TestPlan,
             encode(&TestPlanQuery::Run {
+                config: config.clone(),
                 project: Box::new(project.clone()),
                 target: target.clone(),
             }),
@@ -1001,31 +1016,31 @@ pub async fn format_stdin_command(
     worktree: &Path,
     project: &LanguageProject,
     file: &Path,
-) -> Routed<Option<StdinRun>> {
+    config: &ModuleConfig,
+) -> Routed<Result<Option<StdinRun>, LangError>> {
     match module(language) {
         None => Ok(language
             .support()
             .format_stdin_command(project, file)
             .map(|argv| {
-                let environment = argv.first().and_then(|program| {
-                    language.support().command_env(worktree, worktree, program)
-                });
-                StdinRun::Argv { argv, environment }
-            })),
+                let environment = match argv.first() { Some(program) => language.support().configured_command_env(worktree, worktree, program, config)?, None => None };
+                Ok(StdinRun::Argv { argv, environment })
+            }).transpose()),
         Some(host) => {
-            let effect: Option<EffectRequest> = host
+            let effect: super::payload::FormatPlanAnswer = host
                 .request(
                     language,
                     worktree,
                     Capability::FormatPlan,
                     encode(&FormatPlanRequest {
+                        config: config.clone(),
                         project: project.clone(),
                         file: file.to_path_buf(),
                     }),
                     Vec::new(),
                 )
                 .await?;
-            stdin_run(language, worktree, effect, &[])
+            match effect {Ok(effect) => stdin_run(language, worktree, effect, &[]).map(Ok), Err(error) => Ok(Err(error))}
         }
     }
 }
@@ -1038,24 +1053,24 @@ pub async fn syntax_probe_command(
     root: &Path,
     file: &Path,
     configured: Option<&ProbePrograms>,
-) -> Routed<Option<StdinRun>> {
+    config: &ModuleConfig,
+) -> Routed<Result<Option<StdinRun>, LangError>> {
     match module(language) {
         None => Ok(language
             .support()
             .syntax_probe_command(project, root, file, configured)
             .map(|argv| {
-                let environment = argv
-                    .first()
-                    .and_then(|program| language.support().command_env(worktree, root, program));
-                StdinRun::Argv { argv, environment }
-            })),
+                let environment = match argv.first() {Some(program) => language.support().configured_command_env(worktree, root, program, config)?, None => None};
+                Ok(StdinRun::Argv { argv, environment })
+            }).transpose()),
         Some(host) => {
-            let effect: Option<EffectRequest> = host
+            let effect: super::payload::FormatPlanAnswer = host
                 .request(
                     language,
                     worktree,
                     Capability::Syntax,
                     encode(&SyntaxQuery::ProbePlan {
+                        config: config.clone(),
                         project: Box::new(project.clone()),
                         root: root.to_path_buf(),
                         file: file.to_path_buf(),
@@ -1064,6 +1079,7 @@ pub async fn syntax_probe_command(
                     Vec::new(),
                 )
                 .await?;
+            let effect = match effect {Ok(effect) => effect, Err(error) => return Ok(Err(error))};
             stdin_run(
                 language,
                 worktree,
@@ -1072,7 +1088,7 @@ pub async fn syntax_probe_command(
                     .iter()
                     .flat_map(|tools| [tools.program.as_path(), tools.module.as_path()])
                     .collect::<Vec<_>>(),
-            )
+            ).map(Ok)
         }
     }
 }

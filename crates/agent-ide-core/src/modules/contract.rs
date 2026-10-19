@@ -282,8 +282,9 @@ pub struct HelloOffer {
 pub struct ModuleConfig {
     /// The absolute canonical admitted root of this instance's scope.
     pub worktree: Option<std::path::PathBuf>,
-    /// The language's accepted provider declaration (executable, toolchain, trust, cache
-    /// namespace and its raw option fields), when one is configured.
+    /// In current computation requests, the accepted provider declaration (executable,
+    /// toolchain, trust, cache namespace and raw language options). A separately admitted hosted
+    /// analyzer hello instead wraps its grant/settings here; request data is never that grant.
     pub provider: Option<Value>,
     /// The language's `project_checks` launcher section, when configured.
     pub checks: Option<Value>,

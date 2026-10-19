@@ -187,36 +187,31 @@ pub async fn resolve_command(
     cwd: &std::path::Path,
     argv: &[String],
     command_language: Option<Language>,
-) -> Result<CommandResolution, crate::modules::contract::ModuleUnavailable> {
+    launcher: &super::launcher::LauncherConfig,
+    target: &super::launcher::LaunchTarget,
+) -> Result<Result<CommandResolution, crate::lang::LangError>, crate::modules::contract::ModuleUnavailable> {
     let Some(program) = argv.first() else {
-        return Ok(CommandResolution::default());
+        return Ok(Ok(CommandResolution::default()));
     };
     let mut environment_language = command_language;
     let mut resolved = None;
-    match command_language {
-        Some(language) => {
-            resolved = crate::modules::calls::command_env(language, root, cwd, program).await?;
-        }
-        None => {
-            for &language in crate::lang::registered() {
-                if let Some(env) =
-                    crate::modules::calls::command_env(language, root, cwd, program).await?
-                {
-                    resolved = Some(env);
-                    environment_language = Some(language);
-                    break;
-                }
-            }
+    let languages = command_language.map_or_else(|| crate::lang::registered().to_vec(), |language| vec![language]);
+    for language in languages {
+        let config = launcher.module_config(language, root, target);
+        match crate::modules::calls::command_env(language, root, cwd, program, &config).await? {
+            Err(error) => return Ok(Err(error)),
+            Ok(Some(env)) => { resolved = Some(env); environment_language = Some(language); break; }
+            Ok(None) => {}
         }
     }
     let environment_label = match environment_language {
-        Some(language) => command_environment_label(root, cwd, language).await?,
+        Some(language) => command_environment_label(root, cwd, language, &launcher.module_config(language, root, target)).await?,
         None => None,
     };
-    Ok(CommandResolution {
+    Ok(Ok(CommandResolution {
         resolved,
         environment_label,
-    })
+    }))
 }
 
 impl TestRuns {
@@ -811,8 +806,9 @@ pub(super) async fn command_environment_label(
     worktree: &std::path::Path,
     cwd: &std::path::Path,
     language: Language,
+    config: &crate::modules::contract::ModuleConfig,
 ) -> Result<Option<String>, crate::modules::contract::ModuleUnavailable> {
-    let environments = crate::modules::calls::environments(language, worktree).await?;
+    let environments = crate::modules::calls::environments(language, worktree, config).await?;
     let Some(env) = environments
         .iter()
         .filter(|env| cwd.starts_with(worktree.join(&env.root)))

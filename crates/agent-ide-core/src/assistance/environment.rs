@@ -168,7 +168,8 @@ impl EnvironmentState {
 pub(super) async fn observe(worktree: &Path) -> Vec<(Language, Option<Vec<ResolvedEnv>>)> {
     let mut observed = Vec::new();
     for language in crate::lang::registered() {
-        let envs = crate::modules::calls::environments(*language, worktree).await;
+        let config = crate::modules::calls::module_config(*language, worktree);
+        let envs = crate::modules::calls::environments(*language, worktree, &config).await;
         observed.push((*language, envs.ok()));
     }
     observed

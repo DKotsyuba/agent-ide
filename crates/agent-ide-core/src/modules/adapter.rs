@@ -74,10 +74,18 @@ pub struct SupportServer {
     /// its declared recipes; without it (or when it answers `None`) the plan is the generic
     /// `argv` request, which the core refuses to run.
     plans: Option<EffectPlans>,
+    /// Opt-in current-config planner. When present, refusals/unsupported shapes never fall back
+    /// to a legacy planner that might select ambient tools.
+    configured_plans: Option<ConfiguredEffectPlans>,
 }
 
 /// Turns a formatter or probe argument vector into a request of the language's recipes.
 pub type EffectPlans = fn(&[String]) -> Option<EffectRequest>;
+
+/// Constructs a finite language recipe from argv and this request's immutable accepted facts.
+/// Errors refuse before admission; `None` is an unsupported shape, never permission to use a
+/// legacy ambient planner. No process or environment manager may run in this callback.
+pub type ConfiguredEffectPlans = fn(&[String], &super::contract::ModuleConfig) -> Result<Option<EffectRequest>, crate::lang::LangError>;
 
 impl SupportServer {
     /// The adapter for `language` at `version`.
@@ -86,6 +94,7 @@ impl SupportServer {
             language,
             version: version.to_owned(),
             plans: None,
+            configured_plans: None,
         }
     }
 
@@ -96,12 +105,22 @@ impl SupportServer {
         self
     }
 
+    /// Uses a current-config planner before admission, keeping legacy callbacks source-compatible
+    /// for unaffected languages. A configured refusal never retries through the legacy callback.
+    pub fn with_configured_effect_plans(mut self, plans: ConfiguredEffectPlans) -> Self {
+        self.configured_plans = Some(plans);
+        self
+    }
+
     /// The effect request of one formatter, probe or test-run argument vector; the generic `argv`
     /// request (which the core refuses) when `plans` has none.
-    fn plan(&self, argv: &[String]) -> EffectRequest {
-        self.plans
+    fn plan(&self, argv: &[String], config: &super::contract::ModuleConfig) -> Result<EffectRequest, crate::lang::LangError> {
+        if let Some(plans) = self.configured_plans {
+            return Ok(plans(argv, config)?.unwrap_or_else(|| argv_effect(argv)));
+        }
+        Ok(self.plans
             .and_then(|plans| plans(argv))
-            .unwrap_or_else(|| argv_effect(argv))
+            .unwrap_or_else(|| argv_effect(argv)))
     }
 
     /// The served language.
@@ -204,16 +223,17 @@ impl SupportServer {
         let payload = request.payload.clone();
         Ok(match request.capability {
             Capability::Project => match decode::<ProjectQuery>(payload)? {
-                ProjectQuery::Detect { root, selections } => {
+                ProjectQuery::Detect { root, selections, config: _ } => {
                     replace_selections(&root, self.language, selections);
                     encode(&support.detect(&root))
                 }
                 ProjectQuery::Environments {
                     worktree,
                     selections,
+                    config,
                 } => {
                     replace_selections(&worktree, self.language, selections);
-                    encode(&support.environments(&worktree))
+                    encode(&support.configured_environments(&worktree, &config))
                 }
                 ProjectQuery::CheckSelection {
                     worktree,
@@ -225,9 +245,10 @@ impl SupportServer {
                     cwd,
                     program,
                     selections,
+                    config,
                 } => {
                     replace_selections(&worktree, self.language, selections);
-                    encode(&support.command_env(&worktree, &cwd, &program))
+                    encode(&support.configured_command_env(&worktree, &cwd, &program, &config))
                 }
                 ProjectQuery::TestToolchain { program } => {
                     encode(&support.test_toolchain(&program))
@@ -275,6 +296,7 @@ impl SupportServer {
                     encode(&support.syntax_verdict(&source.path, &text))
                 }
                 SyntaxQuery::ProbePlan {
+                    config,
                     project,
                     root,
                     file,
@@ -282,7 +304,7 @@ impl SupportServer {
                 } => encode(
                     &support
                         .syntax_probe_command(&project, &root, &file, configured.as_ref())
-                        .map(|argv| self.plan(&argv)),
+                        .map(|argv| self.plan(&argv, &config)).transpose(),
                 ),
             },
             Capability::FormatPlan => {
@@ -290,20 +312,20 @@ impl SupportServer {
                 encode(
                     &support
                         .format_stdin_command(&query.project, &query.file)
-                        .map(|argv| self.plan(&argv)),
+                        .map(|argv| self.plan(&argv, &query.config)).transpose(),
                 )
             }
             Capability::TestPlan => match decode::<TestPlanQuery>(payload)? {
-                TestPlanQuery::Selection { project, target } => {
+                TestPlanQuery::Selection { project, target, config: _ } => {
                     encode(&support.test_selection(&project, &target))
                 }
-                TestPlanQuery::Run { project, target } => encode(
+                TestPlanQuery::Run { project, target, config } => encode(
                     &support
                         .test_selection(&project, &target)
-                        .map(|selection| TestRun {
-                            effect: self.plan(&selection.command),
+                        .and_then(|selection| Ok(TestRun {
+                            effect: self.plan(&selection.command, &config)?,
                             tests: selection.tests,
-                        }),
+                        })),
                 ),
                 TestPlanQuery::TestIds {
                     file,
@@ -487,6 +509,7 @@ mod tests {
             scope_key: "s".into(),
             revision_key: "r".into(),
             payload: encode(&ProjectQuery::Detect {
+                config: Default::default(),
                 root: "/nonexistent".into(),
                 selections: Vec::new(),
             }),

@@ -97,6 +97,9 @@ impl Drop for Waiter<'_> {
 
 /// The daemon's module routing state.
 pub struct ModuleHost {
+    /// Immutable daemon launcher policy, used only to construct current request context outside
+    /// an individual job. It is never a mutable environment registry or a module launch grant.
+    launcher: Option<crate::assistance::launcher::LauncherConfig>,
     /// The pinned executable, `None` when it could not be measured (everything stays in process).
     executable: Option<Arc<ModuleExecutable>>,
     /// The fallback switch, read once.
@@ -190,6 +193,7 @@ impl ModuleHost {
             .filter_map(|seam| Some((seam.to_owned(), crate::test_seams::var(seam)?)))
             .collect();
         Self {
+            launcher: None,
             executable: ModuleExecutable::current().map(Arc::new),
             modes: LanguageModes::from_env(),
             shipped,
@@ -212,6 +216,7 @@ impl ModuleHost {
         budget: Duration,
     ) -> Self {
         Self {
+            launcher: None,
             executable: Some(Arc::new(executable)),
             modes: LanguageModes::default(),
             shipped: shipped.iter().map(|id| (*id).to_owned()).collect(),
@@ -221,6 +226,22 @@ impl ModuleHost {
             extra_env,
             budget,
         }
+    }
+
+    /// Attaches this daemon generation's immutable launcher policy before sharing the host.
+    /// Individual jobs still supply their exact selected target's context in each request.
+    pub fn with_launcher(mut self, launcher: crate::assistance::launcher::LauncherConfig) -> Self {
+        self.launcher = Some(launcher);
+        self
+    }
+
+    /// Current request facts for a worktree-only operation; unknown launcher evidence remains
+    /// absent. This is not `hello.config.provider`, whose separate hosted-provider grant is
+    /// created only by analyzer admission. Never substitute this data for that grant.
+    pub fn module_config(&self, language: Language, worktree: &Path) -> ModuleConfig {
+        self.launcher.as_ref().map_or_else(|| ModuleConfig {
+            worktree: Some(worktree.to_path_buf()), ..Default::default()
+        }, |launcher| launcher.worktree_module_config(language, worktree))
     }
 
     /// The journal lines of ignored switch entries (`language_mode_ignored:<id>`).

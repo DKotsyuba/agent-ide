@@ -249,6 +249,17 @@ pub trait ServerBackend: Send + Sync {
 /// Implemented by the worker. Every method is synchronous and bounded except the two that return
 /// futures, which consult durable Workspace authority.
 pub trait ProviderHost: Send + Sync {
+    /// Supplies current immutable accepted facts for this exact provider and admitted worktree.
+    /// The default knows the accepted provider but no project-check declaration; the daemon
+    /// implementation adds its actual launcher section. This is data, not a new read/execution
+    /// grant; consumers resolve/refuse before reuse or admission and never infer ambient tools.
+    fn module_config(&self, launch: &ProviderLaunch, worktree: &Path) -> crate::modules::contract::ModuleConfig {
+        crate::modules::contract::ModuleConfig {
+            worktree: Some(worktree.to_path_buf()), provider: Some(launch.module_declaration()),
+            ..Default::default()
+        }
+    }
+
     /// Returns a current boot-fenced authority stamp for `binding` after a fresh binding consume.
     fn authority<'a>(
         &'a self,

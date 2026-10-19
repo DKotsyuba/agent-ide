@@ -213,6 +213,7 @@ impl ProjectProblemFeed {
         let checkers: Vec<Arc<dyn Checker>> = checks
             .sections()
             .map(|(language, config)| {
+                let context = launcher.check_module_config(language);
                 checks
                     .raw_section(language)
                     .and_then(|section| {
@@ -221,9 +222,10 @@ impl ProjectProblemFeed {
                             section,
                             runner.clone(),
                             checks.check_timeout(),
+                            &context,
                         )
                     })
-                    .unwrap_or_else(|| config.checker(runner.clone(), checks.check_timeout()))
+                    .unwrap_or_else(|| config.configured_checker(runner.clone(), checks.check_timeout(), context))
             })
             .collect();
         if checkers.is_empty() {

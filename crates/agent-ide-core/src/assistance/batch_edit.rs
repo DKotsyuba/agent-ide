@@ -421,7 +421,7 @@ impl Worker<'_> {
             }
             let candidate = self
                 .format_candidate(job, &observed, Path::new(&path), content.clone())
-                .await;
+                .await?;
             return Ok(Ok(Planned {
                 path,
                 base: observed,

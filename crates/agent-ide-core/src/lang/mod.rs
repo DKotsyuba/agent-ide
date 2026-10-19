@@ -777,6 +777,21 @@ pub trait LanguageSupport: Send + Sync {
         Vec::new()
     }
 
+    /// Resolves environments against the current accepted launcher facts of this request.
+    /// `config.worktree` is the admitted boundary; provider/check sections remain language-owned
+    /// opaque declarations. Implementations must not replace absent facts with ambient tool
+    /// guesses, run managers or enlarge read authority. Missing/incompatible preparation is a
+    /// resolution with no chosen candidate and an actionable cause. The default preserves
+    /// existing file-based resolution for languages that need no configured tools.
+    fn configured_environments(
+        &self,
+        worktree: &Path,
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Vec<environment::ResolvedEnv> {
+        let _ = config;
+        self.environments(worktree)
+    }
+
     /// Accepts or refuses `selector` for the project `root` (relative to `worktree`) before it
     /// is stored. `Err` carries the cause and the way out: an unknown candidate with the
     /// candidates, or a project pin that overrides any selection. Admission of absolute paths
@@ -802,6 +817,23 @@ pub trait LanguageSupport: Send + Sync {
                 path_prefix: Some(directory),
                 vars: Vec::new(),
             })
+    }
+
+    /// Plans activation for `program` in `cwd` under this request's current accepted config.
+    /// `None` means the language does not claim the program. An authoritative incompatible,
+    /// missing or denied environment must return `Unsupported` with its cause/native recovery,
+    /// rather than silently selecting ambient tools. Resolve before command/effect admission;
+    /// a successful activation never authorizes changing an already admitted specification.
+    /// The default preserves existing activation for unaffected languages.
+    fn configured_command_env(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        program: &str,
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Result<Option<environment::CommandEnv>, LangError> {
+        let _ = config;
+        Ok(self.command_env(worktree, cwd, program))
     }
 
     /// First module documentation line of a file's `text` (a directory outline shows it next to

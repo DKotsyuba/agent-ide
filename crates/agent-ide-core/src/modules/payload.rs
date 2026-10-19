@@ -106,6 +106,9 @@ pub enum ProjectQuery {
         /// explicitly, and older recorded payloads deserialize to the same empty reset.
         #[serde(default)]
         selections: Vec<EnvSelection>,
+        /// Current accepted request facts; absent recorded data is unconfigured, not authority.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
     },
     /// `LanguageSupport::environments` honouring the core's stored `selections`; answers
     /// `Vec<ResolvedEnv>`.
@@ -114,6 +117,9 @@ pub enum ProjectQuery {
         worktree: PathBuf,
         /// The core's stored selections for this worktree and language.
         selections: Vec<EnvSelection>,
+        /// Current accepted request facts; implementations must not infer missing tool evidence.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
     },
     /// `LanguageSupport::check_selection`; answers `Result<(), String>`.
     CheckSelection {
@@ -135,6 +141,9 @@ pub enum ProjectQuery {
         program: String,
         /// The core's stored selections for this worktree and language.
         selections: Vec<EnvSelection>,
+        /// Immutable accepted facts for this exact command request, before effect admission.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
     },
     /// `LanguageSupport::test_toolchain`; answers `Option<(PathBuf, PathBuf)>`.
     TestToolchain {
@@ -150,7 +159,7 @@ pub type EnvironmentsAnswer = Vec<ResolvedEnv>;
 /// Answer of [`ProjectQuery::CheckSelection`].
 pub type CheckSelectionAnswer = Result<(), String>;
 /// Answer of [`ProjectQuery::CommandEnv`].
-pub type CommandEnvAnswer = Option<CommandEnv>;
+pub type CommandEnvAnswer = Result<Option<CommandEnv>, LangError>;
 /// Answer of [`ProjectQuery::TestToolchain`].
 pub type TestToolchainAnswer = Option<(PathBuf, PathBuf)>;
 
@@ -252,9 +261,12 @@ pub enum SyntaxQuery {
         /// The candidate text.
         source: SourceRef,
     },
-    /// `syntax_probe_command` as a stdin probe recipe; answers `Option<EffectRequest>` (the core
+    /// `syntax_probe_command` as a stdin probe recipe; answers `Result<Option<EffectRequest>, LangError>` (the core
     /// feeds the candidate, [`Stdin::Candidate`]).
     ProbePlan {
+        /// Current accepted request facts; absence supplies no launcher/tool proof.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
         /// The project.
         project: Box<LanguageProject>,
         /// Absolute project root.
@@ -579,6 +591,9 @@ impl EditProposal {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FormatPlanRequest {
+    /// Current immutable request configuration, applied before constructing an effect.
+    #[serde(default)]
+    pub config: super::contract::ModuleConfig,
     /// The project.
     pub project: LanguageProject,
     /// Root-relative file.
@@ -586,7 +601,7 @@ pub struct FormatPlanRequest {
 }
 
 /// Answer of [`FormatPlanRequest`].
-pub type FormatPlanAnswer = Option<EffectRequest>;
+pub type FormatPlanAnswer = Result<Option<EffectRequest>, LangError>;
 
 /// `test_plan`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -594,6 +609,9 @@ pub type FormatPlanAnswer = Option<EffectRequest>;
 pub enum TestPlanQuery {
     /// `test_selection`; answers `Result<TestSelection, LangError>`.
     Selection {
+        /// Current immutable request configuration; absent facts remain unknown.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
         /// The project.
         project: Box<LanguageProject>,
         /// The target.
@@ -602,6 +620,9 @@ pub enum TestPlanQuery {
     /// The run of `test_selection` as a recipe request; answers [`RunAnswer`]. The core runs
     /// module-planned tests only this way (an explicit `ide.test` command keeps its own path).
     Run {
+        /// Current immutable request configuration, resolved before recipe admission.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
         /// The project.
         project: Box<LanguageProject>,
         /// The target.
@@ -651,6 +672,10 @@ pub struct TestParseRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckPlanRequest {
+    /// Accepted provider/check facts for this request; raw `config` below remains the language
+    /// check section. Missing historical context conveys no accepted provider or tool identity.
+    #[serde(default)]
+    pub module_config: super::contract::ModuleConfig,
     /// The core's check invocation.
     pub request: CheckRequest,
     /// The language's `project_checks` launcher section, decoded by the module.
