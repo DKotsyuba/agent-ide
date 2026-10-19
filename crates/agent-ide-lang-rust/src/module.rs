@@ -781,7 +781,9 @@ fn configured_effect(
     let root = config.worktree.as_deref().ok_or_else(|| {
         LangError::Environment("Rust request has no worktree; use native cargo".into())
     })?;
-    let (tools, _) = crate::environment::resolve(root, config).map_err(LangError::Environment)?;
+    let cwd = crate::environment::command_directory(root, argv).map_err(LangError::Environment)?;
+    let (tools, _) =
+        crate::environment::resolve_at(root, &cwd, config).map_err(LangError::Environment)?;
     let Some((program, words)) = argv.split_first() else {
         return Ok(None);
     };
@@ -1102,6 +1104,10 @@ fn checker_for(
 #[derive(Clone, Debug, Serialize, serde::Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RustProviderSettings {
+    /// Current source demand's effective project, relative to the admitted worktree. Legacy
+    /// root requests omit it. The module revalidates its containment before planning any child.
+    #[serde(default)]
+    pub project_root: Option<PathBuf>,
     /// Actual request context shared with card/check/interactive resolution; never a grant.
     #[serde(default)]
     pub configuration: agent_ide_core::modules::contract::ModuleConfig,
@@ -1132,6 +1138,7 @@ impl RustProviderSettings {
     pub fn from_launch(launch: &ProviderLaunch, cache_namespace: &str) -> Option<Self> {
         let options = launch.options::<RustLaunchOptions>()?;
         Some(Self {
+            project_root: None,
             configuration: agent_ide_core::modules::contract::ModuleConfig {
                 provider: Some(launch.module_declaration()),
                 ..Default::default()
@@ -1200,7 +1207,11 @@ impl ProviderBuilder for RustBuilder {
                 "cargo_home": settings.cargo_home,
             }));
         }
-        crate::environment::resolve(worktree, &settings.configuration)
+        let cwd = settings
+            .project_root
+            .as_ref()
+            .map_or_else(|| worktree.to_path_buf(), |root| worktree.join(root));
+        crate::environment::resolve_at(worktree, &cwd, &settings.configuration)
             .map_err(|cause| refused(&cause))?;
         let profile = settings
             .profile()
@@ -1480,14 +1491,30 @@ mod tests {
     /// Current configuration, exact accepted bytes and pins drive both actual native child and
     /// module recipe launches. Changing the request is fresh without hello/global mutation;
     /// incompatible/denied/changed evidence refuses identically before either launch.
-    #[test]
-    fn configured_children_share_current_tools_and_refusals() {
+    #[tokio::test]
+    async fn configured_children_share_current_tools_and_refusals() {
         use agent_ide_core::lang::{LangError, LanguageSupport};
         use std::os::unix::fs::PermissionsExt;
         let base = Scratch::new("configured-children");
         let root = base.0.join("project");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"fixture\"\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[]\nexclude=[\"legacy\"]\n[package]\nname=\"fixture\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("legacy")).unwrap();
+        std::fs::write(
+            root.join("legacy/Cargo.toml"),
+            "[workspace]\n[package]\nname=\"legacy\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("legacy/rust-toolchain.toml"),
+            "[toolchain]\nchannel=\"nightly\"\n",
+        )
+        .unwrap();
+        let mut channel = open(Role::Analyzer).await;
         std::fs::write(
             root.join("rust-toolchain.toml"),
             "[toolchain]\nchannel=\"1.98.1\"\n",
@@ -1552,6 +1579,41 @@ mod tests {
             assert_eq!(
                 String::from_utf8(native.stdout).unwrap(),
                 format!("0|{}|test", dir.display())
+            );
+            let selected = vec![
+                "cargo".into(),
+                "test".into(),
+                "--manifest-path".into(),
+                "legacy/Cargo.toml".into(),
+            ];
+            let Err(LangError::Environment(native)) =
+                RustSupport.configured_command_argv(&root, &root, &selected, &context)
+            else {
+                panic!("selected legacy must refuse");
+            };
+            let Err(LangError::Environment(module)) = configured_effect(&selected, &context) else {
+                panic!("selected legacy must refuse");
+            };
+            assert_eq!(native, module);
+            assert!(native.contains("nightly"));
+            let answer: payload::CommandEnvAnswer = ask(
+                &mut channel,
+                Capability::Project,
+                payload::encode(&payload::ProjectQuery::CommandEnv {
+                    program: "cargo".into(),
+                    args: selected[1..].to_vec(),
+                    worktree: root.clone(),
+                    cwd: root.clone(),
+                    selections: Vec::new(),
+                    config: context.clone(),
+                }),
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(
+                answer,
+                Err(LangError::Environment(native)),
+                "actual module request must preserve manifest args before admission"
             );
             contexts.push(context);
         }
@@ -2471,6 +2533,7 @@ mod real_provider_tests {
             std::fs::create_dir_all(namespace.join(dir)).unwrap();
         }
         let settings = RustProviderSettings {
+            project_root: None,
             configuration: Default::default(),
             binary: analyzer.clone(),
             version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),

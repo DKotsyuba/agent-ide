@@ -369,10 +369,14 @@ disabled. Selection of another Rust environment and rustup-manager discovery are
 
 Rust native identity includes full-byte manifest/lock/pin/config inputs inside the worktree,
 including nested members, and actual configured tool bytes/stamps. Semantic leases include this
-identity. Text parsing is limited to 64 KiB; native discovery is bounded to 16,384 entries and
-12 directory levels, excluding standard generated/dependency roots. Unsupported declarations,
-foreign members, symlinked input scope, or exhausted discovery refuse rather than certify a
-partial identity. With extra read exclusions, the legacy CI/task project-fact detector is
+identity. Text parsing is limited to 64 KiB. Discovery reads only the effective root,
+literal/whole-component `*` workspace members (respecting excludes), double-quoted local dependency
+paths and their relevant configuration ancestors, up to 1,024 projects. Root commands ignore
+unrelated/excluded projects; an explicit cwd or Cargo manifest selector resolves that project's
+pin separately. Other member glob syntax, escaped/multiline dependency paths, foreign members
+and symlinked native input paths are unsupported. Relevant paths are checked before content
+reads; unrelated assets and their links do not participate. Unsupported or exhausted scope
+refuses rather than certify a partial identity. With extra read exclusions, the legacy CI/task project-fact detector is
 unavailable; guarded environment/check resolution remains separate. These are implementation
 scope limits, not evidence that the integrated mandatory gate or owner acceptance has passed.
 

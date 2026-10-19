@@ -837,7 +837,7 @@ pub trait LanguageSupport: Send + Sync {
 
     /// Plans activation for `program` in `cwd` under this request's current accepted config.
     /// `None` means the language does not claim the program. An authoritative incompatible,
-    /// missing or denied environment must return `Unsupported` with its cause/native recovery,
+    /// missing or denied environment must return `Environment` with its cause/native recovery,
     /// rather than silently selecting ambient tools. Resolve before command/effect admission;
     /// A preparation refusal uses `LangError::Environment`, separating native recovery from
     /// unsupported argument shapes. A successful activation never authorizes changing an
@@ -852,6 +852,22 @@ pub trait LanguageSupport: Send + Sync {
     ) -> Result<Option<environment::CommandEnv>, LangError> {
         let _ = config;
         Ok(self.command_env(worktree, cwd, program))
+    }
+
+    /// Resolves activation with the actual argv, so a language can honor explicit project
+    /// selectors before admission. The default preserves the existing program-only hook;
+    /// empty argv is unclaimed. Arguments convey no execution or read authority.
+    fn configured_command_argv(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        argv: &[String],
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Result<Option<environment::CommandEnv>, LangError> {
+        match argv.first() {
+            Some(program) => self.configured_command_env(worktree, cwd, program, config),
+            None => Ok(None),
+        }
     }
 
     /// First module documentation line of a file's `text` (a directory outline shows it next to
@@ -1112,6 +1128,30 @@ pub(crate) mod testing {
                     vars: vec![("ENV_FIXTURE".into(), "resolved".into())],
                 }
             })
+        }
+
+        /// The Gamma configured-node fixture projects exactly its explicit launcher path so
+        /// admission tests can distinguish it from a conflicting ambient executable. Others
+        /// retain their unchanged activation; this creates no production tool qualification.
+        fn configured_command_env(
+            &self,
+            worktree: &Path,
+            cwd: &Path,
+            program: &str,
+            config: &crate::modules::contract::ModuleConfig,
+        ) -> Result<Option<environment::CommandEnv>, LangError> {
+            if self.0 == "gamma" && program == "node" {
+                return Ok(config
+                    .checks
+                    .as_ref()
+                    .and_then(|checks| checks.get("node"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|path| environment::CommandEnv {
+                        argv_prefix: vec![path.into()],
+                        ..Default::default()
+                    }));
+            }
+            Ok(self.command_env(worktree, cwd, program))
         }
 
         /// An outline with no symbols, except for epsilon: it keeps each top-level server symbol

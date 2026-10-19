@@ -193,9 +193,9 @@ pub async fn resolve_command(
     Result<CommandResolution, crate::lang::LangError>,
     crate::modules::contract::ModuleUnavailable,
 > {
-    let Some(program) = argv.first() else {
+    if argv.is_empty() {
         return Ok(Ok(CommandResolution::default()));
-    };
+    }
     let mut environment_language = command_language;
     let mut resolved = None;
     let languages = command_language.map_or_else(
@@ -204,7 +204,7 @@ pub async fn resolve_command(
     );
     for language in languages {
         let config = launcher.module_config(language, root, target);
-        match crate::modules::calls::command_env(language, root, cwd, program, &config).await? {
+        match crate::modules::calls::command_env_argv(language, root, cwd, argv, &config).await? {
             Err(error) => return Ok(Err(error)),
             Ok(Some(env)) => {
                 resolved = Some(env);

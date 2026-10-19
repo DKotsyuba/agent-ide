@@ -497,16 +497,32 @@ pub async fn command_env(
     program: &str,
     config: &ModuleConfig,
 ) -> Routed<CommandEnvAnswer> {
+    command_env_argv(language, worktree, cwd, &[program.to_owned()], config).await
+}
+
+/// Current command activation with actual argv; existing program-only callers remain valid.
+/// The module sees selectors before planning, never a mutation of an admitted specification.
+pub async fn command_env_argv(
+    language: Language,
+    worktree: &Path,
+    cwd: &Path,
+    argv: &[String],
+    config: &ModuleConfig,
+) -> Routed<CommandEnvAnswer> {
+    let Some(program) = argv.first() else {
+        return Ok(Ok(None));
+    };
     match module(language) {
         None => Ok(language
             .support()
-            .configured_command_env(worktree, cwd, program, config)),
+            .configured_command_argv(worktree, cwd, argv, config)),
         Some(host) => {
             host.request::<CommandEnvAnswer>(
                 language,
                 worktree,
                 Capability::Project,
                 encode(&ProjectQuery::CommandEnv {
+                    args: argv[1..].to_vec(),
                     config: config.clone(),
                     worktree: worktree.to_path_buf(),
                     cwd: cwd.to_path_buf(),
@@ -1005,18 +1021,52 @@ fn admitted_with(
     }
     let recipes = super::recipe::declared(language.name());
     let path = tool_path();
-    let programs: Vec<(String, PathBuf)> = recipes
+    let recipe = recipes
         .iter()
-        .flat_map(|recipe| recipe.executables.iter())
-        .filter_map(|slot| match slot.source {
-            super::payload::SlotSource::HomeTool(name) => Some((
-                name.to_owned(),
-                crate::execution::job::executable_on(name, worktree, &path)?,
-            )),
-            super::payload::SlotSource::Launcher(_) => None,
-        })
-        .collect();
+        .find(|recipe| recipe.id == effect.recipe)
+        .ok_or_else(refused)?;
+    let mut programs = Vec::new();
+    for slot in recipe.executables.iter().filter(|slot| {
+        effect.params.values().any(
+            |param| matches!(param, super::payload::Param::Executable(name) if name == slot.name),
+        )
+    }) {
+        let (name, program) = match slot.source {
+            super::payload::SlotSource::HomeTool(name) => {
+                let Some(program) = crate::execution::job::executable_on(name, worktree, &path)
+                else {
+                    continue;
+                };
+                (name, program)
+            }
+            super::payload::SlotSource::Launcher(name) => {
+                let activation = language
+                    .support()
+                    .configured_command_argv(worktree, worktree, &[name.to_owned()], config)
+                    .map_err(|_| refused())?
+                    .ok_or_else(refused)?;
+                // A program slot cannot encode an interpreter prefix or activation vars. Those
+                // require explicit recipe arguments/environment before admission, never edits
+                // to the expanded spec or silent loss of activation.
+                let [program] = activation.argv_prefix.as_slice() else {
+                    return Err(refused());
+                };
+                if !activation.vars.is_empty() || activation.path_prefix.is_some() {
+                    return Err(refused());
+                }
+                let program = PathBuf::from(program);
+                if !crate::assistance::launcher::absolute(&program)
+                    || !environment::readable(&program, &config.read_denies)
+                {
+                    return Err(refused());
+                }
+                (name, program)
+            }
+        };
+        programs.push((name.to_owned(), program));
+    }
     let mut roots = super::recipe::declared_roots(language.name());
+    roots.extend(programs.iter().map(|(_, program)| program.clone()));
     if config.provider.is_none() && config.checks.is_none() {
         roots.extend(super::recipe::environment_roots(language.name(), worktree));
     }
@@ -1316,7 +1366,7 @@ mod tests {
                 assets: &[],
             }
         }
-        static RECIPES: [EffectRecipe; 4] = [
+        static RECIPES: [EffectRecipe; 6] = [
             recipe("fmt", RunClass::Interactive),
             EffectRecipe {
                 executables: &[ExecutableSlot {
@@ -1332,6 +1382,20 @@ mod tests {
                     source: SlotSource::HomeTool("agent-ide-no-such-tool"),
                 }],
                 ..recipe("absent", RunClass::Test)
+            },
+            EffectRecipe {
+                executables: &[ExecutableSlot {
+                    name: "tool",
+                    source: SlotSource::Launcher("node"),
+                }],
+                ..recipe("configured-node", RunClass::Interactive)
+            },
+            EffectRecipe {
+                executables: &[ExecutableSlot {
+                    name: "tool",
+                    source: SlotSource::Launcher("node"),
+                }],
+                ..recipe("configured-node-test", RunClass::Test)
             },
         ];
         static DECLARED: [(&str, &[EffectRecipe]); 1] = [("gamma", &RECIPES)];
@@ -1366,6 +1430,102 @@ mod tests {
                 second
             )
             .is_ok()
+        );
+        // A real conflicting ambient Node cannot substitute for a configured launcher slot.
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = crate::scratch::ScratchDir::new("configured-slot");
+        let ambient = scratch.join("ambient");
+        let configured = scratch.join("configured");
+        std::fs::create_dir_all(&ambient).unwrap();
+        std::fs::create_dir_all(&configured).unwrap();
+        for (path, body) in [
+            (
+                ambient.join("node"),
+                "#!/bin/sh\nprintf ran > ambient-ran\nprintf ambient\n",
+            ),
+            (configured.join("node"), "#!/bin/sh\nprintf configured\n"),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        /// Restores exact process PATH even if a synchronous serialized assertion unwinds.
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            /// Restores the process-local fixture setting after all child commands have reaped.
+            fn drop(&mut self) {
+                // SAFETY: this synchronous test runs under the required serialized gate; the
+                // guard outlives every child and restores the exact original OsString.
+                unsafe {
+                    match self.0.take() {
+                        Some(path) => std::env::set_var("PATH", path),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+        let _restore = RestorePath(std::env::var_os("PATH"));
+        // SAFETY: the required core gate serializes tests; no async work or live child spans
+        // this mutation, and RestorePath runs before the owning scratch fixture is removed.
+        unsafe {
+            std::env::set_var("PATH", &ambient);
+        }
+        assert_eq!(
+            crate::execution::job::executable_on("node", &scratch, &tool_path()),
+            Some(ambient.join("node"))
+        );
+        let context = ModuleConfig {
+            worktree: Some(scratch.to_path_buf()),
+            checks: Some(serde_json::json!({"node":configured.join("node")})),
+            ..Default::default()
+        };
+        for (id, class) in [
+            ("configured-node", RunClass::Interactive),
+            ("configured-node-test", RunClass::Test),
+        ] {
+            let spec =
+                admitted_with(gamma, &scratch, &request(id), class, second, &[], &context).unwrap();
+            assert_eq!(spec.program, configured.join("node"));
+            let output = std::process::Command::new(&spec.program)
+                .args(&spec.args)
+                .current_dir(&spec.cwd)
+                .env_clear()
+                .envs(spec.env)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"configured");
+            assert!(!scratch.join("ambient-ran").exists());
+        }
+        assert!(
+            admitted_with(
+                gamma,
+                &scratch,
+                &request("configured-node"),
+                RunClass::Interactive,
+                second,
+                &[],
+                &ModuleConfig::default()
+            )
+            .is_err(),
+            "missing launcher binding must not use ambient Node"
+        );
+        let mut denied = context;
+        denied
+            .read_denies
+            .push(crate::execution::seatbelt::ReadDeny::Path(
+                configured.join("node"),
+            ));
+        assert!(
+            admitted_with(
+                gamma,
+                &scratch,
+                &request("configured-node"),
+                RunClass::Interactive,
+                second,
+                &[],
+                &denied
+            )
+            .is_err()
         );
     }
 

@@ -253,6 +253,7 @@ impl SupportServer {
                     selector,
                 } => encode(&support.check_selection(&worktree, &root, &selector)),
                 ProjectQuery::CommandEnv {
+                    args,
                     worktree,
                     cwd,
                     program,
@@ -260,7 +261,8 @@ impl SupportServer {
                     config,
                 } => {
                     replace_selections(&worktree, self.language, selections);
-                    encode(&support.configured_command_env(&worktree, &cwd, &program, &config))
+                    let argv = std::iter::once(program).chain(args).collect::<Vec<_>>();
+                    encode(&support.configured_command_argv(&worktree, &cwd, &argv, &config))
                 }
                 ProjectQuery::TestToolchain { program } => {
                     encode(&support.test_toolchain(&program))

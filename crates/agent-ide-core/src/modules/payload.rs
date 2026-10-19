@@ -131,8 +131,12 @@ pub enum ProjectQuery {
         selector: String,
     },
     /// `LanguageSupport::command_env` with the core's stored `selections`; answers
-    /// `Option<CommandEnv>`.
+    /// `CommandEnvAnswer`, including a typed pre-admission environment refusal.
     CommandEnv {
+        /// Actual arguments after the program; historical program-only requests default empty.
+        /// Languages may interpret project selectors before constructing an admitted command.
+        #[serde(default)]
+        args: Vec<String>,
         /// Worktree.
         worktree: PathBuf,
         /// Command working directory.
