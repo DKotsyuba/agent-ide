@@ -552,6 +552,29 @@ pub const RECIPES: &[EffectRecipe] = &[
 ];
 
 /// The recipe request of a formatter or probe argument vector the in-process support builds
+/// ([`crate::support`]), under this request's accepted facts: a compiler or Node-pin
+/// obstruction refuses before any recipe is generated (never an ambient fallback), and every
+/// other shape answers exactly as [`interactive_effect`] does.
+///
+/// # Errors
+///
+/// The environment obstruction of the request's configured tools.
+pub fn configured_effect(
+    argv: &[String],
+    config: &agent_ide_core::modules::contract::ModuleConfig,
+) -> Result<Option<EffectRequest>, agent_ide_core::lang::LangError> {
+    crate::environment::admit_effects(&config_worktree(config), config)?;
+    Ok(interactive_effect(argv))
+}
+
+/// The worktree this request's configuration names: the admitted boundary the environment
+/// facts are resolved against. A request without one has no project environment to obstruct
+/// effect planning.
+fn config_worktree(config: &agent_ide_core::modules::contract::ModuleConfig) -> PathBuf {
+    config.worktree.clone().unwrap_or_default()
+}
+
+/// The recipe request of a formatter or probe argument vector the in-process support builds
 /// ([`crate::support`]); `None` for any other shape, which the core then refuses.
 pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
     let words: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -1035,7 +1058,8 @@ impl ModuleServer for AnalyzerServer {
 /// The transport fault that ended the loop.
 pub async fn serve(role: Role) -> Result<(), ServeError> {
     let support = SupportServer::new(crate::LANGUAGE, env!("CARGO_PKG_VERSION"))
-        .with_effect_plans(interactive_effect);
+        .with_effect_plans(interactive_effect)
+        .with_configured_effect_plans(configured_effect);
     match role {
         Role::Analyzer => {
             let provider = ProviderServer::new(support, Host);

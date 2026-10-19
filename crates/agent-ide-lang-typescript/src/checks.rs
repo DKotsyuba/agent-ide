@@ -46,6 +46,188 @@ const FOOTER: [&str; 13] = [
 /// Final footer label proving the CLI completed its report.
 const TOTAL_TIME: &str = "Total time";
 
+/// The release version of the qualified compiler closure: byte-equality with
+/// [`TYPESCRIPT_CLOSURE_V1`] proves it, so consumers can name the compiler's version without
+/// reading any metadata file.
+pub(crate) const QUALIFIED_TYPESCRIPT_VERSION: &str = "5.9.3";
+
+/// Which TypeScript compiler project checks run, from the project's own facts: the shared
+/// decision of the confined checker and the environment resolver, so the two can never name
+/// different compilers for one worktree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CompilerFact {
+    /// No manifest declares TypeScript: the operator's accepted compiler module runs.
+    Operator(PathBuf),
+    /// The project's prepared compiler is byte-qualified; `version` is the qualified release
+    /// version (`QUALIFIED_TYPESCRIPT_VERSION`), proven by the byte check itself.
+    Project {
+        /// The qualified project `tsc.js`.
+        cli: PathBuf,
+        /// The qualified release version.
+        version: Option<String>,
+    },
+}
+
+/// Decides the compiler fact for `worktree`: the operator's compiler when no manifest declares
+/// TypeScript, the project's prepared compiler when its bytes are qualified, or the refusal
+/// `(reason, cause)` — identical branch-for-branch with the confined checker's selection, so
+/// the card and the check can never disagree. Reads only regular admitted files: a bounded
+/// root package manifest and the exact already-qualified compiler library bytes. No manager,
+/// install or dependency mutation runs; declared version ranges are validated against the
+/// actual runtime by the adapter, not here.
+///
+/// The qualified project compiler's version is [`QUALIFIED_TYPESCRIPT_VERSION`]: byte-equality
+/// with the qualified closure proves the release, and no extra metadata file is read.
+pub(crate) fn compiler_fact(
+    worktree: &Path,
+    operator_cli: &Path,
+    read_denies: &[ReadDeny],
+) -> Result<CompilerFact, (UnavailableReason, String)> {
+    let denied = |path: &Path| {
+        path.ancestors()
+            .any(|part| read_denies.iter().any(|deny| deny.matches(part)))
+    };
+    let manifest = worktree.join("package.json");
+    if denied(&manifest) {
+        return Err((
+            UnavailableReason::ReadRestricted,
+            "project environment manifest is read restricted".to_owned(),
+        ));
+    }
+    let metadata = match fs::symlink_metadata(&manifest) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(CompilerFact::Operator(operator_cli.to_path_buf()));
+        }
+        Err(_) => {
+            return Err((
+                UnavailableReason::ReadRestricted,
+                "project environment manifest cannot be read".to_owned(),
+            ));
+        }
+    };
+    if !regular_allowed(&manifest, read_denies) {
+        return Err((
+            UnavailableReason::ReadRestricted,
+            "project environment manifest must be a regular admitted file".to_owned(),
+        ));
+    }
+    if metadata.len() > 1024 * 1024 {
+        return Err((
+            UnavailableReason::Fatal,
+            "project environment manifest exceeds the 1 MiB input bound".to_owned(),
+        ));
+    }
+    let bytes = fs::read(&manifest).map_err(|_| {
+        (
+            UnavailableReason::ReadRestricted,
+            "project environment manifest cannot be read".to_owned(),
+        )
+    })?;
+    let package: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+        (
+            UnavailableReason::Fatal,
+            "project environment package.json is invalid".to_owned(),
+        )
+    })?;
+    if !package.is_object() {
+        return Err((
+            UnavailableReason::Fatal,
+            "project environment package.json must be an object".to_owned(),
+        ));
+    }
+    let groups = [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ];
+    if groups
+        .iter()
+        .any(|group| package.get(group).is_some_and(|value| !value.is_object()))
+    {
+        return Err((
+            UnavailableReason::Fatal,
+            "project environment dependency declarations must be objects".to_owned(),
+        ));
+    }
+    if !groups.iter().any(|group| {
+        package
+            .get(group)
+            .and_then(|value| value.get("typescript"))
+            .is_some()
+    }) {
+        return Ok(CompilerFact::Operator(operator_cli.to_path_buf()));
+    }
+    let cli = worktree.join("node_modules/typescript/lib/tsc.js");
+    let library = cli.with_file_name("typescript.js");
+    for tool in [&cli, &library] {
+        if denied(tool) {
+            return Err((
+                UnavailableReason::ReadRestricted,
+                "project TypeScript compiler is read restricted".to_owned(),
+            ));
+        }
+        match fs::symlink_metadata(tool) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err((
+                    UnavailableReason::ToolMissing,
+                    "project declares TypeScript but its compiler is not prepared; no global fallback"
+                        .to_owned(),
+                ));
+            }
+            Err(_) => {
+                return Err((
+                    UnavailableReason::ReadRestricted,
+                    "project TypeScript compiler cannot be read".to_owned(),
+                ));
+            }
+            Ok(_) => {}
+        }
+        if !regular_allowed(tool, read_denies) {
+            return Err((
+                UnavailableReason::ReadRestricted,
+                "project TypeScript compiler must be regular and link-free".to_owned(),
+            ));
+        }
+    }
+    let (_, digest, length) = crate::backend::TYPESCRIPT_CLOSURE_V1
+        .iter()
+        .find(|(name, _, _)| *name == "typescript.js")
+        .expect("compiled TypeScript closure includes its compiler");
+    let metadata = fs::metadata(&library).map_err(|_| {
+        (
+            UnavailableReason::ReadRestricted,
+            "project TypeScript compiler cannot be read".to_owned(),
+        )
+    })?;
+    if metadata.len() != *length {
+        return Err((
+            UnavailableReason::Fatal,
+            "project compiler is not the qualified TypeScript 5.9.3; use native project checks until qualified"
+                .to_owned(),
+        ));
+    }
+    let bytes = fs::read(&library).map_err(|_| {
+        (
+            UnavailableReason::ReadRestricted,
+            "project TypeScript compiler cannot be read".to_owned(),
+        )
+    })?;
+    if blake3::hash(&bytes).to_hex().as_str() != *digest {
+        return Err((
+            UnavailableReason::Fatal,
+            "project compiler bytes differ from qualified TypeScript 5.9.3; no global fallback"
+                .to_owned(),
+        ));
+    }
+    // Byte-equality with the qualified closure IS the version fact: no extra metadata read.
+    Ok(CompilerFact::Project {
+        cli,
+        version: Some(QUALIFIED_TYPESCRIPT_VERSION.to_owned()),
+    })
+}
+
 /// Runs a root `tsconfig.json` or `jsconfig.json` under the shared confinement seam.
 ///
 /// Instances own operator tool defaults and a timeout. A declared project compiler is selected
@@ -91,156 +273,22 @@ impl TypeScriptChecker {
     }
 
     /// Selects a declared project's prepared compiler, or the operator's compiler when the
-    /// manifest declares none. Missing, denied and unqualified project tools never fall back.
-    /// Reads only regular admitted files: a bounded root package manifest and the exact
-    /// already-qualified compiler library bytes. No manager, install or dependency mutation runs.
-    /// The adapter separately validates declared version ranges against the actual runtime.
+    /// manifest declares none, through the shared fact decision
+    /// ([`compiler_fact`]). Missing, denied and unqualified project tools never fall back.
     fn project_cli(&self, request: &CheckRequest) -> Result<PathBuf, ProblemSnapshot> {
-        let unavailable = |reason, detail: &str| {
-            ProblemSnapshot::unavailable_with_detail(
+        match compiler_fact(&request.worktree, &self.tsc_cli, &request.read_denies) {
+            Ok(fact) => Ok(match fact {
+                CompilerFact::Operator(cli) => cli,
+                CompilerFact::Project { cli, .. } => cli,
+            }),
+            Err((reason, detail)) => Err(ProblemSnapshot::unavailable_with_detail(
                 crate::LANGUAGE,
                 reason,
                 request.input_generation,
                 0,
-                Some(detail.to_owned()),
-            )
-        };
-        let denied = |path: &Path| {
-            path.ancestors()
-                .any(|part| request.read_denies.iter().any(|deny| deny.matches(part)))
-        };
-        let manifest = request.worktree.join("package.json");
-        if denied(&manifest) {
-            return Err(unavailable(
-                UnavailableReason::ReadRestricted,
-                "project environment manifest is read restricted",
-            ));
+                Some(detail),
+            )),
         }
-        let metadata = match fs::symlink_metadata(&manifest) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(self.tsc_cli.clone());
-            }
-            Err(_) => {
-                return Err(unavailable(
-                    UnavailableReason::ReadRestricted,
-                    "project environment manifest cannot be read",
-                ));
-            }
-        };
-        if !regular_allowed(&manifest, &request.read_denies) {
-            return Err(unavailable(
-                UnavailableReason::ReadRestricted,
-                "project environment manifest must be a regular admitted file",
-            ));
-        }
-        if metadata.len() > 1024 * 1024 {
-            return Err(unavailable(
-                UnavailableReason::Fatal,
-                "project environment manifest exceeds the 1 MiB input bound",
-            ));
-        }
-        let bytes = fs::read(&manifest).map_err(|_| {
-            unavailable(
-                UnavailableReason::ReadRestricted,
-                "project environment manifest cannot be read",
-            )
-        })?;
-        let package: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
-            unavailable(
-                UnavailableReason::Fatal,
-                "project environment package.json is invalid",
-            )
-        })?;
-        if !package.is_object() {
-            return Err(unavailable(
-                UnavailableReason::Fatal,
-                "project environment package.json must be an object",
-            ));
-        }
-        let groups = [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ];
-        if groups
-            .iter()
-            .any(|group| package.get(group).is_some_and(|value| !value.is_object()))
-        {
-            return Err(unavailable(
-                UnavailableReason::Fatal,
-                "project environment dependency declarations must be objects",
-            ));
-        }
-        if !groups.iter().any(|group| {
-            package
-                .get(group)
-                .and_then(|value| value.get("typescript"))
-                .is_some()
-        }) {
-            return Ok(self.tsc_cli.clone());
-        }
-        let cli = request.worktree.join("node_modules/typescript/lib/tsc.js");
-        let library = cli.with_file_name("typescript.js");
-        for tool in [&cli, &library] {
-            if denied(tool) {
-                return Err(unavailable(
-                    UnavailableReason::ReadRestricted,
-                    "project TypeScript compiler is read restricted",
-                ));
-            }
-            match fs::symlink_metadata(tool) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Err(unavailable(
-                        UnavailableReason::ToolMissing,
-                        "project declares TypeScript but its compiler is not prepared; no global fallback",
-                    ));
-                }
-                Err(_) => {
-                    return Err(unavailable(
-                        UnavailableReason::ReadRestricted,
-                        "project TypeScript compiler cannot be read",
-                    ));
-                }
-                Ok(_) => {}
-            }
-            if !regular_allowed(tool, &request.read_denies) {
-                return Err(unavailable(
-                    UnavailableReason::ReadRestricted,
-                    "project TypeScript compiler must be regular and link-free",
-                ));
-            }
-        }
-        let (_, digest, length) = crate::backend::TYPESCRIPT_CLOSURE_V1
-            .iter()
-            .find(|(name, _, _)| *name == "typescript.js")
-            .expect("compiled TypeScript closure includes its compiler");
-        let metadata = fs::metadata(&library).map_err(|_| {
-            unavailable(
-                UnavailableReason::ReadRestricted,
-                "project TypeScript compiler cannot be read",
-            )
-        })?;
-        if metadata.len() != *length {
-            return Err(unavailable(
-                UnavailableReason::Fatal,
-                "project compiler is not the qualified TypeScript 5.9.3; use native project checks until qualified",
-            ));
-        }
-        let bytes = fs::read(&library).map_err(|_| {
-            unavailable(
-                UnavailableReason::ReadRestricted,
-                "project TypeScript compiler cannot be read",
-            )
-        })?;
-        if blake3::hash(&bytes).to_hex().as_str() != *digest {
-            return Err(unavailable(
-                UnavailableReason::Fatal,
-                "project compiler bytes differ from qualified TypeScript 5.9.3; no global fallback",
-            ));
-        }
-        Ok(cli)
     }
 
     /// Describes one CLI run with writes restricted to `request.cache_dir`.
@@ -854,5 +902,60 @@ impl CheckConfig for ProjectTypeScriptChecksConfig {
             (self.node.clone(), None),
             (self.tsc_cli.clone(), Some(self.node.clone())),
         ]
+    }
+}
+
+#[cfg(test)]
+mod compiler_fact_tests {
+    use super::*;
+
+    /// A host-denied root manifest refuses the fact as read-restricted before any content is
+    /// read, exactly as the checker's snapshot path reports it; an absent manifest is the
+    /// operator compiler, and a declared-but-unprepared compiler is the no-fallback refusal.
+    #[test]
+    fn denied_manifest_and_missing_compiler_are_honest_facts() {
+        use agent_ide_core::execution::seatbelt::ReadDeny;
+        let root = std::env::temp_dir().join(format!(
+            "agent-ide-ts-fact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let operator = root.join("operator/tsc.js");
+        fs::create_dir_all(operator.parent().unwrap()).unwrap();
+        fs::write(&operator, "").unwrap();
+        fs::write(root.join("package.json"), "{\"dependencies\":{}}").unwrap();
+        let denies = [ReadDeny::Path(root.join("package.json"))];
+        assert_eq!(
+            compiler_fact(&root, &operator, &denies),
+            Err((
+                UnavailableReason::ReadRestricted,
+                "project environment manifest is read restricted".to_owned()
+            ))
+        );
+        // Absent manifest: the operator compiler.
+        fs::remove_file(root.join("package.json")).unwrap();
+        assert_eq!(
+            compiler_fact(&root, &operator, &[]),
+            Ok(CompilerFact::Operator(operator))
+        );
+        // Declared but unprepared: the no-fallback refusal.
+        fs::write(
+            root.join("package.json"),
+            "{\"devDependencies\":{\"typescript\":\"5.9.3\"}}",
+        )
+        .unwrap();
+        assert_eq!(
+            compiler_fact(&root, &operator, &[]),
+            Err((
+                UnavailableReason::ToolMissing,
+                "project declares TypeScript but its compiler is not prepared; no global fallback"
+                    .to_owned()
+            ))
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

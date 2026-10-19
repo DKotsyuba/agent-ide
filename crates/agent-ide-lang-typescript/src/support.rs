@@ -625,6 +625,34 @@ impl LanguageSupport for TypeScript {
         ])
     }
 
+    /// The worktree's environment under this request's configured tools
+    /// ([`crate::environment::environments`]): the compiler the confined checker would run —
+    /// the operator's accepted one or the byte-qualified project compiler — with the exact
+    /// refusal cause otherwise, from the launcher sections the request carries.
+    fn configured_environments(
+        &self,
+        worktree: &Path,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Vec<agent_ide_core::lang::environment::ResolvedEnv> {
+        crate::environment::environments(worktree, config)
+    }
+
+    /// `tsc`/`node` activate the request's configured tools
+    /// ([`crate::environment::command_env`]); a compiler or Node-pin obstruction refuses with
+    /// its cause before admission, and every other program stays unclaimed.
+    fn configured_command_env(
+        &self,
+        worktree: &Path,
+        _cwd: &Path,
+        program: &str,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Result<
+        Option<agent_ide_core::lang::environment::CommandEnv>,
+        agent_ide_core::lang::LangError,
+    > {
+        crate::environment::command_env(worktree, program, config)
+    }
+
     /// A leading `//` comment, or the first text line of a leading `/** */` block.
     fn file_doc(&self, text: &str) -> Option<String> {
         let lines: Vec<_> = text.lines().collect();

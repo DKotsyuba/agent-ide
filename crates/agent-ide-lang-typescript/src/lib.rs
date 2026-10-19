@@ -11,6 +11,7 @@ use agent_ide_core::lang::{Language, LanguageDescriptor};
 mod address_tests;
 pub mod backend;
 pub mod checks;
+pub mod environment;
 pub mod module;
 pub mod names;
 pub mod profile;
