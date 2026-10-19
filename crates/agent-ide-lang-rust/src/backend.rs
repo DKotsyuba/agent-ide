@@ -1,8 +1,10 @@
 //! Worker-side rust-analyzer integration: one long-lived analyzer session per binding.
 //!
 //! The backend owns the exclusive Rust view bookkeeping and every binding's live session. A
-//! session starts on the first request, is reused while its transport lives, and is shut down and
-//! reaped when the binding stops or an exchange fails.
+//! session starts on the first request, is reused while its transport lives and its immutable
+//! profile identity (the declared analyzer, cargo, rustc, toolchain, trust, cache namespace and
+//! worktree incarnation) is unchanged, and is shut down and reaped when the binding stops, an
+//! exchange fails, or that identity changes.
 
 use std::{any::Any, collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
@@ -362,6 +364,8 @@ struct RustLive {
     /// The accepted inputs of a module-hosted session and its worktree, against which its
     /// failures count.
     module_inputs: Option<(String, PathBuf)>,
+    /// The compatibility inputs this session started with; reuse requires them unchanged.
+    identity: RustCompatibilityKey,
 }
 
 /// Exclusive Rust generations and every binding's retained analyzer session.
@@ -374,7 +378,8 @@ struct RustBackend {
 }
 
 impl RustBackend {
-    /// Starts the binding's long-lived Rust session unless its Rust child is still live.
+    /// Starts the binding's long-lived Rust session unless its Rust child is still live with the
+    /// same immutable profile identity.
     ///
     /// `job` supplies binding ownership, cancellation, and spawn authority; `launch` is the
     /// accepted analyzer profile; `source` fixes the worktree and authority epoch. Admission,
@@ -382,6 +387,12 @@ impl RustBackend {
     /// view, spawn and initialize refusals name their stage on `job` (`rust: view refused`,
     /// `spawn failed`, `initialize failed` or `initialize timeout`); a bare `ProviderUnavailable`
     /// from the cache-namespace lookup is named by the caller after this returns.
+    ///
+    /// A live session is reused only when the freshly computed compatibility inputs (analyzer,
+    /// cargo and rustc identity, toolchain, trust, cache namespace, worktree incarnation, and
+    /// the module build for a module-hosted one) equal the ones it started with. A session
+    /// whose declared inputs changed — including a worktree recreated at the same path — is
+    /// released before reuse, so the demand runs against the declared child, never a stale one.
     async fn ensure(
         &mut self,
         host: &mut dyn ProviderHost,
@@ -391,10 +402,9 @@ impl RustBackend {
     ) -> Result<(), FailureCode> {
         let binding = job.binding().clone();
         let worktree_path = source.worktree().worktree_path();
-        if let Some(entry) = self.live.get(&binding) {
-            if entry.live.is_alive() {
-                return Ok(());
-            }
+        if let Some(entry) = self.live.get(&binding)
+            && !entry.live.is_alive()
+        {
             // A module that died — while a call waited for its analyzer to load, or idle — counts
             // against the shared restart policy, and the demand that finds it dead is settled with
             // its typed fault (never silently answered by a restarted one); the next demand
@@ -461,17 +471,28 @@ impl RustBackend {
                 }
             }
         };
-        let (command, program, key) = match &start {
+        let key = match &start {
+            Start::InProcess(profile) => profile.compatibility_key(&worktree),
+            Start::Module { inputs, .. } => RustCompatibilityKey::module(inputs, &worktree),
+        };
+        // A live session whose declared inputs changed is retired before reuse: this demand
+        // restarts on the current declaration instead of being answered by the old child.
+        if let Some(entry) = self.live.get(&binding)
+            && entry.live.is_alive()
+        {
+            if entry.identity == key {
+                return Ok(());
+            }
+            self.release(host, &binding, true).await;
+        }
+        let (command, program) = match &start {
             Start::InProcess(profile) => (
                 profile
                     .command(&worktree)
                     .map_err(|_| FailureCode::ExecutionProfile)?,
                 launch.executable.clone(),
-                profile.compatibility_key(&worktree),
             ),
-            Start::Module {
-                executable, inputs, ..
-            } => (
+            Start::Module { executable, .. } => (
                 agent_ide_core::modules::analyzer::analyzer_command(
                     executable,
                     crate::DESCRIPTOR.id,
@@ -483,7 +504,6 @@ impl RustBackend {
                     identity: "agent-ide-module".to_owned(),
                     blake3: executable.digest.to_hex().to_string(),
                 },
-                RustCompatibilityKey::module(inputs, &worktree),
             ),
         };
         let request = host
@@ -498,7 +518,7 @@ impl RustBackend {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match self.views.request_keyed(
-                key,
+                key.clone(),
                 &worktree,
                 host.registry(),
                 &mut admission,
@@ -566,6 +586,7 @@ impl RustBackend {
                         view,
                         live,
                         module_inputs,
+                        identity: key,
                     },
                 );
                 Ok(())
@@ -714,6 +735,7 @@ impl RustBackend {
             view,
             live,
             module_inputs,
+            ..
         }) = self.live.remove(binding)
         {
             if count

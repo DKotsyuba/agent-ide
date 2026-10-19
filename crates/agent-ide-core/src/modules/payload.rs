@@ -95,10 +95,16 @@ pub enum Field<T> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProjectQuery {
-    /// `LanguageSupport::detect`; answers `Option<LanguageProject>`.
+    /// `LanguageSupport::detect` with the core's stored `selections` applied first, so the
+    /// detected environment (the demanded interpreter a test or format plan reads back) is the
+    /// current choice, never the module instance's last-seen one; answers `Option<LanguageProject>`.
     Detect {
         /// Project root.
         root: PathBuf,
+        /// The core's stored selections for this root's worktree and language. Absent in
+        /// recorded payloads from before it existed (then the instance keeps its own).
+        #[serde(default)]
+        selections: Vec<EnvSelection>,
     },
     /// `LanguageSupport::environments` honouring the core's stored `selections`; answers
     /// `Vec<ResolvedEnv>`.
@@ -650,6 +656,11 @@ pub struct CheckPlanRequest {
     pub config: Value,
     /// Total wall-clock ceiling of the check.
     pub timeout_ms: u64,
+    /// The core's stored environment selections for this worktree and language, applied before
+    /// the module plans, so a planned check runs in the current environment. Absent in recorded
+    /// payloads from before it existed (then the instance keeps its own).
+    #[serde(default)]
+    pub selections: Vec<EnvSelection>,
 }
 
 /// `check_parse`: interpret one completed run the core performed; stdout and stderr follow as

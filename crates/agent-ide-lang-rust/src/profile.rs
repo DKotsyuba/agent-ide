@@ -210,9 +210,11 @@ impl RustProfile {
     }
 
     /// Builds the complete server environment: the toolchain `PATH` plus `HOME`/`CARGO_HOME`
-    /// from the real operator home (the declared override winning when one is configured) and
-    /// the private-namespace target/temp directories. When no real cargo home exists the private
-    /// namespace copy is used so the analyzer never writes registry state outside it.
+    /// from the real operator home (the declared override winning when one is configured),
+    /// `RUSTUP_AUTO_INSTALL=0` (the analyzer's own cargo/rustc children refuse a missing
+    /// toolchain instead of installing one) and the private-namespace target/temp directories.
+    /// When no real cargo home exists the private namespace copy is used so the analyzer never
+    /// writes registry state outside it.
     fn environment(&self) -> BTreeMap<OsString, OsString> {
         let home = crate::home::real_home();
         let derived = crate::home::effective_cargo_home(self.cargo_home.as_deref(), &home);
@@ -247,6 +249,9 @@ impl RustProfile {
             (OsString::from("CARGO"), OsString::from(&self.cargo)),
             (OsString::from("RUSTC"), OsString::from(&self.rustc)),
             (OsString::from("CARGO_HOME"), cargo_home),
+            // Analyzer-side cargo/rustc invocations (cargo metadata, build scripts) resolve a
+            // missing declared toolchain as an honest failure, never a rustup install.
+            (OsString::from("RUSTUP_AUTO_INSTALL"), OsString::from("0")),
             (
                 OsString::from("CARGO_TARGET_DIR"),
                 OsString::from(Path::new(&self.cache_namespace).join("target")),
@@ -1090,6 +1095,11 @@ mod linked_project_tests {
         assert_eq!(
             environment.get(OsStr::new("CARGO_HOME")),
             Some(&OsString::from(&expected_cargo_home))
+        );
+        // The analyzer's own cargo/rustc children never install a missing toolchain.
+        assert_eq!(
+            environment.get(OsStr::new("RUSTUP_AUTO_INSTALL")),
+            Some(&OsString::from("0"))
         );
         // A declared cargo home override wins for the server environment, as for the check.
         let configured = session_profile_with_cargo_home(

@@ -848,6 +848,14 @@ impl CheckerServer {
         effects: &mut Effects<'_>,
     ) -> Result<Value, ServeError> {
         use agent_ide_core::checks::LanguageChecks;
+        // The check plans in the current environment: this instance's copy of the selections may
+        // predate the last `ide.start environment` change, and the planned Pyright interpreter is
+        // read back from the shared resolver.
+        agent_ide_core::lang::environment::replace_selections(
+            &query.request.worktree,
+            crate::LANGUAGE,
+            query.selections,
+        );
         let config = crate::checks::PythonChecks
             .parse_config(query.config)
             .map_err(|error| ServeError::Protocol(error.to_string()))?;

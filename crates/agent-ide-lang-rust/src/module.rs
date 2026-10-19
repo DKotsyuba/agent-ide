@@ -92,6 +92,12 @@ pub const CARGO_CHECK: EffectRecipe = EffectRecipe {
             name: "CARGO_NET_OFFLINE",
             value: "true",
         },
+        // Same as [`RustChecker::cargo_check_spec`]: a missing toolchain refuses instead of
+        // letting cargo's rustup proxies install one.
+        EnvRule::Literal {
+            name: "RUSTUP_AUTO_INSTALL",
+            value: "0",
+        },
         EnvRule::Pattern {
             prefix: "CARGO_TARGET_",
             suffix: "_LINKER",
@@ -298,6 +304,11 @@ pub const RUSTFMT: EffectRecipe = EffectRecipe {
             optional: true,
         },
         EnvRule::Param {
+            name: "RUSTUP_AUTO_INSTALL",
+            param: "RUSTUP_AUTO_INSTALL",
+            optional: true,
+        },
+        EnvRule::Param {
             name: "RUSTUP_HOME",
             param: "RUSTUP_HOME",
             optional: true,
@@ -465,12 +476,13 @@ const TEST_RECIPES: [EffectRecipe; 2 * TEST_SHAPES.len()] = {
 /// when set (its environment is otherwise complete: the `PATH` of `test_run`).
 // ponytail: a fixed list; a variable outside it (e.g. CARGO_BUILD_JOBS) does not reach a
 // module-planned run, add it here and to MODULE_ENV when a project needs it.
-pub const TEST_ENV: [&str; 8] = [
+pub const TEST_ENV: [&str; 9] = [
     "CARGO_HOME",
     "CARGO_TARGET_DIR",
     "DEVELOPER_DIR",
     "HOME",
     "RUSTFLAGS",
+    "RUSTUP_AUTO_INSTALL",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
     "TMPDIR",
@@ -500,6 +512,7 @@ const TEST_RUN_ENV: &[EnvRule] = &[
     passed(TEST_ENV[5]),
     passed(TEST_ENV[6]),
     passed(TEST_ENV[7]),
+    passed(TEST_ENV[8]),
 ];
 
 /// The paths of a [`test_run`]: the pinned cargo and the `PATH` directories before the system's.
@@ -544,18 +557,24 @@ const fn test_run(id: &'static str, program: &'static str, args: &'static [Arg])
 }
 
 /// The daemon variables a rustup-proxied formatter resolves its toolchain from.
-pub const FORMATTER_ENV: [&str; 3] = ["HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"];
+pub const FORMATTER_ENV: [&str; 4] = [
+    "HOME",
+    "RUSTUP_AUTO_INSTALL",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+];
 
 /// The daemon variables the Rust module receives (root composition data): the test toolchain,
 /// [`FORMATTER_ENV`] and [`TEST_ENV`] (with the developer-directory selection `xcode-select`
 /// honours).
-pub const MODULE_ENV: [&str; 9] = [
+pub const MODULE_ENV: [&str; 10] = [
     "AGENT_IDE_RUST_TOOLCHAIN_DIR",
     "CARGO_HOME",
     "CARGO_TARGET_DIR",
     "DEVELOPER_DIR",
     "HOME",
     "RUSTFLAGS",
+    "RUSTUP_AUTO_INSTALL",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
     "TMPDIR",
@@ -1066,6 +1085,13 @@ async fn check_plan(incoming: &Incoming, effects: &mut Effects<'_>) -> Result<An
         Ok(query) => query,
         Err(answer) => return Ok(answer),
     };
+    // Rust's check plan reads no stored selection, but it adopts the core's so this instance's
+    // later answers (the support adapter's project queries) reflect the current choice.
+    agent_ide_core::lang::environment::replace_selections(
+        &query.request.worktree,
+        crate::LANGUAGE,
+        query.selections,
+    );
     let config: ProjectRustChecksConfig = match serde_json::from_value(query.config.clone()) {
         Ok(config) => config,
         Err(error) => {
@@ -1524,6 +1550,7 @@ mod tests {
             request: request.clone(),
             config: json!({"toolchain_dir": toolchain}),
             timeout_ms: 60_000,
+            selections: Vec::new(),
         });
         let mut effects = FakeEffects {
             stdout: br#"{"reason":"build-finished","success":true}
@@ -1641,6 +1668,7 @@ mod tests {
                             request: request.clone(),
                             config: config.clone(),
                             timeout_ms: 60_000,
+                            selections: Vec::new(),
                         }),
                         attachments: Vec::new(),
                     },
@@ -1881,6 +1909,7 @@ mod tests {
             },
             config: json!({"toolchain_dir": base.0.join("none")}),
             timeout_ms: 60_000,
+            selections: Vec::new(),
         });
         let mut effects = FakeEffects {
             stdout: Vec::new(),

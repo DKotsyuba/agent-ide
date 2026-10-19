@@ -902,6 +902,14 @@ impl CheckerServer {
         query: CheckPlanRequest,
         effects: &mut Effects<'_>,
     ) -> Result<Value, ServeError> {
+        // TypeScript's check plan reads no stored selection, but it adopts the core's so this
+        // instance's later answers (the support adapter's project queries) reflect the current
+        // choice.
+        agent_ide_core::lang::environment::replace_selections(
+            &query.request.worktree,
+            crate::LANGUAGE,
+            query.selections,
+        );
         let config = TypeScriptChecks
             .parse_config(query.config)
             .map_err(|error| ServeError::Protocol(error.to_string()))?;
