@@ -239,9 +239,13 @@ impl ModuleHost {
     /// absent. This is not `hello.config.provider`, whose separate hosted-provider grant is
     /// created only by analyzer admission. Never substitute this data for that grant.
     pub fn module_config(&self, language: Language, worktree: &Path) -> ModuleConfig {
-        self.launcher.as_ref().map_or_else(|| ModuleConfig {
-            worktree: Some(worktree.to_path_buf()), ..Default::default()
-        }, |launcher| launcher.worktree_module_config(language, worktree))
+        self.launcher.as_ref().map_or_else(
+            || ModuleConfig {
+                worktree: Some(worktree.to_path_buf()),
+                ..Default::default()
+            },
+            |launcher| launcher.worktree_module_config(language, worktree),
+        )
     }
 
     /// The journal lines of ignored switch entries (`language_mode_ignored:<id>`).
@@ -326,6 +330,7 @@ impl ModuleHost {
             return Ok(slot.clone());
         }
         let config = ModuleConfig {
+            read_denies: Vec::new(),
             worktree: Some(worktree.to_path_buf()),
             provider: None,
             checks: None,

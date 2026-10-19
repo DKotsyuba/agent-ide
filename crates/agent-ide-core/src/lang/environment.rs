@@ -18,9 +18,9 @@ use std::{
 
 use super::Language;
 
-/// Size of one chunk a native input streams through while being hashed: hashing costs this
-/// much memory per file, never the file's size.
-const INPUT_CHUNK: usize = 64 * 1024;
+/// Maximum UTF-8 bytes returned by `read_input`; larger text must be handled by a language's
+/// explicit unsupported path rather than parsed from a prefix. Hashing has no prefix ceiling.
+pub const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
 
 /// Size of one chunk a native input streams through while being hashed: hashing costs this
 /// much memory per file, never the file's size.
@@ -52,27 +52,28 @@ fn open_input(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> O
 }
 
 /// The guarded text of a native environment input, or `None` when it says nothing (see
-/// [`open_input`]). Small declared inputs only — pins and manifests a language parses — never
-/// a substitute for streaming a large file.
-pub fn read_input(
-    path: &Path,
-    denies: &[crate::execution::seatbelt::ReadDeny],
-) -> Option<String> {
-    let mut text = String::new();
+/// `open_input`). At most `MAX_INPUT_TEXT_BYTES` UTF-8 bytes are returned. An oversized,
+/// invalid-UTF-8 or unreadable file returns `None`, never a parsed prefix; a language deciding
+/// authoritative presence must distinguish that refusal from absence before calling this.
+pub fn read_input(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> Option<String> {
+    let mut bytes = Vec::new();
     open_input(path, denies)?
-        .read_to_string(&mut text)
+        .take(MAX_INPUT_TEXT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
         .ok()?;
-    Some(text)
+    (bytes.len() <= MAX_INPUT_TEXT_BYTES)
+        .then(|| String::from_utf8(bytes).ok())
+        .flatten()
 }
 
-/// Whether `path` is readable under the environment-input gate ([`open_input`]): a language
+/// Whether `path` is readable under the environment-input gate (`open_input`): a language
 /// checks this before a content-dependent decision, so a denied input never influences one.
 pub fn readable(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
     open_input(path, denies).is_some()
 }
 
 /// Whole-content BLAKE3 of a native environment input, hashed with bounded memory, or `None`
-/// when the file says nothing (see [`open_input`]). The file is streamed in `INPUT_CHUNK`
+/// when the file says nothing (see `open_input`). The file is streamed in `INPUT_CHUNK`
 /// chunks straight into the hasher, so no input is ever held in memory whole, and any content
 /// — UTF-8 or not — is hashed as the bytes it is. A language's resolver calls this for every
 /// fingerprinted project file so all of them hash identically.
@@ -110,7 +111,8 @@ pub struct EnvCandidate {
     pub label: String,
     /// Absolute environment directory (or toolchain directory).
     pub path: PathBuf,
-    /// Version read from files (`3.14.0`), or `None` when the files do not say.
+    /// Installed version established by native metadata or accepted executable facts, never a
+    /// manifest constraint or directory-name guess; `None` when the version is unknown.
     pub version: Option<String>,
     /// The environment exists but cannot run (for example its base interpreter is gone).
     pub broken: bool,
@@ -206,6 +208,24 @@ pub fn replace_selections(worktree: &Path, language: Language, selections: Vec<E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Oversized text never parses a prefix while binary/tail changes still hash completely;
+    /// denied input returns no data through either read route.
+    #[test]
+    fn guarded_input_bounds_and_full_hashes() {
+        let root = crate::scratch::ScratchDir::new("environment-input");
+        let path = root.join("input");
+        let mut bytes = vec![b'x'; MAX_INPUT_TEXT_BYTES + 2];
+        fs::write(&path, &bytes).unwrap();
+        assert!(read_input(&path, &[]).is_none());
+        let before = hash_input(&path, &[]).unwrap();
+        *bytes.last_mut().unwrap() = 0xff;
+        fs::write(&path, &bytes).unwrap();
+        assert_ne!(hash_input(&path, &[]).unwrap(), before);
+        let denies = [crate::execution::seatbelt::ReadDeny::Path(path.clone())];
+        assert!(!readable(&path, &denies));
+        assert!(read_input(&path, &denies).is_none() && hash_input(&path, &denies).is_none());
+    }
 
     /// A holder that panicked with the process-wide selection map locked does not make every later
     /// read or write of the (rebuildable) cache panic.

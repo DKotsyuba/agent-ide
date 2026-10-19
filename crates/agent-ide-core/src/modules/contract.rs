@@ -280,6 +280,10 @@ pub struct HelloOffer {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleConfig {
+    /// Current computation's read exclusions, never additional read authority. Absent legacy
+    /// payloads carry no extra exclusions; check requests explicitly supply their own policy.
+    #[serde(default)]
+    pub read_denies: Vec<crate::execution::seatbelt::ReadDeny>,
     /// The absolute canonical admitted root of this instance's scope.
     pub worktree: Option<std::path::PathBuf>,
     /// In current computation requests, the accepted provider declaration (executable,

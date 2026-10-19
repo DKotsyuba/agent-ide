@@ -645,6 +645,9 @@ pub enum LangError {
     Unparseable(String),
     /// The project has no runner or command for the request.
     Unsupported(String),
+    /// The target shape is valid but its configured project environment cannot run it. No child
+    /// has started; the message explains preparation/native recovery rather than argument repair.
+    Environment(String),
 }
 
 impl fmt::Display for LangError {
@@ -654,6 +657,7 @@ impl fmt::Display for LangError {
             Self::NotAContainer(path) => write!(f, "{path} has no members"),
             Self::Unparseable(reason) => write!(f, "unparseable source: {reason}"),
             Self::Unsupported(reason) => write!(f, "unsupported: {reason}"),
+            Self::Environment(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -792,6 +796,18 @@ pub trait LanguageSupport: Send + Sync {
         self.environments(worktree)
     }
 
+    /// Detects project facts under this computation's read policy. Languages with guarded native
+    /// inputs override this before their existing detector reads files; unknown/refused discovery
+    /// returns no project, while environment resolution retains its actionable refusal.
+    fn configured_detect(
+        &self,
+        root: &Path,
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Option<LanguageProject> {
+        let _ = config;
+        self.detect(root)
+    }
+
     /// Accepts or refuses `selector` for the project `root` (relative to `worktree`) before it
     /// is stored. `Err` carries the cause and the way out: an unknown candidate with the
     /// candidates, or a project pin that overrides any selection. Admission of absolute paths
@@ -823,7 +839,9 @@ pub trait LanguageSupport: Send + Sync {
     /// `None` means the language does not claim the program. An authoritative incompatible,
     /// missing or denied environment must return `Unsupported` with its cause/native recovery,
     /// rather than silently selecting ambient tools. Resolve before command/effect admission;
-    /// a successful activation never authorizes changing an already admitted specification.
+    /// A preparation refusal uses `LangError::Environment`, separating native recovery from
+    /// unsupported argument shapes. A successful activation never authorizes changing an
+    /// already admitted specification.
     /// The default preserves existing activation for unaffected languages.
     fn configured_command_env(
         &self,

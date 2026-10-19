@@ -516,6 +516,15 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustModuleSession
 pub struct RustCompatibilityKey(String);
 
 impl RustCompatibilityKey {
+    /// Partitions semantic leases and cached facts by the current complete native environment.
+    /// A changed lock/config/member or same-path tool recreation cannot reuse the prior view.
+    pub fn with_environment(self, environment: &str) -> Self {
+        Self(
+            blake3::hash(format!("{}\0{environment}", self.0).as_bytes())
+                .to_hex()
+                .to_string(),
+        )
+    }
     /// Returns the stable opaque backend identity passed to Execution's lease registry.
     pub fn as_str(&self) -> &str {
         &self.0

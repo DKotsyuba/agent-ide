@@ -343,7 +343,10 @@ impl<'de> Deserialize<'de> for ProviderLaunch {
             "executable": raw.executable, "settings": raw.settings,
             "toolchain": raw.toolchain, "trust": raw.trust, "cache_namespace": raw.cache_namespace,
         });
-        declaration.as_object_mut().expect("declaration is an object").extend(fields.clone());
+        declaration
+            .as_object_mut()
+            .expect("declaration is an object")
+            .extend(fields.clone());
         let options = own.parse_options(fields).map_err(D::Error::custom)?;
         Ok(Self {
             executable: raw.executable,
@@ -829,20 +832,44 @@ impl LauncherConfig {
         worktree: &Path,
         target: &LaunchTarget,
     ) -> crate::modules::contract::ModuleConfig {
-        self.language_context(language, Some(worktree), target.providers.iter().find(|provider| provider.language == language).map(ProviderLaunch::module_declaration))
+        self.language_context(
+            language,
+            Some(worktree),
+            target
+                .providers
+                .iter()
+                .find(|provider| provider.language == language)
+                .map(ProviderLaunch::module_declaration),
+        )
     }
 
     /// Supplies exact accepted provider facts alongside this launcher's matching check section.
     /// Used by a live backend that already holds its accepted launch, without choosing a target.
-    pub fn provider_module_config(&self, provider: &ProviderLaunch, worktree: &Path) -> crate::modules::contract::ModuleConfig {
-        self.language_context(provider.language, Some(worktree), Some(provider.module_declaration()))
+    pub fn provider_module_config(
+        &self,
+        provider: &ProviderLaunch,
+        worktree: &Path,
+    ) -> crate::modules::contract::ModuleConfig {
+        self.language_context(
+            provider.language,
+            Some(worktree),
+            Some(provider.module_declaration()),
+        )
     }
 
     /// Immutable context for a check factory shared by worktrees. Provider facts are retained
     /// only when every configured declaration of this language agrees; absent or conflicting
     /// provider evidence stays unknown. Each check supplies its actual admitted worktree later.
-    pub fn check_module_config(&self, language: Language) -> crate::modules::contract::ModuleConfig {
-        let mut declarations = self.targets.values().flat_map(|target| target.providers.iter()).filter(|provider| provider.language == language).map(ProviderLaunch::module_declaration);
+    pub fn check_module_config(
+        &self,
+        language: Language,
+    ) -> crate::modules::contract::ModuleConfig {
+        let mut declarations = self
+            .targets
+            .values()
+            .flat_map(|target| target.providers.iter())
+            .filter(|provider| provider.language == language)
+            .map(ProviderLaunch::module_declaration);
         let first = declarations.next();
         let provider = first.filter(|first| declarations.all(|next| &next == first));
         self.language_context(language, None, provider)
@@ -851,21 +878,50 @@ impl LauncherConfig {
     /// Current context outside an individual job (cards/notices/check planning). Exact candidate
     /// roots or the documented sole managed template supply provider facts; ambiguous targets
     /// retain no invented provider. Callers with a selected job target use `module_config` instead.
-    pub fn worktree_module_config(&self, language: Language, worktree: &Path) -> crate::modules::contract::ModuleConfig {
-        let matching: Vec<_> = self.targets.values().filter(|target| target.candidate.canonicalize().unwrap_or_else(|_| target.candidate.clone()).starts_with(worktree)).collect();
+    pub fn worktree_module_config(
+        &self,
+        language: Language,
+        worktree: &Path,
+    ) -> crate::modules::contract::ModuleConfig {
+        let matching: Vec<_> = self
+            .targets
+            .values()
+            .filter(|target| {
+                target
+                    .candidate
+                    .canonicalize()
+                    .unwrap_or_else(|_| target.candidate.clone())
+                    .starts_with(worktree)
+            })
+            .collect();
         match matching.as_slice() {
             [target] => self.module_config(language, worktree, target),
-            [] if self.sole_target().is_some() => self.module_config(language, worktree, self.sole_target().unwrap()),
-            _ => { let mut config = self.check_module_config(language); config.worktree = Some(worktree.to_path_buf()); config }
+            [] if self.sole_target().is_some() => {
+                self.module_config(language, worktree, self.sole_target().unwrap())
+            }
+            _ => {
+                let mut config = self.check_module_config(language);
+                config.worktree = Some(worktree.to_path_buf());
+                config
+            }
         }
     }
 
     /// Builds bounded language-owned request data without adding authority or ambient tool facts.
-    fn language_context(&self, language: Language, worktree: Option<&Path>, provider: Option<serde_json::Value>) -> crate::modules::contract::ModuleConfig {
+    fn language_context(
+        &self,
+        language: Language,
+        worktree: Option<&Path>,
+        provider: Option<serde_json::Value>,
+    ) -> crate::modules::contract::ModuleConfig {
         crate::modules::contract::ModuleConfig {
+            read_denies: Vec::new(),
             worktree: worktree.map(Path::to_path_buf),
             provider,
-            checks: self.project_checks().and_then(|checks| checks.raw_section(language)).cloned(),
+            checks: self
+                .project_checks()
+                .and_then(|checks| checks.raw_section(language))
+                .cloned(),
             env: crate::modules::launch::module_env(language.name()),
             home: crate::userhome::user_home(),
         }

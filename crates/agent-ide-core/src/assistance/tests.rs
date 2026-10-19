@@ -189,23 +189,41 @@ pub async fn resolve_command(
     command_language: Option<Language>,
     launcher: &super::launcher::LauncherConfig,
     target: &super::launcher::LaunchTarget,
-) -> Result<Result<CommandResolution, crate::lang::LangError>, crate::modules::contract::ModuleUnavailable> {
+) -> Result<
+    Result<CommandResolution, crate::lang::LangError>,
+    crate::modules::contract::ModuleUnavailable,
+> {
     let Some(program) = argv.first() else {
         return Ok(Ok(CommandResolution::default()));
     };
     let mut environment_language = command_language;
     let mut resolved = None;
-    let languages = command_language.map_or_else(|| crate::lang::registered().to_vec(), |language| vec![language]);
+    let languages = command_language.map_or_else(
+        || crate::lang::registered().to_vec(),
+        |language| vec![language],
+    );
     for language in languages {
         let config = launcher.module_config(language, root, target);
         match crate::modules::calls::command_env(language, root, cwd, program, &config).await? {
             Err(error) => return Ok(Err(error)),
-            Ok(Some(env)) => { resolved = Some(env); environment_language = Some(language); break; }
+            Ok(Some(env)) => {
+                resolved = Some(env);
+                environment_language = Some(language);
+                break;
+            }
             Ok(None) => {}
         }
     }
     let environment_label = match environment_language {
-        Some(language) => command_environment_label(root, cwd, language, &launcher.module_config(language, root, target)).await?,
+        Some(language) => {
+            command_environment_label(
+                root,
+                cwd,
+                language,
+                &launcher.module_config(language, root, target),
+            )
+            .await?
+        }
         None => None,
     };
     Ok(Ok(CommandResolution {

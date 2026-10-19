@@ -359,6 +359,23 @@ environment: typescript node 22.11.0 (.nvmrc) ≠ volta.node 20.18.0 · server n
 2. Consider an MCP only if a host without Agent IDE must list and select environments interactively. Even then it would read the same files, honor `allowed_roots`, and keep no trust store of its own.
 
 ## 8. Not verified / open
+
+The current Rust implementation uses the accepted request's provider/check configuration,
+not process `AGENT_IDE_*` variables as tool evidence. A stable release pin requires matching
+accepted rustc evidence; a directory name, Cargo version, unknown version, alias, prerelease,
+or unsupported pin requirements cannot establish compatibility. A refusal has no chosen
+candidate and names native recovery before an IDE child starts. Automatic installation remains
+disabled. Selection of another Rust environment and rustup-manager discovery are unsupported.
+
+Rust native identity includes full-byte manifest/lock/pin/config inputs inside the worktree,
+including nested members, and actual configured tool bytes/stamps. Semantic leases include this
+identity. Text parsing is limited to 64 KiB; native discovery is bounded to 16,384 entries and
+12 directory levels, excluding standard generated/dependency roots. Unsupported declarations,
+foreign members, symlinked input scope, or exhausted discovery refuse rather than certify a
+partial identity. With extra read exclusions, the legacy CI/task project-fact detector is
+unavailable; guarded environment/check resolution remains separate. These are implementation
+scope limits, not evidence that the integrated mandatory gate or owner acceptance has passed.
+
 These are not relied on: the location of poetry's `envs.toml`; the semantics of `uv python find`; where VS Code persists its Python selection; whether rust-analyzer reloads on a toolchain-file edit (the design restarts instead); the fnm and volta install layouts (verify in P3); the `pyvenv.cfg` keys written by virtualenv/poetry (the design shows `version unknown`).
 
 The researcher read Pyright's precedence from source with medium-high confidence. A P1 real-provider test confirms it (§5.6).

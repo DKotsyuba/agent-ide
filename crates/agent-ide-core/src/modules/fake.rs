@@ -153,7 +153,9 @@ impl FakeModule {
                 ProjectQuery::CheckSelection { selector, .. } => {
                     encode(&Err::<(), String>(format!("unknown selector {selector}")))
                 }
-                ProjectQuery::CommandEnv { .. } => encode(&Ok::<Option<crate::lang::environment::CommandEnv>, LangError>(None)),
+                ProjectQuery::CommandEnv { .. } => {
+                    encode(&Ok::<Option<crate::lang::environment::CommandEnv>, LangError>(None))
+                }
                 ProjectQuery::TestToolchain { .. } => json!(null),
             },
             Capability::AnalyzeSource => {
@@ -229,7 +231,9 @@ impl FakeModule {
             }
             Capability::Syntax => match decode::<SyntaxQuery>(payload)? {
                 SyntaxQuery::Verdict { .. } => encode(&SyntaxVerdict::Clean),
-                SyntaxQuery::ProbePlan { .. } => encode(&Ok::<_, LangError>(Some(sample_effect("probe")))),
+                SyntaxQuery::ProbePlan { .. } => {
+                    encode(&Ok::<_, LangError>(Some(sample_effect("probe"))))
+                }
             },
             Capability::Semantic => match decode::<SemanticQuery>(payload)? {
                 SemanticQuery::Context { source, .. } => encode(&ContextEvidence {

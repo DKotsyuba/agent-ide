@@ -253,9 +253,14 @@ pub trait ProviderHost: Send + Sync {
     /// The default knows the accepted provider but no project-check declaration; the daemon
     /// implementation adds its actual launcher section. This is data, not a new read/execution
     /// grant; consumers resolve/refuse before reuse or admission and never infer ambient tools.
-    fn module_config(&self, launch: &ProviderLaunch, worktree: &Path) -> crate::modules::contract::ModuleConfig {
+    fn module_config(
+        &self,
+        launch: &ProviderLaunch,
+        worktree: &Path,
+    ) -> crate::modules::contract::ModuleConfig {
         crate::modules::contract::ModuleConfig {
-            worktree: Some(worktree.to_path_buf()), provider: Some(launch.module_declaration()),
+            worktree: Some(worktree.to_path_buf()),
+            provider: Some(launch.module_declaration()),
             ..Default::default()
         }
     }

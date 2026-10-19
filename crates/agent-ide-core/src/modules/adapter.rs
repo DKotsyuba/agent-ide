@@ -85,7 +85,10 @@ pub type EffectPlans = fn(&[String]) -> Option<EffectRequest>;
 /// Constructs a finite language recipe from argv and this request's immutable accepted facts.
 /// Errors refuse before admission; `None` is an unsupported shape, never permission to use a
 /// legacy ambient planner. No process or environment manager may run in this callback.
-pub type ConfiguredEffectPlans = fn(&[String], &super::contract::ModuleConfig) -> Result<Option<EffectRequest>, crate::lang::LangError>;
+pub type ConfiguredEffectPlans = fn(
+    &[String],
+    &super::contract::ModuleConfig,
+) -> Result<Option<EffectRequest>, crate::lang::LangError>;
 
 impl SupportServer {
     /// The adapter for `language` at `version`.
@@ -114,11 +117,16 @@ impl SupportServer {
 
     /// The effect request of one formatter, probe or test-run argument vector; the generic `argv`
     /// request (which the core refuses) when `plans` has none.
-    fn plan(&self, argv: &[String], config: &super::contract::ModuleConfig) -> Result<EffectRequest, crate::lang::LangError> {
+    fn plan(
+        &self,
+        argv: &[String],
+        config: &super::contract::ModuleConfig,
+    ) -> Result<EffectRequest, crate::lang::LangError> {
         if let Some(plans) = self.configured_plans {
             return Ok(plans(argv, config)?.unwrap_or_else(|| argv_effect(argv)));
         }
-        Ok(self.plans
+        Ok(self
+            .plans
             .and_then(|plans| plans(argv))
             .unwrap_or_else(|| argv_effect(argv)))
     }
@@ -223,9 +231,13 @@ impl SupportServer {
         let payload = request.payload.clone();
         Ok(match request.capability {
             Capability::Project => match decode::<ProjectQuery>(payload)? {
-                ProjectQuery::Detect { root, selections, config: _ } => {
+                ProjectQuery::Detect {
+                    root,
+                    selections,
+                    config,
+                } => {
                     replace_selections(&root, self.language, selections);
-                    encode(&support.detect(&root))
+                    encode(&support.configured_detect(&root, &config))
                 }
                 ProjectQuery::Environments {
                     worktree,
@@ -304,7 +316,8 @@ impl SupportServer {
                 } => encode(
                     &support
                         .syntax_probe_command(&project, &root, &file, configured.as_ref())
-                        .map(|argv| self.plan(&argv, &config)).transpose(),
+                        .map(|argv| self.plan(&argv, &config))
+                        .transpose(),
                 ),
             },
             Capability::FormatPlan => {
@@ -312,20 +325,29 @@ impl SupportServer {
                 encode(
                     &support
                         .format_stdin_command(&query.project, &query.file)
-                        .map(|argv| self.plan(&argv, &query.config)).transpose(),
+                        .map(|argv| self.plan(&argv, &query.config))
+                        .transpose(),
                 )
             }
             Capability::TestPlan => match decode::<TestPlanQuery>(payload)? {
-                TestPlanQuery::Selection { project, target, config: _ } => {
-                    encode(&support.test_selection(&project, &target))
-                }
-                TestPlanQuery::Run { project, target, config } => encode(
+                TestPlanQuery::Selection {
+                    project,
+                    target,
+                    config: _,
+                } => encode(&support.test_selection(&project, &target)),
+                TestPlanQuery::Run {
+                    project,
+                    target,
+                    config,
+                } => encode(
                     &support
                         .test_selection(&project, &target)
-                        .and_then(|selection| Ok(TestRun {
-                            effect: self.plan(&selection.command, &config)?,
-                            tests: selection.tests,
-                        })),
+                        .and_then(|selection| {
+                            Ok(TestRun {
+                                effect: self.plan(&selection.command, &config)?,
+                                tests: selection.tests,
+                            })
+                        }),
                 ),
                 TestPlanQuery::TestIds {
                     file,
@@ -472,6 +494,78 @@ mod tests {
         let mut other = effect;
         other.recipe = "check".into();
         assert_eq!(effect_argv(&other), None);
+    }
+
+    /// A reused module plans from each current request, never stale hello configuration. Typed
+    /// environment refusal is returned intact before any effect can execute.
+    #[tokio::test]
+    async fn configured_effect_plans_use_each_requests_context() {
+        /// Projects the request marker into a non-executed receipt, refusing supplied exclusions.
+        fn plans(
+            _argv: &[String],
+            config: &crate::modules::contract::ModuleConfig,
+        ) -> Result<Option<EffectRequest>, crate::lang::LangError> {
+            if !config.read_denies.is_empty() {
+                return Err(crate::lang::LangError::Environment(
+                    "input excluded; use native tools".into(),
+                ));
+            }
+            Ok(Some(EffectRequest {
+                recipe: "context".into(),
+                params: std::collections::BTreeMap::from([(
+                    "marker".into(),
+                    Param::Token(
+                        config.checks.as_ref().unwrap()["marker"]
+                            .as_str()
+                            .unwrap()
+                            .into(),
+                    ),
+                )]),
+            }))
+        }
+        crate::lang::testing::install();
+        let language = crate::lang::testing::GAMMA;
+        let mut hello = offer(ModuleId::bundled("gamma"), "1.0", Role::Analyzer, 1);
+        hello.config.checks = Some(serde_json::json!({"marker":"stale-hello"}));
+        let (mut channel, _) = in_memory(
+            SupportServer::new(language, "1.0").with_configured_effect_plans(plans),
+            hello,
+        )
+        .await
+        .unwrap();
+        for marker in ["first", "second", "denied"] {
+            let mut call = sample_call(Capability::FormatPlan);
+            call.payload["config"] = encode(&crate::modules::contract::ModuleConfig {
+                checks: Some(serde_json::json!({"marker":marker})),
+                read_denies: if marker == "denied" {
+                    vec![crate::execution::seatbelt::ReadDeny::Path(
+                        "/excluded".into(),
+                    )]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            });
+            let reply = channel
+                .call(call, Duration::from_secs(5), &mut NoEffects)
+                .await
+                .unwrap();
+            let Outcome::Result(value) = reply.outcome else {
+                panic!("typed answer expected")
+            };
+            let answer: crate::modules::payload::FormatPlanAnswer = decode(value).unwrap();
+            if marker == "denied" {
+                assert!(matches!(
+                    answer,
+                    Err(crate::lang::LangError::Environment(_))
+                ));
+            } else {
+                assert_eq!(
+                    answer.unwrap().unwrap().params.get("marker"),
+                    Some(&Param::Token(marker.into()))
+                );
+            }
+        }
     }
 
     /// The adapter answers the test language's own support over the wire exactly as in process.

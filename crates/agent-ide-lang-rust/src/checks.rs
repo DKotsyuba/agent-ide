@@ -40,6 +40,8 @@ const ETC_READ_ROOT: &str = "/private/etc";
 /// cache, generation) arrives in the [`CheckRequest`]. Instances are `Send + Sync` and may be
 /// shared by concurrent scheduler tasks.
 pub struct RustChecker {
+    /// Immutable current launcher facts; legacy direct constructors have unknown provider facts.
+    configuration: Option<agent_ide_core::modules::contract::ModuleConfig>,
     /// Executes the confined cargo process for every [`RustChecker::check`] call.
     runner: Arc<dyn ConfinedRunner>,
     /// Rust toolchain root providing `<dir>/bin/cargo`; missing cargo is [`UnavailableReason::ToolMissing`].
@@ -119,6 +121,7 @@ impl RustChecker {
     ) -> Self {
         let linker_env = resolve_linker_env(primary_developer_dir.as_deref(), &toolchain_dir);
         Self {
+            configuration: None,
             runner,
             toolchain_dir,
             cargo_home,
@@ -126,6 +129,15 @@ impl RustChecker {
             developer_roots: resolve_developer_roots(primary_developer_dir),
             linker_env,
         }
+    }
+
+    /// Attaches accepted per-launcher facts; request worktree/read policy is applied per check.
+    pub(crate) fn with_config(
+        mut self,
+        config: agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Self {
+        self.configuration = Some(config);
+        self
     }
 
     /// Builds the exact confined cargo invocation for `request`.
@@ -236,6 +248,13 @@ impl CargoCheckPlan {
                         .into_owned(),
                 ),
                 ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
+                (
+                    "RUSTC".to_owned(),
+                    self.toolchain_dir
+                        .join("bin/rustc")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 // A missing toolchain must refuse (`ToolMissing`), never send cargo's rustup
                 // proxies to install one from the network.
                 ("RUSTUP_AUTO_INSTALL".to_owned(), "0".to_owned()),
@@ -566,9 +585,34 @@ impl RustChecker {
     /// the pin's rejection is not the project's environment. The detail names the pin, the
     /// configured toolchain and the native fallback.
     pub(crate) fn environment_refusal(&self, request: &CheckRequest) -> Option<String> {
+        if let Some(config) = &self.configuration {
+            let mut config = config.clone();
+            config.worktree = Some(request.worktree.clone());
+            config.read_denies = request.read_denies.clone();
+            // Resolve authoritative pins before the ordinary missing-cargo outcome. A checks-only
+            // declaration supplies no compiler version proof; unknown pinned compatibility refuses.
+            let compiler = config
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.get("rustc_version"))
+                .and_then(|value| value.as_str());
+            if let Some(cause) = crate::environment::pin_conflict(
+                &request.worktree,
+                &self.toolchain_dir,
+                compiler,
+                &request.read_denies,
+            ) {
+                return Some(cause);
+            }
+            if self.cargo_missing(request) {
+                return None;
+            }
+            return crate::environment::resolve(&request.worktree, &config).err();
+        }
         crate::environment::pin_conflict(
             &request.worktree,
             &self.toolchain_dir,
+            None,
             &request.read_denies,
         )
     }
@@ -1026,6 +1070,7 @@ impl CheckConfig for ProjectRustChecksConfig {
             &self.section,
             runner.clone(),
             timeout,
+            &Default::default(),
         ) {
             return checker;
         }
@@ -1036,6 +1081,34 @@ impl CheckConfig for ProjectRustChecksConfig {
             timeout,
             self.developer_dir.clone(),
         ))
+    }
+
+    /// Builds native/module checks with the same immutable actual launcher facts as the card.
+    fn configured_checker(
+        &self,
+        runner: Arc<dyn ConfinedRunner>,
+        timeout: Duration,
+        config: agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Arc<dyn Checker> {
+        if let Some(checker) = agent_ide_core::modules::calls::checker(
+            crate::LANGUAGE,
+            &self.section,
+            runner.clone(),
+            timeout,
+            &config,
+        ) {
+            return checker;
+        }
+        Arc::new(
+            RustChecker::new(
+                runner,
+                self.toolchain_dir.clone(),
+                self.cargo_home.clone(),
+                timeout,
+                self.developer_dir.clone(),
+            )
+            .with_config(config),
+        )
     }
 
     /// The toolchain directory is not probed.
@@ -1113,21 +1186,23 @@ mod tests {
             "{detail}"
         );
         assert!(
-            detail.contains("configured toolchain is 1.98.1"),
+            detail.contains("not qualified") && detail.contains("native cargo"),
             "{detail}"
         );
-        // The agreeing pin runs the check as before (no conflict refusal).
+        // A matching directory name is no compiler-version evidence. With unknown actual
+        // rustc, the stable pin must still refuse before the fake runner can start.
         fs::write(
             root.join("rust-toolchain.toml"),
             "[toolchain]\nchannel = \"1.98.1\"\n",
         )
         .unwrap();
         let snapshot = checker.check(request).await;
-        assert_ne!(
+        assert_eq!(
             snapshot.state,
             CheckState::Unavailable(UnavailableReason::EnvMissing),
             "{snapshot:?}"
         );
+        assert!(snapshot.detail.unwrap().contains("version is unknown"));
         fs::remove_dir_all(root).unwrap();
     }
 

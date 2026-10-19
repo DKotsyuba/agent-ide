@@ -2752,4 +2752,21 @@ mod tests {
         assert!(!text.contains("detail_ref"), "{text}");
         assert_eq!(result.is_error, Some(true));
     }
+
+    /// A valid operation blocked by preparation names native recovery, not argument repair or
+    /// a guessed package-manager command, and remains an MCP business refusal.
+    #[test]
+    fn configured_environment_refusal_names_native_recovery() {
+        let result = render(PeerReply::Error {code: FailureCode::ProviderUnavailable, detail: Some("environment: accepted compiler changed; configure the launcher or use native cargo".into())}, Envelope::TextOnly).unwrap();
+        let text = text_of(&result);
+        assert!(
+            text.contains("accepted compiler changed") && text.contains("native"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("TestTargetUnsupported") && !text.contains("Select one listed"),
+            "{text}"
+        );
+        assert_eq!(result.is_error, Some(true));
+    }
 }

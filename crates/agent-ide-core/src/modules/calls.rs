@@ -44,7 +44,13 @@ static HOST: OnceLock<Arc<ModuleHost>> = OnceLock::new();
 /// Immutable current facts for an operation without a selected job target. Daemon callers with
 /// a target pass its explicit launcher context instead. An absent host supplies no tool proof.
 pub fn module_config(language: Language, worktree: &Path) -> ModuleConfig {
-    HOST.get().map_or_else(|| ModuleConfig {worktree: Some(worktree.to_path_buf()), ..Default::default()}, |host| host.module_config(language, worktree))
+    HOST.get().map_or_else(
+        || ModuleConfig {
+            worktree: Some(worktree.to_path_buf()),
+            ..Default::default()
+        },
+        |host| host.module_config(language, worktree),
+    )
 }
 
 /// Installs the daemon's module routing; later calls keep the first host.
@@ -68,13 +74,10 @@ pub fn checker(
     config: &ModuleConfig,
 ) -> Option<Arc<dyn crate::checks::Checker>> {
     let host = module(language)?.clone();
-    Some(Arc::new(super::checker::ModuleChecker::new(
-        language,
-        host,
-        section.clone(),
-        runner,
-        timeout,
-    ).with_config(config.clone())))
+    Some(Arc::new(
+        super::checker::ModuleChecker::new(language, host, section.clone(), runner, timeout)
+            .with_config(config.clone()),
+    ))
 }
 
 /// The daemon's modes line for `languages` ([`ModuleHost::modes_line`]); `None` without a host
@@ -393,15 +396,20 @@ fn field<T>(value: Field<T>, default: T) -> T {
 /// `LanguageSupport::detect` with the stored selections, which the module applies before
 /// reading manifests: a detected environment (and the commands planned from it) always reflects
 /// the current `ide.start environment` choice, not the instance's last-seen one.
-pub async fn detect(language: Language, root: &Path, config: &ModuleConfig) -> Routed<Option<LanguageProject>> {
+pub async fn detect(
+    language: Language,
+    root: &Path,
+    config: &ModuleConfig,
+) -> Routed<Option<LanguageProject>> {
     match module(language) {
         None => {
             let root = root.to_path_buf();
-            Ok(
-                tokio::task::spawn_blocking(move || language.support().detect(&root))
-                    .await
-                    .unwrap_or(None),
-            )
+            let config = config.clone();
+            Ok(tokio::task::spawn_blocking(move || {
+                language.support().configured_detect(&root, &config)
+            })
+            .await
+            .unwrap_or(None))
         }
         Some(host) => {
             host.request::<DetectAnswer>(
@@ -430,11 +438,13 @@ pub async fn environments(
         None => {
             let worktree = worktree.to_path_buf();
             let config = config.clone();
-            Ok(
-                tokio::task::spawn_blocking(move || language.support().configured_environments(&worktree, &config))
-                    .await
-                    .unwrap_or_default(),
-            )
+            Ok(tokio::task::spawn_blocking(move || {
+                language
+                    .support()
+                    .configured_environments(&worktree, &config)
+            })
+            .await
+            .unwrap_or_default())
         }
         Some(host) => {
             host.request::<EnvironmentsAnswer>(
@@ -488,7 +498,9 @@ pub async fn command_env(
     config: &ModuleConfig,
 ) -> Routed<CommandEnvAnswer> {
     match module(language) {
-        None => Ok(language.support().configured_command_env(worktree, cwd, program, config)),
+        None => Ok(language
+            .support()
+            .configured_command_env(worktree, cwd, program, config)),
         Some(host) => {
             host.request::<CommandEnvAnswer>(
                 language,
@@ -728,7 +740,8 @@ pub async fn test_run(
     let Ok(run) = run else {
         return Ok(Err(run.unwrap_err()));
     };
-    let (command, start) = plan_admitted(language, worktree, &run.effect, budget)?;
+    let (command, start) =
+        plan_admitted_configured(language, worktree, &run.effect, budget, config)?;
     Ok(Ok(PlannedRun {
         tests: run.tests,
         command,
@@ -740,11 +753,23 @@ pub async fn test_run(
 /// class `test` is considered (anything else is refused before any other check); a declared home
 /// tool that is not installed fails to start exactly as the in-process command would, naming the
 /// program; otherwise the core-admitted expansion.
+#[cfg(test)]
 fn plan_admitted(
     language: Language,
     worktree: &Path,
     effect: &EffectRequest,
     budget: std::time::Duration,
+) -> Routed<(Vec<String>, PlannedStart)> {
+    plan_admitted_configured(language, worktree, effect, budget, &ModuleConfig::default())
+}
+
+/// Expands a selected test under its actual per-request resolved environment and read policy.
+fn plan_admitted_configured(
+    language: Language,
+    worktree: &Path,
+    effect: &EffectRequest,
+    budget: std::time::Duration,
+    config: &ModuleConfig,
 ) -> Routed<(Vec<String>, PlannedStart)> {
     let tests: Vec<super::payload::EffectRecipe> = super::recipe::declared(language.name())
         .iter()
@@ -763,12 +788,14 @@ fn plan_admitted(
             PlannedStart::MissingTool(name.to_owned()),
         ));
     }
-    let spec = admitted(
+    let spec = admitted_with(
         language,
         worktree,
         effect,
         super::payload::RunClass::Test,
         budget,
+        &[],
+        config,
     )?;
     Ok((
         shown_command(tool.map(|(name, _)| name), &spec),
@@ -920,6 +947,7 @@ fn stdin_run(
     worktree: &Path,
     effect: Option<EffectRequest>,
     configured: &[&Path],
+    config: &ModuleConfig,
 ) -> Routed<Option<StdinRun>> {
     match effect {
         Some(effect) => admitted_with(
@@ -929,6 +957,7 @@ fn stdin_run(
             super::payload::RunClass::Interactive,
             std::time::Duration::from_secs(10),
             configured,
+            config,
         )
         .map(|spec| Some(StdinRun::Spec(spec))),
         None => Ok(None),
@@ -937,6 +966,7 @@ fn stdin_run(
 
 /// Expands `effect` under the core's interactive admission (see [`stdin_run`]) with `timeout`; a
 /// request outside the language's declared recipes of `class` is refused as `policy_refused`.
+#[cfg(test)]
 fn admitted(
     language: Language,
     worktree: &Path,
@@ -944,10 +974,18 @@ fn admitted(
     class: super::payload::RunClass,
     timeout: std::time::Duration,
 ) -> Routed<crate::checks::runner::RunSpec> {
-    admitted_with(language, worktree, effect, class, timeout, &[])
+    admitted_with(
+        language,
+        worktree,
+        effect,
+        class,
+        timeout,
+        &[],
+        &ModuleConfig::default(),
+    )
 }
 
-/// [`admitted`] with `configured`: operator-declared programs of the launcher configuration (a
+/// Recipe admission with `configured`: operator-declared programs of the launcher configuration (a
 /// probe's Node and package), admitted as roots beside the declared install roots.
 fn admitted_with(
     language: Language,
@@ -956,6 +994,7 @@ fn admitted_with(
     class: super::payload::RunClass,
     timeout: std::time::Duration,
     configured: &[&Path],
+    config: &ModuleConfig,
 ) -> Routed<crate::checks::runner::RunSpec> {
     let refused = || policy_refused(language);
     if !super::recipe::declared(language.name())
@@ -978,7 +1017,21 @@ fn admitted_with(
         })
         .collect();
     let mut roots = super::recipe::declared_roots(language.name());
-    roots.extend(super::recipe::environment_roots(language.name(), worktree));
+    if config.provider.is_none() && config.checks.is_none() {
+        roots.extend(super::recipe::environment_roots(language.name(), worktree));
+    }
+    // The trusted compiled support resolves current immutable launcher facts, never a root
+    // proposed by a module. Refused environments add no authority.
+    if config.provider.is_some() || config.checks.is_some() {
+        roots.extend(
+            language
+                .support()
+                .configured_environments(worktree, config)
+                .into_iter()
+                .filter(|environment| environment.missing_next_step.is_none())
+                .filter_map(|environment| environment.chosen.map(|candidate| candidate.path)),
+        );
+    }
     // The operator-declared programs of the launcher configuration (a probe's Node and package).
     roots.extend(configured.iter().map(|path| path.to_path_buf()));
     let developer_dirs = super::recipe::platform_developer_dirs();
@@ -987,7 +1040,7 @@ fn admitted_with(
     let admission = super::recipe::Admission {
         worktree,
         cache_dir: &scratch,
-        read_denies: &[],
+        read_denies: &config.read_denies,
         home: home.as_deref(),
         launcher_roots: &roots,
         developer_dirs: &developer_dirs,
@@ -1023,9 +1076,15 @@ pub async fn format_stdin_command(
             .support()
             .format_stdin_command(project, file)
             .map(|argv| {
-                let environment = match argv.first() { Some(program) => language.support().configured_command_env(worktree, worktree, program, config)?, None => None };
+                let environment = match argv.first() {
+                    Some(program) => language
+                        .support()
+                        .configured_command_env(worktree, worktree, program, config)?,
+                    None => None,
+                };
                 Ok(StdinRun::Argv { argv, environment })
-            }).transpose()),
+            })
+            .transpose()),
         Some(host) => {
             let effect: super::payload::FormatPlanAnswer = host
                 .request(
@@ -1040,7 +1099,10 @@ pub async fn format_stdin_command(
                     Vec::new(),
                 )
                 .await?;
-            match effect {Ok(effect) => stdin_run(language, worktree, effect, &[]).map(Ok), Err(error) => Ok(Err(error))}
+            match effect {
+                Ok(effect) => stdin_run(language, worktree, effect, &[], config).map(Ok),
+                Err(error) => Ok(Err(error)),
+            }
         }
     }
 }
@@ -1060,9 +1122,15 @@ pub async fn syntax_probe_command(
             .support()
             .syntax_probe_command(project, root, file, configured)
             .map(|argv| {
-                let environment = match argv.first() {Some(program) => language.support().configured_command_env(worktree, root, program, config)?, None => None};
+                let environment = match argv.first() {
+                    Some(program) => language
+                        .support()
+                        .configured_command_env(worktree, root, program, config)?,
+                    None => None,
+                };
                 Ok(StdinRun::Argv { argv, environment })
-            }).transpose()),
+            })
+            .transpose()),
         Some(host) => {
             let effect: super::payload::FormatPlanAnswer = host
                 .request(
@@ -1079,7 +1147,10 @@ pub async fn syntax_probe_command(
                     Vec::new(),
                 )
                 .await?;
-            let effect = match effect {Ok(effect) => effect, Err(error) => return Ok(Err(error))};
+            let effect = match effect {
+                Ok(effect) => effect,
+                Err(error) => return Ok(Err(error)),
+            };
             stdin_run(
                 language,
                 worktree,
@@ -1088,7 +1159,9 @@ pub async fn syntax_probe_command(
                     .iter()
                     .flat_map(|tools| [tools.program.as_path(), tools.module.as_path()])
                     .collect::<Vec<_>>(),
-            ).map(Ok)
+                config,
+            )
+            .map(Ok)
         }
     }
 }

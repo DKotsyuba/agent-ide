@@ -804,6 +804,73 @@ async fn original_rust_analyzer_identity_fixture_is_ready() {
     }
 }
 
+/// Native input changes retire healthy native/module sessions, and a
+/// fresh semantic answer comes from a different owned analyzer. Cleanup proves all captured
+/// processes gone; an unchanged query preserves its healthy process before either mutation.
+#[tokio::test]
+#[ignore = "requires accepted Rust inputs; run explicitly for native environment retirement"]
+async fn changed_rust_native_inputs_retire_the_live_session() {
+    for (label, mode) in [("native", IN_PROCESS), ("module", MODULE)] {
+        let fixture = rust_fixture(PARITY_FILES, &format!("native-inputs-{label}"), 300);
+        let mut daemon = Daemon::start(&fixture, &[mode]).await;
+        let mut session = Session::start(&fixture).await;
+        ready(&mut session, &fixture).await;
+        let analyzer_path = input("AGENT_IDE_RUST_ANALYZER");
+        let current = |tree: ProcessTree| {
+            tree.all()
+                .into_iter()
+                .filter(|process| process.command().contains(&analyzer_path))
+                .collect::<Vec<_>>()
+        };
+        let before = current(daemon.tree());
+        assert_eq!(before.len(), 1, "{label}: initial analyzer");
+        ready(&mut session, &fixture).await;
+        assert_eq!(
+            current(daemon.tree()),
+            before,
+            "{label}: unchanged native inputs reuse the live process"
+        );
+        for (relative, body) in [
+            (
+                "Cargo.lock",
+                format!(
+                    "{}\n# changed input\n",
+                    std::fs::read_to_string(fixture.root.join("Cargo.lock")).unwrap()
+                ),
+            ),
+            (".cargo/config.toml", "[build]\njobs=1\n".into()),
+        ] {
+            let old = current(daemon.tree());
+            assert_eq!(old.len(), 1);
+            let path = fixture.root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+            ready(&mut session, &fixture).await;
+            let fresh = current(daemon.tree());
+            assert_eq!(fresh.len(), 1, "{label}: fresh analyzer for {relative}");
+            assert_ne!(
+                fresh, old,
+                "{label}: changed {relative} must partition native/module reuse"
+            );
+            for process in old {
+                assert!(
+                    process.gone().await,
+                    "{label}: prior {relative} analyzer survived"
+                );
+            }
+        }
+        let owned = daemon.tree().all();
+        session.close(&fixture).await;
+        drop(daemon);
+        for process in owned {
+            assert!(
+                process.gone().await,
+                "{label}: child survived environment test cleanup"
+            );
+        }
+    }
+}
+
 /// A live Rust session never answers after its declared analyzer executable is replaced at the
 /// same path. Both native and module hosting retire the original process before refusing the
 /// now-unqualified replacement; no declaration is silently reaccepted and the daemon survives.
@@ -1205,6 +1272,7 @@ async fn the_module_process_starts_rust_analyzer_within_hello() {
         std::fs::create_dir_all(namespace.join(sub)).unwrap();
     }
     let settings = agent_ide_lang_rust::module::RustProviderSettings {
+        configuration: Default::default(),
         binary: input("AGENT_IDE_RUST_ANALYZER").into(),
         version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),
         cargo: dir.join("bin/cargo"),
@@ -1240,6 +1308,7 @@ async fn the_module_process_starts_rust_analyzer_within_hello() {
         .unwrap();
     let offer = agent_ide_core::modules::contract::HelloOffer {
         config: agent_ide_core::modules::contract::ModuleConfig {
+            read_denies: Vec::new(),
             worktree: Some(fixture.root.clone()),
             provider: Some(json!({
                 "grant": ProviderGrant {
@@ -1388,6 +1457,7 @@ async fn the_daemon_open_path_reaches_a_ready_rust_analyzer() {
         std::fs::create_dir_all(namespace.join(sub)).unwrap();
     }
     let settings = agent_ide_lang_rust::module::RustProviderSettings {
+        configuration: Default::default(),
         binary: input("AGENT_IDE_RUST_ANALYZER").into(),
         version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),
         cargo: dir.join("bin/cargo"),

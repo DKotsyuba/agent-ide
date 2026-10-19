@@ -536,6 +536,100 @@ impl LanguageSupport for RustSupport {
             .map(str::to_owned)
     }
 
+    /// Guards native inputs before the existing detector. Its CI/task detector has no guarded
+    /// reader seam, so an extra-deny request returns no project facts rather than reading that
+    /// unsupported scope. Environment/check resolution remains independently guarded.
+    fn configured_detect(
+        &self,
+        root: &Path,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Option<LanguageProject> {
+        if !config.read_denies.is_empty() {
+            return None;
+        }
+        crate::environment::detectable(root, &[])
+            .then(|| self.detect(root))
+            .flatten()
+    }
+
+    /// Current configured environments come from the same guarded resolver as every child.
+    /// A refused projection has no usable candidate; ambient prepared variables are ignored.
+    fn configured_environments(
+        &self,
+        worktree: &Path,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Vec<agent_ide_core::lang::environment::ResolvedEnv> {
+        if !crate::environment::is_cargo_project(worktree) {
+            return Vec::new();
+        }
+        let resolved = match crate::environment::resolve(worktree, config) {
+            Ok((_, resolved)) => resolved,
+            Err(cause) => {
+                let mut resolved =
+                    crate::environment::environment(worktree, None, &config.read_denies);
+                resolved.missing_next_step = Some(cause);
+                resolved.identity.push_str(
+                    &blake3::hash(serde_json::to_string(config).unwrap_or_default().as_bytes())
+                        .to_hex()
+                        .to_string(),
+                );
+                resolved
+            }
+        };
+        vec![resolved]
+    }
+
+    /// Activates the actual configured Rust tools, refusing incompatible projects before
+    /// admission. Explicit paths must name that same accepted tool; no PATH fallback occurs.
+    fn configured_command_env(
+        &self,
+        worktree: &Path,
+        _cwd: &Path,
+        program: &str,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Result<
+        Option<agent_ide_core::lang::environment::CommandEnv>,
+        agent_ide_core::lang::LangError,
+    > {
+        use agent_ide_core::lang::{LangError, environment::CommandEnv};
+        let Some(name @ ("cargo" | "rustc" | "rustfmt")) = Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            return Ok(None);
+        };
+        let (tools, _) =
+            crate::environment::resolve(worktree, config).map_err(LangError::Environment)?;
+        let executable = tools.dir.join("bin").join(name);
+        if Path::new(program).is_absolute() && Path::new(program) != executable
+            || (!Path::new(program).is_absolute() && program != name)
+        {
+            return Err(LangError::Environment("explicit Rust executable differs from the configured project environment; use native tools".into()));
+        }
+        if !agent_ide_core::lang::environment::readable(&executable, &config.read_denies) {
+            return Err(LangError::Environment(format!(
+                "configured {name} is missing or denied; use native tools"
+            )));
+        }
+        let mut vars = vec![
+            ("RUSTUP_AUTO_INSTALL".into(), "0".into()),
+            ("CARGO_NET_OFFLINE".into(), "true".into()),
+        ];
+        vars.push((
+            "RUSTUP_TOOLCHAIN".into(),
+            tools.dir.as_os_str().to_os_string(),
+        ));
+        vars.push(("RUSTC".into(), tools.dir.join("bin/rustc").into_os_string()));
+        if let Some(home) = tools.cargo_home {
+            vars.push(("CARGO_HOME".into(), home.into_os_string()));
+        }
+        Ok(Some(CommandEnv {
+            argv_prefix: vec![executable.into_os_string()],
+            path_prefix: Some(tools.dir.join("bin")),
+            vars,
+        }))
+    }
+
     /// `cargo` runs from the toolchain named by `AGENT_IDE_RUST_TOOLCHAIN_DIR` when that
     /// directory holds a `bin/cargo`: a toolchain cargo invoked directly still resolves `rustc`
     /// through `PATH`, i.e. the rustup proxy, which answers "no default is configured" outside the
