@@ -393,6 +393,7 @@ pub fn environments(worktree: &Path, config: &ModuleConfig) -> Vec<ResolvedEnv> 
 fn identity_string(
     worktree: &Path,
     tools: Option<&ConfiguredTools>,
+    config: &ModuleConfig,
     denies: &[ReadDeny],
 ) -> String {
     let hash = |path: &Path| {
@@ -531,12 +532,13 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
-    /// Accepted scratch tools.
+    /// Creates empty Node/CLI files below fixture `root` and returns their paths. These are
+    /// selection-policy stubs, not executable qualification or admission evidence.
     fn tools(root: &Path) -> (PathBuf, PathBuf) {
         let node = root.join("tools/node");
         let tsc = root.join("tools/tsc.js");
-        put(&node, "", "");
-        put(&tsc, "", "");
+        put(root, "tools/node", "");
+        put(root, "tools/tsc.js", "");
         (node, tsc)
     }
 
@@ -563,6 +565,7 @@ mod tests {
     fn unconfigured_tools_disclose_scope() {
         let root = scratch("unconfigured");
         put(&root, "package.json", "{\"dependencies\":{}}");
+        let config = ModuleConfig::default();
         let env = environment(&root, None, &config, &[]);
         assert_eq!(env.chosen, None);
         assert_eq!(env.source, None);
@@ -703,7 +706,6 @@ mod tests {
         put(&root, "pnpm-lock.yaml", "lock v1\n");
         put(&root, ".nvmrc", "22.11.0\n");
         let config = config_with(&node, &tsc);
-        let tools = configured_tools(&config).unwrap();
         let id = |config: &ModuleConfig| {
             environment(&root, configured_tools(config).as_ref(), config, &[]).identity
         };

@@ -940,7 +940,7 @@ mod compiler_fact_tests {
         fs::remove_file(root.join("package.json")).unwrap();
         assert_eq!(
             compiler_fact(&root, &operator, &[]),
-            Ok(CompilerFact::Operator(operator))
+            Ok(CompilerFact::Operator(operator.clone()))
         );
         // Declared but unprepared: the no-fallback refusal.
         fs::write(
