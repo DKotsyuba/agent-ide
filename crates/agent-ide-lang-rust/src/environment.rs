@@ -1,595 +1,790 @@
-//! The Rust project environment of one worktree: the configured toolchain its Cargo project
-//! runs with, and the native inputs that decide whether an answer about it is still current.
-//!
-//! This is the language-owned resolver building block of the common project-environment
-//! contract. Its facts are explicit parameters — the caller supplies the toolchain its own
-//! configuration admits (the checker's launcher section, the provider launch's accepted
-//! executables) together with the measured toolchain version it accepted, never a
-//! process-environment variable and never a directory label. What it computes today:
-//!
-//! * [`identity`] — the opaque identity of the worktree's environment: the configured
-//!   toolchain (path, name, measured version, directory stamp, `cargo`/`rustc` stamps), the
-//!   `rust-toolchain.toml`/`rust-toolchain` pin (name, channel and whole content, read under
-//!   the caller's read denies), the worktree's `Cargo.toml`, `Cargo.lock`,
-//!   `.cargo/config.toml`/`.cargo/config`, and its first-level member manifests
-//!   (`*/Cargo.toml`, sorted — depth one; a deeper member tree is disclosed as unsupported
-//!   scope, not silently omitted). A changed or same-path-recreated input moves the identity,
-//!   so consumers stop riding on stale answers with no extra store. Consumers wire it in
-//!   their own seam: the check feed invalidates through the card state, [`crate::backend`]
-//!   retires a live rust-analyzer session on change.
-//! * [`pin_conflict`] — the cause to refuse checks with when the pin's channel is not
-//!   established by the caller's measured version, and the cause to refuse with when the pin
-//!   is host-denied and cannot be verified at all. The native checker and the module's check
-//!   planning refuse with it before any child starts; warning-only would run a toolchain the
-//!   pin rejects. Native cargo remains the project's fallback (its own rustup proxy honors
-//!   the pin).
-//! * [`environment`] — the same facts as a [`ResolvedEnv`] for the card seam, whose
-//!   configuration plumbing (the launcher's per-language facts reaching
-//!   `LanguageSupport::environments`) is a separate committed handoff; until it lands nothing
-//!   activates this on the card, and no consumer claim is made beyond the two seams above.
-//!
-//! The worktree boundary is the whole world: parent checkouts' manifests are foreign and
-//! never read or hashed. No environment manager runs, nothing is installed, and only files
-//! are read — every one through the shared guarded read ([`read_input`]/[`hash_input`]).
+//! Rust environment resolution from accepted request facts and native project files.
+//! Authoritative pins are bounded and guarded; incompatible, denied, invalid and unknown
+//! compatibility refuse before children. Directory names and Cargo versions prove no rustc
+//! release. Discovery stays inside the worktree and refuses exhausted bounds.
 
+use agent_ide_core::{
+    execution::seatbelt::ReadDeny,
+    lang::environment::{EnvCandidate, EnvSource, ResolvedEnv, hash_input, read_input},
+};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    os::unix::fs::MetadataExt,
+    path::{Component, Path, PathBuf},
 };
 
-use agent_ide_core::execution::seatbelt::ReadDeny;
-use agent_ide_core::lang::environment::{EnvCandidate, EnvSource, ResolvedEnv};
+/// Actual configured tools shared by card, checks, semantic and interactive routes. The compiler
+/// identity is accepted evidence only when its executable digest still matches the declaration.
+pub(crate) struct Tools {
+    /// Prepared directory containing the accepted cargo/rustc pair.
+    pub dir: PathBuf,
+    /// Accepted rustc identity; absent in checks-only configurations means unknown.
+    pub compiler: Option<String>,
+    /// Explicit Cargo home, when configured.
+    pub cargo_home: Option<PathBuf>,
+}
 
-/// Whether `worktree` is a Cargo project at its boundary: the environment exists only for one.
+/// Resolves only immutable launcher data, ignoring process AGENT variables. Accepted provider
+/// bytes and check paths must agree; missing/changed/denied tools refuse before admission.
+pub(crate) fn tools(
+    config: &agent_ide_core::modules::contract::ModuleConfig,
+) -> Result<Tools, String> {
+    use agent_ide_core::assistance::launcher::{AcceptedExecutable, absolute};
+    use std::os::unix::fs::PermissionsExt;
+    let checks = config.checks.as_ref();
+    let check_dir = checks
+        .and_then(|section| section.get("toolchain_dir"))
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from);
+    let mut compiler = None;
+    let mut provider_dir = None;
+    if let Some(provider) = &config.provider {
+        for name in ["cargo", "rustc"] {
+            let accepted: AcceptedExecutable = serde_json::from_value(
+                provider.get(name).cloned().unwrap_or_default(),
+            )
+            .map_err(|_| format!("accepted {name} declaration unavailable; use native cargo"))?;
+            if accepted.validate().is_err()
+                || config
+                    .read_denies
+                    .iter()
+                    .any(|deny| deny.matches(&accepted.path))
+                || hash_input(&accepted.path, &config.read_denies)
+                    .map(|hash| hash.to_hex().to_string())
+                    .as_deref()
+                    != Some(accepted.blake3.as_str())
+            {
+                return Err(format!(
+                    "accepted {name} is changed, denied or unqualified; use native cargo"
+                ));
+            }
+            let dir = accepted
+                .path
+                .parent()
+                .filter(|bin| bin.file_name().is_some_and(|part| part == "bin"))
+                .and_then(Path::parent)
+                .ok_or_else(|| {
+                    "unsupported configured Rust executable layout; use native cargo".to_owned()
+                })?
+                .to_path_buf();
+            if accepted.path.file_name().is_none_or(|file| file != name)
+                || provider_dir
+                    .as_ref()
+                    .is_some_and(|previous| previous != &dir)
+            {
+                return Err(
+                    "accepted cargo/rustc must share one prepared toolchain; use native cargo"
+                        .into(),
+                );
+            }
+            provider_dir = Some(dir);
+            if name == "rustc" {
+                if provider
+                    .get("rustc_version")
+                    .and_then(|value| value.as_str())
+                    != Some(accepted.identity.as_str())
+                {
+                    return Err(
+                        "accepted rustc identity disagrees with its declaration; use native cargo"
+                            .into(),
+                    );
+                }
+                compiler = Some(accepted.identity);
+            }
+        }
+    }
+    if check_dir
+        .as_ref()
+        .zip(provider_dir.as_ref())
+        .is_some_and(|(check, provider)| check != provider)
+    {
+        return Err("configured check and provider toolchains disagree; align the launcher or use native cargo".into());
+    }
+    let dir = provider_dir.or(check_dir).ok_or_else(|| {
+        "no accepted configured Rust toolchain; use native cargo or configure the launcher"
+            .to_owned()
+    })?;
+    if !absolute(&dir) {
+        return Err("configured Rust toolchain path is invalid; use native cargo".into());
+    }
+    for name in ["cargo", "rustc"] {
+        let path = dir.join("bin").join(name);
+        if config.read_denies.iter().any(|deny| deny.matches(&path))
+            || !agent_ide_core::lang::environment::readable(&path, &config.read_denies)
+            || !fs::metadata(&path).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        {
+            return Err(format!(
+                "configured {name} is missing, denied or not executable; use native cargo"
+            ));
+        }
+    }
+    let cargo_home = checks
+        .and_then(|section| section.get("cargo_home"))
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from)
+        .or_else(|| {
+            config
+                .provider
+                .as_ref()?
+                .get("cargo_home")?
+                .as_str()
+                .map(PathBuf::from)
+        });
+    Ok(Tools {
+        dir,
+        compiler,
+        cargo_home,
+    })
+}
+
+/// Resolves the shared project environment and enforces its refusal before any owned child.
+pub(crate) fn resolve(
+    worktree: &Path,
+    config: &agent_ide_core::modules::contract::ModuleConfig,
+) -> Result<(Tools, ResolvedEnv), String> {
+    let compiler = config
+        .provider
+        .as_ref()
+        .and_then(|provider| provider.get("rustc_version"))
+        .and_then(|value| value.as_str());
+    if let Some(cause) = pin_conflict(worktree, worktree, compiler, &config.read_denies) {
+        return Err(cause);
+    }
+    let tools = tools(config)?;
+    let mut resolved = environment(
+        worktree,
+        Some(&ConfiguredToolchain {
+            dir: &tools.dir,
+            version: tools.compiler.as_deref(),
+        }),
+        &config.read_denies,
+    );
+    resolved.identity.push_str(
+        &blake3::hash(serde_json::to_string(config).unwrap_or_default().as_bytes())
+            .to_hex()
+            .to_string(),
+    );
+    if let Some(cause) = &resolved.missing_next_step {
+        return Err(cause.clone());
+    }
+    Ok((tools, resolved))
+}
+
+/// Caller-accepted compiler facts, never an ambient tool selection.
+pub struct ConfiguredToolchain<'a> {
+    /// Actual admitted toolchain directory; its name conveys no version evidence.
+    pub dir: &'a Path,
+    /// Accepted rustc identity or exact measured stable release; absent means unknown.
+    pub version: Option<&'a str>,
+}
+
+/// One successfully read authoritative pin.
+struct Pin {
+    /// Effective file name, with TOML taking precedence over the legacy file.
+    file: &'static str,
+    /// Declared channel; unsupported aliases remain explicit refusals.
+    channel: String,
+}
+
+/// Whether the boundary has a Cargo manifest; no parent search occurs.
 pub fn is_cargo_project(worktree: &Path) -> bool {
     worktree.join("Cargo.toml").is_file()
 }
 
-/// The configured toolchain a caller vouches for: the directory its own configuration admits
-/// (the checker's launcher section, the provider launch's accepted executables) and the
-/// measured toolchain version string it accepted — `cargo 1.98.1 (…)` for a launch's measured
-/// cargo, for example. `None` is the honest `version unknown`; a directory label is never a
-/// version.
-pub struct ConfiguredToolchain<'a> {
-    /// The admitted toolchain directory.
-    pub dir: &'a Path,
-    /// The measured version identity the caller accepted, when it has one.
-    pub version: Option<&'a str>,
+/// Whether native facts can be passed to the legacy detector without reading excluded inputs.
+/// Discovery/pin uncertainty is not converted into a guessed project declaration.
+pub(crate) fn detectable(worktree: &Path, denies: &[ReadDeny]) -> bool {
+    native_inputs(worktree, denies).is_ok() && pin_read(worktree, denies).is_ok()
 }
 
-/// How a worktree's toolchain pin read out under the caller's read denies.
-enum PinRead {
-    /// Neither pin file exists: no pin is in force.
-    Absent,
-    /// A pin file exists but the host denies reading it: the pin is in force and unverifiable.
-    Denied(&'static str),
-    /// The pin declared `channel` from its declaring file.
-    Parsed(&'static str, String),
+/// Reads a quoted unescaped value. Complex TOML strings are explicitly unsupported.
+fn quoted(value: &str) -> Option<&str> {
+    let first = value.chars().next()?;
+    if !matches!(first, '"' | '\'') {
+        return None;
+    }
+    let value = value.strip_prefix(first)?.strip_suffix(first)?;
+    (!value.contains(['\\', '\n', '\r', first])).then_some(value)
 }
 
-/// Reads the effective pin under `denies`: the first pin file the gate lets through decides,
-/// exactly as the unguarded [`crate::support::toolchain_pin`] reads them without denies (the
-/// first readable file wins and only it is parsed). A declared-but-denied file is disclosed,
-/// never parsed.
-fn pin_read(worktree: &Path, denies: &[ReadDeny]) -> PinRead {
-    let mut denied: Option<&'static str> = None;
-    for (name, path) in [
-        ("rust-toolchain.toml", worktree.join("rust-toolchain.toml")),
-        ("rust-toolchain", worktree.join("rust-toolchain")),
-    ] {
-        if denies.iter().any(|deny| deny.matches(&path)) {
-            denied.get_or_insert(name);
+/// Accepts bounded printable labels; compatibility is checked separately.
+fn valid_channel(channel: &str) -> Result<String, &'static str> {
+    if channel.is_empty()
+        || channel.len() > 128
+        || !channel
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte))
+    {
+        return Err("invalid or unsupported toolchain channel");
+    }
+    Ok(channel.to_owned())
+}
+
+/// Parses a plain legacy channel or one toolchain table with a channel and optional known
+/// profile. Components/targets/path/complex TOML need native qualification and are refused.
+fn parse_pin(text: &str, toml: bool) -> Result<String, &'static str> {
+    let lines: Vec<_> = text
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or_default().trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if !toml && lines.first().is_some_and(|line| !line.starts_with('[')) {
+        if let [channel] = lines.as_slice() {
+            return valid_channel(channel);
+        }
+        return Err("invalid legacy toolchain pin");
+    }
+    let mut table = false;
+    let mut channel = None;
+    for line in lines {
+        if line == "[toolchain]" {
+            if table {
+                return Err("duplicate toolchain table");
+            }
+            table = true;
             continue;
         }
-        if agent_ide_core::lang::environment::readable(&path, denies) {
-            let Some(text) = agent_ide_core::lang::environment::read_input(&path, denies) else {
-                return PinRead::Absent;
-            };
-            let channel = toml_channel(&text).or_else(|| {
-                text.lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty() && !line.starts_with('#'))
-                    .filter(|line| !line.contains('='))
-                    .map(str::to_owned)
-            });
-            return match channel {
-                Some(channel) => PinRead::Parsed(name, channel),
-                None => PinRead::Absent,
-            };
+        if !table || line.starts_with('[') {
+            return Err("unsupported toolchain pin table");
+        }
+        let (key, value) = line.split_once('=').ok_or("invalid toolchain pin")?;
+        match key.trim() {
+            "channel" => {
+                if channel.is_some() {
+                    return Err("duplicate toolchain channel");
+                }
+                channel = Some(valid_channel(
+                    quoted(value.trim()).ok_or("invalid toolchain channel")?,
+                )?);
+            }
+            "profile"
+                if matches!(
+                    quoted(value.trim()),
+                    Some("minimal" | "default" | "complete")
+                ) => {}
+            _ => return Err("unsupported toolchain pin requirements"),
         }
     }
-    match denied {
-        Some(name) => PinRead::Denied(name),
-        None => PinRead::Absent,
+    channel.ok_or("toolchain pin has no verifiable channel")
+}
+
+/// Reads the first authoritative pin. Denied/invalid/unreadable TOML never falls through;
+/// excluded channel content is neither read nor echoed. Symlinked pins are unsupported.
+fn pin_read(worktree: &Path, denies: &[ReadDeny]) -> Result<Option<Pin>, String> {
+    for file in ["rust-toolchain.toml", "rust-toolchain"] {
+        let path = worktree.join(file);
+        if denies.iter().any(|deny| deny.matches(&path)) {
+            return Err(format!(
+                "{file} is excluded from reads; the pin cannot be verified; use native cargo"
+            ));
+        }
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(metadata) if metadata.is_file() => {}
+            _ => {
+                return Err(format!(
+                    "{file} is unreadable or symlinked; use native cargo"
+                ));
+            }
+        }
+        let text = read_input(&path, denies).ok_or_else(|| {
+            format!("{file} cannot be read as bounded UTF-8 (64 KiB); use native cargo")
+        })?;
+        let channel = parse_pin(&text, file.ends_with(".toml"))
+            .map_err(|reason| format!("{file}: {reason}; use native cargo"))?;
+        return Ok(Some(Pin { file, channel }));
     }
+    Ok(None)
 }
 
-/// The pin's channel from its text: the TOML `channel` key, else the first non-comment line
-/// without `=` — the same shapes [`crate::support::toolchain_pin`] parses.
-fn toml_channel(text: &str) -> Option<String> {
-    crate::support::toml_string(text, "channel").or_else(|| {
-        text.lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty() && !line.starts_with('#'))
-            .filter(|line| !line.contains('='))
-            .map(str::to_owned)
-    })
-}
-
-/// Whether the caller's measured version establishes the pin's channel: the channel appears
-/// as one whitespace/delimiter-separated token of the measured identity (`1.98.1` is a token
-/// of `cargo 1.98.1 (…)`). Aliases, dates and names that no measured token states are never
-/// proven by directory naming.
-fn establishes(version: &str, channel: &str) -> bool {
-    version
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '.')
-        .any(|token| token == channel)
-}
-
-/// The declaring pin file of `worktree`, when one exists and the gate lets it through.
-fn pin_file(worktree: &Path, denies: &[ReadDeny]) -> Option<PathBuf> {
-    match pin_read(worktree, denies) {
-        PinRead::Parsed(name, _) => Some(worktree.join(name)),
-        _ => None,
-    }
-}
-
-/// `ino.mtime` of `path` without following a final link, empty when it cannot be read.
-fn stamp(path: &Path) -> String {
-    fs::symlink_metadata(path)
-        .map(|metadata| {
-            format!(
-                "{}.{}.{}",
-                metadata.ino(),
-                metadata.mtime(),
-                metadata.mtime_nsec()
-            )
+/// Extracts an exact stable compiler release. Cargo identities, substrings, extra numeric
+/// components, leading zeroes and prereleases do not prove a stable rustc release.
+fn compiler_release(identity: &str) -> Option<&str> {
+    let release = identity.strip_prefix("rustc ").map_or(identity, |value| {
+        value.split_whitespace().next().unwrap_or_default()
+    });
+    let parts: Vec<_> = release.split('.').collect();
+    if parts.len() != 3
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part.bytes().all(|byte| byte.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
         })
-        .unwrap_or_default()
+    {
+        return None;
+    }
+    Some(release)
 }
 
-/// The opaque identity of the worktree's environment resolution: the configured toolchain
-/// (path, name, measured version, directory stamp, `cargo`/`rustc` stamps), the pin (its read
-/// outcome, and its whole content when readable), the worktree's `Cargo.toml`, `Cargo.lock`,
-/// `.cargo/config.toml`/`.cargo/config`, and its first-level member manifests. A change or
-/// same-path recreation of any of these moves the identity. `configured.version` is part of
-/// the identity only when the caller measured one.
-fn identity(worktree: &Path, configured: Option<&ConfiguredToolchain<'_>>, denies: &[ReadDeny]) {
-    let _ = (worktree, configured, denies);
-}
-
-/// The cause to refuse checks with when the worktree's pin is not established by the
-/// configured toolchain's measured version, or cannot be read under the host's denies.
-/// `None` means no obstruction: no pin, or a pin the measured version establishes. An absent
-/// configured directory stays the checker's own `ToolMissing`.
-///
-/// Both the native checker and the module's check planning refuse with this cause before any
-/// child starts — warning-only would run a toolchain the pin rejects or that cannot be
-/// verified against it. Native cargo remains the project's fallback: its own rustup proxy
-/// honors the pin.
+/// The same pre-child pin refusal used by all consumers. Only exact stable release pins are
+/// supported. Unknown versions and unsupported aliases/date pins explicitly need native cargo.
 pub fn pin_conflict(
     worktree: &Path,
-    configured_dir: &Path,
+    _configured_dir: &Path,
     configured_version: Option<&str>,
     denies: &[ReadDeny],
 ) -> Option<String> {
-    if !configured_dir.is_dir() {
-        return None;
+    let pin = match pin_read(worktree, denies) {
+        Ok(None) => return None,
+        Ok(Some(pin)) => pin,
+        Err(reason) => return Some(reason),
+    };
+    if compiler_release(&pin.channel) != Some(pin.channel.as_str()) {
+        return Some(format!(
+            "{} pins {}; this channel is not qualified for IDE execution; use native cargo",
+            pin.file, pin.channel
+        ));
     }
-    match pin_read(worktree, denies) {
-        PinRead::Absent => None,
-        PinRead::Denied(name) => Some(format!(
-            "{name} is excluded from reads by the host, so the toolchain pin cannot be \
-             verified — IDE checks refuse an unverifiable pin; adjust the host excludes or \
-             use native cargo (its rustup proxy honors the pin)"
+    match configured_version.and_then(compiler_release) {
+        Some(version) if version == pin.channel => None,
+        Some(version) => Some(format!(
+            "{} pins {}, but the accepted rustc is {version}; align the launcher or use native cargo",
+            pin.file, pin.channel
         )),
-        PinRead::Parsed(file, channel) => {
-            match configured_version {
-                Some(version) if establishes(version, &channel) => None,
-                Some(version) => Some(format!(
-                    "{file} pins {channel}, but the measured toolchain is {version} — IDE \
-                     checks refuse the mismatch; use native cargo (its rustup proxy honors the \
-                     pin) or align the launcher toolchain"
-                )),
-                None => Some(format!(
-                    "{file} pins {channel}, but no measured toolchain version was given, so \
-                     the pin cannot be verified — IDE checks refuse an unverifiable pin; use \
-                     native cargo (its rustup proxy honors the pin) or provide the measured \
-                     toolchain facts"
-                )),
-            }
-        }
+        None => Some(format!(
+            "{} pins {}, but accepted rustc version is unknown or unqualified; use native cargo",
+            pin.file, pin.channel
+        )),
     }
 }
 
-/// The worktree's environment as a [`ResolvedEnv`], from facts the caller vouches for. The
-/// configured toolchain is the `chosen` winner only when nothing obstructs it: a pin the
-/// measured version does not establish, and a pin the host denies, resolve to nothing with
-/// the same cause [`pin_conflict`] refuses checks with — an apparently valid winner the
-/// checks would refuse is never returned. An agreeing pin is the `source`; a pin with no
-/// measured version to check it against keeps the launcher as the winner's source and
-/// discloses that compatibility is unverified. `None` configured resolves nothing with the
-/// disclosure that the environment view was given no configured toolchain.
+/// Link and target stamps detect same-path recreation, including a recreated target behind
+/// an unchanged link. Call only on admitted readable paths.
+fn stamp(path: &Path) -> String {
+    let object = |metadata: fs::Metadata| {
+        format!(
+            "{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mtime(),
+            metadata.mtime_nsec()
+        )
+    };
+    format!(
+        "{:?}:{:?}",
+        fs::symlink_metadata(path).map(object).ok(),
+        fs::metadata(path).map(object).ok()
+    )
+}
+
+/// Generated/dependency state excluded by project discovery. Declared workspace members in
+/// these directories are explicitly unsupported rather than silently qualified.
+const SKIPPED: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".cache",
+];
+
+/// Validates the supported workspace member path syntax before filesystem discovery. This is
+/// not a Cargo parser: escaped/complex declarations and foreign/generated roots refuse.
+fn member_scope(text: &str) -> Result<(), String> {
+    let mut workspace = false;
+    let mut members = false;
+    let mut value = String::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') {
+            workspace = line == "[workspace]";
+        }
+        if workspace && !members {
+            if let Some((key, rhs)) = line.split_once('=') {
+                if key.trim().trim_matches(['"', '\'']) == "members" {
+                    members = true;
+                    value.push_str(rhs);
+                }
+            }
+        } else if members {
+            value.push_str(line);
+        }
+        if members && value.contains(']') {
+            break;
+        }
+    }
+    if !members {
+        return Ok(());
+    }
+    let array = value
+        .trim()
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| "unsupported workspace member declaration; use native cargo".to_owned())?;
+    for item in array
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let path = quoted(item)
+            .ok_or_else(|| "unsupported escaped workspace member; use native cargo".to_owned())?;
+        if Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|part| matches!(part, Component::ParentDir))
+            || path.split('/').any(|part| SKIPPED.contains(&part))
+        {
+            return Err(
+                "workspace members outside supported worktree input scope; use native cargo"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Discovers all native manifests/configs inside the worktree, including crates/alpha and
+/// deeper members. No symlink is followed. Exhausted entry/depth bounds explicitly refuse;
+// no partial identity is certified as complete. Standard generated roots stay excluded.
+fn native_inputs(worktree: &Path, denies: &[ReadDeny]) -> Result<Vec<PathBuf>, String> {
+    let mut pending = vec![(worktree.to_path_buf(), 0_usize)];
+    let mut inputs = Vec::new();
+    let mut budget = 16_384_usize;
+    while let Some((dir, depth)) = pending.pop() {
+        let manifest = dir.join("Cargo.toml");
+        if denies.iter().any(|deny| deny.matches(&manifest)) {
+            return Err("Cargo manifest is read restricted; use native cargo".into());
+        }
+        if dir == worktree || manifest.is_file() {
+            if manifest.is_file() {
+                let text = read_input(&manifest, denies).ok_or_else(|| "Cargo manifest is unreadable/oversized for environment qualification; use native cargo".to_owned())?;
+                member_scope(&text)?;
+            }
+            for name in [
+                "Cargo.toml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+                "rust-toolchain",
+                "rust-project.json",
+                "rustfmt.toml",
+                ".rustfmt.toml",
+            ] {
+                inputs.push(dir.join(name));
+            }
+        }
+        inputs.push(dir.join(".cargo/config.toml"));
+        inputs.push(dir.join(".cargo/config"));
+        inputs.push(dir.join("rust-toolchain.toml"));
+        inputs.push(dir.join("rust-toolchain"));
+        for entry in fs::read_dir(&dir)
+            .map_err(|_| "native input directory is unreadable; use native cargo".to_owned())?
+        {
+            if budget == 0 {
+                return Err(
+                    "native input discovery exceeds its supported bound; use native cargo".into(),
+                );
+            }
+            budget -= 1;
+            let entry = entry.map_err(|_| {
+                "native input directory changed; retry or use native cargo".to_owned()
+            })?;
+            if SKIPPED.iter().any(|skip| entry.file_name() == *skip) {
+                continue;
+            }
+            let kind = entry
+                .file_type()
+                .map_err(|_| "native input metadata unavailable; use native cargo".to_owned())?;
+            if kind.is_symlink() {
+                return Err(
+                    "symlinked project input scope is unsupported; use native cargo".into(),
+                );
+            }
+            if kind.is_dir() {
+                if depth == 12 {
+                    return Err(
+                        "native input discovery exceeds its supported depth; use native cargo"
+                            .into(),
+                    );
+                }
+                pending.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    inputs.sort();
+    inputs.dedup();
+    Ok(inputs)
+}
+
+/// Full-byte native identity plus accepted tool facts. Refused discovery gets a stable refused
+/// identity; no partial hash is called complete. Read-denied bytes never influence the digest.
+pub fn identity(
+    worktree: &Path,
+    configured: Option<&ConfiguredToolchain<'_>>,
+    denies: &[ReadDeny],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    if let Some(facts) = configured {
+        hasher.update(facts.dir.as_os_str().as_encoded_bytes());
+        hasher.update(facts.version.unwrap_or_default().as_bytes());
+        for path in [
+            facts.dir.to_path_buf(),
+            facts.dir.join("bin/cargo"),
+            facts.dir.join("bin/rustc"),
+            facts.dir.join("bin/rustfmt"),
+        ] {
+            if !denies.iter().any(|deny| deny.matches(&path)) {
+                hasher.update(stamp(&path).as_bytes());
+                if let Some(hash) = hash_input(&path, denies) {
+                    hasher.update(hash.as_bytes());
+                }
+            }
+        }
+    }
+    match native_inputs(worktree, denies) {
+        Err(reason) => {
+            hasher.update(reason.as_bytes());
+        }
+        Ok(inputs) => {
+            for path in inputs {
+                hasher.update(path.as_os_str().as_encoded_bytes());
+                if denies.iter().any(|deny| deny.matches(&path)) {
+                    hasher.update(b"denied");
+                } else if let Some(hash) = hash_input(&path, denies) {
+                    hasher.update(hash.as_bytes());
+                    hasher.update(stamp(&path).as_bytes());
+                } else {
+                    hasher.update(b"absent-or-unreadable");
+                }
+            }
+        }
+    }
+    hasher.finalize().to_string()
+}
+
+/// One resolution from caller-accepted facts. A pin or discovery refusal yields no chosen or
+/// source candidate and the same actionable pre-run cause. Successful candidates include
+/// their winner; the directory name is only a label, never compiler version evidence.
 pub fn environment(
     worktree: &Path,
     configured: Option<&ConfiguredToolchain<'_>>,
     denies: &[ReadDeny],
 ) -> ResolvedEnv {
-    let obstruction = configured.and_then(|facts| {
-        pin_conflict(
-            worktree,
-            facts.dir,
-            facts.version,
-            denies,
-        )
-    });
-    let unverified = configured.is_some()
-        && obstruction.is_none()
-        && match pin_read(worktree, denies) {
-            PinRead::Parsed(_, channel) => !configured
-                .and_then(|facts| facts.version)
-                .is_some_and(|version| establishes(version, &channel)),
-            _ => false,
-        };
-    let chosen = (configured.is_some() && obstruction.is_none()).then(|| {
-        let facts = configured.expect("configured");
-        EnvCandidate {
-            label: facts
-                .dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| facts.dir.display().to_string()),
-            path: facts.dir.to_path_buf(),
-            version: facts.version.map(str::to_owned),
-            broken: false,
-        }
-    });
-    let pin = pin_read(worktree, denies);
-    let source = match (&chosen, &pin) {
-        (Some(_), PinRead::Parsed(file, _))
-            if unverified.not() || obstruction.is_some() =>
-        {
-            None
-        }
-        (Some(_), PinRead::Parsed(file, _)) => Some(EnvSource::Pin(file.to_string())),
-        (Some(_), _) => Some(EnvSource::Launcher),
-        (None, _) => None,
-    };
-    let warnings = match unverified.then_some((&pin, configured)) {
-        Some((PinRead::Parsed(file, channel), _)) => {
-            vec![format!(
-                "{file} pins {channel}, but no measured toolchain version verifies it — \
-                 compatibility unverified"
-            )]
-        }
-        _ => Vec::new(),
-    };
-    let missing_next_step = obstruction
-        .or_else(|| {
-            (configured.is_none()).then(|| {
-                "no configured toolchain was given to the environment view; checks follow \
-                 their configured toolchain and report their own availability"
-                    .to_owned()
-            })
+    let nested_refusal = native_inputs(worktree, denies)
+        .and_then(|inputs| {
+            for path in inputs.iter().filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == "rust-toolchain.toml")
+            }) {
+                let root = path.parent().expect("discovered input has its directory");
+                if root != worktree
+                    && let Some(cause) = pin_conflict(
+                        root,
+                        configured.map_or(worktree, |facts| facts.dir),
+                        configured.and_then(|facts| facts.version),
+                        denies,
+                    )
+                {
+                    return Err(format!(
+                        "{}: {cause}",
+                        root.strip_prefix(worktree).unwrap_or(root).display()
+                    ));
+                }
+            }
+            Ok(())
         })
-        .or_else(|| match &pin {
-            PinRead::Denied(name) => Some(format!(
-                "{name} is excluded from reads by the host, so the toolchain pin cannot be \
-                 verified — adjust the host excludes"
-            )),
-            _ => None,
-        });
+        .err();
+    let refusal = configured.and_then(|facts| pin_conflict(worktree, facts.dir, facts.version, denies))
+        .or_else(|| pin_read(worktree, denies).err())
+        .or(nested_refusal)
+        .or_else(|| configured.is_none().then(|| "no accepted configured Rust toolchain; use native cargo or configure the launcher".to_owned()));
+    let chosen = if refusal.is_none() {
+        configured.map(|facts| EnvCandidate {
+            label: facts.dir.display().to_string(),
+            path: facts.dir.to_path_buf(),
+            version: facts.version.and_then(compiler_release).map(str::to_owned),
+            broken: false,
+        })
+    } else {
+        None
+    };
+    let source = chosen.as_ref().map(|_| match pin_read(worktree, denies) {
+        Ok(Some(pin)) => EnvSource::Pin(pin.file.into()),
+        _ => EnvSource::Launcher,
+    });
+    let candidates = chosen.clone().into_iter().collect();
     ResolvedEnv {
         root: PathBuf::new(),
         chosen,
         source,
-        // One configured toolchain per caller: the card shows no `choose:` hint, and the
-        // language keeps its default selection refusal.
-        candidates: Vec::new(),
-        warnings,
-        missing_next_step,
-        identity: identity_string(worktree, configured, denies),
+        candidates,
+        warnings: Vec::new(),
+        missing_next_step: refusal,
+        identity: identity(worktree, configured, denies),
     }
 }
 
-/// [`identity`]'s value: the parts joined and hashed once.
-fn identity_string(
-    worktree: &Path,
-    configured: Option<&ConfiguredToolchain<'_>>,
-    denies: &[ReadDeny],
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    match configured {
-        Some(configured) => {
-            parts.push(configured.dir.display().to_string());
-            parts.push(
-                configured
-                    .dir
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            );
-            parts.push(configured.version.unwrap_or_default().to_owned());
-            parts.push(stamp(configured.dir));
-            parts.push(stamp(&configured.dir.join("bin").join("cargo")));
-            parts.push(stamp(&configured.dir.join("bin").join("rustc")));
-        }
-        None => parts.push("configured=-".to_owned()),
-    }
-    match pin_read(worktree, denies) {
-        PinRead::Absent => parts.push("pin=-".to_owned()),
-        PinRead::Denied(name) => parts.push(format!("pin=denied:{name}")),
-        PinRead::Parsed(name, channel) => {
-            parts.push(format!("pin={name}:{channel}"));
-            parts.push(
-                agent_ide_core::lang::environment::hash_input(&worktree.join(name), denies)
-                    .map_or_else(
-                        || "pin-content=-".to_owned(),
-                        |hash| format!("pin-content={hash}"),
-                    ),
-            );
-        }
-    }
-    let mut members: Vec<PathBuf> = fs::read_dir(worktree)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|dir| dir.is_dir() && dir.join("Cargo.toml").is_file())
-        .collect();
-    members.sort();
-    let mut inputs: Vec<PathBuf> = vec![
-        worktree.join("Cargo.toml"),
-        worktree.join("Cargo.lock"),
-        worktree.join(".cargo/config.toml"),
-        worktree.join(".cargo/config"),
-    ];
-    inputs.extend(members.iter().map(|dir| dir.join("Cargo.toml")));
-    for file in inputs {
-        parts.push(
-            agent_ide_core::lang::environment::hash_input(&file, denies).map_or_else(
-                || format!("{}=-", file.display()),
-                |hash| format!("{}={hash}", file.display()),
-            ),
-        );
-    }
-    blake3::hash(parts.join("\n").as_bytes()).to_string()
-}
-
+/// Guarded input, exact compiler evidence and native-scope regression fixtures.
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Fresh scratch directory for one fixture.
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("agent-ide-rust-env-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Owns one scratch fixture under the executor's prepared TMPDIR.
+    struct ScratchDir(PathBuf);
+    impl ScratchDir {
+        /// Creates a unique directory without mutating process environment.
+        fn new(label: &str) -> Self {
+            /// Separates fixture directories created by one test process.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+        /// Borrows the fixture boundary.
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for ScratchDir {
+        /// Removes only this fixture's owned files.
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
-    /// Writes `text` to `root/relative`, creating parents.
-    fn put(root: &Path, relative: &str, text: &str) {
+    /// Writes one fixture input, creating only its private parent directories.
+    fn put(root: &Path, relative: &str, body: impl AsRef<[u8]>) {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
+        fs::write(path, body).unwrap();
     }
 
-    /// Installs a toolchain `name` under `root/toolchains` with `bin/cargo`/`bin/rustc`.
-    fn toolchain(root: &Path, name: &str) -> PathBuf {
-        let dir = root.join("toolchains").join(name);
-        put(&dir, "bin/cargo", "");
-        put(&dir, "bin/rustc", "");
-        dir
-    }
-
-    /// The caller's vouched facts: directory plus measured version identity.
-    fn configured<'a>(dir: &'a Path, version: Option<&'a str>) -> ConfiguredToolchain<'a> {
-        ConfiguredToolchain { dir, version }
-    }
-
-    /// The pin's channel must be established by the caller's measured version, whatever the
-    /// directory is named: a misleading `1.98.1` name with a measured `cargo 1.97` refuses, a
-    /// generic directory with a measured `cargo 1.98.1` agrees, and no measured version never
-    /// proves a match.
+    /// Misleading names, unknown/Cargo identities and prerelease/substring shortcuts never
+    /// establish a stable compiler pin; a generic dir with actual rustc evidence agrees.
     #[test]
-    fn pin_agreement_uses_measured_versions_not_names() {
-        let root = scratch("agreement");
-        let dir = toolchain(&root, "1.98.1-aarch64-apple-darwin");
-        put(&root, "Cargo.toml", "");
-        put(&root, "rust-toolchain.toml", "[toolchain]\nchannel = \"1.98.1\"\n");
-        // A misleadingly named directory with a measured older toolchain refuses.
-        let older = configured(&dir, Some("cargo 1.97.0 (aabb)"));
-        let cause = pin_conflict(&root, &dir, older.version, &[]).expect("mismatch refuses");
-        assert!(cause.contains("pins 1.98.1"), "{cause}");
-        assert!(cause.contains("measured toolchain is cargo 1.97.0"), "{cause}");
-        // A generically named directory with the measured right toolchain agrees.
-        let generic = root.join("toolchains/toolchain");
-        put(&generic, "bin/cargo", "");
-        put(&generic, "bin/rustc", "");
-        let measured = configured(&generic, Some("cargo 1.98.1 (aabb)"));
-        assert_eq!(pin_conflict(&root, &generic, measured.version, &[]), None);
-        let env = environment(&root, Some(&measured), &[]);
-        assert_eq!(env.source, Some(EnvSource::Pin("rust-toolchain.toml".into())));
-        assert!(env.warnings.is_empty());
-        // No measured version never proves a match: unverified, disclosed, not refused.
-        let unknown = configured(&generic, None);
-        assert_eq!(pin_conflict(&root, &generic, unknown.version, &[]), None);
-        let env = environment(&root, Some(&unknown), &[]);
-        assert_eq!(env.chosen.as_ref().map(|chosen| chosen.version.as_deref()), Some(None));
-        assert_eq!(env.source, Some(EnvSource::Launcher));
-        let warning = env.warnings.first().expect("unverified is disclosed");
-        assert!(warning.contains("compatibility unverified"), "{warning}");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// A configured toolchain a pin rejects resolves to nothing — never an apparently valid
-    /// winner with a warning — and the same cause reaches `pin_conflict`; the cargo config
-    /// and member manifests move the identity within the worktree boundary.
-    #[test]
-    fn conflicting_pin_resolves_nothing_and_identity_covers_members() {
-        let root = scratch("conflict");
-        let dir = toolchain(&root, "1.98.1-aarch64-apple-darwin");
-        put(&root, "Cargo.toml", "[workspace]\n");
-        put(&root, "Cargo.lock", "lock v1\n");
-        put(&root, "crates/alpha/Cargo.toml", "[package]\nname = \"alpha\"\n");
+    fn pin_uses_exact_rustc_release() {
+        let root = ScratchDir::new("rust-pin-evidence");
+        put(&root, "Cargo.toml", "[package]\nname=\"x\"\n");
         put(
             &root,
             "rust-toolchain.toml",
-            "[toolchain]\nchannel = \"nightly\"\n",
+            "[toolchain]\nchannel=\"1.98.1\"\n",
         );
-        let facts = configured(&dir, Some("cargo 1.98.1 (aabb)"));
-        let env = environment(&root, Some(&facts), &[]);
-        assert_eq!(env.chosen, None, "no apparently valid winner");
-        assert_eq!(env.source, None);
-        let step = env.missing_next_step.expect("the conflict is the way out");
-        assert!(step.contains("pins nightly"), "{step}");
+        let dir = root.join("1.98.1-misleading");
+        fs::create_dir_all(&dir).unwrap();
+        for evidence in [
+            None,
+            Some("rustc 1.97.0"),
+            Some("cargo 1.98.1"),
+            Some("rustc 1.98.1-nightly"),
+            Some("rustc 11.98.1"),
+            Some("rustc 1.98.1.2"),
+            Some("rustc 01.98.1"),
+        ] {
+            assert!(
+                pin_conflict(&root, &dir, evidence, &[]).is_some(),
+                "{evidence:?}"
+            );
+        }
+        let generic = root.join("generic");
+        fs::create_dir_all(&generic).unwrap();
+        assert!(pin_conflict(&root, &generic, Some("rustc 1.98.1 (accepted)"), &[]).is_none());
+        let facts = ConfiguredToolchain {
+            dir: &generic,
+            version: Some("rustc 1.98.1"),
+        };
+        let resolved = environment(&root, Some(&facts), &[]);
         assert_eq!(
-            env.missing_next_step,
-            pin_conflict(&root, &dir, facts.version, &[])
+            resolved.source,
+            Some(EnvSource::Pin("rust-toolchain.toml".into()))
         );
-
-        // Member manifests are part of the identity once the conflict clears.
-        fs::remove_file(root.join("rust-toolchain.toml")).unwrap();
-        let before = environment(&root, Some(&facts), &[]).identity;
-        put(&root, "crates/alpha/Cargo.toml", "[package]\nname = \"beta\"\n");
-        assert_ne!(
-            environment(&root, Some(&facts), &[]).identity,
-            before,
-            "changed member manifest"
-        );
-        let _ = fs::remove_dir_all(&root);
+        assert_eq!(resolved.chosen.unwrap().version.as_deref(), Some("1.98.1"));
     }
 
-    /// A host-denied pin is in force and unverifiable: it is disclosed, never parsed into the
-    /// identity or the card, and checks refuse — a regression the unguarded read would fail.
+    /// Denied, invalid, oversized and unknown TOML never fall through to valid legacy pins.
+    /// Changing excluded channel bytes changes neither the refusal nor identity.
     #[test]
-    fn denied_pin_is_disclosed_never_parsed() {
-        use agent_ide_core::execution::seatbelt::ReadDeny;
-        let root = scratch("pin-denied");
-        let dir = toolchain(&root, "1.98.1-aarch64-apple-darwin");
-        put(&root, "Cargo.toml", "");
-        put(&root, "rust-toolchain.toml", "[toolchain]\nchannel = \"nightly\"\n");
-        let facts = configured(&dir, Some("cargo 1.98.1 (aabb)"));
-        let denies = [ReadDeny::Path(root.join("rust-toolchain.toml"))];
-        let env = environment(&root, Some(&facts), &denies);
-        assert_eq!(env.chosen, None, "an unverifiable pin resolves nothing");
-        let step = env.missing_next_step.expect("the denial is the way out");
-        assert!(step.contains("excluded from reads"), "{step}");
-        assert_eq!(
-            pin_conflict(&root, &dir, facts.version, &denies)
-                .expect("checks refuse an unverifiable pin"),
-            step
-        );
-        // The denied channel never leaks into the identity.
-        let identity = environment(&root, Some(&facts), &denies).identity;
-        assert!(!identity.contains("nightly"), "{identity}");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// An agreeing pin is the source, the worktree's Cargo inputs move the identity, and a
-    /// non-Cargo worktree has no environment at all.
-    #[test]
-    fn configured_toolchain_is_chosen_with_the_pin_as_source() {
-        let root = scratch("configured");
-        let dir = toolchain(&root, "1.98.1-aarch64-apple-darwin");
-        put(&root, "Cargo.toml", "[package]\nname = \"svc\"\n");
-        put(&root, "Cargo.lock", "lock v1\n");
-        put(
-            &root,
-            "rust-toolchain.toml",
-            "[toolchain]\nchannel = \"1.98.1\"\n",
-        );
-        let facts = configured(&dir, Some("cargo 1.98.1 (aabb)"));
-        let env = environment(&root, Some(&facts), &[]);
-        let chosen = env.chosen.expect("configured toolchain resolves");
-        assert_eq!(chosen.label, "1.98.1-aarch64-apple-darwin");
-        assert_eq!(chosen.version.as_deref(), Some("cargo 1.98.1 (aabb)"));
-        assert_eq!(chosen.path, dir);
-        assert_eq!(
-            env.source,
-            Some(EnvSource::Pin("rust-toolchain.toml".to_owned()))
-        );
-        assert!(env.warnings.is_empty());
-        assert_eq!(env.missing_next_step, None);
-
-        // The identity covers the worktree's Cargo inputs: a changed lock invalidates, and
-        // two resolutions of one state agree.
-        let before = environment(&root, Some(&facts), &[]).identity;
-        assert_eq!(environment(&root, Some(&facts), &[]).identity, before);
-        put(&root, "Cargo.lock", "lock v2\n");
-        assert_ne!(
-            environment(&root, Some(&facts), &[]).identity,
-            before,
-            "changed lockfile"
-        );
-
-        // A non-Cargo worktree has no environment to describe.
-        let other = scratch("configured-not-rust");
-        assert!(!is_cargo_project(&other));
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&other);
-    }
-
-    /// The pin's whole content feeds the identity, not just its parsed channel: a
-    /// comment-only change at an unchanged channel moves it.
-    #[test]
-    fn pin_content_moves_the_identity() {
-        let root = scratch("pin-content");
-        let dir = toolchain(&root, "1.98.1-aarch64-apple-darwin");
-        put(&root, "Cargo.toml", "");
-        put(&root, "Cargo.lock", "lock\n");
-        put(
-            &root,
-            "rust-toolchain.toml",
-            "[toolchain]\nchannel = \"1.98.1\"\n",
-        );
-        let facts = configured(&dir, Some("cargo 1.98.1 (aabb)"));
-        let before = environment(&root, Some(&facts), &[]).identity;
-        put(
-            &root,
-            "rust-toolchain.toml",
-            "[toolchain]\nchannel = \"1.98.1\"\n# profile = \"minimal\"\n",
-        );
-        assert_ne!(
-            environment(&root, Some(&facts), &[]).identity,
-            before,
-            "changed pin file content at unchanged channel"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// With no configured facts the resolution says nothing won and discloses the seam's
-    /// scope; a bare-file pin is read the same way, and renaming the declaring file moves the
-    /// identity.
-    #[test]
-    fn bare_pin_and_unconfigured_disclosure() {
-        let root = scratch("bare");
-        let dir = toolchain(&root, "1.98.1-aarch64-apple-darwin");
+    fn authoritative_pin_failures_never_fall_through() {
+        let root = ScratchDir::new("rust-pin-authority");
         put(&root, "Cargo.toml", "");
         put(&root, "rust-toolchain", "1.98.1\n");
-        let facts = configured(&dir, Some("cargo 1.98.1 (aabb)"));
-        let toml_less = environment(&root, Some(&facts), &[]);
-        assert_eq!(
-            toml_less.source,
-            Some(EnvSource::Pin("rust-toolchain".to_owned()))
+        let dir = root.join("tools");
+        fs::create_dir_all(&dir).unwrap();
+        let facts = ConfiguredToolchain {
+            dir: &dir,
+            version: Some("rustc 1.98.1"),
+        };
+        for body in [
+            "not toml".to_owned(),
+            "[toolchain]\nprofile=\"minimal\"\n".into(),
+            "x".repeat(65 * 1024),
+            "[toolchain]\nchannel=\"nightly\"\n".into(),
+        ] {
+            put(&root, "rust-toolchain.toml", body);
+            assert!(environment(&root, Some(&facts), &[]).chosen.is_none());
+        }
+        put(
+            &root,
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel=\"private-channel-a\"\n",
         );
-        fs::remove_file(root.join("rust-toolchain")).unwrap();
-        fs::write(root.join("rust-toolchain"), "1.98.1\n# note\n").unwrap();
-        assert_ne!(
-            environment(&root, Some(&facts), &[]).identity,
-            toml_less.identity,
-            "pin content is part of the identity"
+        let denies = [ReadDeny::Path(root.join("rust-toolchain.toml"))];
+        let before = environment(&root, Some(&facts), &denies);
+        put(
+            &root,
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel=\"private-channel-b\"\n",
         );
+        let after = environment(&root, Some(&facts), &denies);
+        assert_eq!(before.identity, after.identity);
+        assert_eq!(before.missing_next_step, after.missing_next_step);
+        assert!(
+            !before
+                .missing_next_step
+                .unwrap()
+                .contains("private-channel")
+        );
+        assert!(after.chosen.is_none() && after.source.is_none());
+    }
 
-        let unconfigured = environment(&root, None, &[]);
-        assert_eq!(unconfigured.chosen, None);
-        assert_eq!(unconfigured.source, None);
-        let step = unconfigured
-            .missing_next_step
-            .expect("the disclosure names the scope");
-        assert!(step.contains("no configured toolchain was given"), "{step}");
-        let _ = fs::remove_dir_all(&root);
+    /// Real nested member manifests/configs and a same-length changed lock tail invalidate
+    /// inside the boundary; foreign parent locks never enter the identity.
+    #[test]
+    fn native_identity_covers_nested_members_and_full_bytes() {
+        let outer = ScratchDir::new("rust-native-inputs");
+        let root = outer.join("workspace");
+        put(&root, "Cargo.toml", "[workspace]\nmembers=[\"crates/*\"]\n");
+        put(
+            &root,
+            "crates/alpha/Cargo.toml",
+            "[package]\nname=\"alpha\"\n",
+        );
+        put(
+            &root,
+            "crates/alpha/.cargo/config.toml",
+            "[build]\njobs=1\n",
+        );
+        let before = identity(&root, None, &[]);
+        put(
+            &root,
+            "crates/alpha/Cargo.toml",
+            "[package]\nname=\"beta\"\n",
+        );
+        assert_ne!(identity(&root, None, &[]), before);
+        let before = identity(&root, None, &[]);
+        put(
+            &root,
+            "crates/alpha/.cargo/config.toml",
+            "[build]\njobs=2\n",
+        );
+        assert_ne!(identity(&root, None, &[]), before);
+        let body = vec![b'x'; 256 * 1024];
+        put(&root, "Cargo.lock", &body);
+        let before = identity(&root, None, &[]);
+        let mut changed = body;
+        *changed.last_mut().unwrap() = b'y';
+        put(&root, "Cargo.lock", changed);
+        assert_ne!(identity(&root, None, &[]), before);
+        let before = identity(&root, None, &[]);
+        put(&outer, "Cargo.lock", "foreign");
+        assert_eq!(identity(&root, None, &[]), before);
     }
 }

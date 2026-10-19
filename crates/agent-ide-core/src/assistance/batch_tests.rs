@@ -93,11 +93,17 @@ impl Worker<'_> {
                         .first()
                         .copied()
                         .ok_or(FailureCode::ProviderUnavailable)?;
-                    let resolution =
-                        crate::assistance::tests::resolve_command(&root, &root, &argv, None, &self.shared.launcher, &job.target)
-                            .await
-                            .map_err(|failure| symbols::module_failure(job, &failure))?
-                            .map_err(|error| symbols::environment_failure(job, &error))?;
+                    let resolution = crate::assistance::tests::resolve_command(
+                        &root,
+                        &root,
+                        &argv,
+                        None,
+                        &self.shared.launcher,
+                        &job.target,
+                    )
+                    .await
+                    .map_err(|failure| symbols::module_failure(job, &failure))?
+                    .map_err(|error| symbols::environment_failure(job, &error))?;
                     planned.push((
                         index,
                         BatchLaunch {
@@ -131,9 +137,10 @@ impl Worker<'_> {
             // One invocation for every file when the runner takes them together.
             if files.len() > 1 {
                 let all = TestTarget::Files(files.iter().map(|file| file.1.clone()).collect());
-                if let Ok((argv, language, count, start)) = test_selection(&root, all, budget, &self.shared.launcher, &job.target)
-                    .await
-                    .map_err(|failure| symbols::module_failure(job, &failure))?
+                if let Ok((argv, language, count, start)) =
+                    test_selection(&root, all, budget, &self.shared.launcher, &job.target)
+                        .await
+                        .map_err(|failure| symbols::module_failure(job, &failure))?
                 {
                     let indexes: Vec<usize> = files.iter().map(|file| file.0).collect();
                     let first = indexes[0];
@@ -145,9 +152,15 @@ impl Worker<'_> {
                 }
             }
             for (index, path) in files {
-                match test_selection(&root, TestTarget::File(path), budget, &self.shared.launcher, &job.target)
-                    .await
-                    .map_err(|failure| symbols::module_failure(job, &failure))?
+                match test_selection(
+                    &root,
+                    TestTarget::File(path),
+                    budget,
+                    &self.shared.launcher,
+                    &job.target,
+                )
+                .await
+                .map_err(|failure| symbols::module_failure(job, &failure))?
                 {
                     Ok((argv, language, count, start)) => {
                         let launch = self
@@ -164,16 +177,19 @@ impl Worker<'_> {
                 path,
                 referencing_tests: tests,
             };
-            let config = self.shared.launcher.module_config(language, &root, &job.target);
+            let config = self
+                .shared
+                .launcher
+                .module_config(language, &root, &job.target);
             let project = crate::modules::calls::detect(language, &root, &config)
                 .await
                 .map_err(|failure| symbols::module_failure(job, &failure))?;
             let selection = match project {
-                Some(project) => {
-                    crate::modules::calls::test_run(language, &root, &project, &target, budget, &config)
-                        .await
-                        .map_err(|failure| symbols::module_failure(job, &failure))?
-                }
+                Some(project) => crate::modules::calls::test_run(
+                    language, &root, &project, &target, budget, &config,
+                )
+                .await
+                .map_err(|failure| symbols::module_failure(job, &failure))?,
                 None => Err(crate::lang::LangError::Unsupported(
                     "no supported test runner was detected".to_owned(),
                 )),
@@ -319,11 +335,25 @@ impl Worker<'_> {
                 {
                     return Ok(TargetPlan::File(target, language));
                 }
-                test_selection(root, TestTarget::File(target), budget, &self.shared.launcher, &job.target).await
+                test_selection(
+                    root,
+                    TestTarget::File(target),
+                    budget,
+                    &self.shared.launcher,
+                    &job.target,
+                )
+                .await
             }
             TestTargetSpec::Command(argv) => return Ok(TargetPlan::Command(argv.clone())),
             TestTargetSpec::Pattern(pattern) => {
-                test_selection(root, TestTarget::Pattern(pattern.clone()), budget, &self.shared.launcher, &job.target).await
+                test_selection(
+                    root,
+                    TestTarget::Pattern(pattern.clone()),
+                    budget,
+                    &self.shared.launcher,
+                    &job.target,
+                )
+                .await
             }
             TestTargetSpec::Symbol(symbol) => {
                 return match self.referencing_tests(job, binding, symbol).await {
@@ -429,10 +459,17 @@ impl Worker<'_> {
                 BatchCommand::Missing(format!("{program} not found"))
             }
             Some(crate::modules::calls::PlannedStart::InProcess) | None => BatchCommand::Resolved(
-                crate::assistance::tests::resolve_command(root, root, &argv, Some(language), &self.shared.launcher, &job.target)
-                    .await
-                    .map_err(|failure| symbols::module_failure(job, &failure))?
-                    .map_err(|error| symbols::environment_failure(job, &error))?,
+                crate::assistance::tests::resolve_command(
+                    root,
+                    root,
+                    &argv,
+                    Some(language),
+                    &self.shared.launcher,
+                    &job.target,
+                )
+                .await
+                .map_err(|failure| symbols::module_failure(job, &failure))?
+                .map_err(|error| symbols::environment_failure(job, &error))?,
             ),
         };
         Ok(BatchLaunch {
@@ -465,6 +502,10 @@ fn running_line(id: u64) -> String {
 /// that no selection was available.
 fn unrunnable(error: &crate::lang::LangError) -> String {
     match error {
+        crate::lang::LangError::Environment(message) => format!(
+            "not run: environment unavailable: {}",
+            test_text_line(message, 200)
+        ),
         crate::lang::LangError::Unsupported(message) => {
             format!("not runnable: {}", test_text_line(message, 200))
         }

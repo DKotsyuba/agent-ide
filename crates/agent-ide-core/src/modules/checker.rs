@@ -64,7 +64,10 @@ impl ModuleChecker {
         timeout: Duration,
     ) -> Self {
         Self {
-            configuration: super::contract::ModuleConfig {checks: Some(section.clone()), ..Default::default()},
+            configuration: super::contract::ModuleConfig {
+                checks: Some(section.clone()),
+                ..Default::default()
+            },
             language,
             host,
             section,
@@ -121,11 +124,22 @@ impl ModuleChecker {
     async fn run(&self, request: &CheckRequest) -> Result<ProblemSnapshot, ModuleUnavailable> {
         let mut configuration = self.configuration.clone();
         configuration.worktree = Some(request.worktree.clone());
+        configuration.read_denies = request.read_denies.clone();
         let mut described = self.described(&request.worktree).await?.clone();
-        described.launcher_roots.extend(recipe::environment_roots(
-            self.language.name(),
-            &request.worktree,
-        ));
+        if configuration.provider.is_none() && configuration.checks.is_none() {
+            described.launcher_roots.extend(recipe::environment_roots(
+                self.language.name(),
+                &request.worktree,
+            ));
+        }
+        described.launcher_roots.extend(
+            self.language
+                .support()
+                .configured_environments(&request.worktree, &configuration)
+                .into_iter()
+                .filter(|environment| environment.missing_next_step.is_none())
+                .filter_map(|environment| environment.chosen.map(|candidate| candidate.path)),
+        );
         let mut effects = CheckEffects {
             recipes: recipe::declared(self.language.name()),
             request,

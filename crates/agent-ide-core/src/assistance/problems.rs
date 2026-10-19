@@ -225,7 +225,9 @@ impl ProjectProblemFeed {
                             &context,
                         )
                     })
-                    .unwrap_or_else(|| config.configured_checker(runner.clone(), checks.check_timeout(), context))
+                    .unwrap_or_else(|| {
+                        config.configured_checker(runner.clone(), checks.check_timeout(), context)
+                    })
             })
             .collect();
         if checkers.is_empty() {

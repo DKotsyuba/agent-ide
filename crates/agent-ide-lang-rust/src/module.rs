@@ -92,6 +92,11 @@ pub const CARGO_CHECK: EffectRecipe = EffectRecipe {
             name: "CARGO_NET_OFFLINE",
             value: "true",
         },
+        EnvRule::Param {
+            name: "RUSTC",
+            param: "rustc",
+            optional: false,
+        },
         // Same as [`RustChecker::cargo_check_spec`]: a missing toolchain refuses instead of
         // letting cargo's rustup proxies install one.
         EnvRule::Literal {
@@ -136,6 +141,12 @@ pub const CARGO_CHECK: EffectRecipe = EffectRecipe {
         },
     ],
     paths: &[
+        PathRule {
+            param: "rustc",
+            roles: &[PathRole::LauncherRoot],
+            existing_only: false,
+            read_root: false,
+        },
         PathRule {
             param: "worktree",
             roles: &[PathRole::WorktreeRoot],
@@ -334,14 +345,48 @@ pub const RUSTFMT: EffectRecipe = EffectRecipe {
     assets: &[],
 };
 
+/// Formatter using the same resolved prepared toolchain as checks and semantic execution.
+const PINNED_RUSTFMT: EffectRecipe = EffectRecipe {
+    id: "rustfmt_pinned",
+    program: "toolchain_rustfmt",
+    env: &[
+        EnvRule::Literal {
+            name: "RUSTUP_AUTO_INSTALL",
+            value: "0",
+        },
+        EnvRule::SearchPath {
+            name: "PATH",
+            param: "bin",
+            fixed: &["/usr/bin", "/bin"],
+        },
+    ],
+    paths: &[
+        PathRule {
+            param: "toolchain_rustfmt",
+            roles: &[PathRole::LauncherRoot],
+            existing_only: true,
+            read_root: false,
+        },
+        PathRule {
+            param: "bin",
+            roles: &[PathRole::LauncherRoot],
+            existing_only: false,
+            read_root: false,
+        },
+    ],
+    executables: &[],
+    ..RUSTFMT
+};
+
 /// Every effect recipe the Rust module may name; the root registers them with the descriptor.
 pub const RECIPES: &[EffectRecipe] = &{
-    let mut all = [CARGO_CHECK; 3 + TEST_RECIPES.len()];
+    let mut all = [CARGO_CHECK; 4 + TEST_RECIPES.len()];
     all[1] = XCODE_SELECT;
     all[2] = RUSTFMT;
+    all[3] = PINNED_RUSTFMT;
     let mut index = 0;
     while index < TEST_RECIPES.len() {
-        all[3 + index] = TEST_RECIPES[index];
+        all[4 + index] = TEST_RECIPES[index];
         index += 1;
     }
     all
@@ -497,6 +542,11 @@ const fn passed(name: &'static str) -> EnvRule {
 
 /// The complete environment of a [`test_run`].
 const TEST_RUN_ENV: &[EnvRule] = &[
+    EnvRule::Param {
+        name: "RUSTC",
+        param: "rustc",
+        optional: true,
+    },
     EnvRule::SearchPath {
         name: "PATH",
         param: "bin",
@@ -518,6 +568,12 @@ const TEST_RUN_ENV: &[EnvRule] = &[
 
 /// The paths of a [`test_run`]: the pinned cargo and the `PATH` directories before the system's.
 const TEST_RUN_PATHS: &[PathRule] = &[
+    PathRule {
+        param: "rustc",
+        roles: &[PathRole::LauncherRoot],
+        existing_only: true,
+        read_root: false,
+    },
     PathRule {
         param: "toolchain_cargo",
         roles: &[PathRole::LauncherRoot, PathRole::HomeRelative],
@@ -712,6 +768,77 @@ pub async fn serve(role: Role) -> Result<(), ServeError> {
 fn support_server() -> agent_ide_core::modules::adapter::SupportServer {
     agent_ide_core::modules::adapter::SupportServer::new(crate::LANGUAGE, env!("CARGO_PKG_VERSION"))
         .with_effect_plans(interactive_effect)
+        .with_configured_effect_plans(configured_effect)
+}
+
+/// Plans only existing Cargo selection or formatter shapes using current accepted tools.
+/// Environment resolution and refusals precede recipe admission; no ambient planner fallback.
+fn configured_effect(
+    argv: &[String],
+    config: &agent_ide_core::modules::contract::ModuleConfig,
+) -> Result<Option<EffectRequest>, agent_ide_core::lang::LangError> {
+    use agent_ide_core::lang::LangError;
+    let root = config.worktree.as_deref().ok_or_else(|| {
+        LangError::Environment("Rust request has no worktree; use native cargo".into())
+    })?;
+    let (tools, _) = crate::environment::resolve(root, config).map_err(LangError::Environment)?;
+    let Some((program, words)) = argv.split_first() else {
+        return Ok(None);
+    };
+    if program == "cargo" {
+        let Some((&(_, pinned, _), mut params)) = TEST_SHAPES
+            .iter()
+            .find_map(|shape| Some((shape, matched(shape.2, words)?)))
+        else {
+            return Ok(None);
+        };
+        params.insert(
+            "toolchain_cargo".into(),
+            Param::Path(tools.dir.join("bin/cargo")),
+        );
+        params.insert("rustc".into(), Param::Path(tools.dir.join("bin/rustc")));
+        params.insert("bin".into(), Param::Paths(vec![tools.dir.join("bin")]));
+        for name in TEST_ENV {
+            if let Some(value) = config.env.get(name) {
+                params.insert(name.into(), Param::Token(value.clone()));
+            }
+        }
+        if let Some(home) = tools.cargo_home {
+            params.insert(
+                "CARGO_HOME".into(),
+                Param::Token(home.to_string_lossy().into_owned()),
+            );
+        }
+        // Resolve conflicting ambient rustup selectors by naming the accepted prepared directory.
+        params.insert(
+            "RUSTUP_TOOLCHAIN".into(),
+            Param::Token(tools.dir.to_string_lossy().into_owned()),
+        );
+        return Ok(Some(EffectRequest {
+            recipe: pinned.into(),
+            params,
+        }));
+    }
+    if let [program, flag, edition] = argv
+        && program == "rustfmt"
+        && flag == "--edition"
+    {
+        let path = tools.dir.join("bin/rustfmt");
+        if !agent_ide_core::lang::environment::readable(&path, &config.read_denies) {
+            return Err(LangError::Environment(
+                "configured rustfmt is missing or denied; use native rustfmt".into(),
+            ));
+        }
+        return Ok(Some(EffectRequest {
+            recipe: PINNED_RUSTFMT.id.into(),
+            params: std::collections::BTreeMap::from([
+                ("toolchain_rustfmt".into(), Param::Path(path)),
+                ("bin".into(), Param::Paths(vec![tools.dir.join("bin")])),
+                ("edition".into(), Param::Token(edition.clone())),
+            ]),
+        }));
+    }
+    Ok(None)
 }
 
 /// The analyzer's server: the support beside the rust-analyzer session the core grants.
@@ -732,6 +859,10 @@ impl CargoCheckPlan {
             ("cargo".to_owned(), Param::Executable("cargo".to_owned())),
             ("worktree".to_owned(), path(&request.worktree)),
             ("toolchain".to_owned(), path(&self.toolchain_dir)),
+            (
+                "rustc".to_owned(),
+                path(&self.toolchain_dir.join("bin/rustc")),
+            ),
             (
                 "toolchain_bin".to_owned(),
                 Param::Paths(vec![self.toolchain_dir.join("bin")]),
@@ -971,6 +1102,9 @@ fn checker_for(
 #[derive(Clone, Debug, Serialize, serde::Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RustProviderSettings {
+    /// Actual request context shared with card/check/interactive resolution; never a grant.
+    #[serde(default)]
+    pub configuration: agent_ide_core::modules::contract::ModuleConfig,
     /// The rust-analyzer executable.
     pub binary: PathBuf,
     /// Its accepted identity.
@@ -998,6 +1132,10 @@ impl RustProviderSettings {
     pub fn from_launch(launch: &ProviderLaunch, cache_namespace: &str) -> Option<Self> {
         let options = launch.options::<RustLaunchOptions>()?;
         Some(Self {
+            configuration: agent_ide_core::modules::contract::ModuleConfig {
+                provider: Some(launch.module_declaration()),
+                ..Default::default()
+            },
             binary: launch.executable.path.clone(),
             version: launch.executable.identity.clone(),
             cargo: options.cargo.as_ref()?.path.clone(),
@@ -1038,13 +1176,32 @@ impl ProviderBuilder for RustBuilder {
     /// exactly the profile's cleared environment.
     fn plan(
         &self,
-        _worktree: &Path,
+        worktree: &Path,
         settings: &Value,
     ) -> std::io::Result<(ProviderSettings, ProviderLaunchPlan)> {
         let refused =
             |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, what.to_owned());
-        let settings: RustProviderSettings =
+        let mut settings: RustProviderSettings =
             serde_json::from_value(settings.clone()).map_err(|_| refused("provider settings"))?;
+        // Legacy recorded settings already pass the independently admitted provider grant.
+        // Reconstruct only those same declared executables, never process/global tool choices.
+        if settings.configuration.provider.is_none() && settings.configuration.checks.is_none() {
+            let accepted = |path: &Path, identity: &str| -> std::io::Result<Value> {
+                let digest = agent_ide_core::execution::measured_executable_digest(path)
+                    .map_err(|_| refused("provider tool bytes"))?;
+                Ok(
+                    serde_json::json!({"path":path,"identity":identity,"blake3":digest.to_hex().to_string()}),
+                )
+            };
+            settings.configuration.provider = Some(serde_json::json!({
+                "cargo": accepted(&settings.cargo, &settings.cargo_version)?,
+                "rustc": accepted(&settings.rustc, &settings.rustc_version)?,
+                "rustc_version": settings.rustc_version,
+                "cargo_home": settings.cargo_home,
+            }));
+        }
+        crate::environment::resolve(worktree, &settings.configuration)
+            .map_err(|cause| refused(&cause))?;
         let profile = settings
             .profile()
             .map_err(|_| refused("provider profile"))?;
@@ -1098,11 +1255,11 @@ async fn check_plan(incoming: &Incoming, effects: &mut Effects<'_>) -> Result<An
     // another toolchain than this check's configured one refuses before any child or
     // missing-tool answer, exactly as the native checker refuses.
     let base = checker_for(&config, Duration::ZERO, None);
-    if let Some(cause) = crate::environment::pin_conflict(
-        &query.request.worktree,
-        &base.cargo_check_plan(&query.request).toolchain_dir,
-        &query.request.read_denies,
-    ) {
+    let mut context = query.module_config.clone();
+    context.checks = Some(query.config.clone());
+    context.read_denies = query.request.read_denies.clone();
+    let base = base.with_config(context);
+    if let Some(cause) = base.environment_refusal(&query.request) {
         return Ok(reply(&ProblemSnapshot::unavailable_with_detail(
             crate::LANGUAGE,
             UnavailableReason::EnvMissing,
@@ -1308,6 +1465,142 @@ mod tests {
     /// A scratch directory below the canonical temporary directory, removed on drop.
     struct Scratch(PathBuf);
 
+    /// Makes executable fixture tools for planning-only tests; these scripts are never compiler
+    /// version evidence. Every started process remains the test's explicit fake runner.
+    fn prepared_tools(toolchain: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+        for name in ["cargo", "rustc", "rustfmt"] {
+            let path = toolchain.join("bin").join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Current configuration, exact accepted bytes and pins drive both actual native child and
+    /// module recipe launches. Changing the request is fresh without hello/global mutation;
+    /// incompatible/denied/changed evidence refuses identically before either launch.
+    #[test]
+    fn configured_children_share_current_tools_and_refusals() {
+        use agent_ide_core::lang::{LangError, LanguageSupport};
+        use std::os::unix::fs::PermissionsExt;
+        let base = Scratch::new("configured-children");
+        let root = base.0.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"fixture\"\n").unwrap();
+        std::fs::write(
+            root.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel=\"1.98.1\"\n",
+        )
+        .unwrap();
+        let argv = vec!["cargo".into(), "test".into(), "--workspace".into()];
+        let mut contexts = Vec::new();
+        for name in ["generic-a", "generic-b"] {
+            let dir = base.0.join(name);
+            prepared_tools(&dir);
+            let cargo = dir.join("bin/cargo");
+            std::fs::write(&cargo, "#!/bin/sh\nprintf '%s|%s|%s' \"$RUSTUP_AUTO_INSTALL\" \"$RUSTUP_TOOLCHAIN\" \"$1\"\n").unwrap();
+            std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let accepted = |path: PathBuf, identity: &str| json!({"blake3":agent_ide_core::lang::environment::hash_input(&path, &[]).unwrap().to_hex().to_string(), "path":path, "identity":identity});
+            let context = agent_ide_core::modules::contract::ModuleConfig {
+                worktree: Some(root.clone()),
+                provider: Some(
+                    json!({"cargo":accepted(cargo.clone(), "cargo 1.98.1"), "rustc":accepted(dir.join("bin/rustc"), "rustc 1.98.1"), "rustc_version":"rustc 1.98.1"}),
+                ),
+                checks: Some(json!({"toolchain_dir":dir})),
+                ..Default::default()
+            };
+            let env = RustSupport
+                .configured_command_env(&root, &root, "cargo", &context)
+                .unwrap()
+                .unwrap();
+            assert_eq!(env.argv_prefix, [cargo.clone().into_os_string()]);
+            let mut native = std::process::Command::new(&env.argv_prefix[0]);
+            native
+                .args(&argv[1..])
+                .current_dir(&root)
+                .env("RUSTUP_AUTO_INSTALL", "1")
+                .envs(env.vars);
+            let native = native.output().unwrap();
+            assert!(native.status.success());
+            let effect = configured_effect(&argv, &context).unwrap().unwrap();
+            let spec = expand(
+                RECIPES,
+                &effect,
+                &Admission {
+                    worktree: &root,
+                    cache_dir: &base.0.join("cache"),
+                    read_denies: &[],
+                    home: None,
+                    launcher_roots: std::slice::from_ref(&dir),
+                    developer_dirs: &[],
+                    programs: &[],
+                    timeout: Duration::from_secs(10),
+                },
+            )
+            .unwrap();
+            assert_eq!(spec.program, cargo);
+            let replay = std::process::Command::new(&spec.program)
+                .args(&spec.args)
+                .current_dir(&spec.cwd)
+                .env_clear()
+                .envs(spec.env)
+                .output()
+                .unwrap();
+            assert!(replay.status.success());
+            assert_eq!(replay.stdout, native.stdout);
+            assert_eq!(
+                String::from_utf8(native.stdout).unwrap(),
+                format!("0|{}|test", dir.display())
+            );
+            contexts.push(context);
+        }
+        assert_ne!(
+            crate::environment::resolve(&root, &contexts[0])
+                .unwrap()
+                .1
+                .identity,
+            crate::environment::resolve(&root, &contexts[1])
+                .unwrap()
+                .1
+                .identity
+        );
+        let context = &mut contexts[0];
+        context
+            .read_denies
+            .push(agent_ide_core::execution::seatbelt::ReadDeny::Path(
+                root.join("rust-toolchain.toml"),
+            ));
+        let card = RustSupport
+            .configured_environments(&root, context)
+            .remove(0);
+        let Err(LangError::Environment(native)) =
+            RustSupport.configured_command_env(&root, &root, "cargo", context)
+        else {
+            panic!("denied pin must refuse")
+        };
+        let Err(LangError::Environment(module)) = configured_effect(&argv, context) else {
+            panic!("denied pin must refuse")
+        };
+        assert!(card.chosen.is_none());
+        assert_eq!(card.missing_next_step.as_deref(), Some(native.as_str()));
+        assert_eq!(native, module);
+        context.read_denies.clear();
+        let cargo: PathBuf =
+            serde_json::from_value(context.provider.as_ref().unwrap()["cargo"]["path"].clone())
+                .unwrap();
+        std::fs::write(cargo, "changed accepted bytes").unwrap();
+        assert!(matches!(
+            configured_effect(&argv, context),
+            Err(LangError::Environment(_))
+        ));
+        assert!(
+            RustSupport.configured_environments(&root, context)[0]
+                .chosen
+                .is_none()
+        );
+    }
+
     impl Scratch {
         /// Creates `tag` fresh.
         fn new(tag: &str) -> Self {
@@ -1463,25 +1756,35 @@ mod tests {
         .unwrap();
         install();
         let project = RustSupport.detect(&dir.0).expect("a Cargo project");
+        let toolchain = dir.0.join("prepared");
+        prepared_tools(&toolchain);
+        let context = agent_ide_core::modules::contract::ModuleConfig {
+            worktree: Some(dir.0.clone()),
+            checks: Some(json!({"toolchain_dir":toolchain})),
+            ..Default::default()
+        };
         let mut channel = open(Role::Analyzer).await;
-        let plan: Option<EffectRequest> = ask(
+        let plan: payload::FormatPlanAnswer = ask(
             &mut channel,
             Capability::FormatPlan,
             payload::encode(&FormatPlanRequest {
+                config: context.clone(),
                 project: project.clone(),
                 file: "src/lib.rs".into(),
             }),
             Vec::new(),
         )
         .await;
-        let plan = plan.expect("rustfmt applies to a Cargo project");
-        assert_eq!(plan.recipe, "rustfmt");
+        let plan = plan
+            .expect("current tools resolve")
+            .expect("rustfmt applies to a Cargo project");
+        assert_eq!(plan.recipe, "rustfmt_pinned");
         // The core's expansion runs exactly the in-process argument vector: the home tool it
         // resolves for `rustfmt`, then the same arguments, the candidate on stdin.
         let argv = RustSupport
             .format_stdin_command(&project, Path::new("src/lib.rs"))
             .unwrap();
-        let tool = dir.0.join("bin/rustfmt");
+        let tool = toolchain.join("bin/rustfmt");
         let programs = [("rustfmt".to_owned(), tool.clone())];
         let spec = expand(
             RECIPES,
@@ -1491,7 +1794,7 @@ mod tests {
                 cache_dir: &dir.0.join("cache"),
                 read_denies: &[],
                 home: Some(&dir.0),
-                launcher_roots: &[],
+                launcher_roots: std::slice::from_ref(&toolchain),
                 developer_dirs: &[],
                 programs: &programs,
                 timeout: Duration::from_secs(10),
@@ -1508,29 +1811,24 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(spec.cwd, dir.0);
-        // The daemon's own rustup-resolving variables reach the run, as they reach the in-process
-        // formatter through the daemon's environment.
-        for name in FORMATTER_ENV {
-            assert_eq!(
-                spec.env
-                    .iter()
-                    .find(|(key, _)| key == name)
-                    .map(|(_, value)| value.clone()),
-                std::env::var(name).ok(),
-                "{name}"
-            );
-        }
-        let none: Option<EffectRequest> = ask(
+        assert!(
+            spec.env
+                .contains(&("RUSTUP_AUTO_INSTALL".into(), "0".into()))
+        );
+        assert!(spec.env.iter().any(|(key, value)| key == "PATH"
+            && value.starts_with(&toolchain.join("bin").display().to_string())));
+        let none: payload::FormatPlanAnswer = ask(
             &mut channel,
             Capability::FormatPlan,
             payload::encode(&FormatPlanRequest {
+                config: context,
                 project,
                 file: "notes.txt".into(),
             }),
             Vec::new(),
         )
         .await;
-        assert_eq!(none, None);
+        assert_eq!(none, Ok(None));
     }
 
     /// A fake developer directory with a clang and its sibling tools.
@@ -1556,7 +1854,7 @@ mod tests {
             let toolchain = base.0.join("toolchains").join(toolchain_name);
             std::fs::create_dir_all(&worktree).unwrap();
             std::fs::create_dir_all(toolchain.join("bin")).unwrap();
-            std::fs::write(toolchain.join("bin/cargo"), "").unwrap();
+            prepared_tools(&toolchain);
             std::fs::write(base.0.join("outer/Cargo.toml"), "").unwrap();
             let developer = developer(&base.0);
             let config = json!({
@@ -1611,7 +1909,7 @@ mod tests {
         let toolchain = base.0.join("toolchains/stable-aarch64-apple-darwin");
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::create_dir_all(toolchain.join("bin")).unwrap();
-        std::fs::write(toolchain.join("bin/cargo"), "").unwrap();
+        prepared_tools(&toolchain);
         let (mut channel, _) = serve(Role::Checker).await;
         let request = CheckRequest {
             worktree,
@@ -1620,6 +1918,7 @@ mod tests {
             read_denies: Vec::new(),
         };
         let payload = payload::encode(&CheckPlanRequest {
+            module_config: Default::default(),
             request: request.clone(),
             config: json!({"toolchain_dir": toolchain}),
             timeout_ms: 60_000,
@@ -1668,7 +1967,7 @@ mod tests {
         let base = Scratch::new("pin-conflict");
         let toolchain = base.0.join("toolchains/1.98.1-aarch64-apple-darwin");
         std::fs::create_dir_all(toolchain.join("bin")).unwrap();
-        std::fs::write(toolchain.join("bin/cargo"), "").unwrap();
+        prepared_tools(&toolchain);
         std::fs::write(base.0.join("Cargo.toml"), "").unwrap();
         std::fs::write(
             base.0.join("rust-toolchain.toml"),
@@ -1677,6 +1976,7 @@ mod tests {
         .unwrap();
         let (mut channel, _) = serve(Role::Checker).await;
         let payload = payload::encode(&CheckPlanRequest {
+            module_config: Default::default(),
             request: CheckRequest {
                 worktree: base.0.clone(),
                 cache_dir: base.0.join("cache"),
@@ -1772,7 +2072,7 @@ mod tests {
         let toolchain = base.0.join("toolchains/stable-aarch64-apple-darwin");
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::create_dir_all(toolchain.join("bin")).unwrap();
-        std::fs::write(toolchain.join("bin/cargo"), "").unwrap();
+        prepared_tools(&toolchain);
         let overridden = developer(&base.0.join("override"));
         let selected = developer(&base.0.join("Xcode-beta.app/Contents"));
         let request = CheckRequest {
@@ -1801,6 +2101,7 @@ mod tests {
                         scope_key: "scope".into(),
                         revision_key: "revision".into(),
                         payload: payload::encode(&CheckPlanRequest {
+                            module_config: Default::default(),
                             request: request.clone(),
                             config: config.clone(),
                             timeout_ms: 60_000,
@@ -2037,6 +2338,7 @@ mod tests {
         let base = Scratch::new("missing");
         let (mut channel, _) = serve(Role::Checker).await;
         let payload = payload::encode(&CheckPlanRequest {
+            module_config: Default::default(),
             request: CheckRequest {
                 worktree: base.0.clone(),
                 cache_dir: base.0.join("cache"),
@@ -2169,6 +2471,7 @@ mod real_provider_tests {
             std::fs::create_dir_all(namespace.join(dir)).unwrap();
         }
         let settings = RustProviderSettings {
+            configuration: Default::default(),
             binary: analyzer.clone(),
             version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),
             cargo: toolchain.join("bin/cargo"),

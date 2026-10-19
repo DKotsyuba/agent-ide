@@ -3387,9 +3387,15 @@ impl<'a> Worker<'a> {
                         None,
                     ));
                 }
-                match test_selection(&root, crate::lang::TestTarget::File(target), budget, &self.shared.launcher, &job.target)
-                    .await
-                    .map_err(|failure| symbols::module_failure(job, &failure))?
+                match test_selection(
+                    &root,
+                    crate::lang::TestTarget::File(target),
+                    budget,
+                    &self.shared.launcher,
+                    &job.target,
+                )
+                .await
+                .map_err(|failure| symbols::module_failure(job, &failure))?
                 {
                     Ok(selection) => selection,
                     Err(crate::lang::LangError::Unsupported(message)) => return Ok((
@@ -3403,6 +3409,9 @@ impl<'a> Worker<'a> {
                         Some(authority),
                         None,
                     )),
+                    Err(error @ crate::lang::LangError::Environment(_)) => {
+                        return Err(symbols::environment_failure(job, &error));
+                    }
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 }
             } else if let Some(pattern) = job.parameters.get("pattern").and_then(Value::as_str) {
@@ -3428,6 +3437,9 @@ impl<'a> Worker<'a> {
                         Some(authority),
                         None,
                     )),
+                    Err(error @ crate::lang::LangError::Environment(_)) => {
+                        return Err(symbols::environment_failure(job, &error));
+                    }
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 }
             } else if let Some(args) = job.parameters.get("command").and_then(Value::as_array) {
@@ -3462,10 +3474,11 @@ impl<'a> Worker<'a> {
                         value.as_str().map(|value| (key.clone(), value.to_owned()))
                     }));
                 }
-                let Some(language) = detect_test_language(&root, &self.shared.launcher, &job.target)
-                    .await
-                    .map_err(|failure| symbols::module_failure(job, &failure))?
-                    .or_else(|| crate::lang::registered().first().copied())
+                let Some(language) =
+                    detect_test_language(&root, &self.shared.launcher, &job.target)
+                        .await
+                        .map_err(|failure| symbols::module_failure(job, &failure))?
+                        .or_else(|| crate::lang::registered().first().copied())
                 else {
                     return Err(FailureCode::ProviderUnavailable);
                 };
@@ -3540,7 +3553,10 @@ impl<'a> Worker<'a> {
                     path,
                     referencing_tests,
                 };
-                let config = self.shared.launcher.module_config(language, &root, &job.target);
+                let config = self
+                    .shared
+                    .launcher
+                    .module_config(language, &root, &job.target);
                 let project = crate::modules::calls::detect(language, &root, &config)
                     .await
                     .map_err(|failure| symbols::module_failure(job, &failure))?
@@ -3563,6 +3579,9 @@ impl<'a> Worker<'a> {
                         Some(authority),
                         None,
                     )),
+                    Err(error @ crate::lang::LangError::Environment(_)) => {
+                        return Err(symbols::environment_failure(job, &error));
+                    }
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 };
                 let mut bins = std::collections::BTreeSet::new();
@@ -3616,9 +3635,17 @@ impl<'a> Worker<'a> {
                     // the language's declared test recipe: its program, arguments, directory
                     // and complete environment, with no command environment of the language.
                     Some(crate::modules::calls::PlannedStart::Admitted(spec)) => {
-                        let label = super::tests::command_environment_label(&root, &root, language, &self.shared.launcher.module_config(language, &root, &job.target))
-                            .await
-                            .map_err(|failure| symbols::module_failure(job, &failure))?;
+                        let label = super::tests::command_environment_label(
+                            &root,
+                            &root,
+                            language,
+                            &self
+                                .shared
+                                .launcher
+                                .module_config(language, &root, &job.target),
+                        )
+                        .await
+                        .map_err(|failure| symbols::module_failure(job, &failure))?;
                         self.shared.test_runs.start_admitted(
                             root.clone(),
                             spec,
@@ -4998,8 +5025,12 @@ impl<'a> Worker<'a> {
             let mut environments = Vec::new();
             let detection = async {
                 for &language in crate::lang::registered() {
-                    let config = self.shared.launcher.module_config(language, &root, &job.target);
-                    if let Ok(Some(project)) = crate::modules::calls::detect(language, &root, &config).await
+                    let config = self
+                        .shared
+                        .launcher
+                        .module_config(language, &root, &job.target);
+                    if let Ok(Some(project)) =
+                        crate::modules::calls::detect(language, &root, &config).await
                     {
                         if let Ok(resolved) =
                             crate::modules::calls::environments(language, &root, &config).await
@@ -9015,7 +9046,13 @@ async fn test_projects(
 > {
     let mut projects = Vec::new();
     for &language in crate::lang::registered() {
-        if let Some(project) = crate::modules::calls::detect(language, root, &launcher.module_config(language, root, target)).await? {
+        if let Some(project) = crate::modules::calls::detect(
+            language,
+            root,
+            &launcher.module_config(language, root, target),
+        )
+        .await?
+        {
             projects.push((language, project));
         }
     }
@@ -9077,11 +9114,19 @@ async fn test_selection(
             "no supported test runner was detected".to_owned(),
         )));
     };
-    let selection =
-        match crate::modules::calls::test_run(*language, root, project, &target, budget, &launcher.module_config(*language, root, launch_target)).await? {
-            Ok(selection) => selection,
-            Err(error) => return Ok(Err(error)),
-        };
+    let selection = match crate::modules::calls::test_run(
+        *language,
+        root,
+        project,
+        &target,
+        budget,
+        &launcher.module_config(*language, root, launch_target),
+    )
+    .await?
+    {
+        Ok(selection) => selection,
+        Err(error) => return Ok(Err(error)),
+    };
     let count = (!selection.tests.is_empty())
         .then_some(format!("{} tests selected", selection.tests.len()));
     Ok(Ok((

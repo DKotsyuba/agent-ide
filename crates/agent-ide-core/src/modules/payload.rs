@@ -1586,6 +1586,7 @@ mod tests {
         };
         assert_eq!(decode::<DescribeQuery>(encode(&query)), Ok(query));
         let config = crate::modules::contract::ModuleConfig {
+            read_denies: Vec::new(),
             worktree: Some("/w".into()),
             provider: None,
             checks: Some(serde_json::json!({})),

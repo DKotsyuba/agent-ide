@@ -462,22 +462,25 @@ impl RustBackend {
         // The worktree's native environment identity (pin, manifest, lock, Cargo config) from
         // the launch's own accepted facts: a changed lock or config retires the session like a
         // changed tool does, instead of the old child answering from stale inputs.
-        let configured = launch.options::<RustLaunchOptions>().and_then(|options| {
-            let cargo = options.cargo.as_ref()?;
-            Some(crate::environment::ConfiguredToolchain {
-                dir: cargo.path.parent()?,
-                version: options.cargo_version.as_deref(),
-            })
-        });
-        // The analyzer route carries no host read denies; the resolver's deny branch is the
-        // checker path's.
-        let environment = crate::environment::environment(worktree_path, configured.as_ref(), &[]);
+        let configuration = host.module_config(launch, worktree_path);
+        let environment = match crate::environment::resolve(worktree_path, &configuration) {
+            Ok((_, environment)) => environment,
+            Err(cause) => {
+                self.release(host, &binding, true).await;
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("environment: {cause}"),
+                );
+                return Err(FailureCode::ProviderUnavailable);
+            }
+        };
         let start = match module {
             None => Start::InProcess(profile_of(launch, &cache_namespace)?),
             Some(executable) => {
-                let settings =
+                let mut settings =
                     crate::module::RustProviderSettings::from_launch(launch, &cache_namespace)
                         .ok_or(FailureCode::ExecutionProfile)?;
+                settings.configuration = configuration;
                 let inputs = format!(
                     "{}:{:?}:{}",
                     executable.digest.to_hex(),
@@ -508,11 +511,12 @@ impl RustBackend {
         let key = match &start {
             Start::InProcess(profile) => profile.compatibility_key(&worktree),
             Start::Module { inputs, .. } => RustCompatibilityKey::module(inputs, &worktree),
-        };
+        }
+        .with_environment(&environment.identity);
         // A live session whose declared inputs or native environment changed is retired before
         // reuse: this demand restarts on the current declaration instead of being answered by
-        // the old child. The exclusive view is not re-keyed on the environment — the worktree
-        // incarnation did not change; only the child and its inputs go stale.
+        // the old child. The exclusive view is also keyed by this environment, keeping facts
+        // from the previous native inputs out of the new session's cache.
         if let Some(entry) = self.live.get(&binding)
             && entry.live.is_alive()
             && !keeps_rust_session(
@@ -523,6 +527,13 @@ impl RustBackend {
             )
         {
             self.release(host, &binding, true).await;
+        }
+        if self
+            .live
+            .get(&binding)
+            .is_some_and(|entry| entry.live.is_alive())
+        {
+            return Ok(());
         }
         let (command, program) = match &start {
             Start::InProcess(profile) => (
