@@ -608,8 +608,8 @@ pub const RECIPES: &[EffectRecipe] = &[
 
 /// The recipe request of a formatter or probe argument vector the in-process support builds
 /// ([`crate::support`]), under this request's accepted facts: a compiler or Node-pin
-/// obstruction refuses before any recipe is generated (never an ambient fallback), and every
-/// other shape answers exactly as [`interactive_effect`] does.
+/// obstruction refuses configured Node consumers before admission. The separately selected
+/// operator Prettier tool keeps its existing recipe; unrelated shapes remain unclaimed.
 ///
 /// # Errors
 ///
@@ -619,7 +619,6 @@ pub fn configured_effect(
     config: &agent_ide_core::modules::contract::ModuleConfig,
     cwd: &Path,
 ) -> Result<Option<EffectRequest>, agent_ide_core::lang::LangError> {
-    crate::environment::admit_effects(cwd, config)?;
     // The same runner-shape refusal the native argv route enforces: `npx`-runner test shapes
     // execute the project's Node runtime through an operator `npx` this request does not
     // configure. `node --test` shapes run the configured Node slot; the Prettier formatter
@@ -627,7 +626,14 @@ pub fn configured_effect(
     if let Some(cause) = crate::environment::runner_shape_refusal(argv) {
         return Err(agent_ide_core::lang::LangError::Environment(cause));
     }
-    Ok(interactive_effect(argv))
+    let effect = interactive_effect(argv);
+    if effect
+        .as_ref()
+        .is_some_and(|effect| effect.recipe != "prettier-npx")
+    {
+        crate::environment::admit_effects(cwd, config)?;
+    }
+    Ok(effect)
 }
 
 /// The recipe request of a formatter or probe argument vector the in-process support builds
@@ -989,27 +995,6 @@ impl CheckerServer {
             crate::LANGUAGE,
             query.selections,
         );
-        // The confined checker's Node bytes guard: a same-path replaced Node cannot execute
-        // under stale accepted facts. The binding uses configured_tools, which resolves the
-        // actual checker Node and its accepted digest from the request's module_config; a
-        // legitimate foreign provider or unbound operator Node is not verified (the guard is
-        // business-unavailable, not a protocol fault).
-        if let Some(tools) = crate::environment::configured_tools(&query.module_config) {
-            if let Some(cause) = crate::environment::verify_configured_node(
-                &tools.node,
-                tools.node_digest.as_deref(),
-                &query.request.read_denies,
-            ) {
-                let snapshot = agent_ide_core::checks::ProblemSnapshot::unavailable_with_detail(
-                    crate::LANGUAGE,
-                    agent_ide_core::checks::UnavailableReason::EnvMissing,
-                    query.request.input_generation,
-                    0,
-                    Some(cause),
-                );
-                return Ok(agent_ide_core::modules::payload::encode(&snapshot));
-            }
-        }
         let config = TypeScriptChecks
             .parse_config(query.config)
             .map_err(|error| ServeError::Protocol(error.to_string()))?;
@@ -1024,6 +1009,7 @@ impl CheckerServer {
             config.tsc_cli().to_path_buf(),
             std::time::Duration::from_millis(query.timeout_ms),
         )
+        .with_config(query.module_config)
         .without_staging();
         let check = agent_ide_core::checks::Checker::check(&checker, query.request);
         tokio::pin!(check);
@@ -1356,6 +1342,157 @@ mod tests {
             "no staging by the module: {}",
             layout.base.display()
         );
+    }
+
+    /// Both actual checker entry points bind accepted facts to their executed Node, refuse a
+    /// same-length replacement before any effect, preserve case-equivalent digests and leave
+    /// foreign-provider/operator checks to their existing qualification. Fake successful
+    /// compiler output is deliberately absent: positive cases prove dispatch, not clean checks.
+    #[tokio::test]
+    async fn configured_checkers_verify_the_actual_node_before_dispatch() {
+        use agent_ide_core::{
+            checks::{CheckState, ProblemSnapshot, UnavailableReason},
+            modules::{
+                contract::{ModuleConfig, Outcome},
+                fake::{FakeEffects, in_memory, offer},
+                host::Call,
+            },
+        };
+        agent_ide_core::lang::install(&[crate::LANGUAGE]);
+        let (layout, request, section, node, _) = layout("accepted-node");
+        std::fs::write(&node, b"accepted-node").unwrap();
+        let accepted = serde_json::json!({
+            "path": node,
+            "identity": "v22.11.0",
+            "blake3": agent_ide_core::lang::environment::hash_input(&node, &[])
+                .unwrap().to_hex().to_string().to_uppercase(),
+        });
+        let configuration = ModuleConfig {
+            provider: Some(serde_json::json!({"node": accepted})),
+            checks: Some(section.clone()),
+            ..Default::default()
+        };
+        let support = SupportServer::new(crate::LANGUAGE, env!("CARGO_PKG_VERSION"));
+        let server = CheckerServer { support };
+        let hello = offer(
+            server.declaration().module_id,
+            env!("CARGO_PKG_VERSION"),
+            Role::Checker,
+            1,
+        );
+        let (mut channel, _) = in_memory(server, hello).await.unwrap();
+        for case in [
+            "uppercase",
+            "provider-only",
+            "range-adapter",
+            "changed",
+            "denied",
+            "foreign",
+            "unbound",
+            "actual-node",
+        ] {
+            std::fs::write(
+                &node,
+                if case == "changed" {
+                    b"modified-node"
+                } else {
+                    b"accepted-node"
+                },
+            )
+            .unwrap();
+            let mut config = configuration.clone();
+            let mut request = request.clone();
+            let _ = std::fs::remove_file(request.worktree.join(".nvmrc"));
+            if case == "provider-only" {
+                config.checks = None;
+            }
+            if case == "range-adapter" {
+                // The real confined adapter validates ranges after Node-byte admission.
+                // Raw-command range refusal must not replace that existing validator.
+                std::fs::write(request.worktree.join(".nvmrc"), ">=999\n").unwrap();
+            }
+            if case == "denied" {
+                request
+                    .read_denies
+                    .push(agent_ide_core::execution::seatbelt::ReadDeny::Path(
+                        node.clone(),
+                    ));
+            }
+            if case == "foreign" {
+                config.provider.as_mut().unwrap()["node"]["path"] =
+                    encode(&layout.base.join("other-node"));
+            }
+            if case == "unbound" {
+                config.provider = None;
+            }
+            if case == "actual-node" {
+                // Request config selects `node`; stale context.checks is not executable authority.
+                config.checks.as_mut().unwrap()["node"] = encode(&layout.base.join("other-node"));
+                std::fs::write(&node, b"modified-node").unwrap();
+            }
+            let expected = match case {
+                "changed" | "actual-node" => UnavailableReason::EnvMissing,
+                "denied" => UnavailableReason::ReadRestricted,
+                _ => UnavailableReason::Fatal,
+            };
+            let refused = matches!(case, "changed" | "actual-node" | "denied");
+            let runner = Arc::new(FakeRunner::default());
+            let checker = TypeScriptChecks
+                .parse_config(section.clone())
+                .unwrap()
+                .configured_checker(runner.clone(), Duration::from_secs(5), config.clone());
+            let native = checker.check(request.clone()).await;
+            assert_eq!(
+                native.state,
+                CheckState::Unavailable(expected),
+                "native {case}"
+            );
+            assert_eq!(runner.specs().len(), usize::from(!refused), "native {case}");
+            if !refused {
+                assert_eq!(runner.specs()[0].program, node);
+            }
+            let mut effects = FakeEffects {
+                stdout: Vec::new(),
+                runs: 0,
+                last: None,
+            };
+            let reply = channel
+                .call(
+                    Call {
+                        capability: Capability::CheckPlan,
+                        scope_key: "scope".into(),
+                        revision_key: case.into(),
+                        payload: encode(&CheckPlanRequest {
+                            request: request.clone(),
+                            config: section.clone(),
+                            module_config: config,
+                            timeout_ms: 5000,
+                            selections: Vec::new(),
+                        }),
+                        attachments: Vec::new(),
+                    },
+                    Duration::from_secs(5),
+                    &mut effects,
+                )
+                .await
+                .unwrap();
+            let Outcome::Result(value) = reply.outcome else {
+                panic!("{case}: {:?}", reply.outcome)
+            };
+            let snapshot: ProblemSnapshot = decode(value).unwrap();
+            assert_eq!(
+                snapshot.state,
+                CheckState::Unavailable(expected),
+                "module {case}"
+            );
+            assert_eq!(snapshot.input_generation, request.input_generation);
+            assert_eq!(effects.runs, u32::from(!refused), "module {case}");
+            assert!(
+                channel.fault().is_none(),
+                "environment refusal must not poison the module"
+            );
+        }
+        channel.shutdown().await;
     }
 
     /// Provider and checks `describe` reject malformed input as typed errors, and the presence

@@ -390,30 +390,8 @@ pub fn admit_effects(worktree: &Path, config: &ModuleConfig) -> Result<(), LangE
     if let Some(cause) = cause {
         return Err(LangError::Environment(cause));
     }
-    // The accepted declaration's Node digest is the only content fact this request carries:
-    // same-path replacement must refuse before any claimed child runs, exactly like a
-    // changed compiler.
-    if let Some(digest) = &tools.node_digest {
-        match agent_ide_core::lang::environment::hash_input(&tools.node, &config.read_denies) {
-            None => {
-                return Err(LangError::Environment(
-                    "the configured Node could not be read for verification — IDE commands \
-                     refuse; restore the accepted executable"
-                        .to_owned(),
-                ));
-            }
-            Some(current) if !current.to_hex().eq_ignore_ascii_case(digest.as_str()) => {
-                return Err(LangError::Environment(
-                    "the configured Node's bytes changed since acceptance — IDE commands \
-                     refuse the modified executable; restore the accepted Node or re-provision \
-                     the launcher declaration"
-                        .to_owned(),
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(())
+    verify_configured_node(&tools.node, config, &config.read_denies)
+        .map_err(|(_, cause)| LangError::Environment(cause))
 }
 
 /// Activation of `program` under this request's configured tools, resolved before any
@@ -527,32 +505,45 @@ pub fn runner_shape_refusal(argv: &[String]) -> Option<String> {
     })
 }
 
-/// The Node bytes guard for the confined checker route: re-measures the configured Node
-/// against the accepted digest before the runner starts. `Ok(())` when no digest is bound
-/// (unbound/provider-only scope) or the bytes match; `Err(cause)` on missing/denied/changed.
-/// The confined checker calls this from its own `configured_checker`/`check_plan` seam so a
-/// same-path replaced Node cannot execute under stale accepted facts.
-pub fn verify_configured_node(
+/// Remeasures only accepted provider facts bound to the actual `node` a consumer will run.
+/// A different/unbound operator Node keeps its existing checker qualification. Matching facts
+/// must be well formed and current; denied reads yield ReadRestricted, missing/changed bytes
+/// yield EnvMissing with native recovery. This bytes-only guard leaves range validation to
+/// the confined adapter and semantic provider instead of imposing raw-command pin rules.
+pub(crate) fn verify_configured_node(
     node: &Path,
-    accepted_digest: Option<&str>,
+    config: &ModuleConfig,
     denies: &[ReadDeny],
-) -> Result<(), String> {
-    let Some(digest) = accepted_digest else {
+) -> Result<(), (agent_ide_core::checks::UnavailableReason, String)> {
+    use agent_ide_core::{assistance::launcher::AcceptedExecutable, checks::UnavailableReason};
+    let Some(fact) = config
+        .provider
+        .as_ref()
+        .and_then(|provider| provider.get("node"))
+    else {
         return Ok(());
     };
-    match agent_ide_core::lang::environment::hash_input(node, denies) {
-        None => Err(
-            "the configured Node could not be read for verification — IDE commands refuse; \
-             restore the accepted executable"
-                .to_owned(),
-        ),
-        Some(current) if current.to_hex().as_str() != digest.as_str() => Err(format!(
-            "the configured Node's bytes changed since acceptance — IDE commands refuse the \
-             modified executable; restore the accepted Node or re-provision the launcher \
-             declaration"
-        )),
-        Some(_) => Ok(()),
+    if fact.get("path").and_then(Value::as_str).map(Path::new) != Some(node) {
+        return Ok(());
     }
+    if node
+        .ancestors()
+        .any(|path| denies.iter().any(|deny| deny.matches(path)))
+    {
+        return Err((
+            UnavailableReason::ReadRestricted,
+            "the configured Node is read restricted; use native tooling".into(),
+        ));
+    }
+    let accepted = serde_json::from_value::<AcceptedExecutable>(fact.clone()).ok();
+    if accepted.as_ref().is_some_and(|accepted| {
+        accepted.validate().is_ok()
+            && agent_ide_core::lang::environment::hash_input(node, denies)
+                .is_some_and(|hash| hash.to_hex().eq_ignore_ascii_case(&accepted.blake3))
+    }) {
+        return Ok(());
+    }
+    Err((UnavailableReason::EnvMissing, "the configured Node's bytes changed since acceptance, are missing or unqualified; restore the accepted Node or re-provision the launcher, or use native tooling".into()))
 }
 
 /// The environments of `worktree` under this request's configured tools and read excludes:
@@ -1021,18 +1012,18 @@ mod tests {
         );
         assert!(command_env(&root, "node", &config).is_err());
         assert!(command_env(&root, "tsc", &config).is_err());
-        // The current measured content participates in the identity: the replaced bytes move
-        // it, and restoring the original bytes moves it back.
+        // Current measured content participates in the identity. Restoring accepted bytes
+        // restores usability, while the file's changed object stamp still invalidates reuse.
         let replaced_identity = environment(&root, Some(&tools), &config, &[]).identity;
         assert_ne!(
             replaced_identity, before,
             "replaced bytes move the identity"
         );
         std::fs::write(&node, &original).unwrap();
-        assert_eq!(
+        assert!(admit_effects(&root, &config).is_ok());
+        assert_ne!(
             environment(&root, Some(&tools), &config, &[]).identity,
-            before,
-            "restored bytes restore the identity"
+            replaced_identity
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1116,10 +1107,29 @@ mod tests {
                 "native route refuses: {runner_args:?}"
             );
             assert!(
-                crate::module::configured_effect(&runner_args, &config).is_err(),
+                crate::module::configured_effect(&runner_args, &config, &root).is_err(),
                 "module planner refuses: {runner_args:?}"
             );
         }
+        // An unsupported raw Node pin cannot veto unrelated commands or the separately
+        // selected operator formatter in either route.
+        put(&root, ".nvmrc", ">=999\n");
+        let prettier = vec![
+            "npx".into(),
+            "prettier".into(),
+            "--stdin-filepath".into(),
+            "a.ts".into(),
+        ];
+        assert!(
+            crate::module::configured_effect(&prettier, &config, &root)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            crate::module::configured_effect(&["npm".into(), "test".into()], &config, &root)
+                .unwrap()
+                .is_none()
+        );
         // The operator formatting tool and unclaimed programs stay unclaimed in the native
         // route (the module planner formats through the accepted shape).
         assert_eq!(

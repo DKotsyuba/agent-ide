@@ -245,6 +245,8 @@ pub struct TypeScriptChecker {
     /// Whether this checker writes the adapter and the temporary directory into the cache itself
     /// (the in-process checker does; in module mode the core stages both before the run).
     stages: bool,
+    /// Immutable accepted provider facts for this checker; absent preserves operator-only use.
+    configuration: Option<agent_ide_core::modules::contract::ModuleConfig>,
 }
 
 impl TypeScriptChecker {
@@ -261,7 +263,19 @@ impl TypeScriptChecker {
             tsc_cli,
             timeout,
             stages: true,
+            configuration: None,
         }
+    }
+
+    /// Retains the current launcher facts for per-run verification against this checker's
+    /// actual Node. A foreign provider never supplies this Node's identity or pin proof.
+    #[must_use]
+    pub(crate) fn with_config(
+        mut self,
+        config: agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Self {
+        self.configuration = Some(config);
+        self
     }
 
     /// The same checker without any cache write of its own: the run's host stages the adapter and
@@ -392,6 +406,21 @@ impl Checker for TypeScriptChecker {
     fn check(&self, request: CheckRequest) -> BoxFuture<'_, ProblemSnapshot> {
         Box::pin(async move {
             let generation = request.input_generation;
+            if let Some(configuration) = &self.configuration
+                && let Err((reason, cause)) = crate::environment::verify_configured_node(
+                    &self.node,
+                    configuration,
+                    &request.read_denies,
+                )
+            {
+                return ProblemSnapshot::unavailable_with_detail(
+                    crate::LANGUAGE,
+                    reason,
+                    generation,
+                    0,
+                    Some(cause),
+                );
+            }
             let Some(config) = select_config(&request.worktree, &request.read_denies) else {
                 return ProblemSnapshot::unavailable(
                     crate::LANGUAGE,
@@ -423,6 +452,7 @@ impl Checker for TypeScriptChecker {
                 tsc_cli,
                 timeout: self.timeout,
                 stages: self.stages,
+                configuration: self.configuration.clone(),
             };
             let spec = effective.run_spec(&request, &config);
             if [&self.node, &effective.tsc_cli].iter().any(|tool| {
@@ -894,6 +924,20 @@ impl CheckConfig for ProjectTypeScriptChecksConfig {
             self.tsc_cli.clone(),
             timeout,
         ))
+    }
+
+    /// Keeps immutable current provider facts on the native checker. Node bytes are checked
+    /// before every dispatch; compiler selection and adapter constraint validation stay intact.
+    fn configured_checker(
+        &self,
+        runner: Arc<dyn ConfinedRunner>,
+        timeout: Duration,
+        config: agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Arc<dyn Checker> {
+        Arc::new(
+            TypeScriptChecker::new(runner, self.node.clone(), self.tsc_cli.clone(), timeout)
+                .with_config(config),
+        )
     }
 
     /// Node, then the `tsc` module run by Node.

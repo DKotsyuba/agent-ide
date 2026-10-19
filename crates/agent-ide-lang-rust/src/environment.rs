@@ -50,9 +50,7 @@ pub(crate) fn tools(
                     .iter()
                     .any(|deny| deny.matches(&accepted.path))
                 || hash_input(&accepted.path, &config.read_denies)
-                    .map(|hash| hash.to_hex().to_string())
-                    .as_deref()
-                    != Some(accepted.blake3.as_str())
+                    .is_none_or(|hash| !hash.to_hex().eq_ignore_ascii_case(&accepted.blake3))
             {
                 return Err(format!(
                     "accepted {name} is changed, denied or unqualified; use native cargo"
@@ -848,6 +846,18 @@ fn native_inputs(worktree: &Path, denies: &[ReadDeny]) -> Result<Vec<PathBuf>, S
     native_inputs_at(worktree, worktree, denies)
 }
 
+/// Whether the file's nearest package belongs to the root check's supported Cargo closure.
+/// Unsupported/blocked discovery is unknown, never evidence that a root check compiled it.
+/// This reuses native input discovery, including explicit members and local dependencies.
+pub(crate) fn checked_package(worktree: &Path, file: &Path) -> Result<bool, String> {
+    let file = input_path(worktree, &worktree.join(file), &[])?;
+    let package = project_root(worktree, file.parent().unwrap_or(worktree), &[])?;
+    if manifest_text(worktree, &package, &[])?.is_none() {
+        return Ok(false);
+    }
+    Ok(native_inputs(worktree, &[])?.contains(&package.join("Cargo.toml")))
+}
+
 /// The nearest authoritative cwd pin inside the admitted boundary. Other members' pins do not
 /// govern a root command; a separately selected project resolves its own pin first.
 fn pin_root(worktree: &Path, active: &Path, denies: &[ReadDeny]) -> Result<PathBuf, String> {
@@ -1026,6 +1036,91 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, body).unwrap();
+    }
+
+    /// Accepted hexadecimal digests have the same case-insensitive semantics as the launcher.
+    #[test]
+    fn uppercase_accepted_tool_digests_are_equivalent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = ScratchDir::new("rust-uppercase-tools");
+        let mut provider = serde_json::json!({"rustc_version":"rustc 1.98.1"});
+        for name in ["cargo", "rustc"] {
+            let path = root.join("bin").join(name);
+            put(&root, &format!("bin/{name}"), format!("accepted {name}"));
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            provider[name] = serde_json::json!({
+                "path": path,
+                "identity": if name == "rustc" { "rustc 1.98.1" } else { "cargo 1.98.1" },
+                "blake3": hash_input(&path, &[]).unwrap().to_hex().to_string().to_uppercase(),
+            });
+        }
+        let config = agent_ide_core::modules::contract::ModuleConfig {
+            provider: Some(provider),
+            ..Default::default()
+        };
+        assert_eq!(tools(&config).unwrap().dir, root.0);
+        put(&root, "bin/cargo", "modified cargo");
+        assert!(tools(&config).is_err());
+    }
+
+    /// Excluded independent crates cannot borrow root clean results; real path dependencies
+    /// remain covered, while unsupported scope stays explicitly not analysed.
+    #[test]
+    fn check_applicability_uses_the_actual_cargo_closure() {
+        use agent_ide_core::checks::LanguageChecks;
+        let root = ScratchDir::new("rust-check-scope");
+        put(
+            &root,
+            "Cargo.toml",
+            "[workspace]\nmembers=[\"crates/app\"]\nexclude=[\"legacy\"]\n",
+        );
+        put(
+            &root,
+            "crates/app/Cargo.toml",
+            "[package]\nname=\"app\"\n[dependencies]\nsupport={path=\"../support\"}\n",
+        );
+        for package in ["crates/support", "legacy"] {
+            put(
+                &root,
+                &format!("{package}/Cargo.toml"),
+                "[package]\nname=\"other\"\n",
+            );
+        }
+        for package in ["crates/app", "crates/support", "legacy"] {
+            put(
+                &root,
+                &format!("{package}/src/lib.rs"),
+                "pub fn value() {}\n",
+            );
+        }
+        let checks = crate::checks::RustChecks;
+        for package in ["crates/app", "crates/support"] {
+            assert_eq!(
+                checks.not_analysed(&root, Path::new(&format!("{package}/src/lib.rs"))),
+                None
+            );
+        }
+        let legacy = Path::new("legacy/src/lib.rs");
+        assert!(
+            checks
+                .not_analysed(&root, legacy)
+                .unwrap()
+                .contains("outside the root Cargo check scope")
+        );
+        assert_eq!(
+            checks.not_analysed(&root.join("legacy"), Path::new("src/lib.rs")),
+            None
+        );
+        put(
+            &root,
+            "Cargo.toml",
+            "[workspace]\nmembers=[\"crates/**\"]\n",
+        );
+        assert!(
+            checks
+                .not_analysed(&root, Path::new("crates/app/src/lib.rs"))
+                .is_some()
+        );
     }
 
     /// Misleading names, unknown/Cargo identities and prerelease/substring shortcuts never

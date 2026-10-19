@@ -999,14 +999,19 @@ impl LanguageChecks for RustChecks {
         Some("target")
     }
 
-    /// A `.rs` file no build target of its package reaches through `mod` declarations, or reaches
-    /// only behind a `cfg`/`path` gate, may never be compiled by `cargo check` (see the private
-    /// `module_graph` walk, which names which of the two it is).
+    /// Root checks apply only to their supported Cargo member/local-dependency closure, then
+    /// to files unconditionally reached by that package's module graph. Excluded packages and
+    /// unknown native scope never inherit a root check's clean result.
     fn not_analysed(&self, worktree: &Path, path: &Path) -> Option<&'static str> {
-        path.extension()
-            .is_some_and(|extension| extension == "rs")
-            .then(|| crate::module_graph::unreached(worktree, path))
-            .flatten()
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            return None;
+        }
+        if crate::environment::checked_package(worktree, path) != Ok(true) {
+            return Some(
+                "rust check may not have compiled this file — its package is outside the root Cargo check scope or that scope cannot be verified; run native cargo for this package",
+            );
+        }
+        crate::module_graph::unreached(worktree, path)
     }
 
     /// Decodes [`ProjectRustChecksConfig`].
