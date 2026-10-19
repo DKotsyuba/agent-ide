@@ -215,6 +215,9 @@ pub(super) struct Detail {
     /// `diff_page` (T09B): never serialized into a `PeerReply`, exists only to resume the same
     /// owner cursor without a second Claude foreground-helper run or daemon source re-read.
     context_page: Option<ContextPageState>,
+    /// Complete safe test replay JSON on its own output cursor; raw runner output is separate.
+    /// Shares this detail's owner, authority and lifetime, without reserving another detail slot.
+    test_replay: Option<ContextPageState>,
     /// Same first-page semantics as `diff_page_fresh`, for `context_page`.
     context_page_fresh: bool,
     /// Bounded paths a completed managed Diff or semantic Context detail represents: diff paths
@@ -392,9 +395,10 @@ impl ContextPageState {
             return Err(FailureCode::InvalidDetail);
         }
         if requested < self.page {
+            let result_reference = reference.strip_suffix("/replay").unwrap_or(reference);
             let text = format!(
                 "output page {requested} already delivered; result: ide.test {}",
-                serde_json::json!({"detail_ref": reference})
+                serde_json::json!({"detail_ref": result_reference})
             );
             return Ok((
                 PeerReply::Complete {
@@ -1261,7 +1265,8 @@ impl Shared {
         }
         (text, owns_detail.then_some(result.detail_ref.clone()))
     }
-    /// Retains the compact completion and its explicit output cursor before advertising a result.
+    /// Retains the compact completion, complete replay JSON and independent raw-output cursor
+    /// before advertising a result. Replay also exists for a run with empty stdout/stderr.
     /// Only the original binding may write the detail. Repeated reads refresh the same compact
     /// receipt without resetting the log cursor; missing details keep the run's output intact.
     /// The saved completion survives the test-history TTL/four-run limit for the session's own
@@ -1280,6 +1285,18 @@ impl Shared {
                 truncated: false,
                 continuation: false,
             };
+            if detail.test_replay.is_none() && !result.command.is_empty() {
+                detail.test_replay = Some(ContextPageState::new(
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "cwd": result.rerun_dir.as_deref().unwrap_or("."),
+                        "argv": result.command,
+                    }))
+                    .expect("replay contains only serializable strings"),
+                    0,
+                    false,
+                    ResultKind::Test,
+                ));
+            }
             if !result.output_paged
                 && !result.output.is_empty()
                 && self
@@ -2806,6 +2823,7 @@ impl WorkerHandle {
                     diff_page: None,
                     diff_page_fresh: false,
                     context_page: None,
+                    test_replay: None,
                     context_page_fresh: false,
                     diff_provenance: None,
                     extra_sources: Vec::new(),
@@ -7600,13 +7618,15 @@ async fn reprove_disclosure(
 /// an authorization, freshness or encoding refusal never records that page as delivered.
 /// A cancelled inspection retains its composed source page for the next retrieval.
 /// Test results keep their compact body under the original reference; numbered `/output/N`
-/// references deliver log pages once, advancing only after a successful receiver handoff.
+/// references deliver raw log pages, and `/replay/output/N` delivers complete safe replay JSON
+/// on an independent cursor under the same owner/authority/lifetime proof. Both advance only
+/// after a successful receiver handoff; explicit output recovery advances neither cursor.
 async fn serve_inspection(
     workspace: &DurableWorkspace<'_>,
     shared: &Shared,
     mut request: Inspection,
 ) {
-    let output_page = request
+    let mut output_page = request
         .reference
         .rsplit_once("/output/")
         .filter(|(_, page)| !page.is_empty() && page.bytes().all(|byte| byte.is_ascii_digit()))
@@ -7616,6 +7636,14 @@ async fn serve_inspection(
                 .filter(|page| *page > 0)
                 .map(|page| (base.to_owned(), page))
         });
+    let replay_output = output_page.as_mut().is_some_and(|(base, _)| {
+        if let Some(original) = base.strip_suffix("/replay") {
+            *base = original.to_owned();
+            true
+        } else {
+            false
+        }
+    });
     if let Some((base, _)) = &output_page {
         request.reference.clone_from(base);
     }
@@ -7740,6 +7768,14 @@ async fn serve_inspection(
         let invalidate = |code: FailureCode| {
             shared.set_diff_page(&request.reference, None);
             shared.set_context_page(&request.reference, None);
+            if let Ok(mut ledger) = shared.ledger.lock()
+                && let Some(detail) = ledger.details.get_mut(&request.reference)
+            {
+                detail.test_replay = None;
+                if detail.selection.0 == AssistanceTool::Test {
+                    detail.reply = PeerReply::Error {code: code.clone(), detail: None};
+                }
+            }
             code
         };
         let complete_edit = matches!(&reply, PeerReply::Edit { result, .. } if result.outcome.has_post_source())
@@ -7806,18 +7842,18 @@ async fn serve_inspection(
                 .get_mut(&request.reference)
                 .filter(|detail| detail.binding == request.binding)
                 .ok_or_else(|| InspectFailure::new(FailureCode::InvalidDetail))?;
-            let page = detail
-                .context_page
+            let page = (if replay_output { &detail.test_replay } else { &detail.context_page })
                 .as_ref()
                 .filter(|page| page.kind == ResultKind::Test)
                 .ok_or_else(|| InspectFailure::new(FailureCode::InvalidDetail))?;
+            let page_reference = if replay_output { format!("{}/replay", request.reference) } else { request.reference.clone() };
             if request.recover_test_output {
                 return page
-                    .recover_test_output_page(&request.reference, requested)
+                    .recover_test_output_page(&page_reference, requested)
                     .map_err(InspectFailure::new);
             }
             let (reply, next) = page
-                .test_output_page(&request.reference, requested)
+                .test_output_page(&page_reference, requested)
                 .map_err(InspectFailure::new)?;
             output_advance = Some(next);
             return Ok(reply);
@@ -7979,7 +8015,11 @@ async fn serve_inspection(
             && let Some(detail) = ledger.details.get_mut(&request.reference)
             && detail.binding == request.binding
         {
-            detail.context_page = Some(next);
+            if replay_output {
+                detail.test_replay = Some(next);
+            } else {
+                detail.context_page = Some(next);
+            }
         }
         shared.mark_diff_body_delivered(&request.binding, &request.reference, &reply);
         if terminal {
@@ -9053,15 +9093,26 @@ pub(super) fn display_argv(argv: &[String]) -> String {
                     }
                 })
                 .collect::<String>();
-            if printable
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_./:-".contains(&byte))
+            if !printable.is_empty()
+                && printable
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_./:-".contains(&byte))
             {
                 printable
             } else {
                 format!("'{}'", printable.replace('\'', "'\\''"))
             }
         })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Quotes exact argv for shell replay, preserving control bytes inside single-quoted arguments.
+/// Use only inside retained JSON or another quoted shell word, never as a compact display line.
+/// No expansion or execution occurs; apostrophes are escaped by ending and reopening the quote.
+pub(super) fn shell_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -11541,6 +11592,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -11862,6 +11914,7 @@ mod stop_retry_tests {
                     diff_page: None,
                     diff_page_fresh: false,
                     context_page: None,
+                    test_replay: None,
                     context_page_fresh: false,
                     diff_provenance: None,
                     extra_sources: Vec::new(),
@@ -12269,6 +12322,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -12338,6 +12392,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -12492,6 +12547,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -12532,6 +12588,7 @@ mod stop_retry_tests {
                             diff_page: None,
                             diff_page_fresh: false,
                             context_page: None,
+                            test_replay: None,
                             context_page_fresh: false,
                             diff_provenance: None,
                             extra_sources: Vec::new(),
@@ -13632,6 +13689,7 @@ mod stop_retry_tests {
             diff_page: None,
             diff_page_fresh: false,
             context_page: None,
+            test_replay: None,
             context_page_fresh: false,
             diff_provenance: None,
             extra_sources: Vec::new(),
@@ -14355,6 +14413,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -15249,6 +15308,377 @@ mod stop_retry_tests {
         }
     }
 
+    /// A real mixed batch retains complete actual replay behind the owner's existing detail,
+    /// including long PATHs, quoted/control arguments, distinct environments/cwd and the first
+    /// nonzero exit. Ordinary continuation pages reconstruct JSON byte-for-byte and execute
+    /// identically; recovery and repeats preserve independent raw stdout state. A real boot
+    /// change invalidates authority and releases both payloads, keeping a compact typed refusal.
+    /// Foreign/wrong-tool/expired/beyond-end references disclose none; silent output still replays.
+    #[tokio::test]
+    async fn full_batch_replay_is_owned_recoverable_and_preserves_raw_output() {
+        use crate::assistance::tests::{
+            BatchCommand, BatchLaunch, BatchPlan, BatchTarget, CommandResolution, StartResult,
+        };
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        let root = fixture.root.clone();
+        let cwd = root.join("pkg");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, authority) =
+            activate_worktree(&mut worker, "replay-owner", "replay-start").await;
+        let reference = "full-replay-detail";
+        retain_detail(
+            &worker,
+            &binding,
+            reference,
+            AssistanceTool::Test,
+            &authority,
+        );
+        let path = format!("/native 'quoted' $path/{}/bin", "p".repeat(40_000));
+        let other_path = format!("/admitted/{}/bin", "q".repeat(40_000));
+        let literal = "literal 'quotes' $value\nsecond line";
+        let script = "printf '%s|%s|%s|%s\\n' \"$MARKER\" \"$PATH\" \"$1\" \"$PWD\"; exit \"$2\"";
+        let args = |exit: &str| {
+            vec![
+                "-c".to_owned(),
+                script.into(),
+                "label".into(),
+                literal.into(),
+                exit.into(),
+            ]
+        };
+        let native = BatchLaunch {
+            targets: vec![0],
+            language: crate::lang::testing::ALPHA,
+            argv: std::iter::once("unused-planning-label".to_owned())
+                .chain(args("7"))
+                .collect(),
+            start: BatchCommand::Resolved(CommandResolution {
+                resolved: Some(crate::lang::environment::CommandEnv {
+                    argv_prefix: vec!["/bin/sh".into()],
+                    path_prefix: None,
+                    vars: vec![
+                        ("PATH".into(), path.clone().into()),
+                        ("MARKER".into(), "native".into()),
+                    ],
+                }),
+                environment_label: None,
+            }),
+        };
+        let admitted = BatchLaunch {
+            targets: vec![1],
+            language: crate::lang::testing::ALPHA,
+            argv: vec!["recipe-display-label".into()],
+            start: BatchCommand::Admitted(crate::checks::runner::RunSpec {
+                program: "/bin/sh".into(),
+                args: args("3")
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect(),
+                cwd: cwd.clone(),
+                env: vec![
+                    ("MARKER".into(), "admitted".into()),
+                    ("PATH".into(), other_path.clone()),
+                ],
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                read_denies: Vec::new(),
+                timeout: Duration::from_secs(5),
+                max_output_bytes: 128 * 1024,
+            }),
+        };
+        let plan = BatchPlan {
+            targets: vec![
+                BatchTarget {
+                    label: "native".into(),
+                    settled: None,
+                },
+                BatchTarget {
+                    label: "admitted".into(),
+                    settled: None,
+                },
+            ],
+            launches: vec![native, admitted],
+            rerun: (vec!["never-executed-plan".into()], None),
+            budget: Duration::from_secs(10),
+            detail_ref: reference.into(),
+        };
+        let id = match worker
+            .shared
+            .test_runs
+            .start_batch(root.clone(), &binding, plan)
+        {
+            StartResult::Started(id) => id,
+            _ => panic!("batch must start"),
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(result) = worker.shared.test_runs.settled_result(id) {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.exit, Some(7));
+        assert!(result.targets[0].contains("no test results (exit 7)"));
+        assert!(result.targets[1].contains("no test results (exit 3)"));
+        assert!(
+            result
+                .targets
+                .iter()
+                .all(|target| !target.contains("passed"))
+        );
+        worker.shared.retain_test_output(id, &binding, &result);
+        let summary = test_result_text(id, &result, true, false);
+        assert!(summary.contains("rerun preview:"), "{summary}");
+        assert!(summary.contains("full replay: ide.test"), "{summary}");
+        let query = async |owner: BindingRef, reference: &str, tool, recover| {
+            let (send, receive) = oneshot::channel();
+            serve_inspection(
+                &worker.workspace,
+                &worker.shared,
+                Inspection {
+                    binding: owner,
+                    reference: reference.into(),
+                    expected: Some((tool, selection(&serde_json::json!({})))),
+                    recover_test_output: recover,
+                    reply: send,
+                    delivery: None,
+                },
+            )
+            .await;
+            receive.await.unwrap()
+        };
+        let replay_ref = format!("{reference}/replay/output/1");
+        let raw_ref = format!("{reference}/output/1");
+        let raw = query(binding.clone(), &raw_ref, AssistanceTool::Test, false).await;
+        assert!(matches!(
+            &raw,
+            PeerReply::Complete {
+                continuation: true,
+                ..
+            }
+        ));
+        let raw_cursor = worker.shared.ledger.lock().unwrap().details[reference]
+            .context_page
+            .clone()
+            .unwrap();
+        assert_eq!(
+            raw_cursor.text, result.output,
+            "raw captured bytes stay exact"
+        );
+        let saved_json = worker.shared.ledger.lock().unwrap().details[reference]
+            .test_replay
+            .as_ref()
+            .unwrap()
+            .text
+            .clone();
+        assert!(
+            saved_json.len() > crate::assistance::reply::MAX_REPLY_BYTES,
+            "fixture must exceed the actual carrier ceiling"
+        );
+        let mut next = Some(replay_ref.clone());
+        let mut reconstructed = String::new();
+        let mut pages = Vec::new();
+        while let Some(reference) = next.take() {
+            let reply = query(binding.clone(), &reference, AssistanceTool::Test, false).await;
+            let PeerReply::Complete {
+                text,
+                detail_ref,
+                continuation,
+                ..
+            } = &reply
+            else {
+                panic!("{reply:?}");
+            };
+            reconstructed.push_str(strip_page_marker(text));
+            assert_eq!(*continuation, detail_ref.is_some());
+            next = detail_ref.clone();
+            pages.push((reference, reply));
+            assert!(pages.len() < 20, "bounded real continuation traversal");
+        }
+        assert!(pages.len() > 1);
+        assert_eq!(reconstructed, saved_json, "every JSON byte exactly once");
+        let receipt: Value = serde_json::from_str(&reconstructed).unwrap();
+        let argv: Vec<_> = receipt["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        let output = tokio::process::Command::new(argv[0])
+            .args(&argv[1..])
+            .current_dir(root.join(receipt["cwd"].as_str().unwrap()))
+            .env_clear()
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        let expected = format!(
+            "native|{path}|{literal}|{}\nadmitted|{other_path}|{literal}|{}\n",
+            root.display(),
+            cwd.display()
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        let after = worker.shared.ledger.lock().unwrap().details[reference]
+            .context_page
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (raw_cursor.page, raw_cursor.delivered, &raw_cursor.text),
+            (after.page, after.delivered, &after.text)
+        );
+        for (reference, original) in [&pages[0], pages.last().unwrap()] {
+            assert_eq!(
+                query(binding.clone(), reference, AssistanceTool::Test, true).await,
+                *original
+            );
+        }
+        let repeated = query(
+            binding.clone(),
+            &pages.last().unwrap().0,
+            AssistanceTool::Test,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(repeated, PeerReply::Complete {text, ..} if text.contains("already delivered") && text.contains(&format!("\"detail_ref\":\"{reference}\"")))
+        );
+        let after_recovery = worker.shared.ledger.lock().unwrap().details[reference]
+            .context_page
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (after.page, after.delivered, &after.text),
+            (
+                after_recovery.page,
+                after_recovery.delivered,
+                &after_recovery.text
+            )
+        );
+        assert!(matches!(
+            query(
+                binding.clone(),
+                &format!("{reference}/replay/output/{}", pages.len() + 1),
+                AssistanceTool::Test,
+                true
+            )
+            .await,
+            PeerReply::Error { .. }
+        ));
+        assert!(matches!(
+            query(binding.clone(), &replay_ref, AssistanceTool::Read, true).await,
+            PeerReply::Error { .. }
+        ));
+        assert!(matches!(
+            query(
+                BindingRef::fixture("foreign", "other", 1),
+                &replay_ref,
+                AssistanceTool::Test,
+                true
+            )
+            .await,
+            PeerReply::Error { .. }
+        ));
+        // Empty stdout still retains replay, independently from the absent raw-output cursor.
+        let silent_ref = "silent-replay-detail";
+        retain_detail(
+            &worker,
+            &binding,
+            silent_ref,
+            AssistanceTool::Test,
+            &authority,
+        );
+        let silent_id = match worker.shared.test_runs.start_with_options(
+            root.clone(),
+            vec!["/usr/bin/true".into(), "long-argument".repeat(80)],
+            &binding,
+            crate::assistance::tests::TestCommandOptions {
+                cwd: root.clone(),
+                env: Vec::new(),
+                language: crate::lang::testing::ALPHA,
+                command_language: None,
+                budget: Duration::from_secs(5),
+                detail_ref: silent_ref.into(),
+                resolution: CommandResolution::default(),
+            },
+        ) {
+            StartResult::Started(id) => id,
+            _ => panic!("silent command must start"),
+        };
+        let silent = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = worker.shared.test_runs.settled_result(silent_id) {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(silent.output.is_empty());
+        worker
+            .shared
+            .retain_test_output(silent_id, &binding, &silent);
+        let full = query(
+            binding.clone(),
+            &format!("{silent_ref}/replay/output/1"),
+            AssistanceTool::Test,
+            true,
+        )
+        .await;
+        assert!(matches!(full, PeerReply::Complete {text, ..} if text.contains("long-argument")));
+        assert!(
+            worker.shared.ledger.lock().unwrap().details[silent_ref]
+                .context_page
+                .is_none()
+        );
+        assert_eq!(worker.admission.lock().unwrap().running_count(), 0);
+        // A real new durable boot permanently invalidates the captured authority without
+        // stopping the host binding first: inspection must take its payload-release path.
+        let _new_owner = DurableWorkspace::open(&store).await.unwrap();
+        let refused = query(binding.clone(), &replay_ref, AssistanceTool::Test, true).await;
+        assert!(matches!(
+            refused,
+            PeerReply::Error {
+                code: FailureCode::WorkspaceAuthority,
+                ..
+            }
+        ));
+        {
+            let ledger = worker.shared.ledger.lock().unwrap();
+            let detail = &ledger.details[reference];
+            assert!(detail.test_replay.is_none() && detail.context_page.is_none());
+            assert!(matches!(
+                detail.reply,
+                PeerReply::Error {
+                    code: FailureCode::WorkspaceAuthority,
+                    ..
+                }
+            ));
+        }
+        worker
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .details
+            .remove(reference);
+        assert!(matches!(
+            query(binding, &replay_ref, AssistanceTool::Test, true).await,
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                ..
+            }
+        ));
+    }
+
     /// Retained output recovery uses the originating Test identity and live owning authority.
     /// Ordinary final consumption retains the body, explicit recovery leaves its cursor intact,
     /// and foreign, wrong-tool, malformed, expired and beyond-end selectors refuse.
@@ -15544,6 +15974,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -15671,6 +16102,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -15768,6 +16200,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -15848,6 +16281,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -16190,8 +16624,9 @@ mod stop_retry_tests {
         ));
     }
 
-    /// A pushed completion's opaque reference immediately exposes full output without a status
-    /// call, while another binding remains unable to read that output.
+    /// A pushed completion's original reference exposes a genuine terminal receipt and an
+    /// immediately usable raw-output link without a status call. The link returns exact captured
+    /// bytes even when argv is only a preview; foreign and wrong-tool reads of either ref refuse.
     #[tokio::test]
     async fn pushed_test_detail_retains_output_before_status_lookup() {
         crate::lang::testing::install();
@@ -16262,15 +16697,7 @@ mod stop_retry_tests {
                 .iter()
                 .any(|(run, _, _)| *run == id)
         );
-        for (caller, owns, expected_tool) in [
-            (binding.clone(), false, AssistanceTool::Read),
-            (binding.clone(), true, AssistanceTool::Test),
-            (
-                BindingRef::fixture("other-owner", "other-channel", 1),
-                false,
-                AssistanceTool::Test,
-            ),
-        ] {
+        let inspect = async |caller: BindingRef, reference: &str, expected_tool| {
             let (reply, result) = oneshot::channel();
             serve_inspection(
                 &worker.workspace,
@@ -16285,15 +16712,54 @@ mod stop_retry_tests {
                 },
             )
             .await;
-            let answer = result.await.unwrap();
+            result.await.unwrap()
+        };
+        for (caller, owns, expected_tool) in [
+            (binding.clone(), false, AssistanceTool::Read),
+            (binding.clone(), true, AssistanceTool::Test),
+            (
+                BindingRef::fixture("other-owner", "other-channel", 1),
+                false,
+                AssistanceTool::Test,
+            ),
+        ] {
+            let answer = inspect(caller.clone(), reference, expected_tool).await;
             if owns {
                 let PeerReply::Complete { text, .. } = answer else {
-                    panic!("owner must read the completed output")
+                    panic!("owner must read the completed terminal receipt")
                 };
-                assert!(text.contains("full-output-sentinel"), "{text}");
+                assert!(
+                    text.starts_with(&format!("tests #{id}: ")) && text.contains("exit 0"),
+                    "{text}"
+                );
                 assert!(!text.contains("tests #1: started"), "{text}");
+                let link: Value = serde_json::from_str(
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("  full output: ide.test "))
+                        .expect("owner's terminal receipt advertises raw output"),
+                )
+                .unwrap();
+                let output_ref = link["detail_ref"].as_str().unwrap();
+                assert_eq!(output_ref, format!("{reference}/output/1"));
+                let raw = inspect(caller, output_ref, AssistanceTool::Test).await;
+                assert!(
+                    matches!(raw, PeerReply::Complete {kind: ResultKind::Test, text, continuation: false, ..} if text == "pass full-output-sentinel\n")
+                );
+                if text.contains("rerun preview:") {
+                    let replay: Value = serde_json::from_str(
+                        text.lines()
+                            .find_map(|line| line.strip_prefix("  full replay: ide.test "))
+                            .expect("preview has complete owned replay"),
+                    )
+                    .unwrap();
+                    assert_eq!(replay["output"], format!("{reference}/replay/output/1"));
+                }
             } else {
                 assert!(matches!(answer, PeerReply::Error { .. }));
+                assert!(matches!(
+                    inspect(caller, &format!("{reference}/output/1"), expected_tool).await,
+                    PeerReply::Error { .. }
+                ));
             }
         }
     }
@@ -16449,6 +16915,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -16507,6 +16974,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),
@@ -16595,6 +17063,7 @@ mod stop_retry_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),

@@ -46,7 +46,7 @@ pub struct BatchPlan {
     pub targets: Vec<BatchTarget>,
     /// The invocations in run order; at least one.
     pub launches: Vec<BatchLaunch>,
-    /// The rerun line's argv reproducing the whole run, and its worktree-relative directory.
+    /// Planned display while no launch has started; settled replay is built from actual starts.
     pub rerun: (Vec<String>, Option<String>),
     /// The whole run's budget; each invocation gets what the earlier ones left.
     pub budget: Duration,
@@ -134,7 +134,17 @@ impl TestRuns {
                 }
                 let (spawned, budget, cap) = match &launch.start {
                     BatchCommand::Admitted(spec) => (
-                        spawn_spec(&admission, &root, spec),
+                        spawn_spec(&admission, &root, spec).map(|child| {
+                            (
+                                child,
+                                spec_replay(spec),
+                                spec.cwd
+                                    .strip_prefix(&root)
+                                    .ok()
+                                    .filter(|path| !path.as_os_str().is_empty())
+                                    .map(|path| path.display().to_string()),
+                            )
+                        }),
                         remaining.min(spec.timeout),
                         spec.max_output_bytes.min(MAX_OUTPUT),
                     ),
@@ -147,7 +157,7 @@ impl TestRuns {
                             &[],
                             resolution.resolved.as_ref(),
                         )
-                        .map(|(child, _)| child),
+                        .map(|(child, replay)| (child, replay, None)),
                         remaining,
                         MAX_OUTPUT,
                     ),
@@ -158,8 +168,8 @@ impl TestRuns {
                     ),
                 };
                 ran.push(match spawned {
-                    Ok(child) => Ran::Result(Box::new(
-                        run_child_cancellable(
+                    Ok((child, replay, cwd)) => {
+                        let mut result = run_child_cancellable(
                             launch.language,
                             budget,
                             child,
@@ -167,8 +177,11 @@ impl TestRuns {
                             cap,
                             cancel.clone(),
                         )
-                        .await,
-                    )),
+                        .await;
+                        result.command = replay;
+                        result.rerun_dir = cwd;
+                        Ran::Result(Box::new(result))
+                    }
                     Err(error) => Ran::NotStarted(error.to_string()),
                 });
             }
@@ -195,7 +208,8 @@ impl TestRuns {
 /// The one result of a several-target run: every invocation's counts and failures summed,
 /// stopped when any invocation was stopped or skipped, the first non-zero exit (else 0, or none
 /// when an invocation has none), every invocation's output behind its `== run <k>` header (the
-/// last [`MAX_OUTPUT`] bytes kept), the plan's rerun line, and one line per target.
+/// last [`MAX_OUTPUT`] bytes kept), actual-start replay and one line per target. Planning labels
+/// never become executable receipts; missing, skipped and cancelled-before-start steps have none.
 fn combine(plan: &BatchPlan, ran: &[Ran], elapsed: Duration) -> RunResult {
     let mut report = TestReport::default();
     let mut output = String::new();
@@ -268,6 +282,7 @@ fn combine(plan: &BatchPlan, ran: &[Ran], elapsed: Duration) -> RunResult {
             crate::assistance::test_fact::target_outcome(index + 1, &target.label, &outcome)
         })
         .collect();
+    let (command, rerun_dir) = batch_replay(ran);
     RunResult {
         report,
         output,
@@ -280,11 +295,48 @@ fn combine(plan: &BatchPlan, ran: &[Ran], elapsed: Duration) -> RunResult {
         exit,
         budget: plan.budget,
         detail_ref: plan.detail_ref.clone(),
-        command: plan.rerun.0.clone(),
-        rerun_dir: plan.rerun.1.clone(),
+        command,
+        rerun_dir,
         environment_label: None,
         targets,
     }
+}
+
+/// Replays only invocations that actually started, in order, with their exact captured argv and
+/// per-step working directory. Several commands use ordinary shell subshells to isolate cwd and
+/// environment and preserve the first nonzero exit while continuing later steps. No starts yields
+/// empty argv, not a fabricated successful command. The full vector is retained separately from
+/// its compact preview; control characters stay exact inside the quoted shell script.
+fn batch_replay(ran: &[Ran]) -> (Vec<String>, Option<String>) {
+    let started: Vec<_> = ran
+        .iter()
+        .filter_map(|run| match run {
+            Ran::Result(result) if !result.command.is_empty() => Some(result),
+            _ => None,
+        })
+        .collect();
+    if let [only] = started.as_slice() {
+        return (only.command.clone(), only.rerun_dir.clone());
+    }
+    if started.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut script = "status=0\n".to_owned();
+    for result in started {
+        let command = crate::assistance::worker::shell_argv(&result.command);
+        let step = match &result.rerun_dir {
+            Some(cwd) => format!(
+                "cd {} && {command}",
+                crate::assistance::worker::shell_argv(std::slice::from_ref(cwd))
+            ),
+            None => command,
+        };
+        script.push_str(&format!(
+            "({step})\ncode=$?\nif [ \"$status\" -eq 0 ]; then status=$code; fi\n"
+        ));
+    }
+    script.push_str("exit \"$status\"");
+    (vec!["/bin/sh".into(), "-c".into(), script], None)
 }
 
 /// The outcome a target line shows for invocation `run` (zero-based): its counts (`run 2 — 3
@@ -465,7 +517,7 @@ mod batch_tests {
     }
 
     /// The invocations of one run go one after another under one id that holds the worktree's
-    /// run slot throughout; the result sums their counts, keeps the plan's rerun line and gives
+    /// run slot throughout; the result sums their counts, keeps actual-start replay and gives
     /// every target a line, a target that runs nothing included.
     #[tokio::test]
     async fn targets_run_as_one_run_with_a_line_per_target() {
@@ -511,7 +563,18 @@ mod batch_tests {
         );
         let result = settled(&runs, &root, id, &owner).await;
         assert_eq!((result.report.passed, result.report.failed), (3, 1));
-        assert_eq!(result.command, ["sh", "-c", "a; b"]);
+        let replay = tokio::process::Command::new(&result.command[0])
+            .args(&result.command[1..])
+            .current_dir(&root)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(replay.status.code(), Some(0));
+        assert_eq!(replay.stdout, b"pass\npass\npass\nfail\n");
+        assert!(
+            !result.command.contains(&"a; b".into()),
+            "planning labels are not replay receipts"
+        );
         assert_eq!(
             result.targets,
             [

@@ -30,7 +30,7 @@ const MAX_MESSAGE_LINE_BYTES: usize = 160;
 /// Longest path shown in a `FAIL` entry's location before the line number.
 const MAX_PATH_BYTES: usize = 128;
 
-/// Longest rerun command on the `rerun:` line; a longer one is cut and ends with `…`.
+/// Longest displayed rerun command; clipped or escaped commands are explicitly previews.
 const MAX_RERUN_BYTES: usize = 300;
 
 /// Longest runner line quoted in the summary of a run that counted no test.
@@ -59,7 +59,7 @@ pub(crate) struct TerminalFact {
     /// The outcome in one line, for example `3 passed, 1 failed, 12 s`.
     pub summary: String,
     /// The `FAIL` entries, the `+K more` line, one line per target of a several-target run, the
-    /// `rerun:` line and the `full output:` line.
+    /// rerun or preview line, the owner-only full replay link when needed and the output link.
     pub detail: String,
 }
 
@@ -268,13 +268,32 @@ pub(super) fn target_lines(result: &RunResult) -> Vec<String> {
         .collect()
 }
 
-/// Renders the lines that end every settled text: `rerun:` always, and `full output:` exactly when
-/// the recipient `owns_detail` of a run that kept any output (reply-hygiene-v1 §1.2 rule 3).
+/// Renders a runnable short rerun or an explicitly clipped/escaped preview, and owner-only
+/// recovery links. Full replay JSON has its own retained cursor, including for empty stdout;
+/// raw output remains on its existing cursor. No invocation started means no rerun is invented.
 pub(super) fn closing_lines(result: &RunResult, owns_detail: bool) -> Vec<String> {
+    let rerun = rerun_text(result);
+    let preview = rerun.len() > MAX_RERUN_BYTES
+        || result
+            .command
+            .iter()
+            .chain(result.rerun_dir.iter())
+            .any(|arg| arg.chars().any(char::is_control));
     let mut closing = vec![format!(
-        "  rerun: {}",
-        cut_with_ellipsis(&rerun_text(result), MAX_RERUN_BYTES)
+        "  rerun{}: {}",
+        if preview { " preview" } else { "" },
+        if result.command.is_empty() {
+            "unavailable (no invocation started)".into()
+        } else {
+            cut_with_ellipsis(&rerun, MAX_RERUN_BYTES)
+        }
     )];
+    if preview && owns_detail && !result.command.is_empty() {
+        closing.push(format!(
+            "  full replay: ide.test {}",
+            serde_json::json!({"output":format!("{}/replay/output/1",result.detail_ref)})
+        ));
+    }
     if owns_detail && (!result.output.is_empty() || result.output_paged) {
         closing.push(format!(
             "  full output: ide.test {}",
@@ -421,7 +440,11 @@ mod tests {
             "{} bytes: {fact:?}",
             fact.summary.len() + fact.detail.len()
         );
-        assert!(fact.detail.contains("\n  rerun: ") || fact.detail.starts_with("  rerun: "));
+        assert!(
+            fact.detail
+                .lines()
+                .any(|line| line.starts_with("  rerun: ") || line.starts_with("  rerun preview: "))
+        );
         for banned in [
             "poll",
             "every few seconds",
@@ -617,7 +640,8 @@ mod tests {
         assert!(fact.summary.is_char_boundary(fact.summary.len()));
     }
 
-    /// A rerun command above its limit is cut with an ellipsis; the reference line survives.
+    /// A clipped command is explicitly a preview with an owner-only full replay path, even
+    /// with no stdout. Preview and raw-output links remain within the ordinary fact budget.
     #[test]
     fn oversized_rerun_command_is_cut_with_an_ellipsis() {
         let mut result = run(1, 0, Vec::new());
@@ -626,14 +650,27 @@ mod tests {
         let rerun = fact
             .detail
             .lines()
-            .find(|line| line.starts_with("  rerun: "))
+            .find(|line| line.starts_with("  rerun preview: "))
             .unwrap();
         assert!(
-            rerun.len() <= "  rerun: ".len() + MAX_RERUN_BYTES,
+            rerun.len() <= "  rerun preview: ".len() + MAX_RERUN_BYTES,
             "{rerun}"
         );
         assert!(rerun.ends_with('…'), "{rerun}");
         assert!(fact.detail.contains("full output:"), "{fact:?}");
+        assert!(
+            fact.detail
+                .contains("full replay: ide.test {\"output\":\"ref-3/replay/output/1\"}")
+        );
+        result.output.clear();
+        let empty = terminal_fact(1, &result, true);
+        assert!(empty.detail.contains("full replay:"));
+        assert!(!empty.detail.contains("full output:"));
+        assert!(
+            !terminal_fact(1, &result, false)
+                .detail
+                .contains("full replay:")
+        );
         assert_in_contract(&fact);
     }
 

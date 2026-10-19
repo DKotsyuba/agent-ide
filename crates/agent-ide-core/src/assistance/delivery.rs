@@ -1492,6 +1492,7 @@ mod worker_tests {
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
+                test_replay: None,
                 context_page_fresh: false,
                 diff_provenance: None,
                 extra_sources: Vec::new(),

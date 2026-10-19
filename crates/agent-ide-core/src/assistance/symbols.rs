@@ -4421,6 +4421,7 @@ async fn run_stdin(
 }
 
 #[cfg(test)]
+/// Checks native stdin command activation and process cleanup through the shared runner.
 mod stdin_environment_tests {
     use super::*;
 
