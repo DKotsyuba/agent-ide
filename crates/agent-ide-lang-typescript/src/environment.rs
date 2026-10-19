@@ -323,22 +323,53 @@ pub fn admit_effects(worktree: &Path, config: &ModuleConfig) -> Result<(), LangE
     let Some(tools) = configured_tools(config) else {
         return Ok(());
     };
-    match obstruction(worktree, &tools, &config.read_denies) {
-        Some(cause) => Err(LangError::Environment(cause)),
-        // An unverifiable authoritative pin refuses effect planning too: a recipe would run
-        // raw Node the pin does not cover.
-        None if node_pin(worktree, &config.read_denies).is_some()
-            && tools.node_identity.is_none() =>
-        {
-            Err(LangError::Environment(
-                "node pin cannot be verified: the configured Node has no measured identity in \
-                 this request — IDE commands refuse an unverifiable pin; align the launcher \
-                 Node or adjust the pin"
-                    .to_owned(),
-            ))
-        }
-        None => Ok(()),
+    // One shared guard for every claimed consumer: a known compiler/pin obstruction, an
+    // authoritative pin whose compatibility cannot be verified (no measured Node identity),
+    // or configured Node bytes that no longer match the accepted declaration — a card
+    // warning or a stale digest is not compatibility proof for a raw Node run.
+    let cause = obstruction(worktree, &tools, &config.read_denies).or_else(|| {
+        let pin = node_pin(worktree, &config.read_denies)?;
+        tools.node_identity.is_none().then(|| {
+            format!(
+                "node pin {pin} cannot be verified: the configured Node has no measured \
+                 identity in this request — IDE commands refuse an unverifiable pin; align \
+                 the launcher Node or adjust the pin"
+            )
+        })
+    });
+    if let Some(cause) = cause {
+        return Err(LangError::Environment(cause));
     }
+    // The accepted declaration's Node digest is the only content fact this request carries:
+    // same-path replacement must refuse before any claimed child runs, exactly like a
+    // changed compiler.
+    if let Some(digest) = &tools.node_digest {
+        match node_content_hash(&tools.node, &config.read_denies) {
+            None => {
+                return Err(LangError::Environment(
+                    "the configured Node could not be read for verification — IDE commands \
+                     refuse; restore the accepted executable"
+                        .to_owned(),
+                ));
+            }
+            Some(current) if current.to_hex().as_str() != digest.as_str() => {
+                return Err(LangError::Environment(
+                    "the configured Node's bytes changed since acceptance — IDE commands \
+                     refuse the modified executable; restore the accepted Node or re-provision \
+                     the launcher declaration"
+                        .to_owned(),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whole-content BLAKE3 of the configured Node executable, under the request's read excludes;
+/// `None` when it cannot be read.
+fn node_content_hash(path: &Path, denies: &[ReadDeny]) -> Option<blake3::Hash> {
+    agent_ide_core::lang::environment::hash_input(path, denies)
 }
 
 /// Activation of `program` under this request's configured tools, resolved before any
@@ -368,17 +399,6 @@ pub fn command_env(
         return Ok(None);
     };
     admit_effects(worktree, config)?;
-    // An authoritative pin this seam cannot verify (no measured Node identity) refuses raw
-    // claimed commands exactly like a known mismatch: a card warning alone is not
-    // compatibility proof for a run that never reaches the adapter's runtime validation.
-    if node_pin(worktree, &config.read_denies).is_some() && tools.node_identity.is_none() {
-        return Err(LangError::Environment(
-            "node pin cannot be verified: the configured Node has no measured identity in \
-             this request — IDE commands refuse an unverifiable pin; align the launcher Node \
-             or adjust the pin"
-                .to_owned(),
-        ));
-    }
     let compiler = match compiler_fact(worktree, &tools.tsc_cli, &config.read_denies) {
         Ok(fact) => fact,
         Err((_, cause)) => return Err(LangError::Environment(cause)),
@@ -399,6 +419,58 @@ pub fn command_env(
         },
     };
     Ok(Some(environment))
+}
+
+/// Activation for the full argument vector under this request's configured tools. The
+/// slot-resolution call (argv is exactly one slot name) answers the Launcher `node` slot with
+/// the configured Node alone — one prepared executable, no interpreter prefix, variables or
+/// `PATH` that a program slot cannot carry. A full argv answers per program: `tsc`/`node`
+/// activate the configured tools, an `npx` runner shape refuses (its runtime is not bound to
+/// the configured Node), and anything else is unclaimed.
+pub fn command_argv(
+    worktree: &Path,
+    argv: &[String],
+    config: &ModuleConfig,
+) -> Result<Option<agent_ide_core::lang::environment::CommandEnv>, LangError> {
+    if let [name] = argv {
+        if name != "node" {
+            return Ok(None);
+        }
+        let Some(tools) = configured_tools(config) else {
+            return Ok(None);
+        };
+        admit_effects(worktree, config)?;
+        return Ok(Some(agent_ide_core::lang::environment::CommandEnv {
+            argv_prefix: vec![tools.node.clone().into_os_string()],
+            ..Default::default()
+        }));
+    }
+    // One shared runner-shape refusal for both routes: an `npx vitest`/`npx jest` test run
+    // executes the project's Node runtime through an operator `npx` this request does not
+    // configure, so it refuses instead of silently running an ambient Node the project's pin
+    // does not cover. `command_env` enforces the same refusal for the native route.
+    if let Some(cause) = runner_shape_refusal(argv) {
+        return Err(LangError::Environment(cause));
+    }
+    let Some(program) = argv.first() else {
+        return Ok(None);
+    };
+    command_env(worktree, program, config)
+}
+
+/// The exact runner-shape refusal shared by the native argv route and the module's effect
+/// planner: an `npx vitest`/`npx jest` test run executes the project's Node runtime through an
+/// operator `npx` this request does not configure. `None` for every other shape — `npx
+/// prettier` stays the operator's accepted formatting tool, and unclaimed programs stay
+/// unclaimed.
+pub fn runner_shape_refusal(argv: &[String]) -> Option<String> {
+    (argv.first().map(String::as_str) == Some("npx")
+        && matches!(argv.get(1).map(String::as_str), Some("vitest" | "jest")))
+    .then(|| {
+        "npx-based vitest/jest runs are not bound to the configured Node; prepare the \
+         package manager's tool or run them natively"
+            .to_owned()
+    })
 }
 
 /// The environments of `worktree` under this request's configured tools and read excludes:
@@ -460,6 +532,13 @@ fn identity_string(
             parts.push(format!(
                 "node-digest={}",
                 tools.node_digest.as_deref().unwrap_or_default()
+            ));
+            // Current measured content, not only the declaration: a same-path replacement
+            // moves the identity even before any consumer refuses on it.
+            parts.push(format!(
+                "node-content={}",
+                agent_ide_core::lang::environment::hash_input(&tools.node, denies)
+                    .map_or_else(String::new, |hash| hash.to_string())
             ));
             // On-disk identity of the selected tools: a same-path mutated executable or
             // compiler module moves the stamp even when the declaration is unchanged. The
@@ -531,13 +610,15 @@ mod tests {
         ModuleConfig {
             worktree: None,
             // Shape projection of the accepted declaration: the provider OPTION `node` is
-            // what the binding reads. This is a unit-fixture shape, not a validated
-            // declaration — the real one is the root-run qualified fixture.
+            // what the binding reads, and its digest is the ACTUAL hash of the fixture file
+            // (a fake constant would make the bytes guard accept anything). This is a
+            // unit-fixture shape, not a validated declaration — the real one is the root-run
+            // qualified fixture.
             provider: Some(serde_json::json!({
                 "node": {
                     "path": node.display().to_string(),
                     "identity": "v22.11.0",
-                    "blake3": "aa5551dd9b4b41b1a6977e7f9f22a5721e1ea6c94a92d7f7eea7fea3b3d7e1c9",
+                    "blake3": blake3::hash(std::fs::read(node).unwrap().as_slice()).to_hex().to_string(),
                 },
                 "toolchain": "v22.11.0",
             })),
@@ -567,13 +648,14 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
-    /// Creates empty Node/CLI files below fixture `root` and returns their paths. These are
-    /// selection-policy stubs, not executable qualification or admission evidence.
+    /// Creates Node/CLI stub files below fixture `root` and returns their paths. These are
+    /// selection-policy fixtures with real, distinct content — the bytes guard measures them,
+    /// but they are not executable qualification or admission evidence.
     fn tools(root: &Path) -> (PathBuf, PathBuf) {
         let node = root.join("tools/node");
         let tsc = root.join("tools/tsc.js");
-        put(root, "tools/node", "");
-        put(root, "tools/tsc.js", "");
+        put(root, "tools/node", "node-stub-v1\n");
+        put(root, "tools/tsc.js", "tsc-stub-v1\n");
         (node, tsc)
     }
 
@@ -784,10 +866,73 @@ mod tests {
         put(&root, "tsconfig.json", "{}");
         let mut config = config_with(&node, &tsc);
         assert!(TypeScript.configured_detect(&root, &config).is_some());
+        // Absent optional pin files never block.
+        assert!(!root.join(".nvmrc").exists());
+        assert!(TypeScript.configured_detect(&root, &config).is_some());
+        // A denied manifest blocks.
         config.read_denies = vec![agent_ide_core::execution::seatbelt::ReadDeny::Path(
             root.join("package.json"),
         )];
         assert_eq!(TypeScript.configured_detect(&root, &config), None);
+        config.read_denies.clear();
+        // A linked manifest blocks without following: the checker's link-free policy.
+        std::fs::rename(root.join("package.json"), root.join("real-package.json")).unwrap();
+        std::os::unix::fs::symlink(root.join("real-package.json"), root.join("package.json"))
+            .unwrap();
+        assert!(
+            root.join("package.json")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(TypeScript.configured_detect(&root, &config), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A same-path replacement of the configured Node (same name, unchanged accepted
+    /// declaration, same file length) refuses claimed commands and effect planning: the
+    /// shared guard re-measures the actual bytes against the accepted digest. The card keeps
+    /// the winner visible; the refusal is the truthful action state.
+    #[test]
+    fn same_path_node_replacement_refuses() {
+        let root = scratch("node-replaced");
+        let (node, tsc) = tools(&root);
+        put(&root, "package.json", "{\"dependencies\":{}}");
+        put(&root, "tsconfig.json", "{}");
+        let config = config_with(&node, &tsc);
+        let tools = configured_tools(&config).unwrap();
+        // Sanity: the pristine fixture passes the bytes guard.
+        assert!(admit_effects(&root, &config).is_ok());
+        // Same path, same length, different bytes, declaration unchanged.
+        let len = std::fs::metadata(&node).unwrap().len();
+        std::fs::write(&node, vec![b'x'; len as usize]).unwrap();
+        assert_ne!(
+            std::fs::read(&node).unwrap().len(),
+            0,
+            "replacement wrote bytes"
+        );
+        let cause = admit_effects(&root, &config).unwrap_err();
+        assert!(
+            cause.to_string().contains("bytes changed since acceptance"),
+            "{cause}"
+        );
+        assert!(command_env(&root, "node", &config).is_err());
+        assert!(command_env(&root, "tsc", &config).is_err());
+        // The identity moved too: current measured content participates.
+        let before = {
+            let pristine = config_with(&node, &tsc);
+            std::fs::write(&node, b"").unwrap();
+            let tools = configured_tools(&pristine).unwrap();
+            let id = environment(&root, Some(&tools), &pristine, &[]).identity;
+            std::fs::write(&node, vec![b'x'; len as usize]).unwrap();
+            id
+        };
+        assert_ne!(
+            environment(&root, Some(&tools), &config, &[]).identity,
+            before,
+            "replaced bytes move the identity"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -830,6 +975,81 @@ mod tests {
         assert!(command_env(&root, "node", &config).is_err());
         assert!(command_env(&root, "tsc", &config).is_err());
         assert!(admit_effects(&root, &config).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The native argv route and the module effect planner enforce the SAME runner-shape
+    /// refusal: `npx vitest`/`npx jest` refuse in both, while the operator formatting tool
+    /// and unclaimed programs stay unclaimed — no ambient fallback either way.
+    #[test]
+    fn runner_shape_refusal_is_shared_by_both_routes() {
+        let root = scratch("runner-shapes");
+        let (node, tsc) = tools(&root);
+        put(&root, "package.json", "{\"dependencies\":{}}");
+        put(&root, "tsconfig.json", "{}");
+        let config = config_with(&node, &tsc);
+        for runner_args in [
+            vec!["npx".to_owned(), "vitest".to_owned(), "run".to_owned()],
+            vec!["npx".to_owned(), "jest".to_owned(), "a.test.ts".to_owned()],
+        ] {
+            assert!(
+                command_argv(&root, &runner_args, &config).is_err(),
+                "native route refuses: {runner_args:?}"
+            );
+            assert!(
+                crate::module::configured_effect(&runner_args, &config).is_err(),
+                "module planner refuses: {runner_args:?}"
+            );
+        }
+        // The operator formatting tool and unclaimed programs stay unclaimed in the native
+        // route (the module planner formats through the accepted shape).
+        assert_eq!(
+            command_argv(
+                &root,
+                &[
+                    "npx".to_owned(),
+                    "prettier".to_owned(),
+                    "--stdin-filepath".to_owned(),
+                    "a.ts".to_owned()
+                ],
+                &config
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            command_argv(
+                &root,
+                &["npm".to_owned(), "run".to_owned(), "test".to_owned()],
+                &config
+            )
+            .unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The Launcher `node` slot resolves to the request's CONFIGURED Node — the fixture's
+    /// `nodeA` — never to whatever a conflicting ambient `PATH` would name: the returned
+    /// activation is exactly that one absolute executable, with no variables or `PATH`
+    /// prefix a program slot cannot carry.
+    #[test]
+    fn node_slot_resolves_the_configured_node_alone() {
+        let root = scratch("slot-node");
+        let (node_a, tsc) = tools(&root);
+        put(&root, "package.json", "{\"dependencies\":{}}");
+        put(&root, "tsconfig.json", "{}");
+        let config = config_with(&node_a, &tsc);
+        let activation = command_argv(&root, &["node".to_owned()], &config)
+            .unwrap()
+            .expect("the configured Node slot resolves");
+        assert_eq!(
+            activation.argv_prefix,
+            [node_a.clone().into_os_string()],
+            "the configured Node, not an ambient lookup"
+        );
+        assert!(activation.vars.is_empty());
+        assert!(activation.path_prefix.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

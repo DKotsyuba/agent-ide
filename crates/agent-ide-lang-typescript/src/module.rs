@@ -361,16 +361,20 @@ const TOOL_ROLES: &[PathRole] = &[
 ];
 
 /// Home tools an interactive recipe may run, looked up by the core on its formatter PATH.
-const HOME_TOOLS: &[ExecutableSlot] = &[
-    ExecutableSlot {
-        name: "npx",
-        source: SlotSource::HomeTool("npx"),
-    },
-    ExecutableSlot {
-        name: "node",
-        source: SlotSource::HomeTool("node"),
-    },
-];
+/// `npx` stays an operator formatter/test tool resolved on that PATH; the project's Node
+/// runtime is never taken from it.
+const HOME_TOOLS: &[ExecutableSlot] = &[ExecutableSlot {
+    name: "npx",
+    source: SlotSource::HomeTool("npx"),
+}];
+
+/// The project's Node runtime slot: resolved through
+/// [`agent_ide_core::lang::LanguageSupport::configured_command_argv`] to the request's
+/// configured Node — exactly one prepared executable, no ambient PATH fallback.
+const NODE_SLOT: &[ExecutableSlot] = &[ExecutableSlot {
+    name: "node",
+    source: SlotSource::Launcher("node"),
+}];
 
 /// Fixed trailing `PATH` entries of an interactive run.
 const SYSTEM_PATH: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
@@ -405,6 +409,19 @@ const fn interactive(
     args: &'static [Arg],
     env: &'static [EnvRule],
 ) -> EffectRecipe {
+    interactive_with(id, program, args, env, HOME_TOOLS)
+}
+
+/// [`interactive`] with the executable slots explicit: the same established `node_path`/`module`
+/// path policy, with the slot list deciding whether the run binds the project's configured Node
+/// ([`NODE_SLOT`]) or an operator home tool ([`HOME_TOOLS`]).
+const fn interactive_with(
+    id: &'static str,
+    program: &'static str,
+    args: &'static [Arg],
+    env: &'static [EnvRule],
+    executables: &'static [ExecutableSlot],
+) -> EffectRecipe {
     EffectRecipe {
         id,
         program,
@@ -424,7 +441,7 @@ const fn interactive(
                 read_root: false,
             },
         ],
-        executables: HOME_TOOLS,
+        executables,
         stdin: Stdin::Candidate,
         class: RunClass::Interactive,
         timeout_ceiling_ms: 10_000,
@@ -433,7 +450,9 @@ const fn interactive(
     }
 }
 
-/// A test run: a home tool selecting `files` (positional tokens) and, when named, one pattern.
+/// A test run: a home tool selecting `files` (positional tokens) and, when named, one
+/// pattern. Only shapes whose runtime this environment claims (the project's Node) use
+/// [`NODE_SLOT`]; `npx` runner shapes are refused by the configured planner instead.
 const fn test_run(
     id: &'static str,
     program: &'static str,
@@ -456,7 +475,52 @@ const fn test_run(
 }
 
 const NPX_ENV: [EnvRule; 2] = tool_env("npx");
-const NODE_TOOL_ENV: [EnvRule; 2] = tool_env("node");
+
+/// The syntax probe on the project's configured Node (the Launcher `node` slot): the same
+/// established path policy as [`interactive`], executing the same runtime the tests use.
+const fn interactive_node(id: &'static str, args: &'static [Arg]) -> EffectRecipe {
+    interactive_with(
+        id,
+        "node",
+        args,
+        &[
+            EnvRule::Home { name: "HOME" },
+            EnvRule::SlotDir {
+                name: "PATH",
+                slot: "node",
+                fixed: SYSTEM_PATH,
+            },
+        ],
+        NODE_SLOT,
+    )
+}
+
+/// A test run on the project's configured Node (the Launcher `node` slot): the exact
+/// executable `configured_command_argv` resolves from this request's checks section — no
+/// ambient PATH fallback. Its `SlotDir` `PATH` leads with the configured Node's own
+/// directory, so `node --test` finds the same runtime it runs.
+const fn node_test_run(id: &'static str, args: &'static [Arg]) -> EffectRecipe {
+    EffectRecipe {
+        id,
+        program: "node",
+        args,
+        env: &[
+            EnvRule::Home { name: "HOME" },
+            EnvRule::SlotDir {
+                name: "PATH",
+                slot: "node",
+                fixed: SYSTEM_PATH,
+            },
+        ],
+        paths: &[],
+        executables: NODE_SLOT,
+        stdin: Stdin::Null,
+        class: RunClass::Test,
+        timeout_ceiling_ms: 600_000,
+        capture_bytes: 16 << 20,
+        assets: &[],
+    }
+}
 
 /// The effect recipes of the TypeScript module, declared by the root: the `tsc` check, the
 /// Prettier formatter and the syntax probe that read the candidate on stdin.
@@ -483,21 +547,14 @@ pub const RECIPES: &[EffectRecipe] = &[
         ],
         &PATH_ENV,
     ),
-    test_run(
-        "test-node",
-        "node",
-        &[Arg::Literal("--test"), Arg::Each("files")],
-        &NODE_TOOL_ENV,
-    ),
-    test_run(
+    node_test_run("test-node", &[Arg::Literal("--test"), Arg::Each("files")]),
+    node_test_run(
         "test-node-named",
-        "node",
         &[
             Arg::Literal("--test"),
             Arg::Joined("--test-name-pattern=", "pattern"),
             Arg::Each("files"),
         ],
-        &NODE_TOOL_ENV,
     ),
     test_run(
         "test-vitest",
@@ -538,16 +595,14 @@ pub const RECIPES: &[EffectRecipe] = &[
         ],
         &NPX_ENV,
     ),
-    interactive(
+    interactive_node(
         "ts-probe-tool",
-        "node",
         &[
             Arg::Literal("-e"),
             Arg::Literal(crate::support::TS_PROBE),
             Arg::Param("module"),
             Arg::Param("file"),
         ],
-        &NODE_TOOL_ENV,
     ),
 ];
 
@@ -564,6 +619,13 @@ pub fn configured_effect(
     config: &agent_ide_core::modules::contract::ModuleConfig,
 ) -> Result<Option<EffectRequest>, agent_ide_core::lang::LangError> {
     crate::environment::admit_effects(&config_worktree(config), config)?;
+    // The same runner-shape refusal the native argv route enforces: `npx`-runner test shapes
+    // execute the project's Node runtime through an operator `npx` this request does not
+    // configure. `node --test` shapes run the configured Node slot; the Prettier formatter
+    // stays the operator's accepted formatting tool.
+    if let Some(cause) = crate::environment::runner_shape_refusal(argv) {
+        return Err(agent_ide_core::lang::LangError::Environment(cause));
+    }
     Ok(interactive_effect(argv))
 }
 
