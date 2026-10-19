@@ -17,17 +17,26 @@
 //! environment manager ever runs.
 //!
 //! A resolution's opaque [`ResolvedEnv::identity`] covers the native project inputs of the root
-//! (`native_inputs`: manifest, pin file, `requirements*.txt`, lockfiles, the version request)
+//! (`native_inputs`: manifest, pin file, `requirements*.txt` and their local includes,
+//! lockfiles, the version request)
 //! besides the chosen environment itself, so a changed or recreated manifest, lock or config
 //! invalidates every consumer of the old answer — the card, the checks, the Pyright session,
-//! tests and formatting — through the same identity comparison, with no extra store.
+//! tests and formatting — through the same identity comparison, with no extra store. These
+//! text fingerprints do not attest installed dependencies. Incomplete requirement-reference
+//! coverage produces a warning; requirements never request an interpreter version.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
     io::Read,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
+    },
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
@@ -280,17 +289,19 @@ fn stamp(path: &Path) -> String {
 /// that changes when it is recreated in place (directory and interpreter inodes, the interpreter
 /// link's target, `pyvenv.cfg` stamp and content), the root's native project inputs
 /// (`native_inputs`) and, when nothing resolves, the missing cause. Why it won (`source`) is
-/// left out: selecting the current winner changes nothing a consumer depends on.
+/// left out: selecting the current winner changes nothing a consumer depends on. Appends
+/// warnings for incomplete local requirement-reference coverage without changing selection.
 fn identity(
     worktree: &Path,
     root: &Path,
     chosen: Option<&EnvCandidate>,
     missing: Option<&str>,
     denies: &[ReadDeny],
+    warnings: &mut Vec<String>,
 ) -> String {
     // The native inputs belong to the root, not to the winner: a changed lock or config
     // invalidates every consumer of this resolution, chosen or missing.
-    let native = native_inputs(worktree, root, denies);
+    let native = native_inputs(worktree, root, denies, warnings);
     let Some(chosen) = chosen else {
         return format!("missing|{}|{native}", missing.unwrap_or_default());
     };
@@ -312,10 +323,334 @@ fn identity(
 /// this much memory per file, never the file's size.
 const NATIVE_INPUT_CHUNK: usize = 64 * 1024;
 
+/// Maximum distinct requirement/constraint files, references per file and queued references
+/// per resolution. Canonical visited identities prevent cycles from causing repeated reads.
+const REQUIREMENT_FILES: usize = 64;
+
+/// Maximum requirement content bytes per resolution, plus one EOF/budget probe byte; no
+/// over-budget prefix is hashed as complete. Fixed manifests and lockfiles retain their
+/// existing whole-content streaming.
+const REQUIREMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum physical requirement line length, excluding LF; longer lines are still fully
+/// hashed within the byte budget, but their reference coverage is explicitly unsupported.
+const REQUIREMENT_LINE: usize = 8 * 1024;
+
+/// Parses one physical requirement line into an optional local include path. Supports `-r`,
+/// `-c`, `--requirement`, `--constraint`, attached short arguments, `=` separators and one
+/// whole single/double-quoted path (spaces allowed), with an optional whitespace-led comment.
+/// Returns a static coverage reason for malformed references, continuations, expansion,
+/// escaped paths and URLs; never expands variables, fetches URLs or interprets package lines.
+fn requirement_reference(line: &str) -> Result<Option<&str>, &'static str> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    if line.ends_with('\\') {
+        return Err("line continuations are unsupported");
+    }
+    let options = ["--requirement", "--constraint", "-r", "-c"];
+    let argument = options
+        .into_iter()
+        .find_map(|option| line.strip_prefix(option).map(|argument| (option, argument)));
+    let Some((option, argument)) = argument else {
+        if line
+            .split_whitespace()
+            .take_while(|word| !word.starts_with('#'))
+            .any(|word| options.iter().any(|option| word.starts_with(*option)))
+        {
+            return Err("references must be standalone directives");
+        }
+        return Ok(None);
+    };
+    if option.starts_with("--") && !argument.is_empty() && !argument.starts_with(['=', ' ', '\t']) {
+        return Err("malformed local reference");
+    }
+    let argument = argument
+        .trim_start()
+        .strip_prefix('=')
+        .unwrap_or(argument.trim_start())
+        .trim_start();
+    let (path, tail) = if argument.starts_with(['\'', '"']) {
+        let quote = argument.as_bytes()[0] as char;
+        let rest = &argument[1..];
+        let end = rest.find(quote).ok_or("malformed local reference")?;
+        (&rest[..end], &rest[end + 1..])
+    } else {
+        let end = argument.find(char::is_whitespace).unwrap_or(argument.len());
+        (&argument[..end], &argument[end..])
+    };
+    if path.is_empty()
+        || path.starts_with('-')
+        || (!tail.is_empty()
+            && (!tail.starts_with(char::is_whitespace) || !tail.trim_start().starts_with('#')))
+    {
+        return Err("malformed local reference");
+    }
+    if path.contains(['$', '~', '%', '\\', ':', '\0', '\'', '"']) {
+        return Err("remote, expanded or escaped references are unsupported");
+    }
+    Ok(Some(path))
+}
+
+/// Resolves a requirement path inside the explicit worktree, checking lexical prefixes and
+/// the canonical target against read exclusions before opening content. Refuses every link
+/// below the worktree (including directory links), missing paths and lexical/resolved escapes;
+/// the authoritative worktree itself may have a canonical alias such as macOS `/var`.
+fn requirement_path(
+    worktree: &Path,
+    path: &Path,
+    denies: &[ReadDeny],
+) -> Result<PathBuf, &'static str> {
+    if denies
+        .iter()
+        .any(|deny| deny.matches(path) || deny.matches(worktree))
+    {
+        return Err("local reference excluded from reads");
+    }
+    let relative = path
+        .strip_prefix(worktree)
+        .map_err(|_| "local reference escapes worktree")?;
+    let mut checked = worktree.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => checked.push(name),
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir if checked != worktree => {
+                checked.pop();
+            }
+            _ => return Err("local reference escapes worktree"),
+        }
+        if denies.iter().any(|deny| deny.matches(&checked)) {
+            return Err("local reference excluded from reads");
+        }
+        let metadata =
+            fs::symlink_metadata(&checked).map_err(|_| "missing or unreadable local reference")?;
+        if metadata.file_type().is_symlink() {
+            return Err("symlinked local references are unsupported");
+        }
+    }
+    let canonical =
+        fs::canonicalize(&checked).map_err(|_| "missing or unreadable local reference")?;
+    let boundary = fs::canonicalize(worktree).map_err(|_| "unavailable worktree boundary")?;
+    if !canonical.starts_with(boundary) {
+        return Err("local reference escapes worktree");
+    }
+    if denies.iter().any(|deny| deny.matches(&canonical)) {
+        return Err("local reference excluded from reads");
+    }
+    Ok(canonical)
+}
+
+/// Opens an absolute, already-contained requirement path with `openat` and `O_NOFOLLOW`
+/// on every component, so a directory replaced by a symlink after validation cannot redirect
+/// the content read. Rejects non-normal components, I/O failures and non-regular final files;
+/// descriptors are owned by `File` and closed on every success/failure path. This mirrors the
+/// core source reader's descriptor walk, whose opener is private to that crate.
+fn open_requirement(path: &Path) -> Result<fs::File, &'static str> {
+    if !path.is_absolute() {
+        return Err("local reference escapes worktree");
+    }
+    let mut directory = fs::File::open("/").map_err(|_| "unavailable worktree boundary")?;
+    let mut components = path.components().skip(1).peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err("local reference escapes worktree");
+        };
+        let name =
+            std::ffi::CString::new(name.as_bytes()).map_err(|_| "malformed local reference")?;
+        let final_component = components.peek().is_none();
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if final_component {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_DIRECTORY
+            };
+        // SAFETY: `directory` owns a live descriptor and `name` is NUL-terminated for the
+        // duration of this call. No pointer or borrowed descriptor escapes `openat`.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err("unreadable or symlinked local reference");
+        }
+        // SAFETY: successful openat returns a fresh owned descriptor; File takes exclusive
+        // ownership and closes it, including when this assignment drops the previous one.
+        directory = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    if !directory
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file())
+    {
+        return Err("local reference is not a regular file");
+    }
+    Ok(directory)
+}
+
+/// Streams a regular requirement file through a whole-content hash and bounded line parser.
+/// Decrements the shared byte budget, returns discovered relative/absolute references and
+/// records unsupported coverage reasons without including private line text. I/O or budget
+/// failures return no hash, so a prefix is never certified as complete; references and line
+/// storage are bounded independently. The caller has already checked containment and denies.
+fn hash_requirements(
+    path: &Path,
+    remaining: &mut usize,
+    reasons: &mut BTreeSet<&'static str>,
+) -> Result<(blake3::Hash, Vec<PathBuf>), &'static str> {
+    let mut file = open_requirement(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = vec![0u8; NATIVE_INPUT_CHUNK];
+    let mut line = Vec::new();
+    let mut references = Vec::new();
+    let mut oversized = false;
+    loop {
+        let window = chunk.len().min(remaining.saturating_add(1));
+        let read = file
+            .read(&mut chunk[..window])
+            .map_err(|_| "unreadable local reference")?;
+        if read > *remaining {
+            *remaining = 0;
+            return Err("requirement byte budget exceeded (8 MiB)");
+        }
+        *remaining -= read;
+        hasher.update(&chunk[..read]);
+        // A synthetic LF at EOF handles a final line with no terminator, without hashing it.
+        for byte in chunk[..read]
+            .iter()
+            .copied()
+            .chain((read == 0).then_some(b'\n'))
+        {
+            if byte == b'\n' {
+                if oversized {
+                    reasons.insert("requirement line exceeds 8 KiB");
+                } else {
+                    match std::str::from_utf8(&line) {
+                        Ok(line) => match requirement_reference(line) {
+                            Ok(Some(reference)) if references.len() < REQUIREMENT_FILES => {
+                                references.push(PathBuf::from(reference))
+                            }
+                            Ok(Some(_)) => {
+                                reasons.insert("requirement reference budget exceeded (64)");
+                            }
+                            Ok(None) => {}
+                            Err(reason) => {
+                                reasons.insert(reason);
+                            }
+                        },
+                        Err(_) => {
+                            reasons.insert("non-UTF-8 requirement lines are unsupported");
+                        }
+                    }
+                }
+                line.clear();
+                oversized = false;
+            } else if line.len() < REQUIREMENT_LINE {
+                line.push(byte);
+            } else {
+                oversized = true;
+            }
+        }
+        if read == 0 {
+            return Ok((hasher.finalize(), references));
+        }
+    }
+}
+
+/// Adds sorted root `requirements*.txt` and their local requirement/constraint closure to the
+/// native fingerprint. Processes at most 64 canonical files and 64 queued references using
+/// an iterative visited set, with an 8 MiB total read budget and 8 KiB physical lines.
+/// Unsupported, denied, missing and over-budget coverage appends one explicit warning;
+/// unreadable files contribute no content, preserving denied/absent input equivalence.
+/// `ponytail:` this is local reference discovery, not pip syntax; extend the documented subset
+/// only when needed, keeping unsupported scope visible and never installing dependencies.
+fn requirement_inputs(
+    worktree: &Path,
+    root: &Path,
+    denies: &[ReadDeny],
+    parts: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let mut reasons = BTreeSet::new();
+    let entries = requirement_path(worktree, root, denies)
+        .and_then(|_| fs::read_dir(root).map_err(|_| "unreadable requirement directory"));
+    let mut requirements: Vec<_> = match entries {
+        Ok(entries) => entries
+            .filter_map(|entry| match entry {
+                Ok(entry) => match entry.file_name().into_string() {
+                    Ok(name) => Some(name),
+                    Err(_) => {
+                        reasons.insert("non-UTF-8 requirement names are unsupported");
+                        None
+                    }
+                },
+                Err(_) => {
+                    reasons.insert("unreadable requirement directory entry");
+                    None
+                }
+            })
+            .filter(|name| name.starts_with("requirements") && name.ends_with(".txt"))
+            .take(REQUIREMENT_FILES + 1)
+            .collect(),
+        Err(reason) => {
+            reasons.insert(reason);
+            Vec::new()
+        }
+    };
+    if requirements.len() > REQUIREMENT_FILES {
+        reasons.insert("requirement file budget exceeded (64)");
+        requirements.clear();
+    }
+    requirements.sort();
+    let mut pending: VecDeque<_> = requirements
+        .into_iter()
+        .map(|name| root.join(name))
+        .collect();
+    let mut visited = HashSet::new();
+    let mut remaining = REQUIREMENT_BYTES;
+    while let Some(path) = pending.pop_front() {
+        let canonical = match requirement_path(worktree, &path, denies) {
+            Ok(path) => path,
+            Err(reason) => {
+                reasons.insert(reason);
+                continue;
+            }
+        };
+        if visited.contains(&canonical) {
+            continue;
+        }
+        if visited.len() == REQUIREMENT_FILES {
+            reasons.insert("requirement file budget exceeded (64)");
+            break;
+        }
+        visited.insert(canonical.clone());
+        match hash_requirements(&canonical, &mut remaining, &mut reasons) {
+            Ok((hash, references)) => {
+                parts.push(format!("{}={hash}", label(worktree, root, &path)));
+                for reference in references {
+                    if pending.len() == REQUIREMENT_FILES {
+                        reasons.insert("requirement reference budget exceeded (64)");
+                        break;
+                    }
+                    pending.push_back(path.parent().unwrap_or(root).join(reference));
+                }
+            }
+            Err(reason) => {
+                reasons.insert(reason);
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    if !reasons.is_empty() {
+        warnings.push(format!("Python requirements input coverage incomplete: {}; text fingerprints do not attest installed dependencies", reasons.into_iter().collect::<Vec<_>>().join("; ")));
+    }
+}
+
 /// The native project inputs of `root` whose content feeds the resolver identity, in fixed
 /// order: the manifest and pin files the resolver and `detect` already read (`pyproject.toml`,
-/// `pyrightconfig.json`, every root `requirements*.txt` sorted by name), the lockfiles that
-/// decide the installed dependencies (`uv.lock`, `poetry.lock`) and the version request
+/// `pyrightconfig.json`, every root `requirements*.txt` sorted by name and its bounded local
+/// requirement/constraint closure), the dependency lockfiles (`uv.lock`, `poetry.lock`) and the version request
 /// (`.python-version`, the root's own, then the worktree's, in `version_request`'s lookup
 /// order, the worktree copy only when `root` differs from `worktree`).
 ///
@@ -325,10 +660,16 @@ const NATIVE_INPUT_CHUNK: usize = 64 * 1024;
 /// treats a denied `.python-version`. An enumerated `requirements*.txt` that says nothing
 /// contributes no entry at all, so an unreadable one fingerprints exactly like an absent one.
 /// Hashing streams the file in `NATIVE_INPUT_CHUNK` chunks through the same gated open
-/// `read_config` uses — under denies, a denied or symlinked input is refused without being
+/// `read_config` uses for fixed files — under denies, a denied or symlinked input is refused without being
 /// followed; without denies, links are followed as `read_config`'s plain read follows them —
-/// so no input is ever held in memory whole.
-fn native_inputs(worktree: &Path, root: &Path, denies: &[ReadDeny]) -> String {
+/// so no input is ever held in memory whole. Requirements use the stricter contained,
+/// link-free reader described by `requirement_inputs`, which also appends coverage warnings.
+fn native_inputs(
+    worktree: &Path,
+    root: &Path,
+    denies: &[ReadDeny],
+    warnings: &mut Vec<String>,
+) -> String {
     /// One fingerprint entry: the whole-content hash, or `-` when the file says nothing.
     fn entry(name: &str, path: &Path, denies: &[ReadDeny]) -> String {
         match hash_config(path, denies) {
@@ -336,14 +677,6 @@ fn native_inputs(worktree: &Path, root: &Path, denies: &[ReadDeny]) -> String {
             None => format!("{name}=-"),
         }
     }
-    let mut requirements: Vec<String> = fs::read_dir(root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with("requirements") && name.ends_with(".txt"))
-        .collect();
-    requirements.sort();
     let mut parts = Vec::new();
     parts.push(entry("pyproject.toml", &root.join(PYPROJECT_FILE), denies));
     parts.push(entry(
@@ -351,14 +684,7 @@ fn native_inputs(worktree: &Path, root: &Path, denies: &[ReadDeny]) -> String {
         &root.join(PYRIGHT_CONFIG_FILE),
         denies,
     ));
-    for name in &requirements {
-        // An enumerated file that says nothing (denied, a link, unopenable) gets no entry at
-        // all: unlike the fixed files above, its name would otherwise enter the fingerprint
-        // only when it exists, so unreadable would fingerprint differently from absent.
-        if let Some(hash) = hash_config(&root.join(name), denies) {
-            parts.push(format!("{name}={hash}"));
-        }
-    }
+    requirement_inputs(worktree, root, denies, &mut parts, warnings);
     parts.push(entry("uv.lock", &root.join("uv.lock"), denies));
     parts.push(entry("poetry.lock", &root.join("poetry.lock"), denies));
     parts.push(entry(
@@ -432,6 +758,8 @@ pub(crate) struct Resolution {
 
 /// Resolves the environment of the project `root` (absolute, inside `worktree`) with the agent's
 /// `selector`, per the module's precedence, reading every file under the host's `denies`.
+/// Incomplete requirement-reference coverage warns without overriding a pin, selection or
+/// discovered interpreter; requirements only contribute text fingerprints, never versions.
 pub(crate) fn resolve_with_denies(
     worktree: &Path,
     root: &Path,
@@ -507,7 +835,14 @@ pub(crate) fn resolve_with_denies(
     {
         warnings.push(format!("≠ .python-version {request}"));
     }
-    let identity = identity(worktree, root, chosen.as_ref(), missing.as_deref(), denies);
+    let identity = identity(
+        worktree,
+        root,
+        chosen.as_ref(),
+        missing.as_deref(),
+        denies,
+        &mut warnings,
+    );
     Resolution {
         env: ResolvedEnv {
             root: root
@@ -1566,7 +1901,7 @@ mod tests {
     /// The native project inputs feed the identity: changing, adding or removing exactly one
     /// input — the manifest, either lockfile, the pin file, a requirements file or the version
     /// request — invalidates the resolution even though the chosen environment itself is
-    /// byte-identical (a changed lock means different installed dependencies), so checks and
+    /// byte-identical (a changed lock changes declared dependency inputs), so checks and
     /// sessions must not ride on the old answer. Each mutation is compared against the identity
     /// captured immediately before it, so only the named input can explain the change. A nested
     /// root also covers its worktree-level version request.
@@ -1647,6 +1982,292 @@ mod tests {
             resolve(&root, &root, None).identity,
             before,
             "a changed tail byte is a changed lock"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The supported standalone include spellings preserve a whole quoted path with spaces;
+    /// remote/expanded/escaped paths, malformed quoting and combined directives stay explicit.
+    #[test]
+    fn requirement_reference_syntax_is_bounded_and_explicit() {
+        for line in [
+            "-r deps.in",
+            "-rdeps.in",
+            "-r=deps.in",
+            "--requirement deps.in",
+            "--requirement=deps.in",
+            "-c deps.in",
+            "-cdeps.in",
+            "-c=deps.in",
+            "--constraint deps.in",
+            "--constraint=deps.in",
+        ] {
+            assert_eq!(requirement_reference(line), Ok(Some("deps.in")), "{line}");
+        }
+        for line in [
+            "-r 'deps with spaces.in'",
+            "-c\"deps with spaces.in\" # comment",
+            "--requirement='deps with spaces.in'",
+            "--constraint=\"deps with spaces.in\"\t# comment",
+        ] {
+            assert_eq!(
+                requirement_reference(line),
+                Ok(Some("deps with spaces.in")),
+                "{line}"
+            );
+        }
+        for line in ["", "# -r ignored", "pkg==1 # -c ignored", "python==3.99"] {
+            assert_eq!(requirement_reference(line), Ok(None), "{line}");
+        }
+        for line in [
+            "-r",
+            "-c 'unclosed",
+            "-r \"bad\"tail",
+            "-r a -c b",
+            "--requirementfoo",
+            "--no-index -r a",
+            "-r https://example.invalid/a",
+            "-r file:///a",
+            "-r ${INPUT}",
+            "-c ~/private",
+            "-r path\\ with\\ spaces",
+            "-r a\\",
+        ] {
+            assert!(requirement_reference(line).is_err(), "{line}");
+        }
+    }
+
+    /// A constraint-only content change invalidates the shared identity, including a request
+    /// for a different Python package version, while the selected prepared interpreter,
+    /// source and version remain unchanged and no interpreter-version warning is invented.
+    #[test]
+    fn referenced_constraint_change_preserves_the_selected_environment() {
+        let root = scratch("constraint-identity");
+        put(&root, "requirements.txt", "-c constraints.txt\n");
+        put(&root, "constraints.txt", "python==3.99\n");
+        venv(&root, ".venv", "version = 3.14.0\n");
+        let before = resolve(&root, &root, Some(".venv"));
+        put(&root, "constraints.txt", "python==3.98\n");
+        let after = resolve(&root, &root, Some(".venv"));
+        assert_ne!(before.identity, after.identity);
+        assert_eq!(interpreter(&before), interpreter(&after));
+        assert_eq!(after.source, Some(EnvSource::Selected));
+        assert_eq!(after.chosen.unwrap().version.as_deref(), Some("3.14.0"));
+        assert!(before.warnings.is_empty());
+        assert!(after.warnings.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// References are relative to each containing file, may cross a nested project root
+    /// within the authoritative worktree, and deduplicate canonical aliases/cycles. Quoted
+    /// paths with spaces work through real file discovery, not just the line parser.
+    #[test]
+    fn nested_requirement_references_deduplicate_and_terminate_cycles() {
+        let root = scratch("requirement-cycle");
+        let project = root.join("svc");
+        put(
+            &project,
+            "requirements.txt",
+            "-r '../shared/dev deps.in'\n-r '../shared/./dev deps.in'\n",
+        );
+        put(
+            &root,
+            "shared/dev deps.in",
+            "--constraint='limits/base pins.txt'\n-r ../svc/requirements.txt\n",
+        );
+        put(
+            &root,
+            "shared/limits/base pins.txt",
+            "pkg==1\n-c '../dev deps.in'\n",
+        );
+        venv(&project, ".venv", "");
+        let before = resolve(&root, &project, None);
+        assert!(before.warnings.is_empty(), "{:?}", before.warnings);
+        let mut parts = Vec::new();
+        let mut warnings = Vec::new();
+        requirement_inputs(&root, &project, &[], &mut parts, &mut warnings);
+        assert_eq!(parts.len(), 3, "each canonical input is hashed once");
+        assert_eq!(resolve(&root, &project, None).identity, before.identity);
+        put(
+            &root,
+            "shared/limits/base pins.txt",
+            "pkg==2\n-c '../dev deps.in'\n",
+        );
+        let after = resolve(&root, &project, None);
+        assert_ne!(after.identity, before.identity);
+        assert_eq!(interpreter(&after), interpreter(&before));
+        assert!(after.warnings.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A same-length changed tail beyond 256 KiB in a referenced constraint is fully hashed;
+    /// the streaming result matches the full-content BLAKE3 and reference coverage is complete.
+    #[test]
+    fn referenced_constraint_tail_is_hashed_in_full() {
+        let root = fs::canonicalize(scratch("constraint-tail")).unwrap();
+        put(&root, "requirements.txt", "--constraint=deps/pins.txt\n");
+        venv(&root, ".venv", "");
+        let padding = "# padding\n".repeat(30_000);
+        let body = format!("{padding}pkg==1\n");
+        assert!(body.len() > 256 * 1024);
+        put(&root, "deps/pins.txt", &body);
+        let before = resolve(&root, &root, None);
+        let mut remaining = REQUIREMENT_BYTES;
+        let mut reasons = BTreeSet::new();
+        let (hash, references) =
+            hash_requirements(&root.join("deps/pins.txt"), &mut remaining, &mut reasons).unwrap();
+        assert_eq!(hash, blake3::hash(body.as_bytes()));
+        assert!(references.is_empty());
+        assert!(reasons.is_empty());
+        put(&root, "deps/pins.txt", &format!("{padding}pkg==2\n"));
+        let after = resolve(&root, &root, None);
+        assert_ne!(after.identity, before.identity);
+        assert!(after.warnings.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Denied lexical/resolved paths, lexical escapes and file/directory symlinks contribute
+    /// no foreign content. Mutating every hidden target leaves the entire resolution output
+    /// unchanged, while coverage reasons remain explicit and the prepared environment wins.
+    #[test]
+    fn excluded_and_escaping_requirement_contents_never_enter_the_resolution() {
+        let fixture = scratch("requirement-boundary");
+        let root = fixture.join("worktree");
+        venv(&root, ".venv", "");
+        put(
+            &root,
+            "requirements.txt",
+            "-c hidden/pins.txt\n-c ../foreign.txt\n-r link.txt\n-r linked/pins.txt\n",
+        );
+        put(&root, "hidden/pins.txt", "hidden==1\n");
+        put(&fixture, "foreign.txt", "foreign==1\n");
+        put(&fixture, "foreign/pins.txt", "foreign==1\n");
+        std::os::unix::fs::symlink(fixture.join("foreign.txt"), root.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(
+            fixture.join("foreign.txt"),
+            root.join("requirements-escape.txt"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(fixture.join("foreign"), root.join("linked")).unwrap();
+        let denies = [ReadDeny::Path(root.join("hidden"))];
+        let before = resolve_with_denies(&root, &root, None, &denies).env;
+        assert_eq!(chosen(&before), Some(".venv"));
+        let warnings = before.warnings.join(";");
+        assert!(warnings.contains("excluded from reads"));
+        assert!(warnings.contains("escapes worktree"));
+        assert!(warnings.contains("symlinked local references"));
+        put(&root, "hidden/pins.txt", "hidden==2\n");
+        put(&fixture, "foreign.txt", "foreign==2\n");
+        put(&fixture, "foreign/pins.txt", "foreign==2\n");
+        let after = resolve_with_denies(&root, &root, None, &denies).env;
+        assert_eq!(format!("{before:?}"), format!("{after:?}"));
+        // A canonical deny also applies when the authoritative worktree has a lexical alias.
+        let alias = fixture.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let resolved_deny = [ReadDeny::Path(
+            fs::canonicalize(root.join("hidden")).unwrap(),
+        )];
+        assert_eq!(
+            requirement_path(&alias, &alias.join("hidden/pins.txt"), &resolved_deny),
+            Err("local reference excluded from reads")
+        );
+        // Replacing an already-validated parent with a link still cannot redirect the open.
+        put(&root, "swap/pins.txt", "local==1\n");
+        let checked = requirement_path(&root, &root.join("swap/pins.txt"), &[]).unwrap();
+        fs::rename(root.join("swap"), root.join("retained")).unwrap();
+        std::os::unix::fs::symlink(fixture.join("foreign"), root.join("swap")).unwrap();
+        let mut remaining = REQUIREMENT_BYTES;
+        assert!(hash_requirements(&checked, &mut remaining, &mut BTreeSet::new()).is_err());
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    /// Missing, unsupported/remote/expanded and non-UTF-8 references are warnings rather than
+    /// falsely complete coverage; overlong lines are fully hashed but explicitly unparsed.
+    #[test]
+    fn unsupported_requirement_coverage_is_visible_without_changing_selection() {
+        let root = scratch("requirement-unsupported");
+        venv(&root, ".venv", "version = 3.14.0\n");
+        for text in [
+            "-r absent.in\n",
+            "-c https://example.invalid/pins\n",
+            "-r ${INPUT}\n",
+            "-r 'unclosed\n",
+            "-r a -c b\n",
+            "-r a\\\n b\n",
+        ] {
+            put(&root, "requirements.txt", text);
+            let env = resolve(&root, &root, Some(".venv"));
+            assert_eq!(chosen(&env), Some(".venv"));
+            assert_eq!(env.source, Some(EnvSource::Selected));
+            assert!(
+                env.warnings
+                    .iter()
+                    .any(|warning| warning.contains("coverage incomplete")),
+                "{text}"
+            );
+        }
+        fs::write(root.join("requirements.txt"), [0xff, b'\n']).unwrap();
+        assert!(resolve(&root, &root, None).warnings[0].contains("non-UTF-8"));
+        put(&root, "requirements.txt", &"a".repeat(REQUIREMENT_LINE + 1));
+        let before = resolve(&root, &root, None);
+        assert!(before.warnings[0].contains("line exceeds 8 KiB"));
+        put(
+            &root,
+            "requirements.txt",
+            &format!("{}b", "a".repeat(REQUIREMENT_LINE)),
+        );
+        assert_ne!(resolve(&root, &root, None).identity, before.identity);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// File/edge/byte bounds stop discovery deterministically and expose incomplete coverage.
+    /// The streaming reader returns no digest for an over-budget prefix, while an exact
+    /// byte-budget file succeeds, including its final physical line without LF.
+    #[test]
+    fn requirement_discovery_limits_are_explicit() {
+        let root = fs::canonicalize(scratch("requirement-limits")).unwrap();
+        venv(&root, ".venv", "");
+        put(&root, "requirements.txt", "-r deps/0.in\n");
+        for index in 0..REQUIREMENT_FILES {
+            put(
+                &root,
+                &format!("deps/{index}.in"),
+                &format!("-r {}.in\n", index + 1),
+            );
+        }
+        assert!(resolve(&root, &root, None).warnings[0].contains("file budget exceeded (64)"));
+        put(
+            &root,
+            "requirements.txt",
+            &"-r deps/0.in\n".repeat(REQUIREMENT_FILES + 1),
+        );
+        assert!(resolve(&root, &root, None).warnings[0].contains("reference budget exceeded (64)"));
+        for index in 0..REQUIREMENT_FILES {
+            put(&root, &format!("requirements-{index}.txt"), "pkg==1\n");
+        }
+        assert!(resolve(&root, &root, None).warnings[0].contains("file budget exceeded (64)"));
+        for index in 0..REQUIREMENT_FILES {
+            fs::remove_file(root.join(format!("requirements-{index}.txt"))).unwrap();
+        }
+        put(
+            &root,
+            "requirements.txt",
+            &"#\n".repeat(REQUIREMENT_BYTES / 2 + 1),
+        );
+        assert!(resolve(&root, &root, None).warnings[0].contains("byte budget exceeded (8 MiB)"));
+        put(&root, "small.in", "pkg==1");
+        let mut reasons = BTreeSet::new();
+        let mut remaining = 6;
+        assert_eq!(
+            hash_requirements(&root.join("small.in"), &mut remaining, &mut reasons)
+                .unwrap()
+                .0,
+            blake3::hash(b"pkg==1")
+        );
+        let mut remaining = 5;
+        assert_eq!(
+            hash_requirements(&root.join("small.in"), &mut remaining, &mut reasons),
+            Err("requirement byte budget exceeded (8 MiB)")
         );
         fs::remove_dir_all(&root).unwrap();
     }
