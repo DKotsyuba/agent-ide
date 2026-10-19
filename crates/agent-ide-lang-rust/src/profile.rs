@@ -531,6 +531,12 @@ impl RustCompatibilityKey {
         );
         Self(blake3::hash(identity.as_bytes()).to_hex().to_string())
     }
+
+    /// Two distinct keys for reuse-rule tests, without building a worktree authority.
+    #[cfg(test)]
+    pub(crate) fn distinct_for_tests() -> (Self, Self) {
+        (Self("k1".to_owned()), Self("k2".to_owned()))
+    }
 }
 
 /// Couples Workspace's canonical worktree incarnation with the Execution authority for it.

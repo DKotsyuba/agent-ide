@@ -1094,8 +1094,25 @@ async fn check_plan(incoming: &Incoming, effects: &mut Effects<'_>) -> Result<An
         }
     };
     let started = std::time::Instant::now();
+    // The common-environment refusal comes first: an authoritative project pin that names
+    // another toolchain than this check's configured one refuses before any child or
+    // missing-tool answer, exactly as the native checker refuses.
+    let base = checker_for(&config, Duration::ZERO, None);
+    if let Some(cause) = crate::environment::pin_conflict(
+        &query.request.worktree,
+        &base.cargo_check_plan(&query.request).toolchain_dir,
+        &query.request.read_denies,
+    ) {
+        return Ok(reply(&ProblemSnapshot::unavailable_with_detail(
+            crate::LANGUAGE,
+            UnavailableReason::EnvMissing,
+            query.request.input_generation,
+            0,
+            Some(cause),
+        )));
+    }
     // The missing-cargo answer depends on the toolchain alone, so it needs no probe.
-    if checker_for(&config, Duration::ZERO, None).cargo_missing(&query.request) {
+    if base.cargo_missing(&query.request) {
         return Ok(reply(&ProblemSnapshot::unavailable(
             crate::LANGUAGE,
             UnavailableReason::ToolMissing,
@@ -1640,6 +1657,69 @@ mod tests {
             "the developer-directory probe, then the check"
         );
         assert_eq!(effects.last.unwrap().recipe, "cargo_check");
+    }
+
+    /// The module's check planning refuses an authoritative pin that names another toolchain
+    /// than the configured one before anything runs — no probe, no check, the conflict as the
+    /// snapshot's detail — exactly as the native checker refuses.
+    #[tokio::test]
+    async fn check_plan_refuses_a_conflicting_pin_before_anything_runs() {
+        install();
+        let base = Scratch::new("pin-conflict");
+        let toolchain = base.0.join("toolchains/1.98.1-aarch64-apple-darwin");
+        std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+        std::fs::write(toolchain.join("bin/cargo"), "").unwrap();
+        std::fs::write(base.0.join("Cargo.toml"), "").unwrap();
+        std::fs::write(
+            base.0.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"nightly\"\n",
+        )
+        .unwrap();
+        let (mut channel, _) = serve(Role::Checker).await;
+        let payload = payload::encode(&CheckPlanRequest {
+            request: CheckRequest {
+                worktree: base.0.clone(),
+                cache_dir: base.0.join("cache"),
+                input_generation: 2,
+                read_denies: Vec::new(),
+            },
+            config: json!({"toolchain_dir": toolchain}),
+            timeout_ms: 60_000,
+            selections: Vec::new(),
+        });
+        let mut effects = FakeEffects {
+            stdout: Vec::new(),
+            runs: 0,
+            last: None,
+        };
+        let reply = channel
+            .call(
+                Call {
+                    capability: Capability::CheckPlan,
+                    scope_key: "scope".into(),
+                    revision_key: "revision".into(),
+                    payload,
+                    attachments: Vec::new(),
+                },
+                Duration::from_secs(10),
+                &mut effects,
+            )
+            .await
+            .unwrap();
+        let Outcome::Result(value) = reply.outcome else {
+            panic!("{:?}", reply.outcome)
+        };
+        let snapshot: ProblemSnapshot = decode(value).unwrap();
+        assert_eq!(
+            snapshot.state,
+            CheckState::Unavailable(UnavailableReason::EnvMissing)
+        );
+        let detail = snapshot.detail.expect("the conflict is the detail");
+        assert!(
+            detail.contains("rust-toolchain.toml pins nightly"),
+            "{detail}"
+        );
+        assert_eq!(effects.runs, 0, "nothing ran");
     }
 
     /// Answers the developer-directory probe with `selected` and exit `status`, every other

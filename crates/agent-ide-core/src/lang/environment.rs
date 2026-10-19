@@ -9,11 +9,88 @@
 use std::{
     collections::HashMap,
     ffi::OsString,
+    fs,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
 
 use super::Language;
+
+/// Size of one chunk a native input streams through while being hashed: hashing costs this
+/// much memory per file, never the file's size.
+const INPUT_CHUNK: usize = 64 * 1024;
+
+/// Size of one chunk a native input streams through while being hashed: hashing costs this
+/// much memory per file, never the file's size.
+const INPUT_CHUNK: usize = 64 * 1024;
+
+/// Opens `path` under the environment-input gate, or `None` when the file says nothing:
+/// missing, host-denied, or a link that refuses to be followed. Without denies a regular file
+/// is read plainly; under denies a denied or symlinked input is refused without being followed
+/// (`O_NOFOLLOW`). The one gate every environment input read goes through.
+fn open_input(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> Option<fs::File> {
+    if denies.is_empty() {
+        if !path.is_file() {
+            return None;
+        }
+        return fs::File::open(path).ok();
+    }
+    if denies.iter().any(|deny| deny.matches(path)) {
+        return None;
+    }
+    // A final link is not proved readable: refuse without following.
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return None;
+    }
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()
+}
+
+/// The guarded text of a native environment input, or `None` when it says nothing (see
+/// [`open_input`]). Small declared inputs only — pins and manifests a language parses — never
+/// a substitute for streaming a large file.
+pub fn read_input(
+    path: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<String> {
+    let mut text = String::new();
+    open_input(path, denies)?
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
+/// Whether `path` is readable under the environment-input gate ([`open_input`]): a language
+/// checks this before a content-dependent decision, so a denied input never influences one.
+pub fn readable(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+    open_input(path, denies).is_some()
+}
+
+/// Whole-content BLAKE3 of a native environment input, hashed with bounded memory, or `None`
+/// when the file says nothing (see [`open_input`]). The file is streamed in `INPUT_CHUNK`
+/// chunks straight into the hasher, so no input is ever held in memory whole, and any content
+/// — UTF-8 or not — is hashed as the bytes it is. A language's resolver calls this for every
+/// fingerprinted project file so all of them hash identically.
+pub fn hash_input(
+    path: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<blake3::Hash> {
+    let mut file = open_input(path, denies)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = vec![0u8; INPUT_CHUNK];
+    loop {
+        let read = file.read(&mut chunk).ok()?;
+        if read == 0 {
+            return Some(hasher.finalize());
+        }
+        hasher.update(&chunk[..read]);
+    }
+}
 
 /// One stored environment choice for one project root of a worktree.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
