@@ -1021,18 +1021,32 @@ fn fill(commands: &mut ProjectCommands, slot: &str, argv: Vec<String>, source: C
 /// Toolchain named by `rust-toolchain.toml` (`channel = "…"`) or a legacy `rust-toolchain`
 /// file (TOML or a bare channel line); `None` when neither exists.
 fn toolchain(root: &Path) -> Option<String> {
-    ["rust-toolchain.toml", "rust-toolchain"]
-        .into_iter()
-        .find_map(|name| fs::read_to_string(root.join(name)).ok())
-        .and_then(|text| {
-            toml_string(&text, "channel").or_else(|| {
-                text.lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty() && !line.starts_with('#'))
-                    .filter(|line| !line.contains('='))
-                    .map(str::to_owned)
-            })
-        })
+    toolchain_pin(root).map(|(_, channel)| channel)
+}
+
+/// The declaring file's name (`rust-toolchain.toml` or `rust-toolchain`) and the toolchain
+/// channel it names: the TOML `channel` key, else the first non-comment line without `=`.
+/// The first readable file wins and only that file is parsed, exactly as [`toolchain`] always
+/// read it; `None` when neither file exists or the readable one names nothing.
+pub(crate) fn toolchain_pin(root: &Path) -> Option<(&'static str, String)> {
+    for (name, path) in [
+        ("rust-toolchain.toml", root.join("rust-toolchain.toml")),
+        ("rust-toolchain", root.join("rust-toolchain")),
+    ] {
+        if let Ok(text) = fs::read_to_string(path) {
+            return Some((
+                name,
+                toml_string(&text, "channel").or_else(|| {
+                    text.lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty() && !line.starts_with('#'))
+                        .filter(|line| !line.contains('='))
+                        .map(str::to_owned)
+                })?,
+            ));
+        }
+    }
+    None
 }
 
 /// Value of the first `key = "value"` line in a TOML text (any table), without parsing TOML.

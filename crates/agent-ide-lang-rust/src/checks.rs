@@ -560,11 +560,33 @@ impl RustChecker {
         request.read_denies.iter().any(|deny| deny.matches(&cargo)) || !cargo.is_file()
     }
 
+    /// The common-environment refusal of this checker: an authoritative project pin that names
+    /// another toolchain than this checker's configured one refuses the check before any child
+    /// starts ([`crate::environment::pin_conflict`]) — running the configured toolchain against
+    /// the pin's rejection is not the project's environment. The detail names the pin, the
+    /// configured toolchain and the native fallback.
+    pub(crate) fn environment_refusal(&self, request: &CheckRequest) -> Option<String> {
+        crate::environment::pin_conflict(
+            &request.worktree,
+            &self.toolchain_dir,
+            &request.read_denies,
+        )
+    }
+
     /// Executes the check body behind [`RustChecker::check`].
     ///
     /// Split from the trait method only to keep the boxed future type uniform.
     async fn run_check(&self, request: CheckRequest) -> ProblemSnapshot {
         let started = Instant::now();
+        if let Some(cause) = self.environment_refusal(&request) {
+            return ProblemSnapshot::unavailable_with_detail(
+                crate::LANGUAGE,
+                UnavailableReason::EnvMissing,
+                request.input_generation,
+                0,
+                Some(cause),
+            );
+        }
         if self.cargo_missing(&request) {
             return ProblemSnapshot::unavailable(
                 crate::LANGUAGE,
@@ -1048,6 +1070,65 @@ mod tests {
             derive_target_env_var(Path::new("1.98.1-aarch64-apple-darwin")),
             Some("AARCH64_APPLE_DARWIN".to_owned())
         );
+    }
+
+    /// An authoritative pin that names another toolchain than the configured one refuses the
+    /// check with the conflict as its detail before any child starts; the agreeing pin runs
+    /// the check as before.
+    #[tokio::test]
+    async fn conflicting_pin_refuses_the_check_before_any_child() {
+        use agent_ide_core::checks::runner::FakeRunner;
+        let root = std::env::temp_dir().join(format!("agent-ide-rust-pin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let configured = root.join("toolchains/1.98.1-aarch64-apple-darwin");
+        fs::create_dir_all(configured.join("bin")).unwrap();
+        fs::write(configured.join("bin/cargo"), "").unwrap();
+        fs::write(root.join("Cargo.toml"), "").unwrap();
+        fs::write(
+            root.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"nightly\"\n",
+        )
+        .unwrap();
+        let checker = RustChecker::for_planning(
+            Arc::new(FakeRunner::default()),
+            configured,
+            None,
+            Duration::from_secs(60),
+            None,
+        );
+        let request = CheckRequest {
+            worktree: root.clone(),
+            cache_dir: root.join("cache"),
+            input_generation: 1,
+            read_denies: Vec::new(),
+        };
+        let snapshot = checker.check(request.clone()).await;
+        assert_eq!(
+            snapshot.state,
+            CheckState::Unavailable(UnavailableReason::EnvMissing)
+        );
+        let detail = snapshot.detail.expect("the conflict is the detail");
+        assert!(
+            detail.contains("rust-toolchain.toml pins nightly"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("configured toolchain is 1.98.1"),
+            "{detail}"
+        );
+        // The agreeing pin runs the check as before (no conflict refusal).
+        fs::write(
+            root.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.98.1\"\n",
+        )
+        .unwrap();
+        let snapshot = checker.check(request).await;
+        assert_ne!(
+            snapshot.state,
+            CheckState::Unavailable(UnavailableReason::EnvMissing),
+            "{snapshot:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Proves a channel rustup toolchain name (`<channel>-<triple>`) with an underscore in the

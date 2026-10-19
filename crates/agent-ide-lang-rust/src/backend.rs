@@ -3,8 +3,9 @@
 //! The backend owns the exclusive Rust view bookkeeping and every binding's live session. A
 //! session starts on the first request, is reused while its transport lives and its immutable
 //! profile identity (the declared analyzer, cargo, rustc, toolchain, trust, cache namespace and
-//! worktree incarnation) is unchanged, and is shut down and reaped when the binding stops, an
-//! exchange fails, or that identity changes.
+//! worktree incarnation) plus its worktree's native environment identity (the
+//! `rust-toolchain` pin, `Cargo.toml`/`Cargo.lock` and `.cargo` config) are unchanged, and is
+//! shut down and reaped when the binding stops, an exchange fails, or either identity changes.
 
 use std::{any::Any, collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
@@ -339,6 +340,19 @@ async fn open_live(
     .await
 }
 
+/// Whether a live session may answer the current demand: its declared compatibility inputs
+/// and its worktree's native environment identity (pin, manifest, lock, Cargo config) must
+/// both be unchanged. A changed either is a stale child: the demand restarts on the current
+/// declaration instead of an old answer.
+fn keeps_rust_session(
+    started_identity: &RustCompatibilityKey,
+    current_identity: &RustCompatibilityKey,
+    started_environment: &str,
+    current_environment: &str,
+) -> bool {
+    started_identity == current_identity && started_environment == current_environment
+}
+
 /// Names the failed initialize stage on the job's failure reply: a handshake that exhausted its
 /// 30-second bound reports the timeout; any other initialize failure (a server that exited or
 /// answered invalidly before readiness) reports the failed initialize. Closed stage words only.
@@ -366,6 +380,9 @@ struct RustLive {
     module_inputs: Option<(String, PathBuf)>,
     /// The compatibility inputs this session started with; reuse requires them unchanged.
     identity: RustCompatibilityKey,
+    /// The native environment identity this session started with (the worktree's pin,
+    /// manifest, lock and Cargo config); a changed one retires the session before reuse.
+    environment: String,
 }
 
 /// Exclusive Rust generations and every binding's retained analyzer session.
@@ -390,9 +407,12 @@ impl RustBackend {
     ///
     /// A live session is reused only when the freshly computed compatibility inputs (analyzer,
     /// cargo and rustc identity, toolchain, trust, cache namespace, worktree incarnation, and
-    /// the module build for a module-hosted one) equal the ones it started with. A session
-    /// whose declared inputs changed — including a worktree recreated at the same path — is
-    /// released before reuse, so the demand runs against the declared child, never a stale one.
+    /// the module build for a module-hosted one) and the worktree's native environment identity
+    /// ([`crate::environment`]: the `rust-toolchain` pin, `Cargo.toml`/`Cargo.lock` and
+    /// `.cargo` config) equal the ones it started with. A session whose declared inputs or
+    /// environment changed — including a worktree recreated at the same path — is released
+    /// before reuse, so the demand runs against the declared child on current inputs, never a
+    /// stale one.
     async fn ensure(
         &mut self,
         host: &mut dyn ProviderHost,
@@ -439,6 +459,19 @@ impl RustBackend {
         let scoped = server::execution_authority(&authority)?;
         let worktree = RustWorktree::new(authority.worktree().clone(), scoped)
             .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        // The worktree's native environment identity (pin, manifest, lock, Cargo config) from
+        // the launch's own accepted facts: a changed lock or config retires the session like a
+        // changed tool does, instead of the old child answering from stale inputs.
+        let configured = launch.options::<RustLaunchOptions>().and_then(|options| {
+            let cargo = options.cargo.as_ref()?;
+            Some(crate::environment::ConfiguredToolchain {
+                dir: cargo.path.parent()?,
+                version: options.cargo_version.as_deref(),
+            })
+        });
+        // The analyzer route carries no host read denies; the resolver's deny branch is the
+        // checker path's.
+        let environment = crate::environment::environment(worktree_path, configured.as_ref(), &[]);
         let start = match module {
             None => Start::InProcess(profile_of(launch, &cache_namespace)?),
             Some(executable) => {
@@ -476,14 +509,19 @@ impl RustBackend {
             Start::InProcess(profile) => profile.compatibility_key(&worktree),
             Start::Module { inputs, .. } => RustCompatibilityKey::module(inputs, &worktree),
         };
-        // A live session whose declared inputs changed is retired before reuse: this demand
-        // restarts on the current declaration instead of being answered by the old child.
+        // A live session whose declared inputs or native environment changed is retired before
+        // reuse: this demand restarts on the current declaration instead of being answered by
+        // the old child. The exclusive view is not re-keyed on the environment — the worktree
+        // incarnation did not change; only the child and its inputs go stale.
         if let Some(entry) = self.live.get(&binding)
             && entry.live.is_alive()
+            && !keeps_rust_session(
+                &entry.identity,
+                &key,
+                &entry.environment,
+                &environment.identity,
+            )
         {
-            if entry.identity == key {
-                return Ok(());
-            }
             self.release(host, &binding, true).await;
         }
         let (command, program) = match &start {
@@ -588,6 +626,7 @@ impl RustBackend {
                         live,
                         module_inputs,
                         identity: key,
+                        environment: environment.identity,
                     },
                 );
                 Ok(())
@@ -823,5 +862,31 @@ impl ServerBackend for RustBackend {
     /// Bindings with a retained analyzer session.
     fn live_bindings(&self) -> Vec<BindingRef> {
         self.live.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod environment_retirement_tests {
+    use super::*;
+
+    /// Reuse requires both the declared inputs and the worktree's native environment identity
+    /// unchanged: a changed lock, config or pin retires a healthy session exactly like a
+    /// changed tool does.
+    #[test]
+    fn reuse_requires_unchanged_inputs_and_environment() {
+        let (key_a, key_b) = RustCompatibilityKey::distinct_for_tests();
+        assert!(keeps_rust_session(&key_a, &key_a, "env-1", "env-1"));
+        assert!(
+            !keeps_rust_session(&key_a, &key_b, "env-1", "env-1"),
+            "changed declared inputs retire"
+        );
+        assert!(
+            !keeps_rust_session(&key_a, &key_a, "env-1", "env-2"),
+            "changed native environment retires"
+        );
+        assert!(
+            !keeps_rust_session(&key_a, &key_b, "env-1", "env-2"),
+            "both changed retire"
+        );
     }
 }
