@@ -204,7 +204,10 @@ impl SupportServer {
         let payload = request.payload.clone();
         Ok(match request.capability {
             Capability::Project => match decode::<ProjectQuery>(payload)? {
-                ProjectQuery::Detect { root } => encode(&support.detect(&root)),
+                ProjectQuery::Detect { root, selections } => {
+                    replace_selections(&root, self.language, selections);
+                    encode(&support.detect(&root))
+                }
                 ProjectQuery::Environments {
                     worktree,
                     selections,
@@ -485,6 +488,7 @@ mod tests {
             revision_key: "r".into(),
             payload: encode(&ProjectQuery::Detect {
                 root: "/nonexistent".into(),
+                selections: Vec::new(),
             }),
             attachments: Vec::new(),
         };

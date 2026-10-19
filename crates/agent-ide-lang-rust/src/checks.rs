@@ -137,7 +137,8 @@ impl RustChecker {
     /// [`UnavailableReason::EnvMissing`] in [`RustChecker::check`]. The environment is
     /// rebuilt from the allowlist: `PATH` limited to toolchain bins plus the system dirs,
     /// `HOME`, explicit `CARGO_HOME`, `TMPDIR`/`CARGO_TARGET_DIR` under the private cache,
-    /// `CARGO_NET_OFFLINE=true`, and
+    /// `CARGO_NET_OFFLINE=true`, `RUSTUP_AUTO_INSTALL=0` (a missing toolchain refuses instead
+    /// of installing), and
     /// this checker's resolved linker-bypass environment (T06B): compiling still needs read
     /// access to the Apple developer directory for headers and libraries, but the link step of a
     /// build script (for example `blake3`'s) is pointed straight at the toolchain `clang` instead
@@ -235,6 +236,9 @@ impl CargoCheckPlan {
                         .into_owned(),
                 ),
                 ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
+                // A missing toolchain must refuse (`ToolMissing`), never send cargo's rustup
+                // proxies to install one from the network.
+                ("RUSTUP_AUTO_INSTALL".to_owned(), "0".to_owned()),
             ]
             .into_iter()
             .chain(self.linker_env.iter().cloned())

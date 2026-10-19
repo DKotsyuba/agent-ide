@@ -210,6 +210,8 @@ fn rust_cargo_check_spec_matches_confined_contract() {
                     .into_owned()
             ),
             ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
+            // A missing toolchain refuses as ToolMissing; no child ever installs one.
+            ("RUSTUP_AUTO_INSTALL".to_owned(), "0".to_owned()),
         ]
     );
     let mut expected_read_roots = vec![

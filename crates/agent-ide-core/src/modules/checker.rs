@@ -133,6 +133,12 @@ impl ModuleChecker {
                         request: request.clone(),
                         config: self.section.clone(),
                         timeout_ms: self.timeout.as_millis() as u64,
+                        // The module plans in the current environment: its own copy of the
+                        // selections may predate the last `ide.start environment` change.
+                        selections: crate::lang::environment::selections(
+                            &request.worktree,
+                            self.language,
+                        ),
                     }),
                 ),
                 self.timeout + super::router::budget_or(PLAN_MARGIN),

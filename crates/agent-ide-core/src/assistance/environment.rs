@@ -49,8 +49,10 @@ impl EnvironmentState {
     /// Records the `observed` resolutions of `worktree` ([`observe`]), returning changed languages
     /// and retaining their change notices. A language whose module could not answer keeps its
     /// previous resolutions. First observation establishes a baseline; unchanged identities
-    /// produce no event. Control and framing characters from filesystem labels are escaped before
-    /// notices reach a plate.
+    /// produce no event. The change notices name exactly what a change triggers here — the
+    /// language's project checks are invalidated (the caller feeds [`observe`]'s changed languages
+    /// to the check feed); no semantic session is restarted by this path. Control and framing
+    /// characters from filesystem labels are escaped before notices reach a plate.
     pub(super) fn refresh(
         &mut self,
         worktree: &Path,
@@ -90,7 +92,7 @@ impl EnvironmentState {
                         format!("{language}:{}", env.root.display())
                     };
                     notices.push(format!(
-                        "{key}: environment now {} (was {}; {source}) — semantic session restarted",
+                        "{key}: environment now {} (was {}; {source}) — project checks invalidated",
                         env.chosen
                             .as_ref()
                             .map_or("missing", |chosen| chosen.label.as_str()),
@@ -111,7 +113,7 @@ impl EnvironmentState {
                         format!("{language}:{}", old.root.display())
                     };
                     notices.push(format!(
-                        "{key}: environment now missing (was {}) — semantic session restarted",
+                        "{key}: environment now missing (was {}) — project checks invalidated",
                         old.chosen
                             .as_ref()
                             .map_or("missing", |chosen| chosen.label.as_str())
@@ -181,7 +183,8 @@ fn observed(worktree: &Path) -> Vec<(Language, Option<Vec<ResolvedEnv>>)> {
         .collect()
 }
 
-/// Resolver identity changes generate one notice per binding, including disappearance.
+/// Resolver identity changes generate one notice per binding, including disappearance, and the
+/// notice names the actual effect (project checks invalidated), not a semantic restart.
 #[test]
 fn environment_identity_changes_and_notice_delivery() {
     use crate::lang::{
@@ -206,7 +209,7 @@ fn environment_identity_changes_and_notice_delivery() {
     let notice = state.notice(&root, &[1; 32]).unwrap();
     assert_eq!(
         notice,
-        "alpha: environment now two (was one; selected) — semantic session restarted"
+        "alpha: environment now two (was one; selected) — project checks invalidated"
     );
     state.consume(&root, &[1; 32], &notice);
     assert!(state.notice(&root, &[1; 32]).is_none());

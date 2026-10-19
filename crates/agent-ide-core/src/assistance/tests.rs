@@ -323,18 +323,42 @@ impl TestRuns {
                 };
             }
         };
-        // The rerun line reproduces the run: its directory and environment overrides included.
+        // The rerun line reproduces the run: its directory, the caller's environment overrides and
+        // the resolved command environment's program prefix, variables and PATH prefix included —
+        // exactly what `spawn_resolved` starts, so the line is a repeatable replay. `$PATH` stands
+        // for the inherited PATH a replay resolves on its own host; the prefix before it is exact.
         let rerun_dir = cwd
             .strip_prefix(&root)
             .ok()
             .filter(|relative| !relative.as_os_str().is_empty())
             .map(|relative| relative.display().to_string());
-        let rerun_command: Vec<String> = if env.is_empty() {
-            argv.clone()
+        let started_argv: Vec<String> = match resolution.resolved.as_ref() {
+            Some(resolved) if !resolved.argv_prefix.is_empty() => resolved
+                .argv_prefix
+                .iter()
+                .map(|part| part.to_string_lossy().into_owned())
+                .chain(argv.iter().skip(1).cloned())
+                .collect(),
+            _ => argv.clone(),
+        };
+        let mut overrides: Vec<String> = env
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        if let Some(resolved) = resolution.resolved.as_ref() {
+            overrides.extend(resolved.vars.iter().map(|(key, value)| {
+                format!("{}={}", key.to_string_lossy(), value.to_string_lossy())
+            }));
+            if let Some(bin) = &resolved.path_prefix {
+                overrides.push(format!("PATH={}:$PATH", bin.display()));
+            }
+        }
+        let rerun_command: Vec<String> = if overrides.is_empty() {
+            started_argv
         } else {
             std::iter::once("env".to_owned())
-                .chain(env.iter().map(|(name, value)| format!("{name}={value}")))
-                .chain(argv.iter().cloned())
+                .chain(overrides)
+                .chain(started_argv)
                 .collect()
         };
         let launch = Launch {
@@ -1545,6 +1569,70 @@ mod runner_tests {
         let result = result.unwrap();
         assert_eq!(result.rerun_dir.as_deref(), Some("pkg"));
         assert_eq!(result.command, ["env", "RUN_MARKER=x", "/bin/echo", "done"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A run that started inside its resolved environment keeps that activation in its rerun
+    /// line: the resolver's program prefix leads the argv, its variables and PATH prefix appear
+    /// as `env` overrides — the same program and environment `spawn_resolved` started, so the
+    /// line replays the run instead of the pre-resolution request.
+    #[tokio::test]
+    async fn rerun_names_the_resolved_environment_activation() {
+        use crate::lang::environment::CommandEnv;
+        let runs = TestRuns::default();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("agent-ide-rerun-env-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = BindingRef::fixture("rerun-env-actor", "rerun-env-channel", 1);
+        let venv_bin = root.join(".venv/bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        let started = runs.start_with_options(
+            root.clone(),
+            vec!["pytest".into(), "-k".into(), "marker".into()],
+            &owner,
+            TestCommandOptions {
+                cwd: root.clone(),
+                env: Vec::new(),
+                language: crate::lang::testing::ALPHA,
+                command_language: None,
+                budget: Duration::from_secs(10),
+                detail_ref: "rerun-env-detail".into(),
+                resolution: CommandResolution {
+                    resolved: Some(CommandEnv {
+                        argv_prefix: vec!["/bin/echo".into()],
+                        path_prefix: Some(venv_bin.clone()),
+                        vars: vec![(
+                            std::ffi::OsString::from("VIRTUAL_ENV"),
+                            root.join(".venv").into_os_string(),
+                        )],
+                    }),
+                    environment_label: Some(".venv".into()),
+                },
+            },
+        );
+        assert!(matches!(started, StartResult::Started(1)));
+        let mut result = None;
+        for _ in 0..100 {
+            result = runs.get(&root, 1, &owner).and_then(|status| status.result);
+            if result.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let result = result.unwrap();
+        assert_eq!(
+            result.command,
+            vec![
+                "env".to_owned(),
+                format!("VIRTUAL_ENV={}", root.join(".venv").display()),
+                format!("PATH={}:$PATH", venv_bin.display()),
+                "/bin/echo".to_owned(),
+                "-k".to_owned(),
+                "marker".to_owned(),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -646,7 +646,10 @@ pub fn sample_call(capability: Capability) -> Call {
     };
     let mut attachments = Vec::new();
     let payload = match capability {
-        Capability::Project => encode(&ProjectQuery::Detect { root: "/w".into() }),
+        Capability::Project => encode(&ProjectQuery::Detect {
+            root: "/w".into(),
+            selections: Vec::new(),
+        }),
         Capability::AnalyzeSource => {
             attachments.push(Attachment {
                 id: 1,
@@ -722,6 +725,7 @@ pub fn sample_call(capability: Capability) -> Call {
             request: check,
             config: json!({}),
             timeout_ms: 1000,
+            selections: Vec::new(),
         }),
         Capability::CheckParse => {
             attachments.push(Attachment::octets(1, vec![0xff; 3]));

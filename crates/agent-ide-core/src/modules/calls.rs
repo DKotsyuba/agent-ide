@@ -383,7 +383,9 @@ fn field<T>(value: Field<T>, default: T) -> T {
     }
 }
 
-/// `LanguageSupport::detect`.
+/// `LanguageSupport::detect` with the stored selections, which the module applies before
+/// reading manifests: a detected environment (and the commands planned from it) always reflects
+/// the current `ide.start environment` choice, not the instance's last-seen one.
 pub async fn detect(language: Language, root: &Path) -> Routed<Option<LanguageProject>> {
     match module(language) {
         None => {
@@ -401,6 +403,7 @@ pub async fn detect(language: Language, root: &Path) -> Routed<Option<LanguagePr
                 Capability::Project,
                 encode(&ProjectQuery::Detect {
                     root: root.to_path_buf(),
+                    selections: environment::selections(root, language),
                 }),
                 Vec::new(),
             )

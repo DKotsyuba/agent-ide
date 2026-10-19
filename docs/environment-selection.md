@@ -199,7 +199,7 @@ environment: typescript node 22.11.0 (.nvmrc) ≠ volta.node 20.18.0 · server n
 
 **Plate / feed**
 - `EnvMissing` carries a detail, as `Fatal` already does (`unavailable_with_detail`): `python: environment .venv-py314 missing (selected) — recreate it or ide.start environment {"python":"auto"}`.
-- One-shot change line, in the style of the `git: HEAD moved` line: `python: environment now .venv-py314 (was .venv; selected) — semantic session restarted`.
+- One-shot change line, in the style of the `git: HEAD moved` line: `python: environment now .venv-py314 (was .venv; selected) — project checks invalidated` (the change itself invalidates the language's project checks; a live semantic session retires at its next use when the resolver identity no longer matches).
 
 **ide.test.** The summary adds ` · env .venv-py314` only when the language has more than one candidate or a selection is in force.
 
@@ -343,7 +343,7 @@ environment: typescript node 22.11.0 (.nvmrc) ≠ volta.node 20.18.0 · server n
 ## 6. What the agent sees, end to end
 1. The `ide.start` card shows: `environment: python .venv (3.12.7, discovered) · also .venv-py314 (3.14.0) — choose: ide.start environment {"python": ".venv-py314"}`.
 2. The agent repeats `ide.start` with that choice, and the card now says `(selected)`.
-3. The plate reports: `python: environment now .venv-py314 (was .venv; selected) — semantic session restarted`.
+3. The plate reports: `python: environment now .venv-py314 (was .venv; selected) — project checks invalidated`.
 4. The next check uses the new env, and `ide.test` runs `.venv-py314/bin/python -m pytest`.
 5. If the directory is later deleted, the plate says: `python: environment .venv-py314 missing (selected) — recreate it or ide.start environment {"python":"auto"}`.
 
