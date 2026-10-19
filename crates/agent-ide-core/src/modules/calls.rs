@@ -884,8 +884,13 @@ pub fn tool_path() -> String {
 /// the language's declared recipes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StdinRun {
-    /// Run as the in-process path always has (formatter PATH, daemon environment).
-    Argv(Vec<String>),
+    /// Native argv with its language-resolved environment, applied before job admission.
+    Argv {
+        /// Program and arguments from the language's formatter or probe planner.
+        argv: Vec<String>,
+        /// Current project activation; absent when the language does not claim this program.
+        environment: Option<environment::CommandEnv>,
+    },
     /// Run exactly this core-built specification.
     Spec(crate::checks::runner::RunSpec),
 }
@@ -1001,7 +1006,12 @@ pub async fn format_stdin_command(
         None => Ok(language
             .support()
             .format_stdin_command(project, file)
-            .map(StdinRun::Argv)),
+            .map(|argv| {
+                let environment = argv.first().and_then(|program| {
+                    language.support().command_env(worktree, worktree, program)
+                });
+                StdinRun::Argv { argv, environment }
+            })),
         Some(host) => {
             let effect: Option<EffectRequest> = host
                 .request(
@@ -1033,7 +1043,12 @@ pub async fn syntax_probe_command(
         None => Ok(language
             .support()
             .syntax_probe_command(project, root, file, configured)
-            .map(StdinRun::Argv)),
+            .map(|argv| {
+                let environment = argv
+                    .first()
+                    .and_then(|program| language.support().command_env(worktree, root, program));
+                StdinRun::Argv { argv, environment }
+            })),
         Some(host) => {
             let effect: Option<EffectRequest> = host
                 .request(

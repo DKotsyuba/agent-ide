@@ -101,8 +101,9 @@ pub enum ProjectQuery {
     Detect {
         /// Project root.
         root: PathBuf,
-        /// The core's stored selections for this root's worktree and language. Absent in
-        /// recorded payloads from before it existed (then the instance keeps its own).
+        /// The core's stored selections for this root's worktree and language. Missing or
+        /// empty resets the instance's selections before detection; current callers send them
+        /// explicitly, and older recorded payloads deserialize to the same empty reset.
         #[serde(default)]
         selections: Vec<EnvSelection>,
     },
@@ -658,7 +659,7 @@ pub struct CheckPlanRequest {
     pub timeout_ms: u64,
     /// The core's stored environment selections for this worktree and language, applied before
     /// the module plans, so a planned check runs in the current environment. Absent in recorded
-    /// payloads from before it existed (then the instance keeps its own).
+    /// payloads deserialize to empty and reset the instance's selections before planning.
     #[serde(default)]
     pub selections: Vec<EnvSelection>,
 }

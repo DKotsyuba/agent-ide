@@ -781,6 +781,123 @@ const FAULT_SEAM: &str = "AGENT_IDE_TEST_MODULE_FAULT";
 /// The module request budget seam (`agent_ide_core::modules::router::BUDGET_SEAM`).
 const BUDGET_SEAM: &str = "AGENT_IDE_TEST_MODULE_BUDGET_MS";
 
+/// Qualifies the identity fixture with the original accepted analyzer before interpreting any
+/// copied-tool failure as a product regression. Both hosting modes must reach the unchanged
+/// semantic readiness barrier and release every captured child; no executable is copied here.
+#[tokio::test]
+#[ignore = "requires the accepted Rust inputs; diagnostic control for the identity fixture"]
+async fn original_rust_analyzer_identity_fixture_is_ready() {
+    for (label, mode) in [("native", IN_PROCESS), ("module", MODULE)] {
+        let fixture = rust_fixture(PARITY_FILES, &format!("identity-control-{label}"), 300);
+        let mut daemon = Daemon::start(&fixture, &[mode]).await;
+        let mut session = Session::start(&fixture).await;
+        ready(&mut session, &fixture).await;
+        let owned = daemon.tree().all();
+        session.close(&fixture).await;
+        drop(daemon);
+        for process in owned {
+            assert!(
+                process.gone().await,
+                "{label}: control child survived cleanup"
+            );
+        }
+    }
+}
+
+/// A live Rust session never answers after its declared analyzer executable is replaced at the
+/// same path. Both native and module hosting retire the original process before refusing the
+/// now-unqualified replacement; no declaration is silently reaccepted and the daemon survives.
+#[tokio::test]
+#[ignore = "requires the accepted Rust inputs; run explicitly with the corrective provider checks"]
+async fn changed_rust_analyzer_bytes_retire_the_live_session() {
+    for (label, mode) in [("native", IN_PROCESS), ("module", MODULE)] {
+        let fixture = rust_fixture(PARITY_FILES, &format!("identity-{label}"), 300);
+        // Preserve the installed tool's basename and sibling asset layout: rust-analyzer may
+        // locate sysroot/proc-macro resources relative to its own executable. Only its bytes
+        // are copied; library/tool siblings remain links to the already prepared toolchain.
+        let prefix = fixture.base.join("toolchain-copy");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let original = std::path::PathBuf::from(input("AGENT_IDE_RUST_ANALYZER"));
+        let original_prefix = original.parent().unwrap().parent().unwrap();
+        for name in ["lib", "libexec", "share"] {
+            let resource = original_prefix.join(name);
+            if resource.exists() {
+                std::os::unix::fs::symlink(resource, prefix.join(name)).unwrap();
+            }
+        }
+        for name in ["cargo", "rustc", "rustfmt", "rust-analyzer-proc-macro-srv"] {
+            let resource = original.parent().unwrap().join(name);
+            if resource.exists() {
+                std::os::unix::fs::symlink(resource, prefix.join("bin").join(name)).unwrap();
+            }
+        }
+        let analyzer_path = prefix.join("bin/rust-analyzer");
+        std::fs::copy(input("AGENT_IDE_RUST_ANALYZER"), &analyzer_path).unwrap();
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+        config["targets"][0]["providers"][0]["executable"] = accepted(
+            analyzer_path.to_str().unwrap(),
+            "rust-analyzer 1.98.1 (48a229ce 2026-09-01)",
+        );
+        std::fs::write(&fixture.config, config.to_string()).unwrap();
+        let mut daemon = Daemon::start(&fixture, &[mode]).await;
+        let mut session = Session::start(&fixture).await;
+        ready(&mut session, &fixture).await;
+        let tree = daemon.tree();
+        let original: Vec<_> = tree
+            .all()
+            .into_iter()
+            .filter(|id| id.command().contains(analyzer_path.to_str().unwrap()))
+            .collect();
+        assert_eq!(original.len(), 1, "{label}: expected one live analyzer");
+        let replacement = fixture.base.join("replacement");
+        std::fs::copy("/usr/bin/false", &replacement).unwrap();
+        std::fs::rename(replacement, &analyzer_path).unwrap();
+        let reply = session
+            .call(
+                &fixture,
+                source_query_tool(&json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET})),
+                json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET}),
+            )
+            .await;
+        let text = reply["text"].as_str().unwrap_or_default();
+        assert!(
+            !text.contains("mode: semantic"),
+            "{label}: stale semantic answer: {reply}"
+        );
+        assert!(
+            text.contains("mode: lexical") && text.contains("unavailable"),
+            "{label}: missing semantic refusal: {reply}"
+        );
+        for process in original {
+            assert!(
+                process.gone().await,
+                "{label}: old analyzer survived identity change"
+            );
+        }
+        let active = session
+            .call(
+                &fixture,
+                "ide.start",
+                json!({"activation_id":"parity-start"}),
+            )
+            .await;
+        assert_eq!(
+            active["kind"], "activation",
+            "{label}: daemon did not answer activation: {active}"
+        );
+        let owned = daemon.tree().all();
+        session.close(&fixture).await;
+        drop(daemon);
+        for process in owned {
+            assert!(
+                process.gone().await,
+                "{label}: owned child survived cleanup"
+            );
+        }
+    }
+}
+
 /// The M-A conformance cases on the Rust analyzer module with the real rust-analyzer: once the
 /// analyzer is ready, a stall past the module budget and a malformed reply each settle the next
 /// semantic call with a typed `module_unavailable (bundled.rust:…)` (timeout, malformed) on the

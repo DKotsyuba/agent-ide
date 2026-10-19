@@ -303,10 +303,9 @@ pub const RUSTFMT: EffectRecipe = EffectRecipe {
             param: "HOME",
             optional: true,
         },
-        EnvRule::Param {
+        EnvRule::Literal {
             name: "RUSTUP_AUTO_INSTALL",
-            param: "RUSTUP_AUTO_INSTALL",
-            optional: true,
+            value: "0",
         },
         EnvRule::Param {
             name: "RUSTUP_HOME",
@@ -476,13 +475,12 @@ const TEST_RECIPES: [EffectRecipe; 2 * TEST_SHAPES.len()] = {
 /// when set (its environment is otherwise complete: the `PATH` of `test_run`).
 // ponytail: a fixed list; a variable outside it (e.g. CARGO_BUILD_JOBS) does not reach a
 // module-planned run, add it here and to MODULE_ENV when a project needs it.
-pub const TEST_ENV: [&str; 9] = [
+pub const TEST_ENV: [&str; 8] = [
     "CARGO_HOME",
     "CARGO_TARGET_DIR",
     "DEVELOPER_DIR",
     "HOME",
     "RUSTFLAGS",
-    "RUSTUP_AUTO_INSTALL",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
     "TMPDIR",
@@ -512,7 +510,10 @@ const TEST_RUN_ENV: &[EnvRule] = &[
     passed(TEST_ENV[5]),
     passed(TEST_ENV[6]),
     passed(TEST_ENV[7]),
-    passed(TEST_ENV[8]),
+    EnvRule::Literal {
+        name: "RUSTUP_AUTO_INSTALL",
+        value: "0",
+    },
 ];
 
 /// The paths of a [`test_run`]: the pinned cargo and the `PATH` directories before the system's.
@@ -557,24 +558,18 @@ const fn test_run(id: &'static str, program: &'static str, args: &'static [Arg])
 }
 
 /// The daemon variables a rustup-proxied formatter resolves its toolchain from.
-pub const FORMATTER_ENV: [&str; 4] = [
-    "HOME",
-    "RUSTUP_AUTO_INSTALL",
-    "RUSTUP_HOME",
-    "RUSTUP_TOOLCHAIN",
-];
+pub const FORMATTER_ENV: [&str; 3] = ["HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"];
 
 /// The daemon variables the Rust module receives (root composition data): the test toolchain,
 /// [`FORMATTER_ENV`] and [`TEST_ENV`] (with the developer-directory selection `xcode-select`
 /// honours).
-pub const MODULE_ENV: [&str; 10] = [
+pub const MODULE_ENV: [&str; 9] = [
     "AGENT_IDE_RUST_TOOLCHAIN_DIR",
     "CARGO_HOME",
     "CARGO_TARGET_DIR",
     "DEVELOPER_DIR",
     "HOME",
     "RUSTFLAGS",
-    "RUSTUP_AUTO_INSTALL",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
     "TMPDIR",
@@ -1230,6 +1225,67 @@ mod tests {
     /// Registers Rust, the only language these tests name.
     fn install() {
         agent_ide_core::lang::install(&[crate::LANGUAGE]);
+    }
+
+    /// Rust native activation and module test/formatter recipes disable installation even when
+    /// the daemon requests it or has no setting. Only controlled shell fixtures run; no manager
+    /// is executed. The process environment is restored before returning under serialized tests.
+    #[test]
+    fn rust_child_routes_disable_auto_install() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("no-install");
+        let saved = std::env::var_os("RUSTUP_AUTO_INSTALL");
+        let tool = scratch.0.join("cargo");
+        std::fs::write(&tool, "#!/bin/sh\nprintf '%s' \"$RUSTUP_AUTO_INSTALL\"\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for ambient in [Some("1"), None] {
+            // SAFETY: project gates serialize environment-mutating tests; no child is live here.
+            unsafe {
+                match ambient {
+                    Some(value) => std::env::set_var("RUSTUP_AUTO_INSTALL", value),
+                    None => std::env::remove_var("RUSTUP_AUTO_INSTALL"),
+                }
+            }
+            let environment = RustSupport
+                .command_env(&scratch.0, &scratch.0, tool.to_str().unwrap())
+                .unwrap();
+            assert!(
+                environment.argv_prefix.is_empty(),
+                "explicit executable must remain exact"
+            );
+            let output = std::process::Command::new(&tool)
+                .envs(environment.vars)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"0");
+            for recipe in [RUSTFMT, TEST_RECIPES[0]] {
+                assert!(recipe.env.iter().any(|rule| matches!(
+                    rule,
+                    EnvRule::Literal {
+                        name: "RUSTUP_AUTO_INSTALL",
+                        value: "0"
+                    }
+                )));
+                assert!(!recipe.env.iter().any(|rule| matches!(
+                    rule,
+                    EnvRule::Param {
+                        name: "RUSTUP_AUTO_INSTALL",
+                        ..
+                    }
+                )));
+            }
+            assert!(!TEST_ENV.contains(&"RUSTUP_AUTO_INSTALL"));
+            assert!(!FORMATTER_ENV.contains(&"RUSTUP_AUTO_INSTALL"));
+            assert!(!MODULE_ENV.contains(&"RUSTUP_AUTO_INSTALL"));
+        }
+        // SAFETY: restore the exact saved process value after all synchronous children reaped.
+        unsafe {
+            match saved {
+                Some(value) => std::env::set_var("RUSTUP_AUTO_INSTALL", value),
+                None => std::env::remove_var("RUSTUP_AUTO_INSTALL"),
+            }
+        }
     }
 
     /// A scratch directory below the canonical temporary directory, removed on drop.

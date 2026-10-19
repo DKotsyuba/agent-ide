@@ -549,6 +549,33 @@ impl LanguageSupport for RustSupport {
         let cargo = bin.join("cargo");
         cargo.is_file().then_some((cargo, bin))
     }
+
+    /// Activates the already prepared Cargo toolchain for a bare Cargo request and disables
+    /// rustup installation for Rust-owned cargo/rustc/rustfmt commands, including explicit paths.
+    /// Explicit executable paths are preserved. Unknown programs are unclaimed; no manager or
+    /// installation runs and absent prepared tools retain the native missing-tool outcome.
+    fn command_env(
+        &self,
+        _worktree: &Path,
+        _cwd: &Path,
+        program: &str,
+    ) -> Option<agent_ide_core::lang::environment::CommandEnv> {
+        if !matches!(
+            Path::new(program).file_name()?.to_str()?,
+            "cargo" | "rustc" | "rustfmt"
+        ) {
+            return None;
+        }
+        let mut environment = agent_ide_core::lang::environment::CommandEnv {
+            vars: vec![("RUSTUP_AUTO_INSTALL".into(), "0".into())],
+            ..Default::default()
+        };
+        if let Some((executable, bin)) = self.test_toolchain(program) {
+            environment.argv_prefix = vec![executable.into_os_string()];
+            environment.path_prefix = Some(bin);
+        }
+        Some(environment)
+    }
 }
 
 /// Builds a Rust test identifier from its project-relative source path and outline path.
