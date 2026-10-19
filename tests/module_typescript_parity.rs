@@ -1147,7 +1147,7 @@ async fn typescript_test_runners_match_in_process_answers() {
 /// absent, the process tree contains no stub, and the test file itself records
 /// `process.execPath` (nodeA) and spawns a bare-`node` child whose `execPath` is also nodeA.
 /// An `npx vitest` selection refuses in both routes with the environment cause and never
-/// spawns any runner.
+/// spawns any runner. A fake npx sentinel prevents package preparation on a regression.
 #[ignore = "requires accepted AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER"]
 #[tokio::test]
 async fn configured_node_wins_over_ambient_and_npx_refuses() {
@@ -1156,7 +1156,7 @@ async fn configured_node_wins_over_ambient_and_npx_refuses() {
     let ambient_bin = fixture.base.join("ambient-bin");
     std::fs::create_dir_all(&ambient_bin).unwrap();
     let stub = ambient_bin.join("node");
-    let sentinel_path = sentinel.display().to_string();
+    let sentinel_path = sentinel.display().to_string().replace('\'', "'\\''");
     std::fs::write(
         &stub,
         format!("#!/bin/sh\ntouch '{sentinel_path}'\necho 'ambient nodeB ran' >&2\nexit 1\n"),
@@ -1166,6 +1166,8 @@ async fn configured_node_wins_over_ambient_and_npx_refuses() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    // A broken admission guard must hit this sentinel instead of a real package manager.
+    std::fs::copy(&stub, ambient_bin.join("npx")).unwrap();
     let exec_recording = fixture.base.join("execPath-primary.txt");
     let child_recording = fixture.base.join("execPath-child.txt");
     let exec_recording_str = exec_recording.display().to_string();
@@ -1253,6 +1255,7 @@ test('records exec paths', () => {{
         let mut package: Value =
             serde_json::from_str(&std::fs::read_to_string(&package_path).unwrap()).unwrap();
         package["devDependencies"] = serde_json::json!({"vitest": "1.0.0"});
+        package["scripts"]["test"] = serde_json::json!("vitest run");
         std::fs::write(&package_path, package.to_string()).unwrap();
         let (refusal, refusal_text) = run_tests(
             &mut session,
@@ -1276,6 +1279,7 @@ test('records exec paths', () => {{
             mode_env,
         );
         package["devDependencies"] = serde_json::json!({});
+        package["scripts"]["test"] = serde_json::json!("node --test");
         std::fs::write(&package_path, package.to_string()).unwrap();
         session.close(&fixture).await;
     }
