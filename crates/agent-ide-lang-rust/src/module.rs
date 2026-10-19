@@ -542,6 +542,10 @@ const fn passed(name: &'static str) -> EnvRule {
 
 /// The complete environment of a [`test_run`].
 const TEST_RUN_ENV: &[EnvRule] = &[
+    EnvRule::Literal {
+        name: "CARGO_NET_OFFLINE",
+        value: "true",
+    },
     EnvRule::Param {
         name: "RUSTC",
         param: "rustc",
@@ -776,12 +780,13 @@ fn support_server() -> agent_ide_core::modules::adapter::SupportServer {
 fn configured_effect(
     argv: &[String],
     config: &agent_ide_core::modules::contract::ModuleConfig,
+    cwd: &Path,
 ) -> Result<Option<EffectRequest>, agent_ide_core::lang::LangError> {
     use agent_ide_core::lang::LangError;
     let root = config.worktree.as_deref().ok_or_else(|| {
         LangError::Environment("Rust request has no worktree; use native cargo".into())
     })?;
-    let cwd = crate::environment::command_directory(root, argv).map_err(LangError::Environment)?;
+    let cwd = crate::environment::command_directory(cwd, argv).map_err(LangError::Environment)?;
     let (tools, _) =
         crate::environment::resolve_at(root, &cwd, config).map_err(LangError::Environment)?;
     let Some((program, words)) = argv.split_first() else {
@@ -1526,7 +1531,7 @@ mod tests {
             let dir = base.0.join(name);
             prepared_tools(&dir);
             let cargo = dir.join("bin/cargo");
-            std::fs::write(&cargo, "#!/bin/sh\nprintf '%s|%s|%s' \"$RUSTUP_AUTO_INSTALL\" \"$RUSTUP_TOOLCHAIN\" \"$1\"\n").unwrap();
+            std::fs::write(&cargo, "#!/bin/sh\nprintf '%s|%s|%s|%s' \"$RUSTUP_AUTO_INSTALL\" \"$CARGO_NET_OFFLINE\" \"$RUSTUP_TOOLCHAIN\" \"$1\"\n").unwrap();
             std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
             let accepted = |path: PathBuf, identity: &str| json!({"blake3":agent_ide_core::lang::environment::hash_input(&path, &[]).unwrap().to_hex().to_string(), "path":path, "identity":identity});
             let context = agent_ide_core::modules::contract::ModuleConfig {
@@ -1550,7 +1555,7 @@ mod tests {
                 .envs(env.vars);
             let native = native.output().unwrap();
             assert!(native.status.success());
-            let effect = configured_effect(&argv, &context).unwrap().unwrap();
+            let effect = configured_effect(&argv, &context, &root).unwrap().unwrap();
             let spec = expand(
                 RECIPES,
                 &effect,
@@ -1578,7 +1583,7 @@ mod tests {
             assert_eq!(replay.stdout, native.stdout);
             assert_eq!(
                 String::from_utf8(native.stdout).unwrap(),
-                format!("0|{}|test", dir.display())
+                format!("0|true|{}|test", dir.display())
             );
             let selected = vec![
                 "cargo".into(),
@@ -1591,7 +1596,8 @@ mod tests {
             else {
                 panic!("selected legacy must refuse");
             };
-            let Err(LangError::Environment(module)) = configured_effect(&selected, &context) else {
+            let Err(LangError::Environment(module)) = configured_effect(&selected, &context, &root)
+            else {
                 panic!("selected legacy must refuse");
             };
             assert_eq!(native, module);
@@ -1641,7 +1647,7 @@ mod tests {
         else {
             panic!("denied pin must refuse")
         };
-        let Err(LangError::Environment(module)) = configured_effect(&argv, context) else {
+        let Err(LangError::Environment(module)) = configured_effect(&argv, context, &root) else {
             panic!("denied pin must refuse")
         };
         assert!(card.chosen.is_none());
@@ -1653,13 +1659,163 @@ mod tests {
                 .unwrap();
         std::fs::write(cargo, "changed accepted bytes").unwrap();
         assert!(matches!(
-            configured_effect(&argv, context),
+            configured_effect(&argv, context, &root),
             Err(LangError::Environment(_))
         ));
         assert!(
             RustSupport.configured_environments(&root, context)[0]
                 .chosen
                 .is_none()
+        );
+    }
+
+    /// Actual native core planning and the core module adapter retain the target project.
+    /// A nightly member refuses under the stable root; compatible targets use the member cwd
+    /// and edition, and a controlled formatter sees identical argv/cwd in both launch routes.
+    #[tokio::test]
+    async fn formatter_target_context_reaches_native_and_module_consumers() {
+        use agent_ide_core::modules::calls::StdinRun;
+        let base = Scratch::new("formatter-target");
+        let root = base.0.join("project");
+        std::fs::create_dir_all(root.join("legacy/src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"),"[workspace]\nmembers=[]\nexclude=[\"legacy\"]\n[package]\nname=\"root\"\nedition=\"2024\"\n").unwrap();
+        std::fs::write(
+            root.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel=\"1.98.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("legacy/Cargo.toml"),
+            "[package]\nname=\"legacy\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("legacy/rust-toolchain.toml"),
+            "[toolchain]\nchannel=\"nightly\"\n",
+        )
+        .unwrap();
+        let tools = base.0.join("prepared");
+        prepared_tools(&tools);
+        std::fs::write(
+            tools.join("bin/rustfmt"),
+            "#!/bin/sh\nprintf '%s|%s' \"$PWD\" \"$*\"\n",
+        )
+        .unwrap();
+        let accepted = |name: &str, identity: &str| {
+            let path = tools.join("bin").join(name);
+            json!({"path":path,"identity":identity,"blake3":agent_ide_core::lang::environment::hash_input(&path,&[]).unwrap().to_hex().to_string()})
+        };
+        let context = agent_ide_core::modules::contract::ModuleConfig {
+            worktree: Some(root.clone()),
+            checks: Some(json!({"toolchain_dir":tools})),
+            provider: Some(
+                json!({"cargo":accepted("cargo","cargo 1.98.1"),"rustc":accepted("rustc","rustc 1.98.1"),"rustc_version":"rustc 1.98.1"}),
+            ),
+            ..Default::default()
+        };
+        install();
+        let project = RustSupport.detect(&root).unwrap();
+        let file = Path::new("legacy/src/lib.rs");
+        assert!(matches!(
+            agent_ide_core::modules::calls::format_stdin_command(
+                crate::LANGUAGE,
+                &root,
+                &project,
+                Path::new("src/lib.rs"),
+                &context
+            )
+            .await
+            .unwrap(),
+            Ok(Some(StdinRun::Argv { .. }))
+        ));
+        let Err(native) = agent_ide_core::modules::calls::format_stdin_command(
+            crate::LANGUAGE,
+            &root,
+            &project,
+            file,
+            &context,
+        )
+        .await
+        .unwrap() else {
+            panic!("nested nightly target must refuse native format")
+        };
+        let mut channel = open(Role::Analyzer).await;
+        let plan = async |channel: &mut HostChannel| {
+            ask::<payload::FormatPlanAnswer>(
+                channel,
+                Capability::FormatPlan,
+                payload::encode(&FormatPlanRequest {
+                    config: context.clone(),
+                    project: project.clone(),
+                    file: file.to_path_buf(),
+                }),
+                Vec::new(),
+            )
+            .await
+        };
+        assert_eq!(plan(&mut channel).await, Err(native));
+        std::fs::write(
+            root.join("legacy/rust-toolchain.toml"),
+            "[toolchain]\nchannel=\"1.98.1\"\n",
+        )
+        .unwrap();
+        let StdinRun::Argv {
+            cwd,
+            argv,
+            environment,
+        } = agent_ide_core::modules::calls::format_stdin_command(
+            crate::LANGUAGE,
+            &root,
+            &project,
+            file,
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        else {
+            panic!("native formatter plan")
+        };
+        assert_eq!(cwd, root.join("legacy"));
+        assert_eq!(argv, ["rustfmt", "--edition", "2021"]);
+        let env = environment.unwrap();
+        let native = std::process::Command::new(&env.argv_prefix[0])
+            .args(&argv[1..])
+            .current_dir(&cwd)
+            .envs(env.vars)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        let effect = plan(&mut channel).await.unwrap().unwrap();
+        let spec = agent_ide_core::modules::recipe::expand_at(
+            RECIPES,
+            &effect,
+            &Admission {
+                worktree: &root,
+                cache_dir: &base.0.join("cache"),
+                read_denies: &[],
+                home: None,
+                launcher_roots: std::slice::from_ref(&tools),
+                developer_dirs: &[],
+                programs: &[],
+                timeout: Duration::from_secs(10),
+            },
+            &cwd,
+        )
+        .unwrap();
+        let module = std::process::Command::new(&spec.program)
+            .args(&spec.args)
+            .current_dir(&spec.cwd)
+            .env_clear()
+            .envs(spec.env)
+            .output()
+            .unwrap();
+        assert!(module.status.success());
+        assert_eq!(module.stdout, native.stdout);
+        assert_eq!(
+            String::from_utf8(module.stdout).unwrap(),
+            format!("{}|--edition 2021", cwd.display())
         );
     }
 

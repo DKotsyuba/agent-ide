@@ -366,6 +366,9 @@ accepted rustc evidence; a directory name, Cargo version, unknown version, alias
 or unsupported pin requirements cannot establish compatibility. A refusal has no chosen
 candidate and names native recovery before an IDE child starts. Automatic installation remains
 disabled. Selection of another Rust environment and rustup-manager discovery are unsupported.
+Formatter planning retains the target file's Cargo project, edition and actual child directory
+before native/module admission; worktree authority remains unchanged. Both native and module
+Cargo test activation force offline mode and disable automatic toolchain installation.
 
 Rust native identity includes full-byte manifest/lock/pin/config inputs inside the worktree,
 including nested members, and actual configured tool bytes/stamps. Semantic leases include this

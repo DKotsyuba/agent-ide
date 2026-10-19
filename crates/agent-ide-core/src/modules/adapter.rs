@@ -11,7 +11,7 @@
 //! [`LanguageSupport`]: crate::lang::LanguageSupport
 //! [`NameFacts`]: crate::lang::names::NameFacts
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use serde_json::Value;
 
@@ -85,9 +85,11 @@ pub type EffectPlans = fn(&[String]) -> Option<EffectRequest>;
 /// Constructs a finite language recipe from argv and this request's immutable accepted facts.
 /// Errors refuse before admission; `None` is an unsupported shape, never permission to use a
 /// legacy ambient planner. No process or environment manager may run in this callback.
+/// The final argument is the planned actual child cwd inside the unchanged worktree boundary.
 pub type ConfiguredEffectPlans = fn(
     &[String],
     &super::contract::ModuleConfig,
+    &Path,
 ) -> Result<Option<EffectRequest>, crate::lang::LangError>;
 
 impl SupportServer {
@@ -121,9 +123,10 @@ impl SupportServer {
         &self,
         argv: &[String],
         config: &super::contract::ModuleConfig,
+        cwd: &Path,
     ) -> Result<EffectRequest, crate::lang::LangError> {
         if let Some(plans) = self.configured_plans {
-            return Ok(plans(argv, config)?.unwrap_or_else(|| argv_effect(argv)));
+            return Ok(plans(argv, config, cwd)?.unwrap_or_else(|| argv_effect(argv)));
         }
         Ok(self
             .plans
@@ -318,17 +321,25 @@ impl SupportServer {
                 } => encode(
                     &support
                         .syntax_probe_command(&project, &root, &file, configured.as_ref())
-                        .map(|argv| self.plan(&argv, &config))
+                        .map(|argv| self.plan(&argv, &config, &root))
                         .transpose(),
                 ),
             },
             Capability::FormatPlan => {
                 let query: FormatPlanRequest = decode(payload)?;
+                let worktree = query.config.worktree.as_deref().unwrap_or(Path::new("."));
                 encode(
                     &support
-                        .format_stdin_command(&query.project, &query.file)
-                        .map(|argv| self.plan(&argv, &query.config))
-                        .transpose(),
+                        .configured_format_stdin_command(
+                            worktree,
+                            &query.project,
+                            &query.file,
+                            &query.config,
+                        )
+                        .and_then(|plan| {
+                            plan.map(|(argv, cwd)| self.plan(&argv, &query.config, &cwd))
+                                .transpose()
+                        }),
                 )
             }
             Capability::TestPlan => match decode::<TestPlanQuery>(payload)? {
@@ -346,7 +357,11 @@ impl SupportServer {
                         .test_selection(&project, &target)
                         .and_then(|selection| {
                             Ok(TestRun {
-                                effect: self.plan(&selection.command, &config)?,
+                                effect: self.plan(
+                                    &selection.command,
+                                    &config,
+                                    config.worktree.as_deref().unwrap_or(Path::new(".")),
+                                )?,
                                 tests: selection.tests,
                             })
                         }),
@@ -506,6 +521,7 @@ mod tests {
         fn plans(
             _argv: &[String],
             config: &crate::modules::contract::ModuleConfig,
+            cwd: &Path,
         ) -> Result<Option<EffectRequest>, crate::lang::LangError> {
             if !config.read_denies.is_empty() {
                 return Err(crate::lang::LangError::Environment(
@@ -514,15 +530,18 @@ mod tests {
             }
             Ok(Some(EffectRequest {
                 recipe: "context".into(),
-                params: std::collections::BTreeMap::from([(
-                    "marker".into(),
-                    Param::Token(
-                        config.checks.as_ref().unwrap()["marker"]
-                            .as_str()
-                            .unwrap()
-                            .into(),
+                params: std::collections::BTreeMap::from([
+                    (
+                        "marker".into(),
+                        Param::Token(
+                            config.checks.as_ref().unwrap()["marker"]
+                                .as_str()
+                                .unwrap()
+                                .into(),
+                        ),
                     ),
-                )]),
+                    ("cwd".into(), Param::Path(cwd.to_path_buf())),
+                ]),
             }))
         }
         crate::lang::testing::install();
@@ -538,6 +557,7 @@ mod tests {
         for marker in ["first", "second", "denied"] {
             let mut call = sample_call(Capability::FormatPlan);
             call.payload["config"] = encode(&crate::modules::contract::ModuleConfig {
+                worktree: Some(format!("/requests/{marker}").into()),
                 checks: Some(serde_json::json!({"marker":marker})),
                 read_denies: if marker == "denied" {
                     vec![crate::execution::seatbelt::ReadDeny::Path(
@@ -562,6 +582,10 @@ mod tests {
                     Err(crate::lang::LangError::Environment(_))
                 ));
             } else {
+                assert_eq!(
+                    answer.as_ref().unwrap().as_ref().unwrap().params.get("cwd"),
+                    Some(&Param::Path(format!("/requests/{marker}").into()))
+                );
                 assert_eq!(
                     answer.unwrap().unwrap().params.get("marker"),
                     Some(&Param::Token(marker.into()))

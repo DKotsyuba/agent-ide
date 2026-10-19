@@ -4388,10 +4388,10 @@ fn push_block(out: &mut String, content: &str) {
     }
 }
 
-/// Runs `run` (the in-process argument vector from `root` with the daemon's environment and
+/// Runs `run` (the in-process argument vector from its planned cwd with the daemon's environment and
 /// formatter `PATH` and resolved language environment, or a module recipe's core-built
 /// specification exactly) with `input` on stdin
-/// as an Execution-owned interactive job of the worktree — admitted, measured, its group torn
+/// as an Execution-owned interactive job of authoritative `root` — admitted, measured, its group torn
 /// down and reaped. `None` when it cannot start, is refused as busy, overflows the capture
 /// ceiling or does not finish within `timeout`.
 async fn run_stdin(
@@ -4403,9 +4403,13 @@ async fn run_stdin(
 ) -> Option<crate::execution::job::JobOutput> {
     use std::ffi::OsString;
     let (command, timeout) = match run {
-        crate::modules::calls::StdinRun::Argv { argv, environment } => {
+        crate::modules::calls::StdinRun::Argv {
+            cwd,
+            argv,
+            environment,
+        } => {
             let (command, _) = crate::assistance::tests::prepare_command(
-                root,
+                cwd,
                 argv,
                 &[("PATH".into(), crate::modules::calls::tool_path())],
                 environment.as_ref(),
@@ -4460,6 +4464,7 @@ mod stdin_environment_tests {
     async fn native_stdin_runs_apply_the_resolved_environment() {
         let root = std::env::temp_dir().canonicalize().unwrap();
         let run = crate::modules::calls::StdinRun::Argv {
+            cwd: root.clone(),
             argv: vec![
                 "/bin/sh".into(),
                 "-c".into(),

@@ -718,6 +718,23 @@ pub trait LanguageSupport: Send + Sync {
     /// pick their config and language from it). `None` when the project has no formatter for it.
     fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>>;
 
+    /// Plans the formatter and its actual child cwd from the existing target-file context,
+    /// before activation/admission. The default preserves the old argv and worktree cwd.
+    /// Languages may select a contained project cwd or return an Environment refusal; the
+    /// authoritative worktree is never changed by the returned directory.
+    fn configured_format_stdin_command(
+        &self,
+        worktree: &Path,
+        project: &LanguageProject,
+        file: &Path,
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Result<Option<(Vec<String>, PathBuf)>, LangError> {
+        let _ = config;
+        Ok(self
+            .format_stdin_command(project, file)
+            .map(|argv| (argv, worktree.to_path_buf())))
+    }
+
     /// In-process structural check when this module has a parser available.
     /// Bounded like the lexical outline: a text the checker refuses to attempt is [`SyntaxVerdict::Unchecked`],
     /// which lets the edit proceed and the project check report.

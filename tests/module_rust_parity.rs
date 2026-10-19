@@ -871,6 +871,100 @@ async fn changed_rust_native_inputs_retire_the_live_session() {
     }
 }
 
+/// The actual edit/format consumers in both hosting modes use the target member's environment
+/// and rustfmt config. A stable root formats successfully; its nightly member refuses without
+/// writing, then a compatible member formats with its own hard-tab configuration. All owned
+/// provider children are reaped; only existing accepted tools run, with no manager/install.
+#[tokio::test]
+#[ignore = "requires the accepted Rust inputs, including prepared bin/rustfmt; explicit formatter scope regression"]
+async fn nested_formatter_scope_is_current_in_native_and_module_consumers() {
+    let mut files = PARITY_FILES.to_vec();
+    files.retain(|(path, _)| !matches!(*path, "Cargo.toml" | "Cargo.lock"));
+    files.extend([
+        ("Cargo.toml","[workspace]\nmembers=[\"legacy\"]\n[package]\nname=\"paritycrate\"\nversion=\"0.1.0\"\nedition=\"2024\"\n"),
+        ("Cargo.lock","version=4\n[[package]]\nname=\"paritycrate\"\nversion=\"0.1.0\"\n[[package]]\nname=\"legacy\"\nversion=\"0.1.0\"\n"),
+        ("rust-toolchain.toml","[toolchain]\nchannel=\"1.98.1\"\n"),
+        ("legacy/Cargo.toml","[package]\nname=\"legacy\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"),
+        ("legacy/rust-toolchain.toml","[toolchain]\nchannel=\"nightly\"\n"),
+        ("legacy/rustfmt.toml","hard_tabs = true\n"),
+        ("legacy/src/lib.rs","pub fn value() -> i32 {\n    1\n}\n"),
+    ]);
+    for (label, mode) in [("native", IN_PROCESS), ("module", MODULE)] {
+        let fixture = rust_fixture(&files, &format!("formatter-scope-{label}"), 300);
+        let mut daemon = Daemon::start(&fixture, &[mode]).await;
+        let mut session = Session::start(&fixture).await;
+        ready(&mut session, &fixture).await;
+        let _ = session
+            .call(&fixture, "ide.read", json!({"symbol":"src/lib.rs#user"}))
+            .await;
+        let root_edit=session.call(&fixture,"ide.edit",json!({"operation_id":"root-format","op":"replace","symbol":"src/lib.rs#user","content":"pub   fn user()->bool{true}"})).await;
+        assert_eq!(
+            root_edit["kind"], "edit",
+            "{label}: root formatter control: {root_edit}"
+        );
+        assert!(
+            std::fs::read_to_string(fixture.root.join("src/lib.rs"))
+                .unwrap()
+                .contains("pub fn user() -> bool {")
+        );
+        let before = std::fs::read(fixture.root.join("legacy/src/lib.rs")).unwrap();
+        let read = session
+            .call(
+                &fixture,
+                "ide.read",
+                json!({"symbol":"legacy/src/lib.rs#value"}),
+            )
+            .await;
+        assert!(
+            read["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pub fn value() -> i32"),
+            "{label}: source delivery: {read}"
+        );
+        let failed=session.call(&fixture,"ide.edit",json!({"operation_id":"member-nightly","op":"replace","symbol":"legacy/src/lib.rs#value","content":"pub   fn value()->i32{2}"})).await;
+        assert_eq!(failed["code"], "provider_unavailable", "{label}: {failed}");
+        let text = failed["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("nightly") && text.contains("native"),
+            "{label}: {failed}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join("legacy/src/lib.rs")).unwrap(),
+            before,
+            "{label}: refused formatter must write nothing"
+        );
+        std::fs::write(
+            fixture.root.join("legacy/rust-toolchain.toml"),
+            "[toolchain]\nchannel=\"1.98.1\"\n",
+        )
+        .unwrap();
+        let _ = session
+            .call(
+                &fixture,
+                "ide.read",
+                json!({"symbol":"legacy/src/lib.rs#value"}),
+            )
+            .await;
+        let edited=session.call(&fixture,"ide.edit",json!({"operation_id":"member-stable","op":"replace","symbol":"legacy/src/lib.rs#value","content":"pub   fn value()->i32{2}"})).await;
+        assert_eq!(edited["kind"], "edit", "{label}: {edited}");
+        let after = std::fs::read_to_string(fixture.root.join("legacy/src/lib.rs")).unwrap();
+        assert!(
+            after.contains("\n\t2\n"),
+            "{label}: member rustfmt.toml was not consumed: {after:?}"
+        );
+        let owned = daemon.tree().all();
+        session.close(&fixture).await;
+        drop(daemon);
+        for process in owned {
+            assert!(
+                process.gone().await,
+                "{label}: formatter test child survived cleanup"
+            );
+        }
+    }
+}
+
 /// A live Rust session never answers after its declared analyzer executable is replaced at the
 /// same path. Both native and module hosting retire the original process before refusing the
 /// now-unqualified replacement; no declaration is silently reaccepted and the daemon survives.

@@ -536,6 +536,43 @@ impl LanguageSupport for RustSupport {
             .map(str::to_owned)
     }
 
+    /// Plans a formatter from its target's effective Cargo project and edition. The returned
+    /// cwd lets rustfmt discover that project's configuration; tool/pin activation still occurs
+    /// before admission, with the original authoritative worktree and exact target preserved.
+    fn configured_format_stdin_command(
+        &self,
+        worktree: &Path,
+        project: &LanguageProject,
+        file: &Path,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Result<Option<(Vec<String>, PathBuf)>, LangError> {
+        if self.format_stdin_command(project, file).is_none() {
+            return Ok(None);
+        }
+        let target = if file.is_absolute() {
+            file.to_path_buf()
+        } else {
+            worktree.join(file)
+        };
+        let cwd = crate::environment::project_root(
+            worktree,
+            target.parent().unwrap_or(worktree),
+            &config.read_denies,
+        )
+        .map_err(LangError::Environment)?;
+        let mut project = project.clone();
+        if let Some(text) = crate::environment::manifest_text(worktree, &cwd, &config.read_denies)
+            .map_err(LangError::Environment)?
+            && let Some(edition) = toml_string(&text, "edition")
+        {
+            project.environment.retain(|(name, _)| name != "edition");
+            project.environment.push(("edition".into(), edition));
+        }
+        Ok(self
+            .format_stdin_command(&project, file)
+            .map(|argv| (argv, cwd)))
+    }
+
     /// Guards native inputs before the existing detector. Its CI/task detector has no guarded
     /// reader seam, so an extra-deny request returns no project facts rather than reading that
     /// unsupported scope. Environment/check resolution remains independently guarded.

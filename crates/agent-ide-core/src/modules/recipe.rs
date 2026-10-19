@@ -406,6 +406,18 @@ pub fn expand(
     expand_staged(recipes, effect, admission).map(|(spec, _)| spec)
 }
 
+/// Expands with an actual child cwd while retaining admission's original worktree boundary.
+/// A different cwd must be an existing, contained, readable directory; no admitted spec is
+/// mutated and parameter/path authority continues to use the authoritative worktree.
+pub fn expand_at(
+    recipes: &[EffectRecipe],
+    effect: &EffectRequest,
+    admission: &Admission<'_>,
+    cwd: &Path,
+) -> Result<RunSpec, Refusal> {
+    expand_staged_at(recipes, effect, admission, cwd).map(|(spec, _)| spec)
+}
+
 /// A run's assets with the admitted cache paths they are staged at.
 pub type Staged = Vec<(PathBuf, &'static [u8])>;
 
@@ -416,6 +428,29 @@ pub fn expand_staged(
     effect: &EffectRequest,
     admission: &Admission<'_>,
 ) -> Result<(RunSpec, Staged), Refusal> {
+    expand_staged_at(recipes, effect, admission, admission.worktree)
+}
+
+/// Constructs the complete expansion with its validated cwd before admission is returned.
+fn expand_staged_at(
+    recipes: &[EffectRecipe],
+    effect: &EffectRequest,
+    admission: &Admission<'_>,
+    cwd: &Path,
+) -> Result<(RunSpec, Staged), Refusal> {
+    let cwd = if cwd == admission.worktree {
+        cwd.to_path_buf()
+    } else {
+        if !normal(cwd) || admission.denied(cwd) {
+            return Err(Refusal::OutOfRule("cwd".into(), cwd.to_path_buf()));
+        }
+        let cwd = resolved(cwd);
+        if !cwd.starts_with(resolved(admission.worktree)) || !cwd.is_dir() || admission.denied(&cwd)
+        {
+            return Err(Refusal::OutOfRule("cwd".into(), cwd));
+        }
+        cwd
+    };
     let recipe = recipes
         .iter()
         .find(|recipe| recipe.id == effect.recipe)
@@ -640,7 +675,7 @@ pub fn expand_staged(
         RunSpec {
             program,
             args,
-            cwd: admission.worktree.to_path_buf(),
+            cwd,
             env,
             read_roots,
             write_roots: vec![admission.cache_dir.to_path_buf()],
