@@ -10,10 +10,11 @@ use super::reply::{
 };
 use crate::changes::edit::EditOutcome;
 
-/// Serialized source-response budget, including framing and an optional structured copy.
+/// Serialized production source-response budget, including text-only MCP framing.
 /// Eight KiB stays below the recorded single-call outer 10k-token truncation boundary even for
 /// dense text; callers aggregating several replies must still budget their outer envelope.
 /// Producers use this same bound before advancing source pages or recording delivered blocks.
+/// The test-only structured oracle remains subject to the complete transport ceiling separately.
 const MAX_SOURCE_REPLY_BYTES: usize = 8 * 1024;
 
 /// Build-embedded MiniJinja source projecting every closed [`PeerReply`] state into its compact
@@ -520,18 +521,26 @@ fn render_text(context: &serde_json::Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-/// Applies the source budget to the complete rendered carrier before the ordinary transport
-/// ceiling. Other result kinds retain their existing budget. No source is cut by this predicate.
+/// Checks the complete carrier against the transport ceiling, then Read's production text-only
+/// carrier against the source budget. The test-only structured oracle does not reduce source
+/// page size. Status and text framing count in both budgets; other result kinds retain only the
+/// transport budget. Serialization failure refuses the reply without cutting source or state.
 fn reply_fits(reply: &PeerReply, rendered: &CallToolResult) -> bool {
-    call_tool_result_fits(rendered)
-        && (!matches!(
-            reply,
-            PeerReply::Complete {
-                kind: ResultKind::Read,
-                ..
-            }
-        ) || serde_json::to_vec(rendered)
-            .is_ok_and(|bytes| bytes.len() <= MAX_SOURCE_REPLY_BYTES))
+    if !call_tool_result_fits(rendered) {
+        return false;
+    }
+    if !matches!(
+        reply,
+        PeerReply::Complete {
+            kind: ResultKind::Read,
+            ..
+        }
+    ) {
+        return true;
+    }
+    let mut production = rendered.clone();
+    production.structured_content = None;
+    serde_json::to_vec(&production).is_ok_and(|bytes| bytes.len() <= MAX_SOURCE_REPLY_BYTES)
 }
 
 /// Returns whether the serialized final MCP carrier stays below the Assistance reply ceiling.
@@ -658,8 +667,8 @@ mod refusal_table;
 #[cfg(test)]
 mod tests {
 
-    /// Source fitting includes the complete serialized MCP carrier, before any delivery ledger
-    /// can claim the body was served; a batch larger than the observed outer budget must page.
+    /// Source fitting includes production framing and status before claiming delivery, without
+    /// counting the test-only oracle twice. The complete oracle still obeys the transport cap.
     #[test]
     fn read_reply_budget_includes_the_complete_carrier() {
         let reply = PeerReply::Complete {
@@ -671,6 +680,30 @@ mod tests {
         };
         assert!(!fits(&reply, Envelope::TextOnly));
         assert!(!fits(&reply, Envelope::WithStructured));
+        let medium = PeerReply::Complete {
+            kind: ResultKind::Read,
+            text: "0123456789".repeat(600),
+            detail_ref: Some("source-budget-ref".into()),
+            truncated: false,
+            continuation: false,
+        };
+        for envelope in [Envelope::TextOnly, Envelope::WithStructured] {
+            assert!(fits(&medium, envelope));
+            let rendered = render_with_status(medium.clone(), None, envelope).unwrap();
+            assert_eq!(text_of(&rendered), "0123456789".repeat(600));
+            assert!(!fits_with_status(&medium, &"s".repeat(3000), envelope));
+        }
+        let oracle = project(&medium, None, Envelope::WithStructured, None, None).unwrap();
+        assert!(serde_json::to_vec(&oracle).unwrap().len() > MAX_SOURCE_REPLY_BYTES);
+        let over_transport = PeerReply::Complete {
+            kind: ResultKind::Read,
+            text: "source".into(),
+            detail_ref: Some("r".repeat(MAX_REPLY_BYTES)),
+            truncated: false,
+            continuation: false,
+        };
+        assert!(fits(&over_transport, Envelope::TextOnly));
+        assert!(!fits(&over_transport, Envelope::WithStructured));
         let small = PeerReply::Complete {
             kind: ResultKind::Read,
             text: "1\tconst answer = 42;\n".into(),

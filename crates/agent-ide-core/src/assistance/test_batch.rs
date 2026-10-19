@@ -146,7 +146,8 @@ impl TestRuns {
                             &launch.argv,
                             &[],
                             resolution.resolved.as_ref(),
-                        ),
+                        )
+                        .map(|(child, _)| child),
                         remaining,
                         MAX_OUTPUT,
                     ),

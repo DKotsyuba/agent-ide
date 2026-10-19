@@ -110,8 +110,9 @@ pub struct RunResult {
     pub budget: Duration,
     /// Detail reference retained under the binding that started the process.
     pub detail_ref: String,
-    /// Argv shown for manual reruns: the original argv, behind `env NAME=VALUE …` when the run set
-    /// environment overrides.
+    /// Replay argv: actual program/arguments, explicit overrides and effective PATH. Admitted
+    /// recipes use `env -i` with their complete allowlisted environment; unrelated daemon
+    /// variables are never copied into the receipt.
     pub command: Vec<String>,
     /// Worktree-relative directory the run used when it was not the worktree root, shown before the
     /// rerun command so the line reproduces the run.
@@ -306,7 +307,7 @@ impl TestRuns {
             };
         };
         let lease = crate::retention::SettledLease::new(Some(lease));
-        let child = match spawn_resolved(
+        let (child, rerun_command) = match spawn_resolved(
             &self.1,
             &root,
             &cwd,
@@ -323,44 +324,13 @@ impl TestRuns {
                 };
             }
         };
-        // The rerun line reproduces the run: its directory, the caller's environment overrides and
-        // the resolved command environment's program prefix, variables and PATH prefix included —
-        // exactly what `spawn_resolved` starts, so the line is a repeatable replay. `$PATH` stands
-        // for the inherited PATH a replay resolves on its own host; the prefix before it is exact.
+        // The receipt comes from the same resolved command that was started, including the
+        // actual effective PATH, without copying unrelated ambient environment values.
         let rerun_dir = cwd
             .strip_prefix(&root)
             .ok()
             .filter(|relative| !relative.as_os_str().is_empty())
             .map(|relative| relative.display().to_string());
-        let started_argv: Vec<String> = match resolution.resolved.as_ref() {
-            Some(resolved) if !resolved.argv_prefix.is_empty() => resolved
-                .argv_prefix
-                .iter()
-                .map(|part| part.to_string_lossy().into_owned())
-                .chain(argv.iter().skip(1).cloned())
-                .collect(),
-            _ => argv.clone(),
-        };
-        let mut overrides: Vec<String> = env
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect();
-        if let Some(resolved) = resolution.resolved.as_ref() {
-            overrides.extend(resolved.vars.iter().map(|(key, value)| {
-                format!("{}={}", key.to_string_lossy(), value.to_string_lossy())
-            }));
-            if let Some(bin) = &resolved.path_prefix {
-                overrides.push(format!("PATH={}:$PATH", bin.display()));
-            }
-        }
-        let rerun_command: Vec<String> = if overrides.is_empty() {
-            started_argv
-        } else {
-            std::iter::once("env".to_owned())
-                .chain(overrides)
-                .chain(started_argv)
-                .collect()
-        };
         let launch = Launch {
             language,
             budget,
@@ -378,7 +348,8 @@ impl TestRuns {
     /// inherited, no language command environment), within the smaller of `budget` and the
     /// spec's timeout, retaining at most its capture ceiling of output. It is an Execution-owned
     /// job like every test run and, as today, not read-confined (design §2.6: tests may execute
-    /// project code as currently authorized). The rerun line shows `command`.
+    /// project code as currently authorized). `command` is the pre-admission display label;
+    /// the rerun receipt uses the actual admitted program, arguments and cleared environment.
     #[allow(
         clippy::too_many_arguments,
         reason = "the run's own facts, as start_with_options carries them in its options"
@@ -387,7 +358,7 @@ impl TestRuns {
         &self,
         root: PathBuf,
         spec: crate::checks::runner::RunSpec,
-        command: Vec<String>,
+        _command: Vec<String>,
         owner: &BindingRef,
         language: Language,
         budget: Duration,
@@ -432,7 +403,7 @@ impl TestRuns {
             budget: budget.min(spec.timeout),
             cap: spec.max_output_bytes.min(MAX_OUTPUT),
             detail_ref,
-            rerun_command: command,
+            rerun_command: spec_replay(&spec),
             rerun_dir: spec
                 .cwd
                 .strip_prefix(&root)
@@ -882,6 +853,7 @@ fn spawn_command(
         env,
         resolved.as_ref(),
     )
+    .map(|(child, _)| child)
 }
 
 /// A started test run: the Execution-owned job and its stdout and stderr pipes.
@@ -895,7 +867,8 @@ type Spawned = (
 /// owned per worktree. The worktree and cwd are already admitted. The daemon's environment is
 /// the base; caller values override it, resolver variables override those and its prefix leads
 /// PATH. Stdin is closed and stdout/stderr are piped to the caller; empty argv, a program not on
-/// PATH (`NotFound`) and a full admission queue (`WouldBlock`) start nothing.
+/// PATH (`NotFound`) and a full admission queue (`WouldBlock`) start nothing. Returns the child
+/// and a replay receipt of its exact program/arguments, explicit overrides and effective PATH.
 fn spawn_resolved(
     admission: &Arc<Mutex<crate::execution::AdmissionController>>,
     worktree: &std::path::Path,
@@ -903,7 +876,32 @@ fn spawn_resolved(
     argv: &[String],
     env: &[(String, String)],
     resolved: Option<&crate::lang::environment::CommandEnv>,
-) -> io::Result<Spawned> {
+) -> io::Result<(Spawned, Vec<String>)> {
+    let (command, replay) = prepare_command(cwd, argv, env, resolved)?;
+    let owner = crate::execution::OwnerId::new(format!(
+        "test:{}",
+        blake3::hash(worktree.as_os_str().as_encoded_bytes()).to_hex()
+    ))
+    .map_err(|error| io::Error::other(format!("{error:?}")))?;
+    crate::execution::job::StreamedJob::start(
+        admission,
+        owner,
+        crate::execution::AdmissionClass::Background,
+        &command,
+    )
+    .map(|child| (child, replay))
+}
+
+/// Resolves one native command before admission, returning its controlled command and replay
+/// argv. `env` overrides ambient values, then `resolved` overrides/prefixes them. The receipt
+/// retains only explicit overrides and effective PATH, never unrelated ambient secrets. Empty
+/// argv, invalid PATH components, missing programs or invalid command policy return I/O errors.
+pub(super) fn prepare_command(
+    cwd: &std::path::Path,
+    argv: &[String],
+    env: &[(String, String)],
+    resolved: Option<&crate::lang::environment::CommandEnv>,
+) -> io::Result<(crate::execution::ControlledCommand, Vec<String>)> {
     use std::ffi::OsString;
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
@@ -949,29 +947,51 @@ fn spawn_resolved(
         .unwrap_or_default();
     let executable = crate::execution::job::executable_on(&prefix[0].to_string_lossy(), cwd, &path)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "program not found"))?;
+    let args: Vec<_> = prefix[1..]
+        .iter()
+        .cloned()
+        .chain(args.iter().map(OsString::from))
+        .collect();
+    let keys: BTreeSet<OsString> = env
+        .iter()
+        .map(|(key, _)| key.into())
+        .chain(
+            resolved
+                .into_iter()
+                .flat_map(|value| value.vars.iter().map(|(key, _)| key.clone())),
+        )
+        .chain(std::iter::once("PATH".into()))
+        .collect();
+    let mut replay = vec!["/usr/bin/env".to_owned()];
+    replay.extend(keys.iter().filter_map(|key| {
+        vars.get(key)
+            .map(|value| format!("{}={}", key.to_string_lossy(), value.to_string_lossy()))
+    }));
+    replay.push(executable.to_string_lossy().into_owned());
+    replay.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
     let command = crate::execution::ControlledCommand::from_validated_peer(
         crate::execution::CommandKind::Job,
         executable,
-        prefix[1..]
-            .iter()
-            .cloned()
-            .chain(args.iter().map(OsString::from))
-            .collect(),
+        args,
         cwd.to_path_buf(),
         vars,
     )
     .map_err(|error| io::Error::new(io::ErrorKind::NotFound, format!("{error:?}")))?;
-    let owner = crate::execution::OwnerId::new(format!(
-        "test:{}",
-        blake3::hash(worktree.as_os_str().as_encoded_bytes()).to_hex()
-    ))
-    .map_err(|error| io::Error::other(format!("{error:?}")))?;
-    crate::execution::job::StreamedJob::start(
-        admission,
-        owner,
-        crate::execution::AdmissionClass::Background,
-        &command,
-    )
+    Ok((command, replay))
+}
+
+/// Replays an admitted recipe with precisely its allowlisted environment, program and arguments.
+/// No daemon variables enter this receipt; `env -i` preserves the original cleared boundary.
+fn spec_replay(spec: &crate::checks::runner::RunSpec) -> Vec<String> {
+    let mut replay = vec!["/usr/bin/env".to_owned(), "-i".to_owned()];
+    replay.extend(spec.env.iter().map(|(key, value)| format!("{key}={value}")));
+    replay.push(spec.program.to_string_lossy().into_owned());
+    replay.extend(
+        spec.args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    );
+    replay
 }
 
 /// How one started run settles and is shown.
@@ -1461,7 +1481,26 @@ mod runner_tests {
         seen.extend(env.output.lines());
         seen.sort_unstable();
         assert_eq!(seen, ["ONLY_THIS=x", "PATH=/usr/bin:/bin"]);
-        assert_eq!(env.command, ["/usr/bin/env"]);
+        assert_eq!(
+            env.command,
+            [
+                "/usr/bin/env",
+                "-i",
+                "ONLY_THIS=x",
+                "PATH=/usr/bin:/bin",
+                "/usr/bin/env"
+            ]
+        );
+        let replay = tokio::process::Command::new("/bin/sh")
+            .args(["-c", &super::super::worker::rerun_text(&env)])
+            .current_dir(&root)
+            .env_clear()
+            .env("UNRELATED_SENTINEL", "hidden")
+            .output()
+            .await
+            .unwrap();
+        assert!(replay.status.success());
+        assert_eq!(String::from_utf8(replay.stdout).unwrap(), env.output);
         assert!(matches!(
             start(spec("/bin/pwd", &[], 4096)),
             StartResult::Started(2)
@@ -1568,14 +1607,19 @@ mod runner_tests {
         }
         let result = result.unwrap();
         assert_eq!(result.rerun_dir.as_deref(), Some("pkg"));
-        assert_eq!(result.command, ["env", "RUN_MARKER=x", "/bin/echo", "done"]);
+        assert_eq!(result.command.first().unwrap(), "/usr/bin/env");
+        assert!(result.command.contains(&"RUN_MARKER=x".to_owned()));
+        assert_eq!(
+            &result.command[result.command.len() - 2..],
+            ["/bin/echo", "done"]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A run that started inside its resolved environment keeps that activation in its rerun
-    /// line: the resolver's program prefix leads the argv, its variables and PATH prefix appear
-    /// as `env` overrides — the same program and environment `spawn_resolved` started, so the
-    /// line replays the run instead of the pre-resolution request.
+    /// Real replay preserves actual PATH precedence, activation and quoted arguments: caller
+    /// PATH when no resolver PATH exists, resolver PATH otherwise, with the prefix in both.
+    /// The replay starts with an empty unrelated environment and cannot expand literal dollars
+    /// or quote characters in argv. Both original jobs settle and replay children are reaped.
     #[tokio::test]
     async fn rerun_names_the_resolved_environment_activation() {
         use crate::lang::environment::CommandEnv;
@@ -1586,53 +1630,75 @@ mod runner_tests {
             .join(format!("agent-ide-rerun-env-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let owner = BindingRef::fixture("rerun-env-actor", "rerun-env-channel", 1);
-        let venv_bin = root.join(".venv/bin");
+        let venv_bin = root.join(".venv/bin space");
         std::fs::create_dir_all(&venv_bin).unwrap();
-        let started = runs.start_with_options(
-            root.clone(),
-            vec!["pytest".into(), "-k".into(), "marker".into()],
-            &owner,
-            TestCommandOptions {
-                cwd: root.clone(),
-                env: Vec::new(),
-                language: crate::lang::testing::ALPHA,
-                command_language: None,
-                budget: Duration::from_secs(10),
-                detail_ref: "rerun-env-detail".into(),
-                resolution: CommandResolution {
-                    resolved: Some(CommandEnv {
-                        argv_prefix: vec!["/bin/echo".into()],
-                        path_prefix: Some(venv_bin.clone()),
-                        vars: vec![(
-                            std::ffi::OsString::from("VIRTUAL_ENV"),
-                            root.join(".venv").into_os_string(),
-                        )],
-                    }),
-                    environment_label: Some(".venv".into()),
-                },
-            },
-        );
-        assert!(matches!(started, StartResult::Started(1)));
-        let mut result = None;
-        for _ in 0..100 {
-            result = runs.get(&root, 1, &owner).and_then(|status| status.result);
-            if result.is_some() {
-                break;
+        for (index, resolved_path) in [None, Some("/resolved path:/bin")].into_iter().enumerate() {
+            let script = "printf '%s\\n' \"$PATH\" \"$MARKER\" \"$1\"";
+            let literal = "literal $value 'quoted'";
+            let mut vars = vec![("MARKER".into(), "resolved 'value'".into())];
+            if let Some(path) = resolved_path {
+                vars.push(("PATH".into(), path.into()));
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let started = runs.start_with_options(
+                root.clone(),
+                vec![
+                    "requested-program".into(),
+                    "-c".into(),
+                    script.into(),
+                    "label".into(),
+                    literal.into(),
+                ],
+                &owner,
+                TestCommandOptions {
+                    cwd: root.clone(),
+                    env: vec![
+                        ("PATH".into(), "/caller path:/bin".into()),
+                        ("MARKER".into(), "caller".into()),
+                    ],
+                    language: crate::lang::testing::ALPHA,
+                    command_language: None,
+                    budget: Duration::from_secs(10),
+                    detail_ref: "rerun-env-detail".into(),
+                    resolution: CommandResolution {
+                        resolved: Some(CommandEnv {
+                            argv_prefix: vec!["/bin/sh".into()],
+                            path_prefix: Some(venv_bin.clone()),
+                            vars,
+                        }),
+                        environment_label: Some(".venv".into()),
+                    },
+                },
+            );
+            assert!(matches!(started, StartResult::Started(_)));
+            let id = index as u64 + 1;
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(result) =
+                        runs.get(&root, id, &owner).and_then(|status| status.result)
+                    {
+                        break result;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let expected = format!(
+                "{}:{}\nresolved 'value'\n{literal}\n",
+                venv_bin.display(),
+                resolved_path.unwrap_or("/caller path:/bin")
+            );
+            assert_eq!(result.output, expected);
+            let replay = tokio::process::Command::new("/bin/sh")
+                .args(["-c", &super::super::worker::rerun_text(&result)])
+                .current_dir(&root)
+                .env_clear()
+                .output()
+                .await
+                .unwrap();
+            assert!(replay.status.success());
+            assert_eq!(String::from_utf8(replay.stdout).unwrap(), expected);
         }
-        let result = result.unwrap();
-        assert_eq!(
-            result.command,
-            vec![
-                "env".to_owned(),
-                format!("VIRTUAL_ENV={}", root.join(".venv").display()),
-                format!("PATH={}:$PATH", venv_bin.display()),
-                "/bin/echo".to_owned(),
-                "-k".to_owned(),
-                "marker".to_owned(),
-            ]
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

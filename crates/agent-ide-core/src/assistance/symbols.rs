@@ -4360,7 +4360,8 @@ fn push_block(out: &mut String, content: &str) {
 }
 
 /// Runs `run` (the in-process argument vector from `root` with the daemon's environment and
-/// formatter `PATH`, or a module recipe's core-built specification exactly) with `input` on stdin
+/// formatter `PATH` and resolved language environment, or a module recipe's core-built
+/// specification exactly) with `input` on stdin
 /// as an Execution-owned interactive job of the worktree — admitted, measured, its group torn
 /// down and reaped. `None` when it cannot start, is refused as busy, overflows the capture
 /// ceiling or does not finish within `timeout`.
@@ -4372,44 +4373,35 @@ async fn run_stdin(
     timeout: Duration,
 ) -> Option<crate::execution::job::JobOutput> {
     use std::ffi::OsString;
-    let (program, args, cwd, env, timeout) = match run {
-        crate::modules::calls::StdinRun::Argv(argv) => {
-            let (program, args) = argv.split_first()?;
-            let path = crate::modules::calls::tool_path();
-            let program = crate::execution::job::executable_on(program, root, &path)?;
-            let mut env: std::collections::BTreeMap<OsString, OsString> =
-                std::env::vars_os().collect();
-            env.insert("PATH".into(), path.into());
-            (
-                program,
-                args.iter().map(OsString::from).collect(),
-                root.to_path_buf(),
-                env,
-                timeout,
+    let (command, timeout) = match run {
+        crate::modules::calls::StdinRun::Argv { argv, environment } => {
+            let (command, _) = crate::assistance::tests::prepare_command(
+                root,
+                argv,
+                &[("PATH".into(), crate::modules::calls::tool_path())],
+                environment.as_ref(),
             )
+            .ok()?;
+            (command, timeout)
         }
         // A module's recipe, expanded by the core: exactly its program, arguments, working
         // directory and environment.
         crate::modules::calls::StdinRun::Spec(spec) => (
-            spec.program.clone(),
-            spec.args.clone(),
-            spec.cwd.clone(),
-            spec.env
-                .iter()
-                .map(|(key, value)| (OsString::from(key), OsString::from(value)))
-                .collect(),
+            crate::execution::ControlledCommand::from_validated_peer(
+                crate::execution::CommandKind::Job,
+                spec.program.clone(),
+                spec.args.clone(),
+                spec.cwd.clone(),
+                spec.env
+                    .iter()
+                    .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+                    .collect(),
+            )
+            .ok()?,
             timeout.min(spec.timeout),
         ),
     };
-    let command = crate::execution::ControlledCommand::from_validated_peer(
-        crate::execution::CommandKind::Job,
-        program,
-        args,
-        cwd,
-        env,
-    )
-    .ok()?
-    .with_private_stdin(private_input(input).ok()?);
+    let command = command.with_private_stdin(private_input(input).ok()?);
     let owner = crate::execution::OwnerId::new(format!(
         "edit:{}",
         blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex()
@@ -4426,6 +4418,38 @@ async fn run_stdin(
     .await
     .ok()?;
     (!output.timed_out && !output.truncated).then_some(output)
+}
+
+#[cfg(test)]
+mod stdin_environment_tests {
+    use super::*;
+
+    /// Native formatter/probe execution applies the language activation before admission,
+    /// preserves candidate stdin, and reaps the controlled shell fixture at completion.
+    #[tokio::test]
+    async fn native_stdin_runs_apply_the_resolved_environment() {
+        let root = std::env::temp_dir().canonicalize().unwrap();
+        let run = crate::modules::calls::StdinRun::Argv {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s:' \"$RUSTUP_AUTO_INSTALL\"; /bin/cat".into(),
+            ],
+            environment: Some(crate::lang::environment::CommandEnv {
+                vars: vec![("RUSTUP_AUTO_INSTALL".into(), "0".into())],
+                ..Default::default()
+            }),
+        };
+        let admission = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::assistance::worker::admission_controller(),
+        ));
+        let output = run_stdin(&admission, &run, &root, "candidate", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(output.status, Some(0));
+        assert_eq!(output.stdout, b"0:candidate");
+        assert_eq!(admission.lock().unwrap().running_count(), 0);
+    }
 }
 
 /// A private, already-unlinked file holding `input`, positioned at its start.

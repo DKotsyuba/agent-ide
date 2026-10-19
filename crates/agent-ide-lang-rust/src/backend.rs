@@ -174,7 +174,7 @@ enum Start {
         executable: Arc<ModuleExecutable>,
         /// The declaration's settings in the allocated namespace.
         settings: crate::module::RustProviderSettings,
-        /// The accepted inputs (module digest and settings) the restart policy is keyed by.
+        /// The measured inputs (module, analyzer/tool bytes and settings) of the restart policy.
         inputs: String,
     },
 }
@@ -446,8 +446,9 @@ impl RustBackend {
                     crate::module::RustProviderSettings::from_launch(launch, &cache_namespace)
                         .ok_or(FailureCode::ExecutionProfile)?;
                 let inputs = format!(
-                    "{}:{}",
+                    "{}:{:?}:{}",
                     executable.digest.to_hex(),
+                    profile_of(launch, &cache_namespace)?.compatibility_key(&worktree),
                     serde_json::json!(settings)
                 );
                 if let Err(failure) = agent_ide_core::modules::analyzer::start_permit(
