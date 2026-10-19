@@ -96,16 +96,24 @@ pub struct RustProfile {
 /// files open detached and lose cross-file references.
 pub fn linked_projects(root: &Path) -> Option<Vec<String>> {
     let root_manifest = root.join("Cargo.toml");
-    let root_is_workspace = root_manifest.is_file() && {
-        let text = std::fs::read_to_string(&root_manifest).ok()?;
-        declares_workspace(&text)
-    };
+    let root_text = crate::environment::manifest_text(root, root, &[]).ok()?;
+    let root_is_workspace = root_text.as_deref().is_some_and(declares_workspace);
     let mut found = Vec::new();
     collect_manifests(root, LINKED_PROJECT_DEPTH, &mut found);
     found.retain(|path| *path != root_manifest);
+    found.retain(|path| {
+        path.parent()
+            .is_some_and(|project| crate::environment::excluded_project(root, project) == Ok(false))
+    });
     if root_is_workspace {
         found.retain(|path| {
-            std::fs::read_to_string(path).is_ok_and(|text| declares_workspace(&text))
+            path.parent()
+                .and_then(|project| {
+                    crate::environment::manifest_text(root, project, &[])
+                        .ok()
+                        .flatten()
+                })
+                .is_some_and(|text| declares_workspace(&text))
         });
     }
     if found.is_empty() {
@@ -148,7 +156,7 @@ fn collect_manifests(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
         {
             continue;
         }
-        if path.is_dir() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             let manifest = path.join("Cargo.toml");
             if manifest.is_file() {
                 found.push(manifest);

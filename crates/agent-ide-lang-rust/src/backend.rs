@@ -463,7 +463,9 @@ impl RustBackend {
         // the launch's own accepted facts: a changed lock or config retires the session like a
         // changed tool does, instead of the old child answering from stale inputs.
         let configuration = host.module_config(launch, worktree_path);
-        let environment = match crate::environment::resolve(worktree_path, &configuration) {
+        let document = worktree_path.join(source.path());
+        let cwd = document.parent().unwrap_or(worktree_path);
+        let environment = match crate::environment::resolve_at(worktree_path, cwd, &configuration) {
             Ok((_, environment)) => environment,
             Err(cause) => {
                 self.release(host, &binding, true).await;
@@ -481,6 +483,7 @@ impl RustBackend {
                     crate::module::RustProviderSettings::from_launch(launch, &cache_namespace)
                         .ok_or(FailureCode::ExecutionProfile)?;
                 settings.configuration = configuration;
+                settings.project_root = Some(environment.root.clone());
                 let inputs = format!(
                     "{}:{:?}:{}",
                     executable.digest.to_hex(),

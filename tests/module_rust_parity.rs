@@ -1272,6 +1272,7 @@ async fn the_module_process_starts_rust_analyzer_within_hello() {
         std::fs::create_dir_all(namespace.join(sub)).unwrap();
     }
     let settings = agent_ide_lang_rust::module::RustProviderSettings {
+        project_root: None,
         configuration: Default::default(),
         binary: input("AGENT_IDE_RUST_ANALYZER").into(),
         version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),
@@ -1457,6 +1458,7 @@ async fn the_daemon_open_path_reaches_a_ready_rust_analyzer() {
         std::fs::create_dir_all(namespace.join(sub)).unwrap();
     }
     let settings = agent_ide_lang_rust::module::RustProviderSettings {
+        project_root: None,
         configuration: Default::default(),
         binary: input("AGENT_IDE_RUST_ANALYZER").into(),
         version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),

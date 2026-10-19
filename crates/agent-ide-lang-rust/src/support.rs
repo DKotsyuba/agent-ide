@@ -584,7 +584,7 @@ impl LanguageSupport for RustSupport {
     fn configured_command_env(
         &self,
         worktree: &Path,
-        _cwd: &Path,
+        cwd: &Path,
         program: &str,
         config: &agent_ide_core::modules::contract::ModuleConfig,
     ) -> Result<
@@ -598,8 +598,8 @@ impl LanguageSupport for RustSupport {
         else {
             return Ok(None);
         };
-        let (tools, _) =
-            crate::environment::resolve(worktree, config).map_err(LangError::Environment)?;
+        let (tools, _) = crate::environment::resolve_at(worktree, cwd, config)
+            .map_err(LangError::Environment)?;
         let executable = tools.dir.join("bin").join(name);
         if Path::new(program).is_absolute() && Path::new(program) != executable
             || (!Path::new(program).is_absolute() && program != name)
@@ -628,6 +628,31 @@ impl LanguageSupport for RustSupport {
             path_prefix: Some(tools.dir.join("bin")),
             vars,
         }))
+    }
+
+    /// Uses the actual Cargo manifest selector before resolving a command. Unclaimed programs
+    /// keep their existing route; selected projects remain bounded by the admitted worktree.
+    fn configured_command_argv(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        argv: &[String],
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Result<Option<agent_ide_core::lang::environment::CommandEnv>, LangError> {
+        let Some(program) = argv.first() else {
+            return Ok(None);
+        };
+        if !matches!(
+            Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("cargo" | "rustc" | "rustfmt")
+        ) {
+            return Ok(None);
+        }
+        let cwd =
+            crate::environment::command_directory(cwd, argv).map_err(LangError::Environment)?;
+        self.configured_command_env(worktree, &cwd, program, config)
     }
 
     /// `cargo` runs from the toolchain named by `AGENT_IDE_RUST_TOOLCHAIN_DIR` when that

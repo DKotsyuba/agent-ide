@@ -144,17 +144,30 @@ pub(crate) fn resolve(
     worktree: &Path,
     config: &agent_ide_core::modules::contract::ModuleConfig,
 ) -> Result<(Tools, ResolvedEnv), String> {
+    resolve_at(worktree, worktree, config)
+}
+
+/// Resolves the effective project selected by the actual child cwd (or manifest selection).
+/// The admitted worktree remains the boundary; no foreign ancestor contributes native inputs.
+pub(crate) fn resolve_at(
+    worktree: &Path,
+    cwd: &Path,
+    config: &agent_ide_core::modules::contract::ModuleConfig,
+) -> Result<(Tools, ResolvedEnv), String> {
+    let active = project_root(worktree, cwd, &config.read_denies)?;
+    let pin = pin_root(worktree, &active, &config.read_denies)?;
     let compiler = config
         .provider
         .as_ref()
         .and_then(|provider| provider.get("rustc_version"))
         .and_then(|value| value.as_str());
-    if let Some(cause) = pin_conflict(worktree, worktree, compiler, &config.read_denies) {
+    if let Some(cause) = pin_conflict(&pin, worktree, compiler, &config.read_denies) {
         return Err(cause);
     }
     let tools = tools(config)?;
-    let mut resolved = environment(
+    let mut resolved = environment_at(
         worktree,
+        &active,
         Some(&ConfiguredToolchain {
             dir: &tools.dir,
             version: tools.compiler.as_deref(),
@@ -369,143 +382,487 @@ fn stamp(path: &Path) -> String {
     )
 }
 
-/// Generated/dependency state excluded by project discovery. Declared workspace members in
-/// these directories are explicitly unsupported rather than silently qualified.
-const SKIPPED: &[&str] = &[
-    ".git",
-    "target",
-    "node_modules",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".cache",
-];
+/// Resolves a native input under the admitted worktree before opening it. Canonicalization
+/// observes path metadata only; an external link or excluded lexical/resolved target refuses
+/// before contents can influence parsing or hashing. Missing in-bound inputs remain optional.
+fn input_path(worktree: &Path, path: &Path, denies: &[ReadDeny]) -> Result<PathBuf, String> {
+    if denies.iter().any(|deny| deny.matches(path)) {
+        return Err("native input is read restricted; use native cargo".into());
+    }
+    let relative = path
+        .strip_prefix(worktree)
+        .map_err(|_| "native input is outside the worktree; use native cargo".to_owned())?;
+    let mut prefix = worktree.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::ParentDir if prefix != worktree => {
+                prefix.pop();
+            }
+            Component::Normal(name) => prefix.push(name),
+            Component::CurDir => continue,
+            _ => return Err("native input escapes the admitted worktree; use native cargo".into()),
+        }
+        if denies.iter().any(|deny| deny.matches(&prefix)) {
+            return Err("native input is read restricted; use native cargo".into());
+        }
+        match fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("symlinked native input is unsupported; use native cargo".into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("native input path is unreadable; use native cargo".into()),
+            _ => {}
+        }
+    }
+    let roots = [worktree.to_path_buf()];
+    let resolved = agent_ide_core::assistance::launcher::admit_path(&roots, &prefix)
+        .map_err(|_| "native input escapes the admitted worktree; use native cargo".to_owned())?;
+    if denies.iter().any(|deny| deny.matches(&resolved)) {
+        return Err("native input target is read restricted; use native cargo".into());
+    }
+    Ok(resolved)
+}
 
-/// Validates the supported workspace member path syntax before filesystem discovery. This is
-/// not a Cargo parser: escaped/complex declarations and foreign/generated roots refuse.
-fn member_scope(text: &str) -> Result<(), String> {
+/// Reads one bounded manifest only after containing its actual path. A missing manifest is
+/// absent; unreadable, denied, invalid UTF-8 and oversized authoritative input are refusals.
+pub(crate) fn manifest_text(
+    worktree: &Path,
+    root: &Path,
+    denies: &[ReadDeny],
+) -> Result<Option<String>, String> {
+    let path = input_path(worktree, &root.join("Cargo.toml"), denies)?;
+    match fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) if metadata.is_file() => read_input(&path, denies)
+            .map(Some)
+            .ok_or_else(|| "Cargo manifest is unreadable/oversized; use native cargo".into()),
+        _ => Err("Cargo manifest is not a readable regular file; use native cargo".into()),
+    }
+}
+
+/// The existing narrow workspace-array syntax: literal quoted paths, multiline arrays and
+/// whole-component '*' expansion. Unknown/escaped/foreign syntax explicitly needs native Cargo.
+fn workspace_paths(text: &str, key: &str) -> Result<Vec<String>, String> {
     let mut workspace = false;
-    let mut members = false;
+    let mut collecting = false;
     let mut value = String::new();
     for raw in text.lines() {
         let line = raw.split('#').next().unwrap_or_default().trim();
-        if line.starts_with('[') {
+        if !collecting && line.starts_with('[') {
             workspace = line == "[workspace]";
         }
-        if workspace && !members {
-            if let Some((key, rhs)) = line.split_once('=') {
-                if key.trim().trim_matches(['"', '\'']) == "members" {
-                    members = true;
-                    value.push_str(rhs);
-                }
-            }
-        } else if members {
+        if collecting {
             value.push_str(line);
+        } else if workspace
+            && let Some((name, rhs)) = line.split_once('=')
+            && name.trim() == key
+        {
+            collecting = true;
+            value.push_str(rhs.trim());
         }
-        if members && value.contains(']') {
+        if collecting && value.contains(']') {
             break;
         }
     }
-    if !members {
-        return Ok(());
+    if !collecting {
+        return Ok(Vec::new());
     }
-    let array = value
+    let values = value
         .trim()
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
-        .ok_or_else(|| "unsupported workspace member declaration; use native cargo".to_owned())?;
-    for item in array
+        .ok_or_else(|| format!("unsupported workspace {key}; use native cargo"))?;
+    values
         .split(',')
         .map(str::trim)
         .filter(|item| !item.is_empty())
-    {
-        let path = quoted(item)
-            .ok_or_else(|| "unsupported escaped workspace member; use native cargo".to_owned())?;
-        if Path::new(path).is_absolute()
-            || Path::new(path)
-                .components()
-                .any(|part| matches!(part, Component::ParentDir))
-            || path.split('/').any(|part| SKIPPED.contains(&part))
-        {
-            return Err(
-                "workspace members outside supported worktree input scope; use native cargo"
-                    .to_owned(),
-            );
-        }
-    }
-    Ok(())
+        .map(|item| {
+            let value = quoted(item)
+                .ok_or_else(|| format!("unsupported workspace {key} string; use native cargo"))?;
+            if Path::new(value).is_absolute()
+                || Path::new(value)
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir))
+                || value.split('/').any(|part| {
+                    part.contains(['?', '[', ']', '{', '}']) || (part.contains('*') && part != "*")
+                })
+            {
+                return Err(format!(
+                    "unsupported workspace {key} path; use native cargo"
+                ));
+            }
+            Ok(value.to_owned())
+        })
+        .collect()
 }
 
-/// Discovers all native manifests/configs inside the worktree, including crates/alpha and
-/// deeper members. No symlink is followed. Exhausted entry/depth bounds explicitly refuse;
-// no partial identity is certified as complete. Standard generated roots stay excluded.
-fn native_inputs(worktree: &Path, denies: &[ReadDeny]) -> Result<Vec<PathBuf>, String> {
-    let mut pending = vec![(worktree.to_path_buf(), 0_usize)];
-    let mut inputs = Vec::new();
-    let mut budget = 16_384_usize;
-    while let Some((dir, depth)) = pending.pop() {
-        let manifest = dir.join("Cargo.toml");
-        if denies.iter().any(|deny| deny.matches(&manifest)) {
-            return Err("Cargo manifest is read restricted; use native cargo".into());
-        }
-        if dir == worktree || manifest.is_file() {
-            if manifest.is_file() {
-                let text = read_input(&manifest, denies).ok_or_else(|| "Cargo manifest is unreadable/oversized for environment qualification; use native cargo".to_owned())?;
-                member_scope(&text)?;
-            }
-            for name in [
-                "Cargo.toml",
-                "Cargo.lock",
-                "rust-toolchain.toml",
-                "rust-toolchain",
-                "rust-project.json",
-                "rustfmt.toml",
-                ".rustfmt.toml",
-            ] {
-                inputs.push(dir.join(name));
-            }
-        }
-        inputs.push(dir.join(".cargo/config.toml"));
-        inputs.push(dir.join(".cargo/config"));
-        inputs.push(dir.join("rust-toolchain.toml"));
-        inputs.push(dir.join("rust-toolchain"));
-        for entry in fs::read_dir(&dir)
-            .map_err(|_| "native input directory is unreadable; use native cargo".to_owned())?
-        {
-            if budget == 0 {
-                return Err(
-                    "native input discovery exceeds its supported bound; use native cargo".into(),
-                );
-            }
-            budget -= 1;
-            let entry = entry.map_err(|_| {
-                "native input directory changed; retry or use native cargo".to_owned()
-            })?;
-            if SKIPPED.iter().any(|skip| entry.file_name() == *skip) {
-                continue;
-            }
-            let kind = entry
-                .file_type()
-                .map_err(|_| "native input metadata unavailable; use native cargo".to_owned())?;
-            if kind.is_symlink() {
-                return Err(
-                    "symlinked project input scope is unsupported; use native cargo".into(),
-                );
-            }
-            if kind.is_dir() {
-                if depth == 12 {
+/// Matches the supported workspace path syntax, without treating '*' as a recursive glob.
+fn member_matches(pattern: &str, path: &Path) -> bool {
+    let pattern: Vec<_> = Path::new(pattern).components().collect();
+    let path: Vec<_> = path.components().collect();
+    pattern.len() == path.len()
+        && pattern.iter().zip(path).all(|(pattern, value)| {
+            *pattern == Component::Normal(std::ffi::OsStr::new("*")) || *pattern == value
+        })
+}
+
+/// Whether an independently discovered semantic project is explicitly excluded by the root
+/// workspace. This shares guarded input/supported pattern semantics with native resolution.
+pub(crate) fn excluded_project(root: &Path, project: &Path) -> Result<bool, String> {
+    let text = manifest_text(root, root, &[])?.unwrap_or_default();
+    let relative = project
+        .strip_prefix(root)
+        .map_err(|_| "project outside worktree".to_owned())?;
+    Ok(workspace_paths(&text, "exclude")?
+        .iter()
+        .any(|pattern| member_matches(pattern, relative)))
+}
+
+/// Expands only declared workspace member path segments, never a repository-wide tree walk.
+/// Candidate/member bounds apply to relevant directories, not unrelated source/assets files.
+fn member_roots(
+    worktree: &Path,
+    patterns: &[String],
+    excluded: &[String],
+    denies: &[ReadDeny],
+) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    for pattern in patterns {
+        let mut candidates = vec![worktree.to_path_buf()];
+        for component in Path::new(pattern).components() {
+            let mut next = Vec::new();
+            for parent in candidates {
+                if component == Component::Normal(std::ffi::OsStr::new("*")) {
+                    let parent = input_path(worktree, &parent, denies)?;
+                    for entry in fs::read_dir(parent).map_err(|_| {
+                        "workspace member directory unavailable; use native cargo".to_owned()
+                    })? {
+                        let entry = entry
+                            .map_err(|_| "workspace member changed; use native cargo".to_owned())?;
+                        let relative = entry
+                            .path()
+                            .strip_prefix(worktree)
+                            .map(Path::to_path_buf)
+                            .map_err(|_| "workspace member escaped".to_owned())?;
+                        if excluded
+                            .iter()
+                            .any(|exclude| member_matches(exclude, &relative))
+                        {
+                            continue;
+                        }
+                        let kind = entry
+                            .file_type()
+                            .map_err(|_| "workspace member metadata unavailable".to_owned())?;
+                        if kind.is_dir() || kind.is_symlink() {
+                            let path = input_path(worktree, &entry.path(), denies)?;
+                            if path.is_dir() {
+                                next.push(path);
+                            }
+                        }
+                    }
+                } else {
+                    next.push(parent.join(component));
+                }
+                if next.len() > 1024 {
                     return Err(
-                        "native input discovery exceeds its supported depth; use native cargo"
+                        "workspace member expansion exceeds 1024 directories; use native cargo"
                             .into(),
                     );
                 }
-                pending.push((entry.path(), depth + 1));
+            }
+            candidates = next;
+        }
+        for root in candidates {
+            let relative = root
+                .strip_prefix(worktree)
+                .map_err(|_| "workspace member escaped".to_owned())?;
+            if excluded
+                .iter()
+                .any(|exclude| member_matches(exclude, relative))
+            {
+                continue;
+            }
+            let root = input_path(worktree, &root, denies)?;
+            if manifest_text(worktree, &root, denies)?.is_none() {
+                return Err(
+                    "declared workspace member manifest is missing; use native cargo".into(),
+                );
+            }
+            roots.push(root);
+        }
+        if roots.len() > 1024 {
+            return Err("workspace has more than 1024 supported members; use native cargo".into());
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// The nearest effective manifest at/below the current directory, never a foreign ancestor.
+/// File demands pass their parent directory; explicit manifests pass their containing directory.
+pub(crate) fn project_root(
+    worktree: &Path,
+    cwd: &Path,
+    denies: &[ReadDeny],
+) -> Result<PathBuf, String> {
+    let absolute = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        worktree.join(cwd)
+    };
+    let absolute = input_path(worktree, &absolute, denies)?;
+    for dir in absolute
+        .ancestors()
+        .take_while(|dir| dir.starts_with(worktree))
+    {
+        if manifest_text(worktree, dir, denies)?.is_some() {
+            return Ok(dir.to_path_buf());
+        }
+    }
+    Ok(worktree.to_path_buf())
+}
+
+/// The cwd selected by Cargo's explicit manifest option, or the supplied actual cwd. This
+/// interprets only project selection, never executable/install authority or arbitrary flags.
+pub(crate) fn command_directory(cwd: &Path, argv: &[String]) -> Result<PathBuf, String> {
+    let cargo = argv
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .is_some_and(|name| name == "cargo");
+    if !cargo {
+        return Ok(cwd.to_path_buf());
+    }
+    let mut selected = None;
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg.starts_with('+') {
+            return Err("per-command Rust toolchain selectors are unsupported; configure the launcher or use native cargo".into());
+        }
+        let path = if arg == "--manifest-path" {
+            Some(
+                args.next()
+                    .ok_or_else(|| {
+                        "Cargo manifest option has no path; use native cargo".to_owned()
+                    })?
+                    .as_str(),
+            )
+        } else {
+            arg.strip_prefix("--manifest-path=")
+        };
+        if let Some(path) = path {
+            if selected.is_some() {
+                return Err(
+                    "multiple Cargo manifest selectors are unsupported; use native cargo".into(),
+                );
+            }
+            let path = Path::new(path);
+            if path.file_name().is_none_or(|name| name != "Cargo.toml") {
+                return Err("unsupported Cargo manifest path; use native cargo".into());
+            }
+            selected = Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            });
+        }
+    }
+    Ok(selected
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf()))
+}
+
+/// Literal local dependency/patch paths in the supported line-oriented manifest subset. Reuses
+/// the existing TOML string reader; escaped/multiline path forms are explicitly unsupported.
+fn dependency_roots(
+    worktree: &Path,
+    package: &Path,
+    text: &str,
+    denies: &[ReadDeny],
+) -> Result<Vec<PathBuf>, String> {
+    let mut dependency = false;
+    let mut package_table = false;
+    let mut roots = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') {
+            package_table = line == "[package]";
+            dependency =
+                line.contains("dependencies") || line.starts_with("[patch.") || line == "[replace]";
+        }
+        if package_table
+            && line
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim().trim_matches(['"', '\'']) == "workspace")
+        {
+            return Err(
+                "explicit package.workspace relocation is unsupported; use native cargo".into(),
+            );
+        }
+        if !dependency {
+            continue;
+        }
+        for piece in line.split(['{', ',']) {
+            let Some((key, value)) = piece.split_once('=') else {
+                continue;
+            };
+            if key.contains('\\') {
+                return Err("escaped dependency keys are unsupported; use native cargo".into());
+            }
+            if key.trim().trim_matches(['"', '\'']) != "path" {
+                continue;
+            }
+            let value = value.trim().trim_end_matches('}').trim();
+            if quoted(value).is_none() {
+                return Err("unsupported local dependency path syntax; use native cargo".into());
+            }
+            let line = format!("path = {value}");
+            let path = crate::support::toml_string(&line, "path").ok_or_else(|| {
+                "unsupported local dependency path string; use native cargo".to_owned()
+            })?;
+            let root = input_path(worktree, &package.join(path), denies)?;
+            if manifest_text(worktree, &root, denies)?.is_none() {
+                return Err(
+                    "declared local dependency manifest is missing; use native cargo".into(),
+                );
+            }
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+/// Completes a bounded declared project set through literal local dependencies only. This
+/// accounts for Cargo's implicit path-dependency members without scanning unrelated folders.
+fn project_closure(
+    worktree: &Path,
+    mut pending: Vec<PathBuf>,
+    denies: &[ReadDeny],
+) -> Result<Vec<PathBuf>, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(root) = pending.pop() {
+        if !seen.insert(root.clone()) {
+            continue;
+        }
+        if seen.len() > 1024 {
+            return Err("more than 1024 relevant Cargo projects; use native cargo".into());
+        }
+        if let Some(text) = manifest_text(worktree, &root, denies)? {
+            pending.extend(dependency_roots(worktree, &root, &text, denies)?);
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// Native inputs for the effective root/workspace and declared members. Excluded/unrelated
+/// nested projects and assets do not affect root qualification; a selected independent project
+/// is resolved separately. Unsupported member syntax refuses instead of certifying a partial set.
+fn native_inputs_at(
+    worktree: &Path,
+    active: &Path,
+    denies: &[ReadDeny],
+) -> Result<Vec<PathBuf>, String> {
+    let mut roots = vec![active.to_path_buf()];
+    // A member's Cargo.lock and workspace configuration belong to its enclosing declared
+    // workspace. An excluded independent project is not folded into that workspace.
+    for ancestor in active
+        .ancestors()
+        .take_while(|dir| dir.starts_with(worktree))
+    {
+        let Some(text) = manifest_text(worktree, ancestor, denies)? else {
+            continue;
+        };
+        if !text
+            .lines()
+            .any(|line| line.split('#').next().unwrap_or_default().trim() == "[workspace]")
+        {
+            continue;
+        }
+        let excluded = workspace_paths(&text, "exclude")?;
+        let relative = active
+            .strip_prefix(ancestor)
+            .expect("ancestor contains project");
+        if ancestor != active
+            && excluded
+                .iter()
+                .any(|pattern| member_matches(pattern, relative))
+        {
+            continue;
+        }
+        let members = member_roots(
+            ancestor,
+            &workspace_paths(&text, "members")?,
+            &excluded,
+            denies,
+        )?;
+        let declared = std::iter::once(ancestor.to_path_buf())
+            .chain(members)
+            .collect::<Vec<_>>();
+        if ancestor == active {
+            roots = declared;
+            break;
+        }
+        let declared = project_closure(worktree, declared, denies)?;
+        if declared.iter().any(|member| member == active) {
+            roots = declared;
+            break;
+        }
+    }
+    let mut inputs = Vec::new();
+    for root in project_closure(worktree, roots, denies)? {
+        for name in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            "rust-toolchain",
+            "rust-project.json",
+            "rustfmt.toml",
+            ".rustfmt.toml",
+        ] {
+            inputs.push(input_path(worktree, &root.join(name), denies)?);
+        }
+        for ancestor in root.ancestors().take_while(|dir| dir.starts_with(worktree)) {
+            for name in [
+                ".cargo/config.toml",
+                ".cargo/config",
+                "rust-toolchain.toml",
+                "rust-toolchain",
+            ] {
+                inputs.push(input_path(worktree, &ancestor.join(name), denies)?);
             }
         }
+    }
+    if active != worktree {
+        inputs.push(input_path(worktree, &worktree.join("Cargo.toml"), denies)?);
     }
     inputs.sort();
     inputs.dedup();
     Ok(inputs)
+}
+
+/// Root-context projection retained for card/check consumers.
+fn native_inputs(worktree: &Path, denies: &[ReadDeny]) -> Result<Vec<PathBuf>, String> {
+    native_inputs_at(worktree, worktree, denies)
+}
+
+/// The nearest authoritative cwd pin inside the admitted boundary. Other members' pins do not
+/// govern a root command; a separately selected project resolves its own pin first.
+fn pin_root(worktree: &Path, active: &Path, denies: &[ReadDeny]) -> Result<PathBuf, String> {
+    for root in active
+        .ancestors()
+        .take_while(|root| root.starts_with(worktree))
+    {
+        for file in ["rust-toolchain.toml", "rust-toolchain"] {
+            let path = input_path(worktree, &root.join(file), denies)?;
+            if fs::symlink_metadata(path).is_ok() {
+                return Ok(root.to_path_buf());
+            }
+        }
+    }
+    Ok(worktree.to_path_buf())
 }
 
 /// Full-byte native identity plus accepted tool facts. Refused discovery gets a stable refused
@@ -515,7 +872,18 @@ pub fn identity(
     configured: Option<&ConfiguredToolchain<'_>>,
     denies: &[ReadDeny],
 ) -> String {
+    identity_at(worktree, worktree, configured, denies)
+}
+
+/// Complete relevant native/tool identity, partitioned by the active project root.
+fn identity_at(
+    worktree: &Path,
+    active: &Path,
+    configured: Option<&ConfiguredToolchain<'_>>,
+    denies: &[ReadDeny],
+) -> String {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(active.as_os_str().as_encoded_bytes());
     if let Some(facts) = configured {
         hasher.update(facts.dir.as_os_str().as_encoded_bytes());
         hasher.update(facts.version.unwrap_or_default().as_bytes());
@@ -533,7 +901,7 @@ pub fn identity(
             }
         }
     }
-    match native_inputs(worktree, denies) {
+    match native_inputs_at(worktree, active, denies) {
         Err(reason) => {
             hasher.update(reason.as_bytes());
         }
@@ -554,41 +922,29 @@ pub fn identity(
     hasher.finalize().to_string()
 }
 
-/// One resolution from caller-accepted facts. A pin or discovery refusal yields no chosen or
-/// source candidate and the same actionable pre-run cause. Successful candidates include
-/// their winner; the directory name is only a label, never compiler version evidence.
+/// Root-context resolution retained for card/check callers. Only the effective root pin
+/// governs a child; unrelated or excluded subprojects cannot veto the command.
 pub fn environment(
     worktree: &Path,
     configured: Option<&ConfiguredToolchain<'_>>,
     denies: &[ReadDeny],
 ) -> ResolvedEnv {
-    let nested_refusal = native_inputs(worktree, denies)
-        .and_then(|inputs| {
-            for path in inputs.iter().filter(|path| {
-                path.file_name()
-                    .is_some_and(|name| name == "rust-toolchain.toml")
-            }) {
-                let root = path.parent().expect("discovered input has its directory");
-                if root != worktree
-                    && let Some(cause) = pin_conflict(
-                        root,
-                        configured.map_or(worktree, |facts| facts.dir),
-                        configured.and_then(|facts| facts.version),
-                        denies,
-                    )
-                {
-                    return Err(format!(
-                        "{}: {cause}",
-                        root.strip_prefix(worktree).unwrap_or(root).display()
-                    ));
-                }
-            }
-            Ok(())
-        })
-        .err();
-    let refusal = configured.and_then(|facts| pin_conflict(worktree, facts.dir, facts.version, denies))
-        .or_else(|| pin_read(worktree, denies).err())
-        .or(nested_refusal)
+    environment_at(worktree, worktree, configured, denies)
+}
+
+/// Resolves one actual project without certifying another project's constraints. A native scope
+/// or authoritative-pin refusal has no chosen candidate and names native recovery.
+fn environment_at(
+    worktree: &Path,
+    active: &Path,
+    configured: Option<&ConfiguredToolchain<'_>>,
+    denies: &[ReadDeny],
+) -> ResolvedEnv {
+    let pin = pin_root(worktree, active, denies);
+    let refusal = pin.as_ref().err().cloned()
+        .or_else(|| pin.as_ref().ok().and_then(|root| configured.and_then(|facts| pin_conflict(root, facts.dir, facts.version, denies))))
+        .or_else(|| pin.as_ref().ok().and_then(|root| pin_read(root, denies).err()))
+        .or_else(|| native_inputs_at(worktree, active, denies).err())
         .or_else(|| configured.is_none().then(|| "no accepted configured Rust toolchain; use native cargo or configure the launcher".to_owned()));
     let chosen = if refusal.is_none() {
         configured.map(|facts| EnvCandidate {
@@ -600,19 +956,34 @@ pub fn environment(
     } else {
         None
     };
-    let source = chosen.as_ref().map(|_| match pin_read(worktree, denies) {
-        Ok(Some(pin)) => EnvSource::Pin(pin.file.into()),
-        _ => EnvSource::Launcher,
+    let source = chosen.as_ref().map(|_| {
+        match pin
+            .as_ref()
+            .ok()
+            .and_then(|root| pin_read(root, denies).ok().flatten().map(|pin| (root, pin)))
+        {
+            Some((root, pin)) => EnvSource::Pin(
+                root.join(pin.file)
+                    .strip_prefix(worktree)
+                    .unwrap_or(Path::new(pin.file))
+                    .display()
+                    .to_string(),
+            ),
+            None => EnvSource::Launcher,
+        }
     });
     let candidates = chosen.clone().into_iter().collect();
     ResolvedEnv {
-        root: PathBuf::new(),
+        root: active
+            .strip_prefix(worktree)
+            .unwrap_or(Path::new(""))
+            .to_path_buf(),
         chosen,
         source,
         candidates,
         warnings: Vec::new(),
         missing_next_step: refusal,
-        identity: identity(worktree, configured, denies),
+        identity: identity_at(worktree, active, configured, denies),
     }
 }
 
@@ -786,5 +1157,183 @@ mod tests {
         let before = identity(&root, None, &[]);
         put(&outer, "Cargo.lock", "foreign");
         assert_eq!(identity(&root, None, &[]), before);
+    }
+
+    /// Only declared workspace members govern root inputs. An excluded independent project
+    /// resolves its pin when explicitly selected, while member commands retain workspace locks.
+    #[test]
+    fn effective_workspace_scope_excludes_unrelated_projects() {
+        let base = ScratchDir::new("rust-effective-scope");
+        let root = base.join("workspace");
+        put(
+            &root,
+            "Cargo.toml",
+            "[workspace]\nmembers=[\"crates/app\"]\nexclude=[\"legacy\"]\n",
+        );
+        put(&root, "Cargo.lock", "root lock");
+        put(&root, "crates/app/Cargo.toml", "[package]\nname=\"app\"\n");
+        put(
+            &root,
+            "legacy/Cargo.toml",
+            "[workspace]\n\n[package]\nname=\"legacy\"\n",
+        );
+        put(
+            &root,
+            "legacy/rust-toolchain.toml",
+            "[toolchain]\nchannel=\"nightly\"\n",
+        );
+        put(
+            &root,
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel=\"1.98.1\"\n",
+        );
+        let tools = base.join("tools");
+        fs::create_dir_all(&tools).unwrap();
+        let facts = ConfiguredToolchain {
+            dir: &tools,
+            version: Some("rustc 1.98.1"),
+        };
+        let before = environment(&root, Some(&facts), &[]);
+        assert!(before.chosen.is_some(), "{before:?}");
+        put(
+            &root,
+            "legacy/rust-toolchain.toml",
+            "[toolchain]\nchannel=\"nightly-2026-01-01\"\n",
+        );
+        assert_eq!(
+            environment(&root, Some(&facts), &[]).identity,
+            before.identity
+        );
+        let legacy = project_root(&root, &root.join("legacy"), &[]).unwrap();
+        let selected = environment_at(&root, &legacy, Some(&facts), &[]);
+        assert!(
+            selected.chosen.is_none()
+                && selected
+                    .missing_next_step
+                    .unwrap()
+                    .contains("nightly-2026-01-01")
+        );
+        assert_eq!(
+            crate::profile::linked_projects(&root),
+            None,
+            "excluded independent workspace must not be loaded by the root semantic session"
+        );
+        let member = project_root(&root, &root.join("crates/app"), &[]).unwrap();
+        let before = identity_at(&root, &member, Some(&facts), &[]);
+        put(&root, "Cargo.lock", "changed root lock");
+        assert_ne!(identity_at(&root, &member, Some(&facts), &[]), before);
+        let before = identity_at(&root, &member, Some(&facts), &[]);
+        put(&root, "crates/app/Cargo.toml", "[package]\nname=\"app2\"\n");
+        assert_ne!(identity_at(&root, &member, Some(&facts), &[]), before);
+        put(
+            &root,
+            "Cargo.toml",
+            "[workspace]\nmembers=[\"crates/**\"]\n",
+        );
+        assert!(
+            environment(&root, Some(&facts), &[])
+                .missing_next_step
+                .unwrap()
+                .contains("unsupported workspace")
+        );
+    }
+
+    /// Relevant Cargo/.cargo links refuse before external contents can influence qualification.
+    /// Unrelated asset links and more ordinary files than the former global scan budget are inert.
+    #[test]
+    fn native_links_are_guarded_and_unrelated_assets_are_inert() {
+        let base = ScratchDir::new("rust-input-links");
+        let root = base.join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let outside = base.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        put(&outside, "Cargo.toml", [0xff_u8]);
+        std::os::unix::fs::symlink(outside.join("Cargo.toml"), root.join("Cargo.toml")).unwrap();
+        let before = environment(&root, None, &[]);
+        assert!(
+            before
+                .missing_next_step
+                .as_deref()
+                .unwrap()
+                .contains("symlinked native input")
+        );
+        put(&outside, "Cargo.toml", "[package]\nname=\"external\"\n");
+        let after = environment(&root, None, &[]);
+        assert_eq!(before.identity, after.identity);
+        assert_eq!(before.missing_next_step, after.missing_next_step);
+        fs::remove_file(root.join("Cargo.toml")).unwrap();
+        put(&root, "Cargo.toml", "[package]\nname=\"root\"\n");
+        put(&outside, "config.toml", "[build]\njobs=1\n");
+        std::os::unix::fs::symlink(&outside, root.join(".cargo")).unwrap();
+        let before = environment(&root, None, &[]);
+        assert!(
+            before
+                .missing_next_step
+                .as_deref()
+                .unwrap()
+                .contains("symlinked native input")
+        );
+        put(&outside, "config.toml", "[build]\njobs=2\n");
+        assert_eq!(before.identity, environment(&root, None, &[]).identity);
+        fs::remove_file(root.join(".cargo")).unwrap();
+        let tools = base.join("tools");
+        fs::create_dir_all(&tools).unwrap();
+        let facts = ConfiguredToolchain {
+            dir: &tools,
+            version: Some("rustc 1.98.1"),
+        };
+        let before = environment(&root, Some(&facts), &[]);
+        assert!(before.chosen.is_some());
+        std::os::unix::fs::symlink(&outside, root.join("README.md")).unwrap();
+        let assets = root.join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        for index in 0..16_400 {
+            fs::write(assets.join(index.to_string()), []).unwrap();
+        }
+        let after = environment(&root, Some(&facts), &[]);
+        assert!(after.chosen.is_some(), "{after:?}");
+        assert_eq!(before.identity, after.identity);
+    }
+
+    /// Literal local path dependencies are effective inputs, including Cargo's implicit
+    /// workspace members. Normal '..' paths remain bounded; foreign dependencies refuse.
+    #[test]
+    fn local_dependency_inputs_stay_in_the_actual_workspace() {
+        let base = ScratchDir::new("rust-path-dependencies");
+        let root = base.join("workspace");
+        put(
+            &root,
+            "Cargo.toml",
+            "[workspace]\nmembers=[\"crates/app\"]\n",
+        );
+        put(&root, "Cargo.lock", "workspace lock");
+        put(
+            &root,
+            "crates/app/Cargo.toml",
+            "[package]\nname=\"app\"\n[dependencies]\nsupport={path=\"../support\"}\n",
+        );
+        put(
+            &root,
+            "crates/support/Cargo.toml",
+            "[package]\nname=\"support\"\n",
+        );
+        let before = identity(&root, None, &[]);
+        put(
+            &root,
+            "crates/support/Cargo.toml",
+            "[package]\nname=\"support2\"\n",
+        );
+        assert_ne!(identity(&root, None, &[]), before);
+        let active = project_root(&root, &root.join("crates/support"), &[]).unwrap();
+        let before = identity_at(&root, &active, None, &[]);
+        put(&root, "Cargo.lock", "changed workspace lock");
+        assert_ne!(identity_at(&root, &active, None, &[]), before);
+        put(&base, "foreign/Cargo.toml", "[package]\nname=\"foreign\"\n");
+        put(
+            &root,
+            "crates/app/Cargo.toml",
+            "[package]\nname=\"app\"\n[dependencies]\nforeign={path=\"../../../foreign\"}\n",
+        );
+        assert!(native_inputs(&root, &[]).unwrap_err().contains("escapes"));
     }
 }
