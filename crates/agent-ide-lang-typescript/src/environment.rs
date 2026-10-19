@@ -270,22 +270,29 @@ pub fn environment(
         Some(Ok(CompilerFact::Operator(_))) if chosen.is_some() => Some(EnvSource::Launcher),
         _ => None,
     };
-    // A range-expression pin this seam cannot verify is disclosed, never refused: the
-    // adapter validates it against the actual runtime. Borrowed before `cause` moves into
-    // the missing-environment disclosure below.
-    let unverified = cause.is_none()
-        && tools.is_some()
-        && node_pin(worktree, denies)
-            .and_then(|declared| plain_version(&declared).is_none().then_some(declared))
-            .is_some();
-    let warnings = if unverified {
-        vec![format!(
-            "node pin is a range this environment view cannot verify; the adapter validates \
-             it against the actual runtime"
-        )]
-    } else {
-        Vec::new()
+    // A pin this seam cannot verify is disclosed, never silently healthy: a range expression
+    // is the adapter's runtime validation, and a configured Node without a measured identity
+    // proves nothing about the pin. Borrowed before `cause` moves into the
+    // missing-environment disclosure below.
+    let unverified = match (cause.is_none(), tools, node_pin(worktree, denies)) {
+        (true, Some(tools), Some(declared)) => {
+            if plain_version(&declared).is_none() {
+                Some(format!(
+                    "node pin {declared} is a range this environment view cannot verify; the \
+                     adapter validates it against the actual runtime"
+                ))
+            } else if tools.node_identity.is_none() {
+                Some(format!(
+                    "node pin {declared} cannot be verified: the configured Node has no \
+                     measured identity in this request"
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
     };
+    let warnings = unverified.into_iter().collect();
     let candidates = chosen.iter().cloned().collect();
     let missing_next_step = cause.or_else(|| {
         (tools.is_none()).then(|| {
@@ -308,24 +315,38 @@ pub fn environment(
 }
 
 /// Refuses effect planning when this request's configured tools are obstructed — a compiler
-/// fact refusal or a Node-pin conflict — with the same cause [`command_env`] refuses
-/// `tsc`/`node` with, before any recipe is generated or admitted. `Ok(())` when no configured
-/// tools exist (nothing to obstruct) or the facts are compatible.
+/// fact refusal, a known Node-pin conflict, or an authoritative pin that cannot be verified —
+/// with the same cause [`command_env`] refuses `tsc`/`node` with, before any recipe is
+/// generated or admitted. `Ok(())` when no configured tools exist (nothing to obstruct) or
+/// the facts are compatible.
 pub fn admit_effects(worktree: &Path, config: &ModuleConfig) -> Result<(), LangError> {
     let Some(tools) = configured_tools(config) else {
         return Ok(());
     };
     match obstruction(worktree, &tools, &config.read_denies) {
         Some(cause) => Err(LangError::Environment(cause)),
+        // An unverifiable authoritative pin refuses effect planning too: a recipe would run
+        // raw Node the pin does not cover.
+        None if node_pin(worktree, &config.read_denies).is_some()
+            && tools.node_identity.is_none() =>
+        {
+            Err(LangError::Environment(
+                "node pin cannot be verified: the configured Node has no measured identity in \
+                 this request — IDE commands refuse an unverifiable pin; align the launcher \
+                 Node or adjust the pin"
+                    .to_owned(),
+            ))
+        }
         None => Ok(()),
     }
 }
 
 /// Activation of `program` under this request's configured tools, resolved before any
 /// admission: `tsc` runs the winning compiler through the configured Node, `node` runs the
-/// configured Node itself. A compiler or Node-pin obstruction is `Unsupported` with its
-/// cause — never an ambient fallback. Other programs are unclaimed (`Ok(None)`): project
-/// scripts run through the package manager as today.
+/// configured Node itself. A compiler fact refusal, a known Node-pin mismatch, or an
+/// authoritative pin whose compatibility cannot be verified (no measured Node identity) is
+/// `Environment` with its cause — never an ambient fallback. Other programs are unclaimed
+/// (`Ok(None)`): project scripts run through the package manager as today.
 pub fn command_env(
     worktree: &Path,
     program: &str,
@@ -347,6 +368,17 @@ pub fn command_env(
         return Ok(None);
     };
     admit_effects(worktree, config)?;
+    // An authoritative pin this seam cannot verify (no measured Node identity) refuses raw
+    // claimed commands exactly like a known mismatch: a card warning alone is not
+    // compatibility proof for a run that never reaches the adapter's runtime validation.
+    if node_pin(worktree, &config.read_denies).is_some() && tools.node_identity.is_none() {
+        return Err(LangError::Environment(
+            "node pin cannot be verified: the configured Node has no measured identity in \
+             this request — IDE commands refuse an unverifiable pin; align the launcher Node \
+             or adjust the pin"
+                .to_owned(),
+        ));
+    }
     let compiler = match compiler_fact(worktree, &tools.tsc_cli, &config.read_denies) {
         Ok(fact) => fact,
         Err((_, cause)) => return Err(LangError::Environment(cause)),
@@ -498,11 +530,14 @@ mod tests {
     fn config_with(node: &Path, tsc_cli: &Path) -> ModuleConfig {
         ModuleConfig {
             worktree: None,
+            // Shape projection of the accepted declaration: the provider OPTION `node` is
+            // what the binding reads. This is a unit-fixture shape, not a validated
+            // declaration — the real one is the root-run qualified fixture.
             provider: Some(serde_json::json!({
-                "executable": {
+                "node": {
                     "path": node.display().to_string(),
                     "identity": "v22.11.0",
-                    "blake3": "node-digest",
+                    "blake3": "aa5551dd9b4b41b1a6977e7f9f22a5721e1ea6c94a92d7f7eea7fea3b3d7e1c9",
                 },
                 "toolchain": "v22.11.0",
             })),
@@ -594,10 +629,9 @@ mod tests {
         let chosen = env.chosen.expect("the operator compiler resolves");
         assert_eq!(chosen.label, "operator tsc");
         assert_eq!(chosen.path, tsc);
-        assert_eq!(
-            chosen.version.as_deref(),
-            Some(crate::checks::QUALIFIED_TYPESCRIPT_VERSION)
-        );
+        // The operator compiler's version is honestly unknown: it is accepted, not
+        // byte-qualified against the closure.
+        assert_eq!(chosen.version, None);
         assert_eq!(env.source, Some(EnvSource::Launcher));
         assert_eq!(env.missing_next_step, None);
         // `tsc` activates the configured Node with the operator compiler; `node` activates
@@ -723,10 +757,10 @@ mod tests {
         // The same path with different accepted bytes moves the identity through the sections.
         let mut reprovisioned = config_with(&node, &tsc);
         reprovisioned.provider = Some(serde_json::json!({
-            "executable": {
+            "node": {
                 "path": node.display().to_string(),
                 "identity": "v22.11.1",
-                "blake3": "new-digest",
+                "blake3": "cc5551dd9b4b41b1a6977e7f9f22a5721e1ea6c94a92d7f7eea7fea3b3d7e1c9",
             },
             "toolchain": "v22.11.1",
         }));
@@ -738,6 +772,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A host-denied root manifest answers no project from `configured_detect` — no
+    /// unguarded detector fallthrough — while unrestricted detection lists the same tree.
+    #[test]
+    fn configured_detect_refuses_denied_manifests() {
+        use crate::support::TypeScript;
+        use agent_ide_core::lang::LanguageSupport;
+        let root = scratch("detect-denied");
+        let (node, tsc) = tools(&root);
+        put(&root, "package.json", "{\"dependencies\":{}}");
+        put(&root, "tsconfig.json", "{}");
+        let mut config = config_with(&node, &tsc);
+        assert!(TypeScript.configured_detect(&root, &config).is_some());
+        config.read_denies = vec![agent_ide_core::execution::seatbelt::ReadDeny::Path(
+            root.join("package.json"),
+        )];
+        assert_eq!(TypeScript.configured_detect(&root, &config), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The identity's Node facts are bound to the actually selected checker Node: a provider
     /// declaration for a DIFFERENT executable contributes no identity or version to this
     /// request's tools.
@@ -745,27 +798,38 @@ mod tests {
     fn provider_facts_bind_to_the_selected_node() {
         let root = scratch("binding");
         let (node, tsc) = tools(&root);
+        put(&root, "tools/other-node", "");
         let other = root.join("tools/other-node");
-        put(&other, "", "");
         put(&root, "package.json", "{\"dependencies\":{}}");
         put(&root, "tsconfig.json", "{}");
         let mut config = config_with(&node, &tsc);
         config.provider = Some(serde_json::json!({
-            "executable": {
+            "node": {
                 "path": other.display().to_string(),
                 "identity": "v18.0.0",
-                "blake3": "other-digest",
+                "blake3": "bb5551dd9b4b41b1a6977e7f9f22a5721e1ea6c94a92d7f7eea7fea3b3d7e1c9",
             },
             "toolchain": "v18.0.0",
         }));
         let tools = configured_tools(&config).unwrap();
         assert_eq!(tools.node_identity, None, "foreign provider facts unbound");
         assert_eq!(tools.node_digest, None);
-        // A .nvmrc pin that the unbound identity would reject is simply unverified here.
+        // A .nvmrc pin with no bound measured identity is disclosed on the card as
+        // unverifiable, and refused for raw claimed commands and effect planning: facts this
+        // request does not have never become compatibility proof.
         put(&root, ".nvmrc", "99.0.0\n");
         let env = environment(&root, Some(&tools), &config, &[]);
-        assert!(env.chosen.is_some(), "no bound facts, no refusal");
-        assert!(env.warnings.is_empty());
+        assert!(env.chosen.is_some(), "unverified is disclosed, not refused");
+        let warning = env
+            .warnings
+            .first()
+            .expect("the unverified pin is disclosed");
+        assert!(warning.contains("cannot be verified"), "{warning}");
+        // Raw claimed commands and effect planning refuse the unverifiable pin: a warning is
+        // not compatibility proof for a run that never reaches the adapter's validation.
+        assert!(command_env(&root, "node", &config).is_err());
+        assert!(command_env(&root, "tsc", &config).is_err());
+        assert!(admit_effects(&root, &config).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

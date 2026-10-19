@@ -637,6 +637,35 @@ impl LanguageSupport for TypeScript {
         crate::environment::environments(worktree, config)
     }
 
+    /// Detects project facts under this request's read policy, as far as this seam's gate
+    /// reaches: a host-denied root manifest, root config, or Node pin (`.nvmrc`,
+    /// `.node-version` — the detector's other reads) answers no project instead of falling
+    /// through to the unguarded detector. `tsconfig.*` siblings are enumerated as project
+    /// facts, not parsed here. Unrestricted requests detect as usual.
+    fn configured_detect(
+        &self,
+        root: &Path,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Option<LanguageProject> {
+        let denied = |name: &str| {
+            let path = root.join(name);
+            config.read_denies.iter().any(|deny| deny.matches(&path))
+        };
+        if [
+            "package.json",
+            "tsconfig.json",
+            "jsconfig.json",
+            ".nvmrc",
+            ".node-version",
+        ]
+        .iter()
+        .any(|name| denied(name))
+        {
+            return None;
+        }
+        self.detect(root)
+    }
+
     /// `tsc`/`node` activate the request's configured tools
     /// ([`crate::environment::command_env`]); a compiler or Node-pin obstruction refuses with
     /// its cause before admission, and every other program stays unclaimed.
