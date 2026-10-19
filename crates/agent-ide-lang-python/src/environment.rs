@@ -15,12 +15,19 @@
 //! `.python-version` is a version request only: a mismatch with the chosen environment becomes a
 //! warning and never switches it. Only files are read, under the host's read denies; no
 //! environment manager ever runs.
+//!
+//! A resolution's opaque [`ResolvedEnv::identity`] covers the native project inputs of the root
+//! (`native_inputs`: manifest, pin file, `requirements*.txt`, lockfiles, the version request)
+//! besides the chosen environment itself, so a changed or recreated manifest, lock or config
+//! invalidates every consumer of the old answer — the card, the checks, the Pyright session,
+//! tests and formatting — through the same identity comparison, with no extra store.
 
 use std::{
     collections::HashMap,
     ffi::OsString,
     fs,
-    os::unix::fs::MetadataExt,
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
@@ -271,16 +278,26 @@ fn stamp(path: &Path) -> String {
 
 /// Opaque identity of a resolution: the chosen environment's path and version plus everything
 /// that changes when it is recreated in place (directory and interpreter inodes, the interpreter
-/// link's target, `pyvenv.cfg` stamp and content), or the missing cause. Why it won (`source`)
-/// is left out: selecting the current winner changes nothing a consumer depends on.
-fn identity(chosen: Option<&EnvCandidate>, missing: Option<&str>, denies: &[ReadDeny]) -> String {
+/// link's target, `pyvenv.cfg` stamp and content), the root's native project inputs
+/// (`native_inputs`) and, when nothing resolves, the missing cause. Why it won (`source`) is
+/// left out: selecting the current winner changes nothing a consumer depends on.
+fn identity(
+    worktree: &Path,
+    root: &Path,
+    chosen: Option<&EnvCandidate>,
+    missing: Option<&str>,
+    denies: &[ReadDeny],
+) -> String {
+    // The native inputs belong to the root, not to the winner: a changed lock or config
+    // invalidates every consumer of this resolution, chosen or missing.
+    let native = native_inputs(worktree, root, denies);
     let Some(chosen) = chosen else {
-        return format!("missing|{}", missing.unwrap_or_default());
+        return format!("missing|{}|{native}", missing.unwrap_or_default());
     };
     let python = python_of(&chosen.path);
     let config = chosen.path.join("pyvenv.cfg");
     format!(
-        "{}|{:?}|{}|{}|{:?}|{}|{}",
+        "{}|{:?}|{}|{}|{:?}|{}|{}|{native}",
         chosen.path.display(),
         chosen.version,
         stamp(&chosen.path),
@@ -289,6 +306,116 @@ fn identity(chosen: Option<&EnvCandidate>, missing: Option<&str>, denies: &[Read
         stamp(&config),
         blake3::hash(read_config(&config, denies).unwrap_or_default().as_bytes())
     )
+}
+
+/// Size of one chunk a native input is streamed through while being hashed: the identity costs
+/// this much memory per file, never the file's size.
+const NATIVE_INPUT_CHUNK: usize = 64 * 1024;
+
+/// The native project inputs of `root` whose content feeds the resolver identity, in fixed
+/// order: the manifest and pin files the resolver and `detect` already read (`pyproject.toml`,
+/// `pyrightconfig.json`, every root `requirements*.txt` sorted by name), the lockfiles that
+/// decide the installed dependencies (`uv.lock`, `poetry.lock`) and the version request
+/// (`.python-version`, the root's own, then the worktree's, in `version_request`'s lookup
+/// order, the worktree copy only when `root` differs from `worktree`).
+///
+/// Each entry contributes `<name>=<blake3 of the whole content>` — any changed byte, including
+/// deep inside a large lockfile, invalidates the resolution; a missing or host-denied fixed
+/// file contributes `<name>=-` — unreadable says nothing, exactly as `version_request`
+/// treats a denied `.python-version`. An enumerated `requirements*.txt` that says nothing
+/// contributes no entry at all, so an unreadable one fingerprints exactly like an absent one.
+/// Hashing streams the file in `NATIVE_INPUT_CHUNK` chunks through the same gated open
+/// `read_config` uses — under denies, a denied or symlinked input is refused without being
+/// followed; without denies, links are followed as `read_config`'s plain read follows them —
+/// so no input is ever held in memory whole.
+fn native_inputs(worktree: &Path, root: &Path, denies: &[ReadDeny]) -> String {
+    /// One fingerprint entry: the whole-content hash, or `-` when the file says nothing.
+    fn entry(name: &str, path: &Path, denies: &[ReadDeny]) -> String {
+        match hash_config(path, denies) {
+            Some(hash) => format!("{name}={hash}"),
+            None => format!("{name}=-"),
+        }
+    }
+    let mut requirements: Vec<String> = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("requirements") && name.ends_with(".txt"))
+        .collect();
+    requirements.sort();
+    let mut parts = Vec::new();
+    parts.push(entry("pyproject.toml", &root.join(PYPROJECT_FILE), denies));
+    parts.push(entry(
+        "pyrightconfig.json",
+        &root.join(PYRIGHT_CONFIG_FILE),
+        denies,
+    ));
+    for name in &requirements {
+        // An enumerated file that says nothing (denied, a link, unopenable) gets no entry at
+        // all: unlike the fixed files above, its name would otherwise enter the fingerprint
+        // only when it exists, so unreadable would fingerprint differently from absent.
+        if let Some(hash) = hash_config(&root.join(name), denies) {
+            parts.push(format!("{name}={hash}"));
+        }
+    }
+    parts.push(entry("uv.lock", &root.join("uv.lock"), denies));
+    parts.push(entry("poetry.lock", &root.join("poetry.lock"), denies));
+    parts.push(entry(
+        ".python-version",
+        &root.join(".python-version"),
+        denies,
+    ));
+    if root != worktree {
+        parts.push(entry(
+            "worktree/.python-version",
+            &worktree.join(".python-version"),
+            denies,
+        ));
+    }
+    blake3::hash(parts.join("\n").as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Whole-content BLAKE3 of a native input, hashed with bounded memory: the file is gated
+/// exactly like `read_config` gates a config — without denies a regular file is read as
+/// usual, under denies a denied or symlinked input is refused without being followed
+/// (`O_NOFOLLOW`) — then streamed in `NATIVE_INPUT_CHUNK` chunks straight into the hasher, so
+/// no input is ever held in memory whole. `None` when the file says nothing: missing, denied or
+/// otherwise unopenable. Any content, UTF-8 or not, is hashed as the bytes it is.
+///
+/// The gate mirrors `read_config`'s two branches (its `allowed_config` is private to
+/// `checks`); the denied-input equivalence is pinned by the `denied_native_inputs_say_nothing`
+/// test.
+fn hash_config(path: &Path, denies: &[ReadDeny]) -> Option<blake3::Hash> {
+    let mut file = if denies.is_empty() {
+        if !path.is_file() {
+            return None;
+        }
+        fs::File::open(path).ok()?
+    } else {
+        if denies.iter().any(|deny| deny.matches(path)) {
+            return None;
+        }
+        if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            return None;
+        }
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = vec![0u8; NATIVE_INPUT_CHUNK];
+    loop {
+        let read = file.read(&mut chunk).ok()?;
+        if read == 0 {
+            return Some(hasher.finalize());
+        }
+        hasher.update(&chunk[..read]);
+    }
 }
 
 /// One root's resolution, with whether a selection or pin governs it: an authoritative
@@ -380,7 +507,7 @@ pub(crate) fn resolve_with_denies(
     {
         warnings.push(format!("≠ .python-version {request}"));
     }
-    let identity = identity(chosen.as_ref(), missing.as_deref(), denies);
+    let identity = identity(worktree, root, chosen.as_ref(), missing.as_deref(), denies);
     Resolution {
         env: ResolvedEnv {
             root: root
@@ -1433,6 +1560,167 @@ mod tests {
         fs::remove_dir_all(root.join(".venv")).unwrap();
         venv(&root, ".venv", "");
         assert_ne!(resolve(&root, &root, None).identity, discovered);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The native project inputs feed the identity: changing, adding or removing exactly one
+    /// input — the manifest, either lockfile, the pin file, a requirements file or the version
+    /// request — invalidates the resolution even though the chosen environment itself is
+    /// byte-identical (a changed lock means different installed dependencies), so checks and
+    /// sessions must not ride on the old answer. Each mutation is compared against the identity
+    /// captured immediately before it, so only the named input can explain the change. A nested
+    /// root also covers its worktree-level version request.
+    #[test]
+    fn native_input_changes_change_the_identity() {
+        let root = scratch("native-identity");
+        put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        venv(&root, ".venv", "home = .\nversion = 3.12.7\n");
+        let id = || resolve(&root, &root, None).identity;
+        let before = id();
+        put(&root, "pyproject.toml", "[project]\nname = \"svc2\"\n");
+        assert_ne!(id(), before, "manifest content");
+
+        let before = id();
+        put(&root, "uv.lock", "lock v1\n");
+        assert_ne!(id(), before, "added lockfile");
+        let before = id();
+        put(&root, "uv.lock", "lock v2\n");
+        assert_ne!(id(), before, "lockfile content");
+        let before = id();
+        fs::remove_file(root.join("uv.lock")).unwrap();
+        assert_ne!(id(), before, "removed lockfile");
+
+        let before = id();
+        put(&root, "poetry.lock", "poetry v1\n");
+        assert_ne!(id(), before, "poetry lockfile");
+        let before = id();
+        fs::remove_file(root.join("poetry.lock")).unwrap();
+        assert_ne!(id(), before, "removed poetry lockfile");
+
+        // A pin file without venv keys pins nothing, so only its fingerprint can move.
+        let before = id();
+        put(&root, "pyrightconfig.json", "{\"extra\": true}\n");
+        assert_ne!(id(), before, "added pin file");
+        let before = id();
+        put(&root, "pyrightconfig.json", "{\"extra\": false}\n");
+        assert_ne!(id(), before, "pin file content");
+        let before = id();
+        fs::remove_file(root.join("pyrightconfig.json")).unwrap();
+        assert_ne!(id(), before, "removed pin file");
+
+        let before = id();
+        put(&root, "requirements-dev.txt", "pytest\n");
+        assert_ne!(id(), before, "requirements file");
+
+        let before = id();
+        put(&root, ".python-version", "3.13\n");
+        assert_ne!(id(), before, "version request");
+
+        // The worktree-level request of a nested root belongs to that root's identity too.
+        let nested = root.join("packages/svc");
+        put(&nested, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        put(&root, "packages/svc/app.py", "");
+        let nested_before = resolve(&root, &nested, None).identity;
+        put(&root, ".python-version", "3.12\n");
+        assert_ne!(
+            resolve(&root, &nested, None).identity,
+            nested_before,
+            "worktree-level version request"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A change deep inside a large lockfile invalidates the resolution: the fingerprint hashes
+    /// the whole content in bounded chunks, not a prefix, so a dependency changed past any
+    /// fixed window must not ride on the old answer. The two lockfiles are the same length and
+    /// differ in exactly one byte beyond 256 KiB.
+    #[test]
+    fn lockfile_tail_change_changes_the_identity() {
+        let root = scratch("native-lock-tail");
+        put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        venv(&root, ".venv", "");
+        let body = "a".repeat(256 * 1024);
+        put(&root, "uv.lock", &format!("{body}a\n"));
+        let before = resolve(&root, &root, None).identity;
+        put(&root, "uv.lock", &format!("{body}b\n"));
+        assert_ne!(
+            resolve(&root, &root, None).identity,
+            before,
+            "a changed tail byte is a changed lock"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A host-denied native input is unreadable and says nothing: a fixed file's fingerprint
+    /// entry equals the file's absence, a dynamically enumerated `requirements*.txt` gets no
+    /// entry at all when denied (denied fingerprints exactly like absent), and the resolver's
+    /// existing refusal of denied manifest/pin files is intact through the new fingerprint path.
+    #[test]
+    fn denied_native_inputs_say_nothing() {
+        use agent_ide_core::execution::seatbelt::ReadDeny;
+        let root = scratch("native-denied");
+        put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        venv(&root, ".venv", "");
+        put(&root, "uv.lock", "lock v1\n");
+        put(&root, "requirements-dev.txt", "pytest\n");
+        let resolve = |denies: &[ReadDeny]| resolve_with_denies(&root, &root, None, denies).env;
+        // A denied lockfile contributes the same `-` entry as no lockfile at all.
+        let denied = [ReadDeny::Path(root.join("uv.lock"))];
+        let with_denied_lock = resolve(&denied).identity;
+        fs::remove_file(root.join("uv.lock")).unwrap();
+        assert_eq!(
+            resolve(&[]).identity,
+            with_denied_lock,
+            "a denied input is unreadable, not a different answer"
+        );
+        put(&root, "uv.lock", "lock v1\n");
+        assert_eq!(chosen(&resolve(&denied)), Some(".venv"));
+        // A denied enumerated requirements file is no entry, not a `-` entry: denied equals
+        // absent for the dynamic part of the fingerprint too.
+        let denied_requirements = [ReadDeny::Path(root.join("requirements-dev.txt"))];
+        let with_denied_requirements = resolve(&denied_requirements).identity;
+        fs::remove_file(root.join("requirements-dev.txt")).unwrap();
+        assert_eq!(
+            resolve(&[]).identity,
+            with_denied_requirements,
+            "a denied requirements file is unreadable, not a different answer"
+        );
+        put(&root, "requirements-dev.txt", "pytest\n");
+        // The existing refusal of a denied manifest is unchanged.
+        let denies = [ReadDeny::Path(root.join("pyproject.toml"))];
+        let refused = resolve(&denies);
+        assert_eq!(chosen(&refused), None);
+        assert!(
+            refused
+                .missing_next_step
+                .as_deref()
+                .is_some_and(|step| step.contains("excluded from reads by the host"))
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A native input that exists but is not UTF-8 text is still content: it is hashed as the
+    /// bytes it is, so its presence — and any change of it — invalidates the resolution. The
+    /// fingerprint is about the file, not about its readability as text.
+    #[test]
+    fn non_utf8_native_input_is_content() {
+        let root = scratch("native-non-utf8");
+        put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        venv(&root, ".venv", "");
+        let without_lock = resolve(&root, &root, None).identity;
+        fs::write(root.join("uv.lock"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let with_binary = resolve(&root, &root, None).identity;
+        assert_ne!(
+            with_binary, without_lock,
+            "existing content counts, whatever its encoding"
+        );
+        assert_eq!(chosen(&resolve(&root, &root, None)), Some(".venv"));
+        fs::write(root.join("uv.lock"), [0xff, 0xfe, 0x00, 0x02]).unwrap();
+        assert_ne!(
+            resolve(&root, &root, None).identity,
+            with_binary,
+            "a changed byte of binary content is a change"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
