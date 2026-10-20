@@ -4192,35 +4192,30 @@ fn hook_journal_dir(project: &Path) -> PathBuf {
         .join(&blake3::hash(key.as_os_str().as_bytes()).to_hex().as_str()[..16])
 }
 
-/// Sends SIGTERM to the exact process holding a shared Claude daemon's runtime lock, if any.
+/// Requests SIGTERM for the recorded live holder of this fixture's shared Claude runtime lock.
 /// A shared daemon deliberately outlives every MCP process's own EOF (EYES-r1 §2), so a test that
-/// causes one to be spawned must reap it explicitly instead of leaving it running past the test
-/// binary's own exit. `lsof` is asked for the specific lock file's current holder only; this never
-/// pattern-kills by process name or command line.
-/// Guarantees a shared daemon a test caused to be spawned is reaped even if an assertion later in
-/// the same test panics, so a failing test cannot leak a long-lived orphan process.
+/// starts one needs cleanup even during unwinding. Other processes may merely read its lock file;
+/// they are never selected or signalled. This guard requests termination but does not prove reap.
 struct SharedClaudeDaemonGuard(PathBuf);
 
 impl Drop for SharedClaudeDaemonGuard {
+    /// Requests termination of only the fixture runtime's recorded live holder; does not wait.
     fn drop(&mut self) {
         terminate_shared_claude_daemon(&self.0);
     }
 }
 
+/// Signals only the live PID recorded under the held lock of the trusted fixture `runtime`.
+/// Missing/released locks, dead records and this test process are harmless no-ops; other lock-file
+/// openers are irrelevant. SIGTERM is a request, without an exit or reap guarantee.
 fn terminate_shared_claude_daemon(runtime: &Path) {
-    let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
-        .arg("-t")
-        .arg(runtime.join("agent-ide.lock"))
-        .output()
-    else {
+    let Some(pid) = agent_ide::app::lock_holder_pid(runtime) else {
         return;
     };
-    for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-        if let Ok(pid) = pid.parse::<libc::pid_t>() {
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-        }
+    // SAFETY: signal 0 checks liveness; the private fixture's held lock supplies its recorded PID.
+    if pid != std::process::id() as libc::pid_t && unsafe { libc::kill(pid, 0) } == 0 {
+        // SAFETY: only the recorded live daemon of this test-owned runtime is signalled.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
     }
 }
 
@@ -4518,20 +4513,84 @@ impl Drop for ManagedCodexCleanup {
     }
 }
 
-/// Returns the exact managed daemon holding this runtime's lock, without process-name matching.
+/// Returns this fixture runtime's recorded holder only while its lock is held and PID is live.
+/// Asserts that the record exists and is not this test process; benign file readers do not change
+/// the result. The caller owns this private runtime; no process-name or opener selection is used.
 async fn managed_daemon_pid(runtime: &Path) -> libc::pid_t {
-    let output = Command::new("/usr/sbin/lsof")
-        .arg("-t")
-        .arg(runtime.join("agent-ide.lock"))
-        .output()
+    let pid = agent_ide::app::lock_holder_pid(runtime)
+        .expect("fixture runtime lock must be held with a recorded PID");
+    assert_ne!(
+        pid,
+        std::process::id() as libc::pid_t,
+        "the fixture daemon is a separate process"
+    );
+    // SAFETY: signal 0 only checks the recorded fixture holder's liveness.
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "recorded fixture holder must be live"
+    );
+    pid
+}
+
+/// A reader may open the lock file without owning its exclusive lock; PID lookup must still
+/// select the real fixture daemon rather than count every `lsof` opener as another holder.
+#[tokio::test]
+async fn managed_pid_ignores_benign_runtime_lock_reader() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let expected = daemon.id().unwrap() as libc::pid_t;
+    let reader = std::fs::File::open(fixture.runtime.join("agent-ide.lock")).unwrap();
+    assert!(agent_ide::app::lock_is_held(&fixture.runtime));
+    assert_eq!(
+        agent_ide::app::lock_holder_pid(&fixture.runtime),
+        Some(expected)
+    );
+    assert_eq!(managed_daemon_pid(&fixture.runtime).await, expected);
+    drop(reader);
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Shared-daemon cleanup signals only the recorded fixture holder; a separately owned child
+/// keeps a benign read descriptor open and must exit normally after its stdin closes.
+#[tokio::test]
+async fn shared_claude_cleanup_preserves_benign_runtime_lock_reader() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let expected = daemon.id().unwrap() as libc::pid_t;
+    assert_eq!(
+        agent_ide::app::lock_holder_pid(&fixture.runtime),
+        Some(expected)
+    );
+    let mut reader = Command::new("/usr/bin/perl")
+        .args(["-e", "open my $lock, '<', $ARGV[0] or die $!; $|=1; print qq(ready\\n); scalar <STDIN>; print qq(reader survived\\n);"])
+        .arg(fixture.runtime.join("agent-ide.lock"))
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .kill_on_drop(true).spawn().unwrap();
+    let mut output = BufReader::new(reader.stdout.take().unwrap());
+    let mut ready = String::new();
+    tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut ready))
         .await
+        .unwrap()
         .unwrap();
-    let pids = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .map(|pid| pid.parse::<libc::pid_t>().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(pids.len(), 1, "one daemon must hold the runtime lock");
-    pids[0]
+    assert_eq!(ready, "ready\n");
+    reader.stdout = Some(output.into_inner());
+    terminate_shared_claude_daemon(&fixture.runtime);
+    tokio::time::timeout(Duration::from_secs(5), daemon.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let survived = tokio::time::timeout(Duration::from_secs(5), reader.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        survived.status.success(),
+        "benign reader was signalled: {survived:?}"
+    );
+    assert_eq!(survived.stdout, b"reader survived\n");
+    assert!(survived.stderr.is_empty());
 }
 
 /// Resumes an exact test daemon even if an assertion aborts a transient-timeout scenario.
