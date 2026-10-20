@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use super::contract::ModuleConfig;
 use super::payload::{
     Arg, ChecksDescription, EffectRecipe, EffectRequest, EnvRule, Param, PathRole, PathRule,
     SlotSource,
@@ -364,15 +365,18 @@ pub fn declared_roots(id: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A language's own host-side resolution of the environments a worktree has accepted (stored
-/// selections, configuration pins, discovered environments): the roots a run of them reads.
-pub type EnvironmentRoots = fn(&Path) -> Vec<PathBuf>;
+/// A language's host-side resolution of roots required by its currently accepted environments.
+/// The configuration supplies this request's read-deny policy; implementations must derive roots
+/// only from environments actually chosen under that policy, never ambient alternatives.
+pub type EnvironmentRoots = fn(&Path, &ModuleConfig) -> Vec<PathBuf>;
 
-/// Each language's [`EnvironmentRoots`], declared by the root.
+/// Each language's [`EnvironmentRoots`], declared by the root; entries are host-owned resolvers
+/// that receive the request's current `ModuleConfig` and must honor its read exclusions.
 static ENVIRONMENTS: std::sync::RwLock<Vec<(&'static str, EnvironmentRoots)>> =
     std::sync::RwLock::new(Vec::new());
 
-/// Declares languages' environment resolutions; a language already declared keeps its first.
+/// Declares host-side environment-root resolvers; the first callback for a language wins, and
+/// registration is protected by the process-wide registry lock.
 pub fn declare_environment_roots(roots: &'static [(&'static str, EnvironmentRoots)]) {
     let mut declared = ENVIRONMENTS
         .write()
@@ -384,17 +388,17 @@ pub fn declare_environment_roots(roots: &'static [(&'static str, EnvironmentRoot
     }
 }
 
-/// The roots of the environments `worktree` accepts for the language `id`, resolved now by the
-/// host (never taken from a module's answer); admitted as launcher roots, so a selected
-/// environment outside the static install roots runs as it does in process.
-pub fn environment_roots(id: &str, worktree: &Path) -> Vec<PathBuf> {
+/// Resolves extra trusted roots for `id` in `worktree` under the request's `config`; roots come
+/// from the registered host callback, with its current read denies, never from a module reply.
+/// Returns no roots when the language has no registered callback.
+pub fn environment_roots(id: &str, worktree: &Path, config: &ModuleConfig) -> Vec<PathBuf> {
     let resolve = ENVIRONMENTS
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .find(|(language, _)| *language == id)
         .map(|(_, resolve)| *resolve);
-    resolve.map_or_else(Vec::new, |resolve| resolve(worktree))
+    resolve.map_or_else(Vec::new, |resolve| resolve(worktree, config))
 }
 
 /// Expands `effect` with its recipe from `recipes` under `admission`.

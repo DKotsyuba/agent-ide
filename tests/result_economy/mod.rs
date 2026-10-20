@@ -47,8 +47,8 @@ fn bridge_publications(fixture: &ProductFixture) -> usize {
         .unwrap()
 }
 
-/// A missing configured cargo binary produces inline established unavailability and no wake;
-/// a working check still settles with its diagnostics and records a deferred check publication.
+/// A missing toolchain remains inline and refuses edits without receipts; a working configured
+/// check settles with diagnostics and records its deferred publication.
 #[tokio::test]
 async fn unavailable_checks_stay_inline_and_working_checks_still_publish() {
     for broken in [true, false] {
@@ -107,36 +107,33 @@ async fn unavailable_checks_stay_inline_and_working_checks_still_publish() {
             )
             .await;
         let read = actor.settle(&fixture, read).await;
-        if !broken {
-            std::fs::remove_file(fixture.base.join(CHECKS_GATE)).unwrap();
-            write_problems_count(&fixture.root, "1");
-        }
-        let edit = batch_call_with_text(
-            &mut actor,
-            &fixture,
-            "ide.edit",
-            json!({
-                "path":"src/lib.rs", "source_ref":read["detail_ref"],
-                "operation_id":"availability-edit", "changes":[{"old":"{ 7 }","new":"{ 8 }"}]
-            }),
-        )
-        .await;
-        let (edit, rendered) = if broken {
-            batch_settle_with_text(&mut actor, &fixture, edit).await
-        } else {
-            edit
-        };
+        let edit_request = json!({
+            "path":"src/lib.rs", "source_ref":read["detail_ref"],
+            "operation_id":"availability-edit", "changes":[{"old":"{ 7 }","new":"{ 8 }"}]
+        });
         if broken {
-            assert_eq!(edit["diagnostics"]["state"], "not_analysed", "{edit}");
-            let reason = edit["diagnostics"]["reason"].as_str().unwrap();
+            let before = std::fs::read(fixture.root.join("src/lib.rs")).unwrap();
+            let (edit, rendered) =
+                batch_call_with_text(&mut actor, &fixture, "ide.edit", edit_request).await;
+            assert_eq!(edit["state"], "error", "{edit}");
+            assert_eq!(edit["code"], "provider_unavailable", "{edit}");
             assert!(
-                reason.contains("checks unavailable:") && reason.contains("tool not found"),
-                "{edit}"
+                rendered.contains("configured cargo is missing"),
+                "{rendered}"
+            );
+            assert_eq!(rendered.matches("Repair:").count(), 1, "{rendered}");
+            assert!(
+                rendered.contains("Repair: Use the project's prepared native command."),
+                "{rendered}"
+            );
+            assert!(
+                edit.get("result").is_none(),
+                "a refusal has no edit receipt: {edit}"
             );
             assert_eq!(
-                rendered.matches("checks unavailable:").count(),
-                1,
-                "{rendered}"
+                std::fs::read(fixture.root.join("src/lib.rs")).unwrap(),
+                before,
+                "missing formatter tooling must leave source bytes unchanged"
             );
             assert_eq!(
                 bridge_publications(&fixture),
@@ -144,6 +141,10 @@ async fn unavailable_checks_stay_inline_and_working_checks_still_publish() {
                 "unavailable check must not publish"
             );
         } else {
+            std::fs::remove_file(fixture.base.join(CHECKS_GATE)).unwrap();
+            write_problems_count(&fixture.root, "1");
+            let (edit, _) =
+                batch_call_with_text(&mut actor, &fixture, "ide.edit", edit_request).await;
             assert_eq!(edit["diagnostics"]["state"], "pending", "{edit}");
             release_checks_gate(&fixture);
             let reference = edit["diagnostics"]["detail_ref"].as_str().unwrap();
@@ -347,6 +348,7 @@ printf '%s\n' '{{"reason":"compiler-message","package_id":"fixture","message":{{
 async fn cargo_2000_tests_keep_results_compact_and_log_pages_explicit() {
     for nocapture in [false, true] {
         let fixture = ProductFixture::new(json!([]));
+        configure_prepared_rust_checks(&fixture);
         let mut source = String::new();
         for index in 0..2000 {
             let body = if index == 1234 {
@@ -574,20 +576,26 @@ async fn explicit_output_body_recovery_is_readonly_through_the_assembled_mcp() {
         "saved result leaked full output: {} bytes",
         compact.len()
     );
-    // An exit-only command honestly retains at most the existing ten-line bounded tail.
-    assert!(
-        compact
-            .split("  output (tail):\n")
-            .nth(1)
-            .unwrap()
-            .split("\n  rerun:")
-            .next()
-            .unwrap()
+    // A rerun preview and its full replay query are distinct footer rows, not output-tail lines.
+    let retained = compact.split("  output (tail):\n").nth(1).unwrap();
+    let footer_at = ["\n  rerun:", "\n  rerun preview:"]
+        .into_iter()
+        .filter_map(|marker| retained.find(marker))
+        .min()
+        .unwrap_or(retained.len());
+    assert!(retained[..footer_at].lines().count() <= 10, "{compact}");
+    if let Some((_, footer)) = retained.split_once("\n  rerun preview:") {
+        let replay = footer
             .lines()
-            .count()
-            <= 10,
-        "{compact}"
-    );
+            .find_map(|line| line.strip_prefix("  full replay: ide.test "))
+            .expect("a preview has its replay query");
+        let replay: Value = serde_json::from_str(replay).expect("replay query is JSON");
+        assert_eq!(
+            replay["output"],
+            json!(format!("{reference}/replay/output/1")),
+            "preview replay stays with this run: {replay}"
+        );
+    }
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

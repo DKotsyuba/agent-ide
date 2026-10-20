@@ -211,15 +211,9 @@ fn node_pin_conflict(
     tools: &ConfiguredTools,
     denies: &[ReadDeny],
 ) -> Option<String> {
-    let Some(admitted) = tools.node_identity.as_deref().and_then(measured_version) else {
-        return None;
-    };
-    let Some(declared) = node_pin(worktree, denies) else {
-        return None;
-    };
-    let Some(components) = plain_version(&declared) else {
-        return None;
-    };
+    let admitted = tools.node_identity.as_deref().and_then(measured_version)?;
+    let declared = node_pin(worktree, denies)?;
+    let components = plain_version(&declared)?;
     let satisfied = components.len() <= admitted.len()
         && components
             .iter()
@@ -239,15 +233,23 @@ fn node_pin_conflict(
 }
 
 /// Why the configured consumers must not run for `worktree` under this request's denies, or
-/// `None` when they may: the compiler fact's refusal, then the Node pin's.
-fn obstruction(worktree: &Path, tools: &ConfiguredTools, denies: &[ReadDeny]) -> Option<String> {
+/// `None` when they may: the compiler fact's refusal, then the Node pin's. Compiler failures
+/// retain their unavailable reason; a Node-pin mismatch is a fatal refusal.
+fn obstruction(
+    worktree: &Path,
+    tools: &ConfiguredTools,
+    denies: &[ReadDeny],
+) -> Option<(agent_ide_core::checks::UnavailableReason, String)> {
     // Without a configured TypeScript CLI (provider-only launch) the compiler fact cannot be
     // evaluated: no compiler obstruction, but the Node pin still applies.
     let compiler_cause = tools
         .tsc_cli
         .as_ref()
         .and_then(|tsc_cli| compiler_fact(worktree, tsc_cli, denies).err());
-    compiler_cause.or_else(|| node_pin_conflict(worktree, tools, denies))
+    compiler_cause.or_else(|| {
+        node_pin_conflict(worktree, tools, denies)
+            .map(|cause| (agent_ide_core::checks::UnavailableReason::Fatal, cause))
+    })
 }
 
 /// The worktree's environment as a [`ResolvedEnv`]: the compiler fact (`CompilerFact`) names, with
@@ -317,7 +319,7 @@ pub fn environment(
     };
     let warnings = unverified.into_iter().collect();
     let candidates = chosen.iter().cloned().collect();
-    let missing_next_step = cause.or_else(|| {
+    let missing_next_step = cause.map(|(_, cause)| cause).or_else(|| {
         (tools.is_none()).then(|| {
             "no configured TypeScript tools were given to the environment view; checks \
                  follow their configured tools and report their own availability"
@@ -351,42 +353,44 @@ pub fn admit_effects(worktree: &Path, config: &ModuleConfig) -> Result<(), LangE
     // a range/alias expression no accepted version establishes), or configured Node bytes
     // that no longer match the accepted declaration — a card warning or a stale digest is not
     // compatibility proof for a raw Node run.
-    let cause = obstruction(worktree, &tools, &config.read_denies).or_else(|| {
-        let pin = node_pin(worktree, &config.read_denies)?;
-        let unverifiable = || {
-            format!(
-                "node pin {pin} cannot be verified against the configured Node in this \
+    let cause = obstruction(worktree, &tools, &config.read_denies)
+        .map(|(_, cause)| cause)
+        .or_else(|| {
+            let pin = node_pin(worktree, &config.read_denies)?;
+            let unverifiable = || {
+                format!(
+                    "node pin {pin} cannot be verified against the configured Node in this \
                  request — IDE commands refuse an unverifiable pin; align the launcher Node \
                  or adjust the pin"
-            )
-        };
-        let Some(identity) = tools.node_identity.as_deref() else {
-            return Some(unverifiable());
-        };
-        let Some(admitted) = measured_version(identity) else {
-            return Some(unverifiable());
-        };
-        let Some(components) = plain_version(&pin) else {
-            // A range or alias expression no accepted version establishes: raw commands
-            // refuse rather than running a Node the pin may reject.
-            return Some(format!(
-                "node pin {pin} is a range/alias this request cannot prove against the \
+                )
+            };
+            let Some(identity) = tools.node_identity.as_deref() else {
+                return Some(unverifiable());
+            };
+            let Some(admitted) = measured_version(identity) else {
+                return Some(unverifiable());
+            };
+            let Some(components) = plain_version(&pin) else {
+                // A range or alias expression no accepted version establishes: raw commands
+                // refuse rather than running a Node the pin may reject.
+                return Some(format!(
+                    "node pin {pin} is a range/alias this request cannot prove against the \
                  configured Node — IDE commands refuse an unproven pin; use native tooling \
                  (the adapter validates ranges for confined checks) or align the pin"
-            ));
-        };
-        let satisfied = components.len() <= admitted.len()
-            && components
-                .iter()
-                .zip(admitted.iter())
-                .all(|(declared, admitted)| declared == admitted);
-        (!satisfied).then(|| {
-            format!(
-                "node pin {pin} does not match the configured Node — IDE commands refuse the \
+                ));
+            };
+            let satisfied = components.len() <= admitted.len()
+                && components
+                    .iter()
+                    .zip(admitted.iter())
+                    .all(|(declared, admitted)| declared == admitted);
+            (!satisfied).then(|| {
+                format!(
+                    "node pin {pin} does not match the configured Node — IDE commands refuse the \
                  mismatch; use the project's own runtime or align the launcher Node"
-            )
-        })
-    });
+                )
+            })
+        });
     if let Some(cause) = cause {
         return Err(LangError::Environment(cause));
     }
@@ -464,19 +468,19 @@ pub fn command_argv(
     argv: &[String],
     config: &ModuleConfig,
 ) -> Result<Option<agent_ide_core::lang::environment::CommandEnv>, LangError> {
-    if let [name] = argv {
-        if name == "node" {
-            let Some(tools) = configured_tools(config) else {
-                return Ok(None);
-            };
-            admit_effects(worktree, config)?;
-            return Ok(Some(agent_ide_core::lang::environment::CommandEnv {
-                argv_prefix: vec![tools.node.clone().into_os_string()],
-                ..Default::default()
-            }));
-        }
-        // Bare "tsc" and any other slot name falls through to the full-argv path below.
+    if let [name] = argv
+        && name == "node"
+    {
+        let Some(tools) = configured_tools(config) else {
+            return Ok(None);
+        };
+        admit_effects(worktree, config)?;
+        return Ok(Some(agent_ide_core::lang::environment::CommandEnv {
+            argv_prefix: vec![tools.node.clone().into_os_string()],
+            ..Default::default()
+        }));
     }
+    // Bare "tsc" and any other slot name falls through to the full-argv path below.
     // One shared runner-shape refusal for both routes: an `npx vitest`/`npx jest` test run
     // executes the project's Node runtime through an operator `npx` this request does not
     // configure, so it refuses instead of silently running an ambient Node the project's pin

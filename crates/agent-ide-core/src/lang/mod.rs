@@ -1147,9 +1147,10 @@ pub(crate) mod testing {
             })
         }
 
-        /// The Gamma configured-node fixture projects exactly its explicit launcher path so
-        /// admission tests can distinguish it from a conflicting ambient executable. Others
-        /// retain their unchanged activation; this creates no production tool qualification.
+        /// The Gamma fixture projects its explicit launcher path and its test-only interpreter
+        /// activation so admission tests distinguish identity, unchanged, substituted and ambient
+        /// programs. Others retain their unchanged activation; this creates no production tool
+        /// qualification.
         fn configured_command_env(
             &self,
             worktree: &Path,
@@ -1167,6 +1168,33 @@ pub(crate) mod testing {
                         argv_prefix: vec![path.into()],
                         ..Default::default()
                     }));
+            }
+            if self.0 == "gamma"
+                && let Some(checks) = config.checks.as_ref()
+                && checks
+                    .get("interpreter")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(program)
+            {
+                let prefix = match checks
+                    .get("interpreter_prefix")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("identity") => vec![Path::new(program).as_os_str().to_os_string()],
+                    Some("substitute") => {
+                        vec![
+                            Path::new(program)
+                                .with_file_name("substituted-program")
+                                .into_os_string(),
+                        ]
+                    }
+                    _ => Vec::new(),
+                };
+                return Ok(Some(environment::CommandEnv {
+                    argv_prefix: prefix,
+                    path_prefix: Path::new(program).parent().map(Path::to_path_buf),
+                    vars: Vec::new(),
+                }));
             }
             Ok(self.command_env(worktree, cwd, program))
         }

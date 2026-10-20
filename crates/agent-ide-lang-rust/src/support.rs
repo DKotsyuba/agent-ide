@@ -606,9 +606,9 @@ impl LanguageSupport for RustSupport {
                     crate::environment::environment(worktree, None, &config.read_denies);
                 resolved.missing_next_step = Some(cause);
                 resolved.identity.push_str(
-                    &blake3::hash(serde_json::to_string(config).unwrap_or_default().as_bytes())
+                    blake3::hash(serde_json::to_string(config).unwrap_or_default().as_bytes())
                         .to_hex()
-                        .to_string(),
+                        .as_str(),
                 );
                 resolved
             }

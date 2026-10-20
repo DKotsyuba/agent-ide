@@ -27,8 +27,8 @@ use agent_ide_core::{
     intelligence::{server::LanguageServer, session::ProviderSettings},
     modules::{
         contract::{
-            Capability, CapabilityDecl, Cause, Declaration, ErrorCode, HelloOffer, ModuleId, Role,
-            Support,
+            Capability, CapabilityDecl, Cause, Declaration, ErrorCode, HelloOffer, ModuleConfig,
+            ModuleId, Role, Support,
         },
         payload::{
             self, Arg, CheckParseRequest, CheckPlanRequest, ChecksDescription, DeclaredExecutable,
@@ -686,14 +686,41 @@ fn test_effect(argv: &[String]) -> Option<EffectRequest> {
     })
 }
 
-/// The daemon's pinned test toolchain (`AGENT_IDE_RUST_TOOLCHAIN_DIR`), the root a
-/// module-planned test run's cargo and `bin` are admitted under (root composition data, the same
-/// for every worktree).
-pub fn toolchain_roots(_worktree: &Path) -> Vec<PathBuf> {
+/// The daemon's pinned test toolchain (`AGENT_IDE_RUST_TOOLCHAIN_DIR`) for an unconfigured
+/// request. Configured provider/check sections keep their own declared roots and receive no
+/// ambient toolchain fallback.
+pub fn toolchain_roots(_worktree: &Path, config: &ModuleConfig) -> Vec<PathBuf> {
+    if config.provider.is_some() || config.checks.is_some() {
+        return Vec::new();
+    }
     std::env::var_os("AGENT_IDE_RUST_TOOLCHAIN_DIR")
         .map(PathBuf::from)
         .into_iter()
         .collect()
+}
+
+/// Tests that configured requests never inherit the ambient Rust toolchain root.
+#[cfg(test)]
+mod environment_root_tests {
+    use super::*;
+
+    /// Configured Rust checks cannot borrow the process-selected toolchain root as a fallback.
+    #[test]
+    fn configured_requests_do_not_receive_ambient_toolchain_roots() {
+        let worktree = Path::new("/workspace");
+        for config in [
+            ModuleConfig {
+                checks: Some(serde_json::json!({})),
+                ..ModuleConfig::default()
+            },
+            ModuleConfig {
+                provider: Some(serde_json::json!({})),
+                ..ModuleConfig::default()
+            },
+        ] {
+            assert!(toolchain_roots(worktree, &config).is_empty());
+        }
+    }
 }
 
 /// The parameters under which `args` expand to exactly `words`, or `None`: a literal must be
@@ -2383,7 +2410,8 @@ mod tests {
         let tool = base.0.join("bin/cargo");
         let programs = [("cargo".to_owned(), tool.clone())];
         let home = agent_ide_core::userhome::user_home();
-        let roots = toolchain_roots(&base.0);
+        let config = ModuleConfig::default();
+        let roots = toolchain_roots(&base.0, &config);
         let admission = Admission {
             worktree: &base.0,
             cache_dir: &base.0.join("cache"),

@@ -1062,15 +1062,7 @@ fn supported_resolution_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    matches!(
-        name,
-        "tsconfig.json"
-            | "jsconfig.json"
-            | "package.json"
-            | "package-lock.json"
-            | "yarn.lock"
-            | "pnpm-lock.yaml"
-    ) || is_tsconfig_like(name)
+    RESOLUTION_FILENAMES.contains(&name) || is_tsconfig_like(name)
 }
 
 /// Whether `name` is a `tsconfig`/`jsconfig`-prefixed `.json` file with exactly one more
@@ -1184,8 +1176,8 @@ fn parsed_input(path: &Path) -> bool {
 
 impl ObservedInputs {
     /// Reads the closed ancestor candidate set of `document` (a worktree-relative path) after the
-    /// `node_modules` ancestry policy: the six fixed names at the document directory and each
-    /// ancestor, never a directory listing.
+    /// `node_modules` ancestry policy: the fixed names in `RESOLUTION_FILENAMES` at the
+    /// document directory and each ancestor, never a directory listing.
     ///
     /// `path_proof` must authorize each auxiliary input before it is read (T36B): an unproven
     /// candidate fails the resolution closed, never skipped as if missing.

@@ -94,6 +94,15 @@ pub fn module_executable(
     Some(module(language)?.executable(language))
 }
 
+/// Stops and reaps every module slot of `worktree` after its last workspace grant was revoked.
+/// Callers must preserve slots while another actor still owns a grant there. An absent host is
+/// harmless; the host retains its existing quarantine and admission on unproven cleanup.
+pub async fn stop_worktree(worktree: &Path) {
+    if let Some(host) = HOST.get() {
+        host.stop_worktree(worktree).await;
+    }
+}
+
 /// Where `language` computes in this process.
 pub fn mode(language: Language) -> Mode {
     module(language).map_or(Mode::InProcess, |_| Mode::Module)
@@ -1005,8 +1014,9 @@ fn admitted(
 }
 
 /// Recipe admission with `configured`: operator-declared programs of the launcher configuration (a
-/// probe's Node and package), admitted as roots beside the declared install roots. `scope` keeps
-/// the authoritative worktree separate from the actual child cwd throughout expansion.
+/// probe's Node and package), plus the current config's host-resolved environment roots, admitted
+/// beside the declared install roots. `scope` keeps the authoritative worktree separate from the
+/// actual child cwd throughout expansion; host read denies remain in force for every root.
 fn admitted_with(
     language: Language,
     scope: (&Path, &Path),
@@ -1073,7 +1083,8 @@ fn admitted_with(
     let mut roots = super::recipe::declared_roots(language.name());
     roots.extend(programs.iter().map(|(_, program)| program.clone()));
     // A path program can be vouched for by the same trusted language resolver in the actual
-    // cwd. Admit only that exact prepared executable/bin, not a module-proposed parent root.
+    // cwd. An empty prefix preserves the requested executable; one exact prefix is also safe.
+    // Any other replacement is refused before adding its executable/bin roots.
     if let Some(super::payload::Param::Path(program)) = effect.params.get(recipe.program) {
         let name = program.to_str().ok_or_else(refused)?;
         if let Some(activation) = language
@@ -1081,16 +1092,20 @@ fn admitted_with(
             .configured_command_argv(worktree, cwd, &[name.to_owned()], config)
             .map_err(|_| refused())?
         {
-            if activation.argv_prefix.as_slice() != [program.as_os_str().to_os_string()] {
+            if !activation.argv_prefix.is_empty()
+                && activation.argv_prefix.as_slice() != [program.as_os_str().to_os_string()]
+            {
                 return Err(refused());
             }
             roots.push(program.clone());
             roots.extend(activation.path_prefix);
         }
     }
-    if config.provider.is_none() && config.checks.is_none() {
-        roots.extend(super::recipe::environment_roots(language.name(), worktree));
-    }
+    roots.extend(super::recipe::environment_roots(
+        language.name(),
+        worktree,
+        config,
+    ));
     // The trusted compiled support resolves current immutable launcher facts, never a root
     // proposed by a module. Refused environments add no authority.
     if config.provider.is_some() || config.checks.is_some() {
@@ -1372,8 +1387,8 @@ mod tests {
     }
 
     /// A module-planned test run may name only a declared recipe of class `test`, and a
-    /// formatter or probe only an interactive one: anything else is refused before expansion, and
-    /// before a missing tool could be reported for it.
+    /// formatter or probe only an interactive one. A path program also requires a trusted
+    /// activation that leaves the program unchanged or prefixes it with itself.
     #[test]
     fn effects_are_admitted_only_from_their_own_class() {
         use super::super::payload::{
@@ -1398,7 +1413,8 @@ mod tests {
                 assets: &[],
             }
         }
-        static RECIPES: [EffectRecipe; 6] = [
+        /// Routes test and interactive fixtures through their distinct admission contracts.
+        static RECIPES: [EffectRecipe; 7] = [
             recipe("fmt", RunClass::Interactive),
             EffectRecipe {
                 executables: &[ExecutableSlot {
@@ -1434,6 +1450,24 @@ mod tests {
                     source: SlotSource::Launcher("node"),
                 }],
                 ..recipe("configured-node-test", RunClass::Test)
+            },
+            EffectRecipe {
+                id: "configured-interpreter",
+                program: "interpreter",
+                args: &[],
+                env: &[],
+                paths: &[crate::modules::payload::PathRule {
+                    param: "interpreter",
+                    roles: &[crate::modules::payload::PathRole::LauncherRoot],
+                    existing_only: false,
+                    read_root: false,
+                }],
+                executables: &[],
+                stdin: Stdin::Null,
+                class: RunClass::Interactive,
+                timeout_ceiling_ms: 1000,
+                capture_bytes: 1024,
+                assets: &[],
             },
         ];
         static DECLARED: [(&str, &[EffectRecipe]); 1] = [("gamma", &RECIPES)];
@@ -1620,6 +1654,86 @@ mod tests {
                 &denied
             )
             .is_err()
+        );
+
+        let worktree = scratch.join("fixture-worktree");
+        let selected = scratch.join("fixture-runtime/bin/program");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        std::fs::write(&selected, "fixture interpreter").unwrap();
+        let path_request = EffectRequest {
+            recipe: "configured-interpreter".to_owned(),
+            params: [("interpreter".to_owned(), Param::Path(selected.clone()))].into(),
+        };
+        let config_for = |path: &Path, prefix: &str| ModuleConfig {
+            worktree: Some(worktree.clone()),
+            checks: Some(serde_json::json!({
+                "interpreter": path.display().to_string(),
+                "interpreter_prefix": prefix,
+            })),
+            ..ModuleConfig::default()
+        };
+        for prefix in ["unchanged", "identity"] {
+            let spec = admitted_with(
+                gamma,
+                (&worktree, &worktree),
+                &path_request,
+                RunClass::Interactive,
+                second,
+                &[],
+                &config_for(&selected, prefix),
+            )
+            .unwrap();
+            assert_eq!(spec.program, selected);
+        }
+        assert!(
+            admitted_with(
+                gamma,
+                (&worktree, &worktree),
+                &path_request,
+                RunClass::Interactive,
+                second,
+                &[],
+                &config_for(&selected, "substitute"),
+            )
+            .is_err(),
+            "a different interpreter prefix is refused"
+        );
+        assert!(
+            admitted_with(
+                gamma,
+                (&worktree, &worktree),
+                &path_request,
+                RunClass::Interactive,
+                second,
+                &[],
+                &ModuleConfig {
+                    checks: Some(serde_json::json!({
+                        "interpreter": scratch.join("other-program").display().to_string(),
+                        "interpreter_prefix": "unchanged",
+                    })),
+                    ..ModuleConfig::default()
+                },
+            )
+            .is_err(),
+            "an unrelated configured interpreter cannot grant the selected path"
+        );
+        let denied_path = ModuleConfig {
+            read_denies: vec![crate::execution::seatbelt::ReadDeny::Path(selected.clone())],
+            ..config_for(&selected, "unchanged")
+        };
+        assert!(
+            admitted_with(
+                gamma,
+                (&worktree, &worktree),
+                &path_request,
+                RunClass::Interactive,
+                second,
+                &[],
+                &denied_path,
+            )
+            .is_err(),
+            "read denies still override the identity-preserving activation"
         );
     }
 

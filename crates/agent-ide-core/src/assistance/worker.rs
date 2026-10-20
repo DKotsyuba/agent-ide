@@ -3263,12 +3263,13 @@ impl<'a> Worker<'a> {
     /// Target batches share one ordered runner/budget. Bridge mode returns the started run
     /// without waiting for child completion; legacy deployments retain their finite inline wait.
     /// Results settle independently of turn completion; cancellation settles only after reaping.
+    /// The nested target-batch future is heap-backed to bound stack use in this same task.
     async fn test(
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         if job.parameters.get("targets").is_some() {
-            return self.batch_tests(job).await;
+            return Box::pin(self.batch_tests(job)).await;
         }
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
@@ -4109,6 +4110,8 @@ impl<'a> Worker<'a> {
     }
     /// Rechecks queued liveness, executes only the selected owner operation, and fences every result.
     /// Starts/resumes exclusive stage timing and journals read/edit totals only on settlement.
+    /// Each selected tool future is heap-backed in this same task, bounding nested batch stack
+    /// use without spawning, changing cancellation ownership or increasing runtime limits.
     async fn perform(&mut self, job: &mut Job) {
         if let Ok(mut progress) = job.progress.lock() {
             progress.switch(Some(if job.stage.is_some() { "check" } else { "plan" }));
@@ -4177,13 +4180,13 @@ impl<'a> Worker<'a> {
             revoked
         } else if *job.cancel.borrow() || self.shared.active(&binding).is_err() {
             if job.stage.is_some() {
-                self.edit(job).await
+                Box::pin(self.edit(job)).await
             } else {
                 Err(FailureCode::Cancelled)
             }
         } else if tokio::time::Instant::now() >= job.deadline {
             if job.stage.is_some() {
-                self.edit(job).await
+                Box::pin(self.edit(job)).await
             } else if was_parked {
                 Err(FailureCode::ProviderLoading)
             } else {
@@ -4195,7 +4198,7 @@ impl<'a> Worker<'a> {
             }
             if tokio::time::Instant::now() >= job.deadline {
                 if job.stage.is_some() {
-                    self.edit(job).await
+                    Box::pin(self.edit(job)).await
                 } else if was_parked {
                     Err(FailureCode::ProviderLoading)
                 } else {
@@ -4203,29 +4206,29 @@ impl<'a> Worker<'a> {
                 }
             } else {
                 match job.tool {
-                    AssistanceTool::Edit => self.edit(job).await,
-                    AssistanceTool::Start => self.activate(job).await,
-                    AssistanceTool::Context => self.context(job).await,
+                    AssistanceTool::Edit => Box::pin(self.edit(job)).await,
+                    AssistanceTool::Start => Box::pin(self.activate(job)).await,
+                    AssistanceTool::Context => Box::pin(self.context(job)).await,
                     AssistanceTool::Inspect
                         if matches!(
                             job.parameters.get("kind").and_then(Value::as_str),
                             Some("problems" | "diagnostics")
                         ) =>
                     {
-                        self.context(job).await
+                        Box::pin(self.context(job)).await
                     }
-                    AssistanceTool::Diff => self.diff(job).await,
-                    AssistanceTool::Outline => self.outline(job).await,
+                    AssistanceTool::Diff => Box::pin(self.diff(job)).await,
+                    AssistanceTool::Outline => Box::pin(self.outline(job)).await,
                     AssistanceTool::Read => {
                         panic_seam(job);
-                        self.read(job).await
+                        Box::pin(self.read(job)).await
                     }
                     AssistanceTool::Symbol if job.parameters.get("path").is_some() => {
-                        self.context(job).await
+                        Box::pin(self.context(job)).await
                     }
-                    AssistanceTool::Symbol => self.symbol(job).await,
-                    AssistanceTool::Graph => self.graph(job).await,
-                    AssistanceTool::Test => self.test(job).await,
+                    AssistanceTool::Symbol => Box::pin(self.symbol(job)).await,
+                    AssistanceTool::Graph => Box::pin(self.graph(job)).await,
+                    AssistanceTool::Test => Box::pin(self.test(job)).await,
                     _ => Err(FailureCode::Internal),
                 }
             }
@@ -7268,6 +7271,7 @@ impl<'a> Worker<'a> {
     /// stopped binding's source or provider authority and no stop is ever replayed: the host
     /// binding was already stopped by the ingress path and stays unusable either way. A daemon
     /// restart boot-fences old grants independently, so pending state is intentionally in-memory.
+    /// The final grant release also reaps this worktree's module slots; active peers retain them.
     async fn settle_revocation(&mut self, binding: &BindingRef) -> Result<bool, FailureCode> {
         self.close_provider(binding).await?;
         let Some(receipt) = self.grants.get(binding).cloned() else {
@@ -7314,6 +7318,13 @@ impl<'a> Worker<'a> {
                 self.grants.remove(binding);
                 self.pending_revocations.remove(binding);
                 self.release_binding_state(binding);
+                if !self
+                    .grants
+                    .values()
+                    .any(|grant| grant.worktree() == receipt.worktree())
+                {
+                    crate::modules::calls::stop_worktree(receipt.worktree().worktree_path()).await;
+                }
                 return Ok(false);
             }
             if self.pending_revocations.len() < MAX_PENDING_REVOCATIONS {
@@ -7327,6 +7338,13 @@ impl<'a> Worker<'a> {
         self.pending_revocations.remove(binding);
         self.release_live(binding).await;
         self.release_binding_state(binding);
+        if !self
+            .grants
+            .values()
+            .any(|grant| grant.worktree() == receipt.worktree())
+        {
+            crate::modules::calls::stop_worktree(receipt.worktree().worktree_path()).await;
+        }
         Ok(true)
     }
 

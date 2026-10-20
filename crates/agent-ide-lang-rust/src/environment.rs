@@ -173,9 +173,9 @@ pub(crate) fn resolve_at(
         &config.read_denies,
     );
     resolved.identity.push_str(
-        &blake3::hash(serde_json::to_string(config).unwrap_or_default().as_bytes())
+        blake3::hash(serde_json::to_string(config).unwrap_or_default().as_bytes())
             .to_hex()
-            .to_string(),
+            .as_str(),
     );
     if let Some(cause) = &resolved.missing_next_step {
         return Err(cause.clone());

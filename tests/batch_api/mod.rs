@@ -1424,9 +1424,11 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
         let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
         let text = batch_without_status_plate(status["text"].as_str().unwrap_or_default());
         if !text.contains("running") {
-            break text.to_owned();
+            break status;
         }
     };
+    let replay = product_test_replay(&mut actor, &fixture, &result).await;
+    let result = batch_without_status_plate(result["text"].as_str().unwrap()).to_owned();
     assert!(
         result.starts_with("tests #1: 4 passed, 1 failed, "),
         "{result}"
@@ -1440,23 +1442,58 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
             && result.contains("\n  target 5 path README.md: not runnable: "),
         "{result}"
     );
-    let rerun = result
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix("rerun: "))
-        .unwrap_or_else(|| panic!("one rerun line: {result}"));
+    let argv = replay["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(&argv[..2], ["/bin/sh", "-c"], "{replay}");
+    assert_eq!(argv.len(), 3, "{replay}");
+    let script = argv[2];
     assert!(
-        rerun.starts_with("sh -c 'cargo test --workspace -- --exact ")
-            && rerun.ends_with(
-                "; cargo test --manifest-path Cargo.toml --test path_tests; cargo test \
-                 --manifest-path Cargo.toml --test more_tests'"
-            ),
-        "{rerun}"
+        script.starts_with("status=0\n") && script.ends_with("exit \"$status\""),
+        "{replay}"
     );
-    let reproduced = std::process::Command::new("/bin/sh")
-        .args(["-c", rerun])
-        .current_dir(&fixture.root)
+    let cargo = shell_quote_for_test(Path::new(&toolchain_bin("cargo")));
+    assert_eq!(
+        script.matches(&cargo).count(),
+        3,
+        "one complete invocation per run: {replay}"
+    );
+    for args in [
+        "'test' '--workspace' '--' '--exact' 'tests::doubles' 'tests::fails' 'tests::halves'",
+        "'test' '--manifest-path' 'Cargo.toml' '--test' 'path_tests'",
+        "'test' '--manifest-path' 'Cargo.toml' '--test' 'more_tests'",
+    ] {
+        assert!(script.contains(&format!("{cargo} {args}")), "{replay}");
+    }
+    assert_eq!(
+        script.matches("'RUSTUP_AUTO_INSTALL=0'").count(),
+        3,
+        "{replay}"
+    );
+    assert_eq!(
+        script.matches("'CARGO_NET_OFFLINE=true'").count(),
+        3,
+        "{replay}"
+    );
+    let cwd = fixture.root.join(replay["cwd"].as_str().unwrap());
+    assert_eq!(
+        cwd.canonicalize().unwrap(),
+        fixture.root.canonicalize().unwrap(),
+        "{replay}"
+    );
+    let reproduced = std::process::Command::new(argv[0])
+        .args(&argv[1..])
+        .current_dir(cwd)
         .output()
         .unwrap();
+    assert_eq!(
+        reproduced.status.code(),
+        Some(101),
+        "the whole replay preserves its failed run"
+    );
     let reproduced = String::from_utf8_lossy(&reproduced.stdout);
     for line in [
         "test tests::doubles ... ok",

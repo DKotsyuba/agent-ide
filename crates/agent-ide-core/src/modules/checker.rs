@@ -120,18 +120,18 @@ impl ModuleChecker {
             .await
     }
 
-    /// Runs one check, or the typed failure of its module.
+    /// Runs one check, or returns its typed module failure. Builds admission roots from this
+    /// request's current module configuration and read denies before the module plans effects.
     async fn run(&self, request: &CheckRequest) -> Result<ProblemSnapshot, ModuleUnavailable> {
         let mut configuration = self.configuration.clone();
         configuration.worktree = Some(request.worktree.clone());
         configuration.read_denies = request.read_denies.clone();
         let mut described = self.described(&request.worktree).await?.clone();
-        if configuration.provider.is_none() && configuration.checks.is_none() {
-            described.launcher_roots.extend(recipe::environment_roots(
-                self.language.name(),
-                &request.worktree,
-            ));
-        }
+        described.launcher_roots.extend(recipe::environment_roots(
+            self.language.name(),
+            &request.worktree,
+            &configuration,
+        ));
         described.launcher_roots.extend(
             self.language
                 .support()

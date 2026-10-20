@@ -42,7 +42,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Atomic multi-file edit: batch production and test files ({path, changes}, {path, create:true,\ncontent} or {path, content}); all apply or none. A change: {symbol, content} (op\ninsert/delete, where), exact {old, new} once (within scopes it), {lines, content},\nadd_import or remove_import. Rename: op rename, symbol, new_name. At the inline wait limit\nthe reply is edit_progress: requested and committed files, stage and detail_ref; the project\ncheck reports separately.",
+    "description": "Atomic `files` batches (all-or-none), symbol/line/text/import edits, rename or host patch.\nLong edits return `edit_progress` with stage, requested/committed paths, and `detail_ref`;\nchecks report separately.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

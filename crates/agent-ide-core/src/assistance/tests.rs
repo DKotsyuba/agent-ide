@@ -659,7 +659,7 @@ impl TestRuns {
     }
 
     /// Lists one binding's runs whose result no caller of that binding ever read — a run still
-    /// running, or a settled one no status, handle or plate delivered — as `(id, argv, running)`.
+    /// running, or a settled one no status, handle or plate delivered — as `(id, replay, running)`.
     /// `ide.stop` reports them so an agent cannot claim results it never collected.
     pub fn uncollected(&self, binding: &[u8; 32]) -> Vec<(u64, Vec<String>, bool)> {
         self.0
@@ -1872,7 +1872,7 @@ mod runner_tests {
         ));
     }
 
-    /// Reports an uncollected run with its command until the owner reads the settled result.
+    /// Reports an uncollected run with its prepared replay until the owner reads the settled result.
     #[tokio::test]
     async fn uncollected_reports_runs_until_the_owner_reads_them() {
         let runs = TestRuns::default();
@@ -1892,7 +1892,16 @@ mod runner_tests {
         let binding = owner.fingerprint();
         assert_eq!(
             runs.uncollected(&binding),
-            vec![(1, vec!["/bin/echo".into(), "done".into()], true)]
+            vec![(
+                1,
+                vec![
+                    "/usr/bin/env".into(),
+                    format!("PATH={}", std::env::var("PATH").unwrap_or_default()),
+                    "/bin/echo".into(),
+                    "done".into(),
+                ],
+                true,
+            )]
         );
         for _ in 0..100 {
             if runs
@@ -1962,8 +1971,14 @@ mod runner_tests {
             .result
             .take();
         let pending = runs.stop_summaries(&owner.fingerprint()).join("\n");
-        assert!(pending.contains("running"), "{pending}");
-        assert!(!pending.contains("exit 7"), "{pending}");
+        assert!(
+            pending.starts_with(&format!("tests #{id}: running — ")),
+            "{pending}"
+        );
+        assert!(
+            pending.contains("retained-failure-sentinel"),
+            "the live recipe remains visible without claiming its exit: {pending}"
+        );
         runs.0.lock().unwrap().jobs.get_mut(&id).unwrap().result = result;
 
         runs.observe_binding(&owner.fingerprint());

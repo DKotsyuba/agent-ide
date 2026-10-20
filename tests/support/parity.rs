@@ -45,6 +45,46 @@ pub fn source_query(arguments: Value) -> (&'static str, Value) {
     (source_query_tool(&arguments), arguments)
 }
 
+/// Recovers one complete owner-authorized test replay JSON receipt through public output pages.
+///
+/// `first_reference` must be the exact `<run>/replay/output/1` reference printed by that run's
+/// terminal preview. The helper reads with `ide.test {"output": reference}`, strips only page
+/// position markers, follows at most 20 total pages, and parses the concatenated JSON.
+/// It never reruns the test; an invalid, unavailable, or incomplete page panics the owning test.
+pub async fn recover_test_replay(
+    session: &mut Session,
+    fixture: &Fixture,
+    first_reference: &str,
+) -> Value {
+    assert!(
+        first_reference.ends_with("/replay/output/1"),
+        "test replay starts at page one: {first_reference}"
+    );
+    let mut reference = first_reference.to_owned();
+    let mut recovered = String::new();
+    let mut pages = 0;
+    loop {
+        let reply = session
+            .call(fixture, "ide.test", json!({"output":reference}))
+            .await;
+        assert_eq!(reply["state"], "complete", "{reply}");
+        assert_eq!(reply["kind"], "test", "{reply}");
+        let text = reply["text"].as_str().unwrap_or_default();
+        let body = text
+            .split_once('\n')
+            .filter(|(marker, _)| marker.starts_with("page "))
+            .map_or(text, |(_, body)| body);
+        recovered.push_str(body);
+        if reply["continuation"] != true {
+            break;
+        }
+        reference = reply["detail_ref"].as_str().unwrap().to_owned();
+        pages += 1;
+        assert!(pages < 20, "bounded test replay continuation");
+    }
+    serde_json::from_str(&recovered).expect("complete test replay is valid JSON")
+}
+
 /// The fallback switch the harness flips.
 pub const LANGUAGE_MODE: &str = "AGENT_IDE_LANGUAGE_MODE";
 /// Trusted fixture channel attachment.
@@ -254,8 +294,18 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Starts a daemon on `fixture` with `env` and waits for its endpoint.
+    /// Starts a daemon on `fixture` with `env` and waits for its endpoint. When `TS_DUMP` is
+    /// set, retains daemon stderr in that directory even if the daemon aborts after startup.
     pub async fn start(fixture: &Fixture, env: &[(&str, &str)]) -> Self {
+        let stderr_path = std::env::var_os("TS_DUMP").map(|directory| {
+            PathBuf::from(directory).join(format!(
+                "daemon-{}.stderr",
+                fixture.base.file_name().unwrap().to_string_lossy()
+            ))
+        });
+        let stderr = stderr_path.as_ref().map_or_else(Stdio::piped, |path| {
+            Stdio::from(std::fs::File::create(path).unwrap())
+        });
         let mut command = Command::new(binary());
         command
             .env_remove(LANGUAGE_MODE)
@@ -266,7 +316,7 @@ impl Daemon {
             .env("AGENT_IDE_LAUNCHER_CONFIG", &fixture.config)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(stderr)
             .kill_on_drop(true);
         let mut daemon = Self {
             child: command.spawn().unwrap(),
@@ -282,13 +332,11 @@ impl Daemon {
                 }
                 if let Some(status) = daemon.child.try_wait().unwrap() {
                     let mut stderr = String::new();
-                    let _ = daemon
-                        .child
-                        .stderr
-                        .take()
-                        .unwrap()
-                        .read_to_string(&mut stderr)
-                        .await;
+                    if let Some(mut pipe) = daemon.child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr).await;
+                    } else if let Some(path) = &stderr_path {
+                        stderr = std::fs::read_to_string(path).unwrap();
+                    }
                     panic!("daemon exited with {status}: {stderr}");
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -582,10 +630,14 @@ impl Session {
         panic!("{tool} did not settle: {reply}");
     }
 
-    /// One correlated tool call without settling.
+    /// One correlated tool call without settling; a missing or non-object structured result panics
+    /// with the tool, arguments, and raw RPC response instead of manufacturing a null reply. For
+    /// the TS backend's `src/index.js` edit, `TS_DUMP` also retains current bytes and that raw
+    /// response before the panic so an unknown outcome can be inspected after fixture teardown.
     async fn call_once(&mut self, fixture: &Fixture, tool: &str, arguments: Value) -> Value {
         let id = CALL.fetch_add(1, Ordering::Relaxed) + 1;
         let call = format!("call-{id}");
+        let request_arguments = arguments.clone();
         self.hook(fixture, "PreToolUse", &call).await;
         let reply = self
             .exchange(
@@ -595,7 +647,34 @@ impl Session {
             )
             .await;
         self.hook(fixture, "PostToolUse", &call).await;
-        let mut structured = reply["result"]["structuredContent"].clone();
+        let Some(mut structured) = reply
+            .pointer("/result/structuredContent")
+            .filter(|value| value.is_object())
+            .cloned()
+        else {
+            if tool == "ide.edit"
+                && request_arguments["symbol"]
+                    .as_str()
+                    .is_some_and(|symbol| symbol.starts_with("src/index.js#"))
+                && let Some(directory) = std::env::var_os("TS_DUMP").map(PathBuf::from)
+            {
+                let _ = std::fs::create_dir_all(&directory);
+                let fixture_name = fixture.base.file_name().map_or_else(
+                    || "fixture".to_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                let stem = format!("node-unknown-{fixture_name}");
+                let _ = std::fs::copy(
+                    fixture.root.join("src/index.js"),
+                    directory.join(format!("{stem}-src-index.js")),
+                );
+                let _ = std::fs::write(
+                    directory.join(format!("{stem}-reply.json")),
+                    reply.to_string(),
+                );
+            }
+            panic!("tool `{tool}` returned no structured object for {request_arguments}: {reply}");
+        };
         // An error reply carries its message as content text only; keep it comparable.
         if let Some(object) = structured.as_object_mut()
             && !object.contains_key("text")

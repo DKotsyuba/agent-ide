@@ -378,7 +378,7 @@ fn parent_or_self(path: &Path) -> PathBuf {
 /// Returns `path`'s parent's parent directory (its grandparent), or `path` itself when fewer
 /// than two ancestors exist. Used to strip a `bin/<interpreter>` suffix down to its installation
 /// root.
-fn grandparent_or_self(path: &Path) -> PathBuf {
+pub(crate) fn grandparent_or_self(path: &Path) -> PathBuf {
     path.parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
@@ -416,7 +416,7 @@ pub fn session_interpreter(worktree: &Path) -> Option<PathBuf> {
 
 /// Follows at most 32 interpreter or tool links with no-follow metadata, proving each normalized
 /// hop first. Loops, denied paths, and unsafe relative targets return `None`.
-fn resolved_link_target(
+pub(crate) fn resolved_link_target(
     path: &Path,
     denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<PathBuf> {

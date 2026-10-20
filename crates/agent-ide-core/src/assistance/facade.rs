@@ -5350,12 +5350,9 @@ impl StdioFacade {
         self.call(AssistanceTool::Stop, parameters, context).await
     }
 
-    /// Atomic multi-file edit: batch production and test files ({path, changes}, {path, create:true,
-    /// content} or {path, content}); all apply or none. A change: {symbol, content} (op
-    /// insert/delete, where), exact {old, new} once (within scopes it), {lines, content},
-    /// add_import or remove_import. Rename: op rename, symbol, new_name. At the inline wait limit
-    /// the reply is edit_progress: requested and committed files, stage and detail_ref; the project
-    /// check reports separately.
+    /// Atomic `files` batches (all-or-none), symbol/line/text/import edits, rename or host patch.
+    /// Long edits return `edit_progress` with stage, requested/committed paths, and `detail_ref`;
+    /// checks report separately.
     #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
     async fn edit(
@@ -5989,7 +5986,7 @@ fn inspect_mode_restrictions_are_explicit_in_catalog_and_refusal() {
     }
     let error = validate_call(
         AssistanceTool::Inspect,
-        json!({"kind":"diagnostics","path":"a.rs","language":"rust"}),
+        json!({"kind":"diagnostics","path":"a.rs","language":"other"}),
     )
     .unwrap_err();
     assert_eq!(

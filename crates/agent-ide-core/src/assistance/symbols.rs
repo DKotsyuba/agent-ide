@@ -1028,13 +1028,14 @@ impl Worker<'_> {
     }
 
     /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: the symbol card; the
-    /// `{symbols}` form answers each entry through this same path (`batch_symbols`).
+    /// `{symbols}` form answers each entry through this same path (`batch_symbols`), with the
+    /// nested batch future on the heap to bound stack use without changing task ownership.
     pub(super) async fn symbol(
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         if job.parameters.get("symbols").is_some() {
-            return self.batch_symbols(job).await;
+            return Box::pin(self.batch_symbols(job)).await;
         }
         let binding = job.invocation.binding_ref().clone();
         let requested = job.parameters["symbol"]
@@ -1438,7 +1439,8 @@ impl Worker<'_> {
     }
 
     /// `ide.graph {symbol, direction, depth}`: bounded breadth-first call hierarchy; the
-    /// `{symbols}` form answers each root through this same path (`batch_symbols`).
+    /// `{symbols}` form answers each root through this same path (`batch_symbols`), with the
+    /// nested batch future on the heap to bound stack use without changing task ownership.
     ///
     /// A call-hierarchy request that fails is recorded on the node it was made for and the reply
     /// says `unavailable (<cause>)` there (see [`render::call_graph_text`]); the session is marked
@@ -1449,7 +1451,7 @@ impl Worker<'_> {
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         if job.parameters.get("symbols").is_some() {
-            return self.batch_symbols(job).await;
+            return Box::pin(self.batch_symbols(job)).await;
         }
         let binding = job.invocation.binding_ref().clone();
         let requested = job.parameters["symbol"]
@@ -1861,6 +1863,7 @@ impl Worker<'_> {
     /// the outline came from the text alone (replies then say so in one compact line; an
     /// address it does not contain waits for the server while it loads — see
     /// [`missing_symbol`]). The job accumulates this interval as provider-wait timing.
+    /// Its nested provider-admission future is heap-backed to bound stack use in batch callers.
     pub(super) async fn outline_of(
         &mut self,
         job: &mut Job,
@@ -1900,7 +1903,7 @@ impl Worker<'_> {
                 }
             };
         };
-        let live = match self.live_session_for(job, observed).await {
+        let live = match Box::pin(self.live_session_for(job, observed)).await {
             Ok(live) => live,
             Err(FailureCode::ProviderLoading) if support.outline_while_loading() => {
                 // The registered server is loading: the source outline answers now (the park
@@ -4081,6 +4084,8 @@ impl Worker<'_> {
     /// and its site count; one that stops midway answers the multi-file reply naming each file's
     /// state, and a retry with the same `operation_id` resumes it. A settled or conflicting
     /// `operation_id` answers from its receipt before the language server is asked.
+    /// The nested outline future is heap-backed to bound the runtime worker's stack use; it
+    /// stays in the same task with the rename's existing cancellation and receipt ownership.
     async fn rename_symbol(
         &mut self,
         job: &mut Job,
@@ -4121,7 +4126,10 @@ impl Worker<'_> {
             }
             Err(other) => return Err(other),
         }
-        let (outline, worktree_root, lexical) = self.outline_of(job, &observed, &bytes).await?;
+        // The module-backed outline has a large nested future; keep it off the runtime
+        // worker's stack while retaining this rename's task, cancellation and receipt owner.
+        let (outline, worktree_root, lexical) =
+            Box::pin(self.outline_of(job, &observed, &bytes)).await?;
         let found = outline
             .find(&symbol)
             .cloned()

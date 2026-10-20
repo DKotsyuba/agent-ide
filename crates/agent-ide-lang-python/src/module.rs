@@ -340,8 +340,9 @@ const TEST_RECIPES: [EffectRecipe; 6] = [
 /// A test-run recipe: `program` is the `interpreter` path parameter (admitted under
 /// [`INTERPRETER_ROLES`]) or a home tool slot of the same name. The core runs exactly the
 /// expanded specification as the `ide.test` job: its complete environment is `HOME`, `PATH`
-/// (an activated environment's `bin` first, then the system directories) and, for an
-/// environment's own interpreter, `VIRTUAL_ENV`.
+/// (an activated environment's existing `bin` first, then the system directories) and, for an
+/// environment's own interpreter, `VIRTUAL_ENV`. Activation's `venv` and `bin` are required
+/// existing directories, derived only when the selected interpreter has a `pyvenv.cfg`.
 const fn test_run(id: &'static str, program: &'static str, args: &'static [Arg]) -> EffectRecipe {
     EffectRecipe {
         id,
@@ -370,13 +371,13 @@ const fn test_run(id: &'static str, program: &'static str, args: &'static [Arg])
             PathRule {
                 param: "venv",
                 roles: INTERPRETER_ROLES,
-                existing_only: true,
+                existing_only: false,
                 read_root: false,
             },
             PathRule {
                 param: "bin",
                 roles: INTERPRETER_ROLES,
-                existing_only: true,
+                existing_only: false,
                 read_root: false,
             },
         ],

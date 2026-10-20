@@ -12,7 +12,10 @@ use parity::{source_query, source_query_tool};
 #[path = "support/parity.rs"]
 mod parity;
 
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use parity::{Daemon, Fixture, ProcessIdentity, ProcessTree, Session};
 use serde_json::{Value, json};
@@ -204,9 +207,15 @@ fn test_runs() -> Vec<Value> {
     ]
 }
 
-/// One `ide.test` run: its start reply (the selected command) and, polled with `{"status": N}`
-/// until it is no longer running (180 s), its settled result.
-async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) -> Vec<String> {
+/// One `ide.test` run: its start reply and status polled for up to 180 s. The terminal status and
+/// full replay recipe are validated against the requested test and hosting route before only its
+/// recipe footer is canonicalized for transcript parity.
+async fn test_run(
+    session: &mut Session,
+    fixture: &Fixture,
+    arguments: Value,
+    module: bool,
+) -> Vec<String> {
     let started = session.call(fixture, "ide.test", arguments.clone()).await;
     let text = started["text"].as_str().unwrap_or_default().to_owned();
     let mut lines = vec![record(fixture, "ide.test", &arguments, &started)];
@@ -223,7 +232,22 @@ async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) ->
         let reply = session.call(fixture, "ide.test", status.clone()).await;
         let text = reply["text"].as_str().unwrap_or_default();
         if !text.contains(": running") && !text.contains(": started") {
-            lines.push(record(fixture, "ide.test", &status, &reply));
+            assert_rust_test_recipe(session, fixture, &arguments, &reply, text, module).await;
+            let entry = record(fixture, "ide.test", &status, &reply);
+            lines.push(
+                entry
+                    .lines()
+                    .filter(|row| !row.starts_with("  full replay:"))
+                    .map(|row| {
+                        if row.starts_with("  rerun") {
+                            "  rerun: <route-verified recipe>"
+                        } else {
+                            row
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
             return lines;
         }
         assert!(
@@ -232,6 +256,144 @@ async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) ->
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Checks one Rust test result's status and complete replay receipt against its requested target
+/// and route. Module receipts must contain the exact env-i allowlist; native receipts must contain
+/// only the configured command overrides plus the effective inherited PATH. `cwd` must remain
+/// the fixture root, and the settled counts and exit stay unmasked for transcript comparison.
+async fn assert_rust_test_recipe(
+    session: &mut Session,
+    fixture: &Fixture,
+    selection: &Value,
+    reply: &Value,
+    text: &str,
+    module: bool,
+) {
+    assert_eq!(reply["state"], "complete", "{reply}");
+    assert_eq!(reply["kind"], "test", "{reply}");
+    let (cargo_args, counts, exit): (Vec<&str>, &str, &str) =
+        if selection["symbol"] == "src/lib.rs#user" {
+            (
+                vec!["test", "--workspace"],
+                "2 passed, 1 failed",
+                "(exit 101)",
+            )
+        } else if selection["path"] == "tests/service.rs" {
+            (
+                vec!["test", "--manifest-path", "Cargo.toml", "--test", "service"],
+                "1 passed, 0 failed",
+                "(exit 0)",
+            )
+        } else if selection["path"] == "tests/broken.rs" {
+            (
+                vec!["test", "--manifest-path", "Cargo.toml", "--test", "broken"],
+                "0 passed, 1 failed",
+                "(exit 101)",
+            )
+        } else if selection["pattern"] == "added_test" {
+            (
+                vec!["test", "--workspace", "added_test"],
+                "1 passed, 0 failed",
+                "(exit 0)",
+            )
+        } else {
+            panic!("unexpected Rust test target: {selection}");
+        };
+    assert!(text.contains(counts) && text.contains(exit), "{text}");
+    let rerun = text
+        .lines()
+        .find(|line| line.starts_with("  rerun preview:"))
+        .expect("the long Rust recipe has an explicit preview");
+    assert!(
+        rerun.starts_with("  rerun preview: /usr/bin/env "),
+        "{rerun}"
+    );
+    assert!(rerun.ends_with('…'), "{rerun}");
+    let replay: Value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("  full replay: ide.test "))
+        .map(|line| serde_json::from_str(line).expect("preview has a replay query"))
+        .expect("a preview has an owner-only full replay");
+    let first_reference = replay["output"].as_str().unwrap();
+    let replay = parity::recover_test_replay(session, fixture, first_reference).await;
+    assert_eq!(
+        replay["cwd"], ".",
+        "Rust tests run at the project root: {replay}"
+    );
+
+    let toolchain = PathBuf::from(input("AGENT_IDE_RUST_TOOLCHAIN_DIR"));
+    let bin = toolchain.join("bin");
+    let cargo = bin.join("cargo").display().to_string();
+    let rustc = bin.join("rustc").display().to_string();
+    let mut expected = vec!["/usr/bin/env".to_owned()];
+    if module {
+        expected.push("-i".to_owned());
+        expected.push("CARGO_NET_OFFLINE=true".to_owned());
+        expected.push(format!("RUSTC={rustc}"));
+        let mut bins = vec![bin.clone()];
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+        if let (Some(home), Some(cargo_home)) = (agent_ide::userhome::user_home(), cargo_home) {
+            let cargo_bin = cargo_home.join("bin");
+            if cargo_bin.starts_with(&home) && cargo_bin.is_dir() {
+                bins.push(cargo_bin);
+            }
+        }
+        let path = bins
+            .iter()
+            .map(|path| path.display().to_string())
+            .chain(
+                ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .collect::<Vec<_>>()
+            .join(":");
+        expected.push(format!("PATH={path}"));
+        for name in [
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "DEVELOPER_DIR",
+            "HOME",
+            "RUSTFLAGS",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "TMPDIR",
+        ] {
+            let value = match name {
+                "CARGO_TARGET_DIR" => Some(fixture.base.join("cargo-target").display().to_string()),
+                "RUSTUP_TOOLCHAIN" => Some(toolchain.display().to_string()),
+                _ => std::env::var(name).ok(),
+            };
+            if let Some(value) = value {
+                expected.push(format!("{name}={value}"));
+            }
+        }
+        expected.push("RUSTUP_AUTO_INSTALL=0".to_owned());
+    } else {
+        expected.extend([
+            "CARGO_NET_OFFLINE=true".to_owned(),
+            format!(
+                "PATH={}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+            format!("RUSTC={rustc}"),
+            "RUSTUP_AUTO_INSTALL=0".to_owned(),
+            format!("RUSTUP_TOOLCHAIN={}", toolchain.display()),
+        ]);
+    }
+    expected.push(cargo);
+    expected.extend(cargo_args.into_iter().map(str::to_owned));
+    let actual = replay["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "complete Rust replay recipe: {replay}");
 }
 
 /// Polls the positional Symbol query until rust-analyzer answers semantically (60 s).
@@ -312,8 +474,8 @@ fn analyzer(tree: &ProcessTree) -> Option<(parity::Node, ProcessIdentity)> {
         })
 }
 
-/// The transcript of one daemon run with `env`: source-first answers, the semantic and editing
-/// rows, the landed project check, then an edit of a file the crate never compiles.
+/// The transcript of one daemon run with `env`: source-first answers, semantic and editing rows,
+/// the landed project check, then an exact read/edit check of a file the crate never compiles.
 async fn run(fixture: &Fixture, env: &[(&str, &str)]) -> (Vec<String>, ProcessTree, Daemon) {
     let mut daemon = Daemon::start(fixture, env).await;
     let mut session = Session::start(fixture).await;
@@ -327,8 +489,9 @@ async fn run(fixture: &Fixture, env: &[(&str, &str)]) -> (Vec<String>, ProcessTr
         let reply = session.call(fixture, tool, arguments.clone()).await;
         replies.push(record(fixture, tool, &arguments, &reply));
     }
+    let module = env.contains(&MODULE);
     for arguments in test_runs() {
-        replies.extend(test_run(&mut session, fixture, arguments).await);
+        replies.extend(test_run(&mut session, fixture, arguments, module).await);
     }
     replies.push(
         problems(&mut session, fixture, Duration::from_secs(120), |text| {
@@ -338,10 +501,23 @@ async fn run(fixture: &Fixture, env: &[(&str, &str)]) -> (Vec<String>, ProcessTr
     );
     let read = json!({"path":"src/orphan.rs","lines":"1-3"});
     let observed = session.call(fixture, "ide.read", read.clone()).await;
+    let orphan_path = fixture.root.join("src/orphan.rs");
+    assert_eq!(
+        std::fs::read(&orphan_path).unwrap(),
+        b"pub fn orphan() -> u8 {\n    1\n}\n"
+    );
     replies.push(record(fixture, "ide.read", &read, &observed));
     let orphan = json!({"operation_id":"p-orphan","op":"replace","path":"src/orphan.rs",
         "lines":"2-2","content":"    2","source_ref":observed["detail_ref"]});
     let reply = session.call(fixture, "ide.edit", orphan.clone()).await;
+    assert_eq!(reply["state"], "edit", "{reply}");
+    assert_eq!(reply["result"]["outcome"], "replaced", "{reply}");
+    assert_eq!(reply["result"]["path"], "src/orphan.rs", "{reply}");
+    assert_eq!(
+        std::fs::read(&orphan_path).unwrap(),
+        b"pub fn orphan() -> u8 {\n    2\n}\n",
+        "the source-only edit lands without claiming compile coverage"
+    );
     replies.push(record(fixture, "ide.edit", &orphan, &reply));
     let tree = daemon.tree();
     session.close(fixture).await;
@@ -390,10 +566,14 @@ async fn rust_module_and_in_process_transcripts_are_equal() {
             ("expected failure", "libtest failure message parsed"),
             ("rust: ready", "the check landed"),
             ("unused", "the check reported the warning"),
-            ("not_analysed", "module-graph noncoverage"),
         ] {
             assert!(all.contains(needle), "{row}: {needle:?} missing in\n{all}");
         }
+        assert!(
+            all.contains("graph: callers and callees of src/lib.rs#user")
+                && all.contains("\n  +3 tests"),
+            "the graph reports its bounded call chain and omitted test count:\n{all}"
+        );
     }
     let masked = |replies: &[String]| {
         replies
@@ -872,9 +1052,9 @@ async fn changed_rust_native_inputs_retire_the_live_session() {
 }
 
 /// The actual edit/format consumers in both hosting modes use the target member's environment
-/// and rustfmt config. A stable root formats successfully; its nightly member refuses without
-/// writing, then a compatible member formats with its own hard-tab configuration. All owned
-/// provider children are reaped; only existing accepted tools run, with no manager/install.
+/// and rustfmt config. A stable root edit returns an edit-state replacement; its nightly member
+/// refuses without writing, then a compatible member formats with its own hard-tab configuration.
+/// All owned provider children are reaped; only existing accepted tools run, with no manager/install.
 #[tokio::test]
 #[ignore = "requires the accepted Rust inputs, including prepared bin/rustfmt; explicit formatter scope regression"]
 async fn nested_formatter_scope_is_current_in_native_and_module_consumers() {
@@ -898,10 +1078,9 @@ async fn nested_formatter_scope_is_current_in_native_and_module_consumers() {
             .call(&fixture, "ide.read", json!({"symbol":"src/lib.rs#user"}))
             .await;
         let root_edit=session.call(&fixture,"ide.edit",json!({"operation_id":"root-format","op":"replace","symbol":"src/lib.rs#user","content":"pub   fn user()->bool{true}"})).await;
-        assert_eq!(
-            root_edit["kind"], "edit",
-            "{label}: root formatter control: {root_edit}"
-        );
+        assert_eq!(root_edit["state"], "edit", "{label}: {root_edit}");
+        assert_eq!(root_edit["result"]["outcome"], "replaced", "{root_edit}");
+        assert_eq!(root_edit["result"]["path"], "src/lib.rs", "{root_edit}");
         assert!(
             std::fs::read_to_string(fixture.root.join("src/lib.rs"))
                 .unwrap()
@@ -947,7 +1126,9 @@ async fn nested_formatter_scope_is_current_in_native_and_module_consumers() {
             )
             .await;
         let edited=session.call(&fixture,"ide.edit",json!({"operation_id":"member-stable","op":"replace","symbol":"legacy/src/lib.rs#value","content":"pub   fn value()->i32{2}"})).await;
-        assert_eq!(edited["kind"], "edit", "{label}: {edited}");
+        assert_eq!(edited["state"], "edit", "{label}: {edited}");
+        assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+        assert_eq!(edited["result"]["path"], "legacy/src/lib.rs", "{edited}");
         let after = std::fs::read_to_string(fixture.root.join("legacy/src/lib.rs")).unwrap();
         assert!(
             after.contains("\n\t2\n"),

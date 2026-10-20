@@ -43,6 +43,7 @@ use std::{
 
 use agent_ide_core::execution::seatbelt::ReadDeny;
 use agent_ide_core::lang::environment::{CommandEnv, EnvCandidate, EnvSource, ResolvedEnv};
+use agent_ide_core::modules::contract::ModuleConfig;
 
 use crate::checks::{
     PYPROJECT_FILE, PYRIGHT_CONFIG_FILE, allowed_file, read_config, read_pyproject_venv_keys,
@@ -932,20 +933,32 @@ pub(crate) fn for_path(worktree: &Path, path: &Path) -> Option<Resolution> {
         .or_else(|| governing(worktree))
 }
 
-/// The roots a run of `worktree`'s accepted environments reads: each chosen environment directory
-/// and its interpreter's canonical installation prefix (a base interpreter outside every static
-/// prefix, such as a user-home installation, included), exactly as the in-process check grants.
-pub fn accepted_roots(worktree: &Path) -> Vec<PathBuf> {
+/// The roots a run of `worktree`'s currently chosen Python environments reads: each selected
+/// interpreter's invocation prefix and the installation prefix the checker derives for that
+/// interpreter. Empty read-deny policies use filesystem canonicalization; nonempty policies use
+/// the checker's deny-safe link resolver. A missing or unprovable canonical target contributes no
+/// roots; the recipe's separately admitted environment root remains independent.
+pub fn accepted_roots(worktree: &Path, config: &ModuleConfig) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for env in environments(worktree, &[]) {
+    for env in environments(worktree, &config.read_denies) {
+        if env.missing_next_step.is_some() {
+            continue;
+        }
         let Some(interpreter) = interpreter(&env) else {
             continue;
         };
-        let canonical = fs::canonicalize(&interpreter).unwrap_or_else(|_| interpreter.clone());
+        let canonical = if config.read_denies.is_empty() {
+            fs::canonicalize(&interpreter).ok()
+        } else {
+            crate::checks::resolved_link_target(&interpreter, &config.read_denies)
+        };
+        let Some(canonical) = canonical else {
+            continue;
+        };
         for path in [&interpreter, &canonical] {
-            let prefix = path.parent().and_then(Path::parent).unwrap_or(path);
-            if !roots.iter().any(|root| root == prefix) {
-                roots.push(prefix.to_path_buf());
+            let prefix = crate::checks::grandparent_or_self(path);
+            if !roots.contains(&prefix) {
+                roots.push(prefix);
             }
         }
     }
@@ -1548,26 +1561,69 @@ mod tests {
         fs::remove_dir_all(&outside).unwrap();
     }
 
-    /// The accepted roots are the chosen environment and its interpreter's canonical installation
-    /// prefix, reached through the `bin/python` link even when it lies outside every static
-    /// prefix; a project without an environment accepts nothing.
+    /// Accepted roots follow only the chosen interpreter and honor the current read-deny policy.
     #[test]
     fn accepted_roots_follow_the_interpreter_link() {
         let root = scratch("accepted-roots");
-        let base = scratch("accepted-roots-base");
+        let base = fs::canonicalize(scratch("accepted-roots-base")).unwrap();
+        let base_alias = root.join("python-base-alias");
+        let unrelated = scratch("accepted-roots-unrelated");
         put(&base, "bin/python3.14", "");
+        put(&unrelated, "bin/python3.14", "");
+        std::os::unix::fs::symlink(&base, &base_alias).unwrap();
         put(&root, "pyproject.toml", "");
-        fs::create_dir_all(root.join(".venv/bin")).unwrap();
-        std::os::unix::fs::symlink(base.join("bin/python3.14"), root.join(".venv/bin/python"))
-            .unwrap();
+        for name in [".venv", ".venv-alt"] {
+            fs::create_dir_all(root.join(name).join("bin")).unwrap();
+            put(&root, &format!("{name}/pyvenv.cfg"), "version = 3.14.0\n");
+        }
+        std::os::unix::fs::symlink(
+            base_alias.join("bin/python3.14"),
+            root.join(".venv/bin/python"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            unrelated.join("bin/python3.14"),
+            root.join(".venv-alt/bin/python"),
+        )
+        .unwrap();
+        select(&root, "", ".venv");
+        let config = ModuleConfig::default();
         assert_eq!(
-            accepted_roots(&root),
-            vec![root.join(".venv"), fs::canonicalize(&base).unwrap()]
+            accepted_roots(&root, &config),
+            vec![root.join(".venv"), base.clone()]
         );
+        let denied = ModuleConfig {
+            read_denies: vec![ReadDeny::Path(base.clone())],
+            ..ModuleConfig::default()
+        };
+        // A nonempty deny policy keeps symlinked parents fail-closed, matching the checker.
+        assert!(accepted_roots(&root, &denied).is_empty());
+        let unrelated_deny = ModuleConfig {
+            read_denies: vec![ReadDeny::Path(fs::canonicalize(&unrelated).unwrap())],
+            ..ModuleConfig::default()
+        };
+        assert!(accepted_roots(&root, &unrelated_deny).is_empty());
+
+        fs::remove_file(root.join(".venv/bin/python")).unwrap();
+        std::os::unix::fs::symlink(
+            unrelated.join("bin/python3.14"),
+            root.join(".venv/bin/python"),
+        )
+        .unwrap();
+        let denied_changed_target = ModuleConfig {
+            read_denies: vec![ReadDeny::Path(fs::canonicalize(&unrelated).unwrap())],
+            ..ModuleConfig::default()
+        };
+        assert!(accepted_roots(&root, &denied_changed_target).is_empty());
+
         fs::remove_dir_all(root.join(".venv")).unwrap();
-        assert!(accepted_roots(&root).is_empty());
+        // The explicit selection is missing; a different discovered environment is not a fallback.
+        assert!(accepted_roots(&root, &config).is_empty());
+        fs::remove_dir_all(root.join(".venv-alt")).unwrap();
+        agent_ide_core::lang::environment::replace_selections(&root, crate::LANGUAGE, Vec::new());
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&base).unwrap();
+        fs::remove_dir_all(&unrelated).unwrap();
     }
 
     /// Explicit commands run activated in the environment of the deepest root holding `cwd`,
@@ -1647,7 +1703,8 @@ mod tests {
     /// Real Pyright: `.venv` lacks `stub_package`, `.venv-py314` provides it. Before the
     /// selection the project check reports the import unresolved; after selecting
     /// `.venv-py314` the same check resolves it. Needs `AGENT_IDE_PYRIGHT`, `AGENT_IDE_NODE` and
-    /// `AGENT_IDE_PYTHON` like the product tests.
+    /// `AGENT_IDE_PYTHON` like the product tests. Runs the public package `index.js` entry so its
+    /// bootstrap initializes the bundled typeshed root.
     #[tokio::test]
     #[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
     async fn real_pyright_check_follows_the_selected_environment() {
@@ -1659,25 +1716,12 @@ mod tests {
         let cli = pyright
             .parent()
             .and_then(Path::parent)
-            .map(|prefix| prefix.join("lib/node_modules/pyright/dist/pyright.js"))
+            .map(|prefix| prefix.join("lib/node_modules/pyright/index.js"))
             .map(|cli| fs::canonicalize(&cli).unwrap_or(cli))
             .unwrap();
         let root = fs::canonicalize(scratch("real-selection")).unwrap();
         put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
         put(&root, "src/app.py", "from stub_package import VALUE\n");
-        // Pyright 1.1.413 flags parts of the 3.14 standard library itself; ignore them so only the
-        // import under test counts. No `venv` key: this config pins nothing.
-        let prefix = fs::canonicalize(&python)
-            .unwrap()
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .to_path_buf();
-        put(
-            &root,
-            "pyrightconfig.json",
-            &serde_json::json!({ "ignore": [prefix] }).to_string(),
-        );
         for name in [".venv", ".venv-py314"] {
             let interpreter = root.join(name).join("bin/python");
             fs::create_dir_all(interpreter.parent().unwrap()).unwrap();

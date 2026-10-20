@@ -72,13 +72,14 @@ fn python_venv_named(dir: &Path, name: &str) {
     .unwrap();
 }
 
-/// The accepted Pyright's own CLI module (beside its language server).
+/// The accepted public Pyright package entry point beside its language server; unlike the
+/// internal `dist/pyright.js`, `index.js` initializes the package root used to load bundled typeshed.
 fn pyright_cli() -> PathBuf {
     let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
     Path::new(&pyright)
         .parent()
         .and_then(Path::parent)
-        .map(|bin| bin.join("lib/node_modules/pyright/dist/pyright.js"))
+        .map(|bin| bin.join("lib/node_modules/pyright/index.js"))
         .map(|cli| std::fs::canonicalize(&cli).unwrap_or(cli))
         .expect("the pyright CLI module sits beside the language server")
 }
@@ -244,8 +245,10 @@ async fn python_module_matches_in_process_answers() {
     assert!(!direct, "no language server is a direct daemon child");
     let problems = in_process.last().unwrap();
     assert!(
-        problems.contains("python: ready") || problems.contains("python: partial"),
-        "the in-process check landed:\n{problems}"
+        problems.contains("python: ready; errors: 1")
+            && problems.contains("main.py:")
+            && problems.contains("error [reportReturnType]"),
+        "the fixture's project error remains after suppressing stdlib noise:\n{problems}"
     );
     assert!(moduled.iter().any(|reply| reply.contains("mode: semantic")));
     assert!(
@@ -304,8 +307,9 @@ else:
             f.write(fmt(text))
 "#;
 
-/// [`python_fixture`] plus a test file, black configured as the formatter, and the
-/// [`PYTEST_STAND_IN`] and [`BLACK_STAND_IN`] modules, committed.
+/// [`python_fixture`] plus a test that checks the selected interpreter's live environment, black
+/// configured as the formatter, and the [`PYTEST_STAND_IN`] and [`BLACK_STAND_IN`] modules,
+/// committed.
 fn python_edit_fixture(cache: &str) -> Fixture {
     let fixture = python_fixture(cache, None);
     for (path, text) in [
@@ -315,7 +319,7 @@ fn python_edit_fixture(cache: &str) -> Fixture {
         ),
         (
             "tests/test_helper.py",
-            "from helper import double\n\n\ndef test_double():\n    assert double(2) == 4\n",
+            "import os\nimport sys\nfrom pathlib import Path\n\nfrom helper import double\n\n\ndef test_double():\n    \"\"\"Checks the selected interpreter's environment and the fixture function.\"\"\"\n    selected = Path(__file__).resolve().parents[1] / \".venv-alt\"\n    assert Path.cwd() == selected.parent\n    assert Path(sys.prefix) == selected\n    assert Path(sys.executable).resolve() == (selected / \"bin/python\").resolve()\n    assert os.environ[\"VIRTUAL_ENV\"] == str(selected)\n    assert Path(os.environ[\"PATH\"].split(os.pathsep)[0]) == selected / \"bin\"\n    assert double(2) == 4\n",
         ),
         (".gitignore", "__pycache__/\n.venv/\n.venv-alt/\n"),
         ("pytest/__init__.py", ""),
@@ -372,8 +376,9 @@ fn edit_calls() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// The transcript of [`edit_calls`] on a fresh [`python_edit_fixture`] and daemon with `env`,
-/// with the Pyright-hosting module seen and the daemon.
+/// Selects `.venv-alt`, waits for its existing semantic readiness query, then records the
+/// remaining [`edit_calls`] on a fresh [`python_edit_fixture`] and daemon with `env`; returns the
+/// Pyright-hosting module when present and the daemon.
 async fn run_edit_transcript(
     cache: &str,
     env: &[(&str, &str)],
@@ -381,13 +386,37 @@ async fn run_edit_transcript(
     let fixture = python_edit_fixture(cache);
     let mut daemon = Daemon::start(&fixture, env).await;
     let mut session = Session::start(&fixture).await;
-    // Edits wait for a warm server, as an agent would after reading.
-    let warm = session
-        .call(&fixture, "ide.symbol", json!({"symbol":"helper.py#double"}))
-        .await;
-    assert_eq!(warm["kind"], "symbol", "{warm}");
-    let mut replies = Vec::new();
-    for (tool, arguments) in edit_calls() {
+    let mut calls = edit_calls().into_iter();
+    let (tool, arguments) = calls
+        .next()
+        .expect("the transcript selects an environment first");
+    assert_eq!(tool, "ide.start");
+    let start = session.call(&fixture, tool, arguments.clone()).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+    let mut replies = vec![line_for(&fixture, tool, &arguments, &start)];
+
+    let helper = std::fs::read_to_string(fixture.root.join("helper.py")).unwrap();
+    let offset = helper.find("double").expect("the helper defines double");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let request = json!({"path":"helper.py","byte_offset":offset});
+        let (tool, arguments) = source_query(request);
+        let warm = session.call(&fixture, tool, arguments).await;
+        let text = warm["text"].as_str().unwrap_or_default();
+        if warm["kind"] == "symbol" && text.contains("mode: semantic") {
+            break;
+        }
+        assert!(
+            warm["kind"] == "symbol"
+                && (text.contains("mode: lexical (semantic provider is still loading")
+                    || text.contains("mode: lexical (module refused: Warming)")),
+            "the selected Python provider becomes semantically ready: {warm}"
+        );
+        assert!(Instant::now() < deadline, "provider readiness: {warm}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for (tool, arguments) in calls {
         let mut reply = session.call(&fixture, tool, arguments.clone()).await;
         // A test run starts in the background: its settled status is the answer.
         if tool == "ide.test" {
@@ -403,8 +432,30 @@ async fn run_edit_transcript(
                     .await;
             }
         }
-        replies.push(line_for(&fixture, tool, &arguments, &reply));
+        let rendered = line_for(&fixture, tool, &arguments, &reply);
+        if tool == "ide.test" {
+            assert_python_test_recipe(&mut session, &fixture, &reply, env.is_empty()).await;
+            replies.push(normalize_verified_test_footer(&rendered));
+        } else {
+            replies.push(rendered);
+        }
     }
+    assert_eq!(
+        std::fs::read(fixture.root.join("helper.py")).unwrap(),
+        b"def twice(x: int) -> int:\n    return x + x\n",
+        "the formatted and renamed helper bytes are exact"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("main.py")).unwrap(),
+        b"from helper import twice\n\n\nclass Greeter:\n    def greet(self, name: str) -> str:\n        return \"hi \" + name\n\n\ndef run() -> int:\n    return twice(2)\n\n\ndef added() -> int:\n    return twice(3)\n\n\ndef bad() -> int:\n    return \"bad\"\n",
+        "the inserted and renamed source bytes are exact"
+    );
+    assert!(
+        replies
+            .iter()
+            .any(|reply| reply.contains("2\t    return x + x\n")),
+        "the read returns numbered source with formatter-stripped trailing blanks"
+    );
     // The start card names where Python computes; every other byte must agree.
     let mode = if env.is_empty() {
         "\nmodules: python module"
@@ -416,6 +467,133 @@ async fn run_edit_transcript(
     let module = provider_module(&mut daemon);
     session.close(&fixture).await;
     (replies, module, daemon, fixture)
+}
+
+/// Verifies the selected Python test run's terminal facts and route-specific replay recipe.
+///
+/// Short reruns expose complete argv and environment inline; clipped reruns are recovered through
+/// the owner-authorized output pages and include the working directory in their JSON receipt. The
+/// fixture test independently checks cwd and the selected interpreter's live environment.
+async fn assert_python_test_recipe(
+    session: &mut Session,
+    fixture: &Fixture,
+    reply: &Value,
+    module: bool,
+) {
+    assert_eq!(reply["state"], "complete", "{reply}");
+    assert_eq!(reply["kind"], "test", "{reply}");
+    let text = reply["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("1 passed, 0 failed")
+            && text.contains("(exit 0)")
+            && text.contains("env .venv-alt"),
+        "the selected-environment test actually passed: {text}"
+    );
+    let rerun = text
+        .lines()
+        .find(|line| line.starts_with("  rerun:") || line.starts_with("  rerun preview:"))
+        .expect("a started test has a replay recipe");
+    let root = fixture.root.canonicalize().unwrap();
+    let venv = root.join(".venv-alt");
+    let bin = venv.join("bin");
+    let python = bin.join("python");
+    let arguments = [
+        "-m",
+        "pytest",
+        "tests/test_helper.py",
+        "--no-header",
+        "-p",
+        "no:cacheprovider",
+    ];
+    let mut expected_argv = vec!["/usr/bin/env".to_owned()];
+    let expected = if module {
+        expected_argv.push("-i".to_owned());
+        let home = agent_ide::userhome::user_home().unwrap();
+        let path = format!(
+            "{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+            bin.display()
+        );
+        expected_argv.extend([
+            format!("HOME={}", home.display()),
+            format!("PATH={path}"),
+            format!("VIRTUAL_ENV={}", venv.display()),
+        ]);
+        format!(
+            "  rerun: /usr/bin/env -i 'HOME={}' 'PATH={path}' 'VIRTUAL_ENV={}' {} {}",
+            home.display(),
+            venv.display(),
+            python.display(),
+            arguments.join(" ")
+        )
+    } else {
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        expected_argv.extend([
+            format!("PATH={path}"),
+            format!("VIRTUAL_ENV={}", venv.display()),
+        ]);
+        format!(
+            "  rerun: /usr/bin/env 'PATH={path}' 'VIRTUAL_ENV={}' {} {}",
+            venv.display(),
+            python.display(),
+            arguments.join(" ")
+        )
+    };
+    expected_argv.push(python.display().to_string());
+    expected_argv.extend(arguments.into_iter().map(str::to_owned));
+
+    if rerun.starts_with("  rerun preview:") {
+        assert!(rerun.ends_with('…'), "{rerun}");
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("  full replay: ide.test "))
+            .expect("a clipped recipe carries its complete replay");
+        let query: Value =
+            serde_json::from_str(line.strip_prefix("  full replay: ide.test ").unwrap())
+                .expect("the replay line is JSON");
+        let replay = parity::recover_test_replay(
+            session,
+            fixture,
+            query["output"].as_str().expect("the replay page cursor"),
+        )
+        .await;
+        assert_eq!(
+            replay["cwd"], ".",
+            "the recipe starts at the fixture root: {replay}"
+        );
+        let argv = replay["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|argument| argument.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(argv, expected_argv, "complete Python replay: {replay}");
+    } else {
+        assert_eq!(rerun, expected, "complete route-specific Python recipe");
+        assert!(
+            !text.contains("  full replay:"),
+            "a complete short rerun needs no hidden replay: {text}"
+        );
+    }
+}
+
+/// Replaces only a Python test footer whose exact route was verified by
+/// [`assert_python_test_recipe`], keeping the shared transcript normalizer strict.
+fn normalize_verified_test_footer(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.starts_with("  full replay: ide.test "))
+        .map(|line| {
+            if line.starts_with("  rerun:") || line.starts_with("  rerun preview:") {
+                "  rerun: <route-verified Python recipe>"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Python's changing answers are the same in module mode and in process, each on its own fresh
@@ -441,13 +619,12 @@ async fn python_module_edits_match_in_process() {
         "from helper import twice",
         "tests #1: 1 passed, 0 failed",
         "environment: python .venv-alt",
-        "rerun: <root>/.venv-alt/bin/python -m pytest",
     ] {
         assert!(joined.contains(expected), "{expected}:\n{joined}");
     }
     assert!(
-        joined.contains("2\t    return x + x\nsource_ref"),
-        "the formatter stripped the trailing blanks:\n{joined}"
+        joined.contains("2\t    return x + x\n"),
+        "the numbered source preserves the returned bytes:\n{joined}"
     );
     parity::assert_parity(&in_process, &moduled);
     let owned = daemon.tree().all();

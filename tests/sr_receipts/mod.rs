@@ -104,9 +104,12 @@ while (my $header=<STDIN>) {
 "#.replace("@GATE@", gate.to_str().unwrap());
     std::fs::write(&program, script).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
-        "settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1",
-        "rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"held-diagnostics"}]));
+    write_fixture_rust_provider(
+        fixture,
+        &program,
+        "rust-analyzer 1.98.1 (48a229ce 2026-09-01)",
+        "held-diagnostics",
+    );
 }
 
 /// Waits on the provider's actual post-write synchronization checkpoint; elapsed time is only
@@ -275,6 +278,17 @@ async fn ready_provider_fallback_is_post_receipt_and_does_not_block_plain_read()
         let retry = actor.call(&fixture, "ide.edit", parameters).await;
         assert_eq!(retry["result"]["source_ref"], reference, "{retry}");
         std::fs::remove_file(&gate).unwrap();
+        let publication = tokio::time::timeout(Duration::from_secs(5), publications.recv())
+            .await
+            .unwrap()
+            .expect("one useful accepted fallback terminal attempt");
+        assert!(
+            publication.to_string().contains("edit-checked")
+                && publication
+                    .to_string()
+                    .contains("fixture post-write type error"),
+            "{publication}"
+        );
         let terminal = actor
             .call(
                 &fixture,
@@ -291,17 +305,6 @@ async fn ready_provider_fallback_is_post_receipt_and_does_not_block_plain_read()
                 .to_string()
                 .contains("fixture post-write type error"),
             "{terminal}"
-        );
-        let publication = tokio::time::timeout(Duration::from_secs(5), publications.recv())
-            .await
-            .unwrap()
-            .expect("one useful accepted fallback terminal attempt");
-        assert!(
-            publication.to_string().contains("edit-checked")
-                && publication
-                    .to_string()
-                    .contains("fixture post-write type error"),
-            "{publication}"
         );
         for settled in [&terminal, &publication] {
             assert!(
@@ -340,7 +343,7 @@ fn usable_events(home: &Path) -> Vec<agent_ide::errorlog::LoggedEvent> {
 #[tokio::test]
 async fn usable_journal_requires_actual_source_or_confirmed_receipt() {
     let fixture = ProductFixture::new(json!([]));
-    let home = provider_home(&fixture);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = ProductActor::new(&fixture, "usable-journal").await;
     let start = actor.call(&fixture, "ide.start", json!({})).await;
