@@ -321,3 +321,65 @@ checks add a bounded reason when the checker reported one (or say no reason was 
 `{"kind":"problems","language"?,"offset"?}` returns counts and up to 20 problems per call with
 `next_offset`. One `ProjectCheckCompleted` telemetry event (bucketed counts, no paths or messages)
 extends the TELEMETRY-r1 event scope.
+
+## Experimental Jev support pilot
+
+Build with `--features jev-pilot` to include the optional client. The same executable
+supports restart-only `jev_pilot.mode` values `off` (default) and `jev`. Existing
+checks and the ten public tools are unchanged. A malformed or incomplete helper
+section disables only the helper and records a fixed safe operator reason.
+
+```json
+"jev_pilot": {
+  "mode": "jev",
+  "route": "opencode",
+  "task": "Review the changed behavior using observed project evidence.",
+  "credential_file": "/absolute/private/key-file",
+  "egress_allowed": true,
+  "initial_scope": ["src/example.ts"],
+  "trace_dir": "/absolute/private/existing-trace-directory"
+}
+```
+
+`route` selects exactly `opencode` (default: OpenCode System One,
+`jev-1.13-free`) or `typesafe` (`https://api.typesafe.ai/v1/systemone`,
+`jev-1.13.0`). There are no custom endpoints, models, retries or provider fallbacks.
+The key file must be canonical, regular, owned by the current user, inaccessible
+to group/world and at most 4096 bytes. The existing trace directory must be
+canonical, owner-only and private. OFF never opens a key, constructs HTTP or sends.
+The task is nonempty and at most 1024 UTF-8 bytes. Scope paths must be relative;
+only current writer authority can admit their bounded private source reads.
+Those reads never become main-agent source receipts.
+
+One real confirmed edit starts a 250 ms coalesced optional episode. Native changes
+qualify only after normal MCP authorization/reconciliation. The episode binds
+exact task, activation, binding generation, source versions and change epoch.
+Verified edit geometry supplies a bounded window around the actual changed byte;
+missing geometry is explicitly unavailable. Scope alternatives remain selectable.
+Only previously observed or explicitly scoped files are read: at most eight unique
+files and 2 MiB aggregate bytes including freshness rereads, under the existing
+1 MiB per-file reader ceiling.
+Model state is at most 8 KiB; options at most twelve; ready graph borrowing is
+currently unavailable (zero graph requests). Source and relationship coverage is
+explicitly partial. No new provider warming or source index is introduced.
+
+At most two decisions, including test choice, run within five seconds of compute;
+each HTTP exchange has a 1.5-second total deadline. The helper may inspect, expand
+or reopen existing snapshots, suggest a next-natural-reply review, remain inactive,
+or choose one existing core-admitted test. The run option names the actual observed
+test target; source-to-test relation is unverified. Without an admitted recipe no
+automatic test is offered. Choice confidence must be at least 0.5 and an independent
+usefulness Noul at least 0.8. A test uses existing admission, output/replay retention
+and canonical completion delivery, within min(recipe timeout, 30 seconds). Same-root
+busy is exclusion only; foreign output is never reused or cancelled. Explicit main
+tests cancel only their exact binding's optional work and wait for actual cleanup;
+a delay above two seconds is recorded as a violation. Stop/shutdown cancel and join
+owned optional work. Started results remain historical when source changes.
+
+Private JSONL records retain exact state, ordered options and requests without auth,
+bounded redacted responses, transport timing/status/bytes, reported usage, per-field
+token coverage and dated tariff estimates. Missing/interrupted usage and actual
+provider charges remain unknown. A durable exclusive task/worktree claim and a
+flushed pre-send pending record prevent restart replay from hiding attempted work.
+Changing the task text creates a new task identity. Trace files contain private
+project context and are not sent to the main agent or ordinary logs.

@@ -48,6 +48,8 @@ impl Default for TestRuns {
 /// Mutable run registry protected only while job metadata is read or changed.
 #[derive(Default)]
 struct State {
+    /// Exact typed support origins, separate from main-agent calls and same-root exclusion.
+    support_origins: BTreeMap<u64, SupportOrigin>,
     /// Highest allocated daemon-local identifier; identifiers start at one and never repeat.
     next_id: u64,
     /// Retained jobs keyed by daemon-local id and partitioned by `Job::root`.
@@ -55,6 +57,20 @@ struct State {
     /// Called with a run's id right after its result is recorded (the session outbox's
     /// `test-finished` producer); absent until the worker installs it.
     on_settle: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+}
+
+/// Internal authority of one optional test; never accepted through model/tool arguments.
+#[derive(Clone)]
+pub(crate) struct SupportOrigin {
+    /// Exact host binding generation owning cancellation and result disclosure.
+    pub binding: BindingRef,
+    /// Durable workspace authority generation proved immediately before admission.
+    pub authority_epoch: u64,
+    /// Stable configured task digest; does not confer authority by itself.
+    pub task: [u8; 32],
+    /// Exact native/edit source epoch at optional admission; later differences label history.
+    #[cfg(feature = "jev-pilot")]
+    pub source_epoch: super::outbox::JobEpoch,
 }
 
 /// One job's worktree, command, timing, and optional completed report/output.
@@ -353,7 +369,7 @@ impl TestRuns {
             rerun_dir,
             environment_label: resolution.environment_label,
         };
-        self.register(&mut state, root, owner, child, lease, launch)
+        self.register(&mut state, root, owner, child, lease, launch, None)
     }
 
     /// Starts the run the core expanded and admitted from a language's declared test recipe:
@@ -378,6 +394,82 @@ impl TestRuns {
         detail_ref: String,
         environment_label: Option<String>,
     ) -> StartResult {
+        self.start_admitted_origin(
+            root,
+            spec,
+            _command,
+            owner,
+            language,
+            budget,
+            detail_ref,
+            environment_label,
+            None,
+        )
+    }
+
+    /// Starts an optional test only with explicit internal task/generation ownership. The origin
+    /// binding must equal `owner` and its durable epoch be nonzero; all ordinary recipe, process,
+    /// output, timeout and same-root exclusion rules remain those of `start_admitted`.
+    #[cfg(feature = "jev-pilot")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "same admitted recipe boundary plus typed support authority"
+    )]
+    pub(crate) fn start_support_admitted(
+        &self,
+        root: PathBuf,
+        spec: crate::checks::runner::RunSpec,
+        command: Vec<String>,
+        owner: &BindingRef,
+        language: Language,
+        budget: Duration,
+        detail_ref: String,
+        origin: SupportOrigin,
+    ) -> StartResult {
+        if origin.binding != *owner || origin.authority_epoch == 0 {
+            return StartResult::Failed {
+                error: "support authority invalid".into(),
+                not_found: false,
+            };
+        }
+        self.start_admitted_origin(
+            root,
+            spec,
+            command,
+            owner,
+            language,
+            budget,
+            detail_ref,
+            None,
+            Some(origin),
+        )
+    }
+
+    /// Common admitted start; records a typed optional origin atomically with job registration.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "shared existing recipe boundary and optional internal origin"
+    )]
+    fn start_admitted_origin(
+        &self,
+        root: PathBuf,
+        spec: crate::checks::runner::RunSpec,
+        _command: Vec<String>,
+        owner: &BindingRef,
+        language: Language,
+        budget: Duration,
+        detail_ref: String,
+        environment_label: Option<String>,
+        origin: Option<SupportOrigin>,
+    ) -> StartResult {
+        if origin.as_ref().is_some_and(|origin| {
+            origin.binding != *owner || origin.authority_epoch == 0 || origin.task == [0; 32]
+        }) {
+            return StartResult::Failed {
+                error: "support authority invalid".into(),
+                not_found: false,
+            };
+        }
         let mut state = match self.0.lock() {
             Ok(state) => state,
             Err(error) => {
@@ -425,10 +517,14 @@ impl TestRuns {
                 .map(|relative| relative.display().to_string()),
             environment_label,
         };
-        self.register(&mut state, root, owner, child, lease, launch)
+        self.register(&mut state, root, owner, child, lease, launch, origin)
     }
 
     /// Records a spawned run as the next job of `root` and settles it in the background.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "existing run facts plus explicit internal support origin"
+    )]
     fn register(
         &self,
         state: &mut std::sync::MutexGuard<'_, State>,
@@ -437,9 +533,13 @@ impl TestRuns {
         child: Spawned,
         lease: crate::retention::SettledLease,
         launch: Launch,
+        origin: Option<SupportOrigin>,
     ) -> StartResult {
         state.next_id = state.next_id.saturating_add(1);
         let id = state.next_id;
+        if let Some(origin) = origin {
+            state.support_origins.insert(id, origin);
+        }
         let started = tokio::time::Instant::now();
         let cancel = tokio_util::sync::CancellationToken::new();
         state.jobs.insert(
@@ -519,6 +619,12 @@ impl TestRuns {
     /// while it runs or once it was pruned.
     pub fn settled_result(&self, id: u64) -> Option<RunResult> {
         self.0.lock().ok()?.jobs.get(&id)?.result.clone()
+    }
+
+    /// Returns immutable support origin only for an internally admitted optional test.
+    #[cfg(feature = "jev-pilot")]
+    pub(crate) fn support_origin(&self, id: u64) -> Option<SupportOrigin> {
+        self.0.lock().ok()?.support_origins.get(&id).cloned()
     }
 
     /// Marks `id` as an explicit command only when it belongs to `owner`; missing or foreign ids
@@ -736,6 +842,18 @@ impl TestRuns {
             })
         })
     }
+
+    /// Reports only a live same-root child. This is exclusion, never equivalence of test targets
+    /// or permission to reuse output or cancel another binding's process.
+    #[cfg(feature = "jev-pilot")]
+    pub(crate) fn running(&self, root: &std::path::Path) -> bool {
+        self.0.lock().map_or(true, |state| {
+            state
+                .jobs
+                .values()
+                .any(|job| job.root == root && job.result.is_none())
+        })
+    }
 }
 
 /// Removes the oldest finished runs until each worktree retains at most four.
@@ -748,7 +866,9 @@ fn prune_completed(registry: &Arc<Mutex<State>>, root: &PathBuf) {
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         while completed.len() > COMPLETED_PER_WORKTREE {
-            state.jobs.remove(&completed.remove(0));
+            let id = completed.remove(0);
+            state.jobs.remove(&id);
+            state.support_origins.remove(&id);
         }
     }
 }

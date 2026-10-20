@@ -11,6 +11,7 @@ description = "Language-independent core of Agent IDE: sessions, providers, chec
 path = "src/lib.rs"
 
 [dependencies]
+reqwest = { workspace = true, optional = true }
 bridge-sdk.workspace = true
 async-lsp.workspace = true
 blake3.workspace = true
@@ -25,6 +26,8 @@ tokio-util.workspace = true
 tower-service.workspace = true
 
 [features]
+# Optional HTTP transport for the bounded support pilot.
+jev-pilot = ["dep:reqwest"]
 # Honours the `AGENT_IDE_*` test seams (see `test_seams`); never enabled in a release build.
 test-seams = []
 

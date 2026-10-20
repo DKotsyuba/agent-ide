@@ -63,6 +63,8 @@ mod progress;
 mod providers;
 #[path = "snapshots.rs"]
 pub(super) mod snapshots;
+#[path = "support.rs"]
+mod support;
 #[path = "symbols.rs"]
 mod symbols;
 #[path = "takeover.rs"]
@@ -878,6 +880,8 @@ struct Shared {
     project_feed: Option<Arc<ProjectProblemFeed>>,
     /// Explicitly requested background test processes, retained until daemon shutdown.
     test_runs: TestRuns,
+    /// Optional one-episode helper; owns its task, cancellation and exact test origin separately.
+    support: support::Pilot,
     /// Undelivered one-shot `git: HEAD moved …` plate lines keyed by binding fingerprint.
     git_notices: Mutex<BTreeMap<[u8; 32], String>>,
     /// Shared environment identities and one-shot notices.
@@ -1259,7 +1263,10 @@ impl Shared {
             .as_ref()
             .expect("a settled run always carries its result");
         let owns_detail = status.owner == binding.fingerprint();
-        let text = test_result_text(id, result, owns_detail, status.explicit_command);
+        let mut text = test_result_text(id, result, owns_detail, status.explicit_command);
+        if self.support_test_historical(id) {
+            text.push_str("\nhistorical: source changed after optional test admission");
+        }
         if owns_detail {
             self.retain_test_output(id, binding, result);
         }
@@ -1278,9 +1285,13 @@ impl Shared {
                 .get_mut(&result.detail_ref)
                 .filter(|detail| detail.binding == *binding)
         {
+            let mut text = test_result_text(id, result, true, false);
+            if self.support_test_historical(id) {
+                text.push_str("\nhistorical: source changed after optional test admission");
+            }
             detail.reply = PeerReply::Complete {
                 kind: ResultKind::Test,
-                text: test_result_text(id, result, true, false),
+                text,
                 detail_ref: Some(result.detail_ref.clone()),
                 truncated: false,
                 continuation: false,
@@ -1313,6 +1324,19 @@ impl Shared {
                 detail.context_page_fresh = false;
                 self.test_runs.clear_output(id, &binding.fingerprint());
             }
+        }
+    }
+    /// Labels only internally owned optional tests whose exact admission source epoch changed.
+    /// Actual exit/count/output remain historical evidence; ordinary requested tests are unchanged.
+    fn support_test_historical(&self, id: u64) -> bool {
+        #[cfg(feature = "jev-pilot")]
+        return self.test_runs.support_origin(id).is_some_and(|origin| {
+            self.outbox.current_epoch(&origin.binding) != origin.source_epoch
+        });
+        #[cfg(not(feature = "jev-pilot"))]
+        {
+            let _ = id;
+            false
         }
     }
     /// Marks `binding`'s retained feedback as already submitted to a live caller, but only when
@@ -1588,6 +1612,7 @@ impl std::fmt::Debug for WorkerHandle {
 impl Drop for WorkerHandle {
     /// Cancels owned work without inventing child-reap or admission-release evidence.
     fn drop(&mut self) {
+        self.shared.support.request_stop();
         self.startup_cancel
             .store(true, std::sync::atomic::Ordering::Release);
         if let Ok(task) = self.task.get_mut()
@@ -1678,7 +1703,8 @@ impl WorkerHandle {
     /// the sole worker must not be killed by a daemon that considers itself idle while it runs.
     /// Both counts live behind one short-held lock, so the answer is a consistent snapshot.
     pub fn is_processing(&self) -> bool {
-        self.shared.test_runs.is_busy()
+        self.shared.support.is_busy()
+            || self.shared.test_runs.is_busy()
             || self
                 .shared
                 .ledger
@@ -1714,6 +1740,7 @@ impl WorkerHandle {
         telemetry: Arc<dyn super::telemetry::EditTelemetry>,
     ) -> Self {
         let (inspect, receiver) = mpsc::channel(launcher.limits.queued);
+        let support = support::Pilot::new(launcher.jev_pilot());
         Self {
             shared: Arc::new(Shared {
                 bridge: Mutex::new(None),
@@ -1728,6 +1755,7 @@ impl WorkerHandle {
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 shutdown_failure: Mutex::new(None),
                 test_runs: TestRuns::new(admission.clone()),
+                support,
                 admission,
                 telemetry,
                 problem_source: None,
@@ -1901,6 +1929,9 @@ impl WorkerHandle {
     /// available, fallback ingress accepts only datagrams authenticated by a configured launcher
     /// attachment for this exact runtime.
     pub async fn start(&self, runtime: &Path) -> Result<(), FailureCode> {
+        if !matches!(self.shared.support.reason(), "off" | "enabled") {
+            support::operator_reason(self.shared.support.reason());
+        }
         self.shared.install_test_settle_hook();
         let receiver = self
             .receiver
@@ -2074,6 +2105,7 @@ impl WorkerHandle {
     }
     /// Fences admission, cancels every binding, and waits for the sole worker to reap providers.
     pub async fn shutdown(&self) -> Result<(), FailureCode> {
+        support::interrupt(&self.shared, None, "shutdown").await;
         if let Some(bridge) = self
             .shared
             .bridge
@@ -2153,6 +2185,12 @@ impl WorkerHandle {
         request: Option<&str>,
     ) -> PeerReply {
         let binding = invocation.binding_ref().clone();
+        if tool == AssistanceTool::Test
+            && tool.mutates_with(&parameters)
+            && parameters.get("cancel").is_none()
+        {
+            support::interrupt(&self.shared, Some(&binding), "main_test").await;
+        }
         let expected = Some((tool, selection(&parameters)));
         let output = (tool == AssistanceTool::Test)
             .then(|| parameters.get("output"))
@@ -2354,6 +2392,7 @@ impl WorkerHandle {
     /// cancelled and removed while other sessions' jobs stay queued.
     pub async fn stop(&self, invocation: ValidatedInvocation, attachment: &str) -> PeerReply {
         let binding = invocation.binding_ref().clone();
+        support::interrupt(&self.shared, Some(&binding), "stop").await;
         // Capture terminal results before stop retires observation state and output details.
         // Bridge delivery is not an explicit fetch, so give the result here instead of
         // suggesting that an automatically delivered result must be fetched again.
@@ -4282,7 +4321,7 @@ impl<'a> Worker<'a> {
         // A stale source has already failed byte validation, so no retained reference can be
         // promised as a valid retry; the reply leaves the caller to obtain a fresh read.
         self.track_unsettled_edit(&binding, &reply);
-        let reply = match reply {
+        let mut reply = match reply {
             PeerReply::Edit {
                 result,
                 diagnostics,
@@ -4362,6 +4401,41 @@ impl<'a> Worker<'a> {
                 self.shared.telemetry.edit_completed(fact);
             }));
         }
+        if let Some(note) = support::take_note(&self.shared, &binding) {
+            match &mut reply {
+                PeerReply::Complete { text, .. } => {
+                    text.push('\n');
+                    text.push_str(&note);
+                }
+                PeerReply::Edit { note: slot, .. } if slot.is_none() => *slot = Some(note),
+                _ => {}
+            }
+        }
+        let support_source = match &reply {
+            PeerReply::Edit { result, .. }
+                if matches!(
+                    result.outcome,
+                    ChangesEditOutcome::Created | ChangesEditOutcome::Replaced
+                ) =>
+            {
+                source.clone()
+            }
+            PeerReply::EditBatch { files, .. } => source
+                .as_ref()
+                .filter(|source| {
+                    files.iter().any(|file| {
+                        file.path == source.path().to_string_lossy()
+                            && matches!(
+                                file.state,
+                                super::reply::EditBatchFileState::Created
+                                    | super::reply::EditBatchFileState::Replaced
+                            )
+                    })
+                })
+                .cloned(),
+            _ => None,
+        };
+        let support_authority = authority.clone();
         self.shared.complete(
             &job.reference,
             reply.clone(),
@@ -4369,6 +4443,9 @@ impl<'a> Worker<'a> {
             source,
             job.native_epoch,
         );
+        if let (Some(authority), Some(source)) = (&support_authority, &support_source) {
+            support::changed(&self.shared, authority, source, &job.target);
+        }
         // Holder facts name the holder's last observed activity: record every settled job of an
         // activated binding (E013 item 1).
         if self.grants.contains_key(&binding) {
@@ -5694,8 +5771,28 @@ impl<'a> Worker<'a> {
                     break;
                 }
                 // Maintenance, not a request: the refresh keeps each path's real last-use time.
-                if self.observe_as(binding, path, false).await.is_err() {
-                    break;
+                let previous = self.shared.ledger.lock().ok().and_then(|ledger| {
+                    ledger
+                        .details
+                        .values()
+                        .filter(|detail| detail.binding == *binding)
+                        .flat_map(|detail| detail.source.iter().chain(&detail.extra_sources))
+                        .filter(|source| source.path() == path)
+                        .max_by_key(|source| source.sequence())
+                        .cloned()
+                });
+                match self.observe_as(binding, path, false).await {
+                    Ok((source, _))
+                        if previous
+                            .as_ref()
+                            .is_some_and(|old| old.bytes() != source.bytes()) =>
+                    {
+                        if let Ok(authority) = self.authority(binding).await {
+                            support::changed(&self.shared, &authority, &source, &job.target);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
                 }
             }
         }
@@ -11830,6 +11927,7 @@ mod stop_retry_tests {
                 problem_source: None,
                 project_feed: None,
                 test_runs: TestRuns::default(),
+                support: support::Pilot::new(None),
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),
                 activated: Mutex::new(BTreeMap::new()),

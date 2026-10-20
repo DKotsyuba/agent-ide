@@ -23,6 +23,7 @@ libc = "0.2"
 minijinja = { version = "2.24.0", default-features = false, features = ["serde", "builtins", "fuel"] }
 proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
 quote = { version = "1", default-features = false }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls", "system-proxy"] }
 rmcp = { version = "=3.4.0", features = ["server", "macros", "transport-io"] }
 rusqlite = { version = "0.37", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -63,6 +64,8 @@ tokio-util.workspace = true
 tower-service.workspace = true
 
 [features]
+# Experimental task-aware helper; disabled in normal builds.
+jev-pilot = ["agent-ide-core/jev-pilot"]
 # Honours the `AGENT_IDE_*` test seams of the core and the binary; never enabled in a release build.
 test-seams = ["agent-ide-core/test-seams"]
 

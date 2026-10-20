@@ -570,6 +570,9 @@ struct RawConfig {
     /// Optional explicit protected Bridge deployment; absence preserves legacy delivery.
     #[serde(default)]
     bridge: Option<super::bridge::BridgeConfig>,
+    /// Optional restart-only experimental helper input; malformed helper fields disable only it.
+    #[serde(default)]
+    jev_pilot: Option<Value>,
 }
 
 /// One validated trusted target; metadata alone never creates one of these values.
@@ -596,6 +599,8 @@ pub struct LauncherConfig {
     project_checks: Option<ProjectChecksConfig>,
     /// Optional protected Bridge deployment shared by the managed front and daemon.
     bridge: Option<super::bridge::BridgeConfig>,
+    /// Untrusted helper-shaped configuration, validated separately without failing core startup.
+    jev_pilot: Option<Value>,
     /// Retired settings identifiers whose provider entries were dropped, each once.
     retired: Vec<&'static RetiredSettings>,
 }
@@ -742,6 +747,7 @@ impl LauncherConfig {
             allowed_roots: raw.allowed_roots,
             project_checks: raw.project_checks,
             bridge: raw.bridge,
+            jev_pilot: raw.jev_pilot,
             retired,
         })
     }
@@ -752,6 +758,10 @@ impl LauncherConfig {
     /// Returns explicit restart-only Bridge configuration; no runtime discovery or I/O.
     pub fn bridge(&self) -> Option<&super::bridge::BridgeConfig> {
         self.bridge.as_ref()
+    }
+    /// Returns restart-only optional helper input; reading this value performs no credential I/O.
+    pub fn jev_pilot(&self) -> Option<&Value> {
+        self.jev_pilot.as_ref()
     }
     /// Verifies each immutable configured executable once before the worker becomes visible.
     /// Duplicate paths share verification; conflicting fingerprints and cancellation fail closed.

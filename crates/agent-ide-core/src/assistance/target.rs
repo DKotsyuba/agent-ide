@@ -353,6 +353,8 @@ impl Worker<'_> {
     /// Candidate validation/refusals never call this. Unknown context or an unavailable source
     /// outline preserves the old guard. `before` contains exact bytes of the successful write's
     /// base; fully read units refresh only if those bytes match their remembered baseline.
+    /// The optional helper borrows the verified pair solely for change geometry and byte hashes;
+    /// it receives no new source receipt and never changes the read guard's delivery state.
     pub(super) async fn refresh_written_unit_memory(
         &mut self,
         job: &Job,
@@ -361,6 +363,7 @@ impl Worker<'_> {
         before: &[u8],
     ) {
         let binding = job.invocation.binding_ref();
+        super::support::note_span(&self.shared, binding, observed, before, bytes);
         if self.context_epoch(binding).is_none() {
             return;
         }

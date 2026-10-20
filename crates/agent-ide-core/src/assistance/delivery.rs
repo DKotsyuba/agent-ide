@@ -23,7 +23,7 @@ use super::super::{
     outbox::FencedPath,
     outbox::{
         DeferSpec, FactDraft, FactKind, JobEpoch, MAX_FACT_BYTES, MAX_SUBJECT_BYTES,
-        MAX_SUMMARY_BYTES, MAX_TARGET_BYTES, SessionOutbox,
+        MAX_SUMMARY_BYTES, MAX_TARGET_BYTES, MAX_TEST_FACT_BYTES, SessionOutbox,
     },
     reply::{EditDiagnostics, PeerReply, ResultKind},
     test_fact::terminal_fact,
@@ -323,13 +323,28 @@ fn bridge_job_fact(
 ///
 /// The text is M-024's [`terminal_fact`] (`M024-M026-TEST-FACT` r3): a summary of at most 256
 /// bytes plus a detail that stays inside the `test-finished` budget, rendered verbatim.
-fn test_fact(id: u64, result: &RunResult, owns_detail: bool) -> FactDraft {
+/// `historical` qualifies optional source-changed results within the same existing byte budgets.
+fn test_fact(id: u64, result: &RunResult, owns_detail: bool, historical: bool) -> FactDraft {
     let fact = terminal_fact(id, result, owns_detail);
+    let summary = if historical {
+        bounded(
+            &format!("historical: {}", fact.summary),
+            MAX_SUMMARY_BYTES,
+            false,
+        )
+    } else {
+        fact.summary
+    };
+    let detail = if historical {
+        bounded(&fact.detail, MAX_TEST_FACT_BYTES - summary.len(), true)
+    } else {
+        fact.detail
+    };
     FactDraft {
         kind: FactKind::TestFinished,
         subject: test_subject(id),
-        summary: fact.summary,
-        detail: Some(fact.detail),
+        summary,
+        detail: Some(detail),
         detail_ref: owns_detail.then(|| result.detail_ref.clone()),
         failed: result.report.failed > 0
             || result.stopped
@@ -562,12 +577,34 @@ impl Shared {
     /// progress deferral is replaced by that check's existing in-flight registration, so a lost
     /// initial reply cannot cause a duplicate job-ready fact or repeat a write.
     pub(super) fn retain_edit_receipt(
-        &self,
+        self: &Arc<Self>,
         job: &Job,
         reply: &PeerReply,
         authority: &crate::workspace::authority::AuthorityStamp,
         sources: Vec<crate::workspace::observation::SourceObservation>,
     ) {
+        let changed = sources
+            .iter()
+            .find(|source| match reply {
+                PeerReply::Edit { result, .. } => {
+                    result.path == source.path().to_string_lossy()
+                        && matches!(
+                            result.outcome,
+                            crate::changes::edit::EditOutcome::Created
+                                | crate::changes::edit::EditOutcome::Replaced
+                        )
+                }
+                PeerReply::EditBatch { files, .. } => files.iter().any(|file| {
+                    file.path == source.path().to_string_lossy()
+                        && matches!(
+                            file.state,
+                            super::super::reply::EditBatchFileState::Created
+                                | super::super::reply::EditBatchFileState::Replaced
+                        )
+                }),
+                _ => false,
+            })
+            .cloned();
         if let Ok(mut ledger) = self.ledger.lock()
             && let Some(detail) = ledger.details.get_mut(&job.reference)
             && detail.binding == *job.invocation.binding_ref()
@@ -601,6 +638,9 @@ impl Shared {
                     ..Default::default()
                 },
             );
+        }
+        if let Some(source) = changed {
+            super::support::changed(self, authority, &source, &job.target);
         }
     }
 
@@ -1071,12 +1111,12 @@ impl Shared {
             return;
         };
         self.retain_test_output(id, &work.owner, &result);
-        self.push_or_transfer(
-            std::slice::from_ref(&work.owner),
-            test_fact(id, &result, true),
-        );
+        let historical = self.support_test_historical(id);
+        let fact = test_fact(id, &result, true, historical);
+        self.push_or_transfer(std::slice::from_ref(&work.owner), fact);
         if !work.subscribers.is_empty() {
-            self.push_or_transfer(&work.subscribers, test_fact(id, &result, false));
+            let fact = test_fact(id, &result, false, historical);
+            self.push_or_transfer(&work.subscribers, fact);
         }
     }
 
@@ -1087,6 +1127,7 @@ impl Shared {
         self.test_runs.on_settle(Arc::new(move |id| {
             if let Some(shared) = shared.upgrade() {
                 shared.test_settled(id);
+                shared.support.on_settle(id);
             }
         }));
     }
@@ -1241,6 +1282,7 @@ mod tests {
 
     /// A settled run becomes a `test-finished` draft that is exactly M-024's terminal text, valid
     /// for the outbox, with the owner's reference named once and none for a subscriber.
+    /// Optional historical qualification must also fit maximal summary/detail input.
     #[test]
     fn test_fact_is_the_terminal_text_of_the_run() {
         let result = RunResult {
@@ -1268,7 +1310,7 @@ mod tests {
             environment_label: None,
             targets: Vec::new(),
         };
-        let owner = test_fact(7, &result, true);
+        let owner = test_fact(7, &result, true, false);
         let expected = terminal_fact(7, &result, true);
         assert_eq!(owner.summary, "2 passed, 1 failed, 3 s (exit 101)");
         assert_eq!(owner.detail.as_deref(), Some(expected.detail.as_str()));
@@ -1285,9 +1327,20 @@ mod tests {
                 .count(),
             1
         );
-        let subscriber = test_fact(7, &result, false);
+        let subscriber = test_fact(7, &result, false, false);
         assert_eq!(subscriber.detail_ref, None);
         assert!(!subscriber.detail.unwrap().contains("run-detail"));
+        let mut long = result.clone();
+        long.environment_label = Some("x".repeat(512));
+        long.output = "output ".repeat(1024);
+        long.report.failures[0].message = "failure ".repeat(1024);
+        let historical = test_fact(7, &long, true, true);
+        assert!(
+            historical
+                .summary
+                .starts_with("historical: 2 passed, 1 failed")
+        );
+        assert_eq!(historical.validate(), Ok(()));
     }
 
     /// A run that exits 0 but reported no recognised summary is not a pass: its fact is failed
@@ -1312,12 +1365,12 @@ mod tests {
             environment_label: None,
             targets: Vec::new(),
         };
-        assert!(test_fact(1, &result, true).failed);
+        assert!(test_fact(1, &result, true, false).failed);
         result.report = crate::lang::TestReport {
             passed: 3,
             ..crate::lang::TestReport::default()
         };
-        assert!(!test_fact(1, &result, true).failed);
+        assert!(!test_fact(1, &result, true, false).failed);
     }
 
     /// Source-bearing answers carry no text in their fact; failures carry their first line.
