@@ -190,7 +190,11 @@ impl ProviderBuilder for Host {
 }
 
 /// The embedded compiler adapter, staged by the core in the private cache before each run.
-const ADAPTER: &[u8] = include_bytes!("typescript_adapter.js");
+const ADAPTER: &[u8] = concat!(
+    include_str!("version_range.js"),
+    include_str!("typescript_adapter.js")
+)
+.as_bytes();
 
 /// The project check: Node running the staged adapter around the pinned `tsc`, writes confined to
 /// the private cache. The core's expansion equals [`TypeScriptChecker::run_spec`] field for field
@@ -361,7 +365,7 @@ const TOOL_ROLES: &[PathRole] = &[
 ];
 
 /// Home tools an interactive recipe may run, looked up by the core on its formatter PATH.
-/// `npx` stays an operator formatter/test tool resolved on that PATH; the project's Node
+/// `npx` stays an operator formatter tool resolved on that PATH; the project's Node
 /// runtime is never taken from it.
 const HOME_TOOLS: &[ExecutableSlot] = &[ExecutableSlot {
     name: "npx",
@@ -450,30 +454,6 @@ const fn interactive_with(
     }
 }
 
-/// A test run: a home tool selecting `files` (positional tokens) and, when named, one
-/// pattern. Only shapes whose runtime this environment claims (the project's Node) use
-/// [`NODE_SLOT`]; `npx` runner shapes are refused by the configured planner instead.
-const fn test_run(
-    id: &'static str,
-    program: &'static str,
-    args: &'static [Arg],
-    env: &'static [EnvRule],
-) -> EffectRecipe {
-    EffectRecipe {
-        id,
-        program,
-        args,
-        env,
-        paths: &[],
-        executables: HOME_TOOLS,
-        stdin: Stdin::Null,
-        class: RunClass::Test,
-        timeout_ceiling_ms: 600_000,
-        capture_bytes: 16 << 20,
-        assets: &[],
-    }
-}
-
 const NPX_ENV: [EnvRule; 2] = tool_env("npx");
 
 /// The syntax probe on the project's configured Node (the Launcher `node` slot): the same
@@ -522,6 +502,60 @@ const fn node_test_run(id: &'static str, args: &'static [Arg]) -> EffectRecipe {
     }
 }
 
+/// A prepared project-local runner bin on the configured Node, with positional files and
+/// a separate optional pattern so runner options never arise from file-list tokens.
+const fn runner_test_run(id: &'static str, args: &'static [Arg]) -> EffectRecipe {
+    let mut recipe = node_test_run(id, args);
+    recipe.paths = &[
+        PathRule {
+            param: "runner",
+            roles: &[PathRole::Worktree],
+            existing_only: false,
+            read_root: false,
+        },
+        PathRule {
+            param: "verifier",
+            roles: TOOL_ROLES,
+            existing_only: false,
+            read_root: false,
+        },
+        PathRule {
+            param: "node_bin",
+            roles: TOOL_ROLES,
+            existing_only: false,
+            read_root: false,
+        },
+    ];
+    recipe.executables = &[ExecutableSlot {
+        name: "node",
+        source: SlotSource::Launcher("runner_node"),
+    }];
+    recipe.env = &[
+        EnvRule::Home { name: "HOME" },
+        EnvRule::SearchPath {
+            name: "PATH",
+            param: "node_bin",
+            fixed: SYSTEM_PATH,
+        },
+        EnvRule::Param {
+            name: "AGENT_IDE_RUNNER_REQUIREMENTS",
+            param: "requirements",
+            optional: false,
+        },
+        EnvRule::Param {
+            name: "AGENT_IDE_RUNNER_TYPESCRIPT",
+            param: "verifier",
+            optional: true,
+        },
+        EnvRule::Param {
+            name: "AGENT_IDE_RUNNER_NODE_IDENTITY",
+            param: "node_identity",
+            optional: true,
+        },
+    ];
+    recipe
+}
+
 /// The effect recipes of the TypeScript module, declared by the root: the `tsc` check, the
 /// Prettier formatter and the syntax probe that read the candidate on stdin.
 pub const RECIPES: &[EffectRecipe] = &[
@@ -556,44 +590,47 @@ pub const RECIPES: &[EffectRecipe] = &[
             Arg::Each("files"),
         ],
     ),
-    test_run(
+    runner_test_run(
         "test-vitest",
-        "npx",
         &[
-            Arg::Literal("vitest"),
+            Arg::Literal("--import"),
+            Arg::Literal(crate::environment::RUNNER_PRELUDE),
+            Arg::Param("runner"),
             Arg::Literal("run"),
             Arg::Each("files"),
         ],
-        &NPX_ENV,
     ),
-    test_run(
+    runner_test_run(
         "test-vitest-named",
-        "npx",
         &[
-            Arg::Literal("vitest"),
+            Arg::Literal("--import"),
+            Arg::Literal(crate::environment::RUNNER_PRELUDE),
+            Arg::Param("runner"),
             Arg::Literal("run"),
             Arg::Each("files"),
             Arg::Literal("-t"),
             Arg::Param("pattern"),
         ],
-        &NPX_ENV,
     ),
-    test_run(
+    runner_test_run(
         "test-jest",
-        "npx",
-        &[Arg::Literal("jest"), Arg::Each("files")],
-        &NPX_ENV,
-    ),
-    test_run(
-        "test-jest-named",
-        "npx",
         &[
-            Arg::Literal("jest"),
+            Arg::Literal("--import"),
+            Arg::Literal(crate::environment::RUNNER_PRELUDE),
+            Arg::Param("runner"),
+            Arg::Each("files"),
+        ],
+    ),
+    runner_test_run(
+        "test-jest-named",
+        &[
+            Arg::Literal("--import"),
+            Arg::Literal(crate::environment::RUNNER_PRELUDE),
+            Arg::Param("runner"),
             Arg::Each("files"),
             Arg::Literal("-t"),
             Arg::Param("pattern"),
         ],
-        &NPX_ENV,
     ),
     interactive_node(
         "ts-probe-tool",
@@ -606,14 +643,14 @@ pub const RECIPES: &[EffectRecipe] = &[
     ),
 ];
 
-/// The recipe request of a formatter or probe argument vector the in-process support builds
+/// The recipe request of a test, formatter or probe argument vector the in-process support builds
 /// ([`crate::support`]), under this request's accepted facts: a compiler or Node-pin
 /// obstruction refuses configured Node consumers before admission. The separately selected
 /// operator Prettier tool keeps its existing recipe; unrelated shapes remain unclaimed.
 ///
 /// # Errors
 ///
-/// The environment obstruction of the request's configured tools.
+/// The environment obstruction of the request's configured tools or prepared runner package.
 pub fn configured_effect(
     argv: &[String],
     config: &agent_ide_core::modules::contract::ModuleConfig,
@@ -626,7 +663,39 @@ pub fn configured_effect(
     if let Some(cause) = crate::environment::runner_shape_refusal(argv) {
         return Err(agent_ide_core::lang::LangError::Environment(cause));
     }
-    let effect = interactive_effect(argv);
+    let mut effect = interactive_effect(argv);
+    if let Some("vitest" | "jest") = argv.first().map(String::as_str)
+        && let Some(effect) = &mut effect
+    {
+        let activation = crate::environment::command_argv(cwd, argv, config)?
+            .expect("runner activation either binds configured Node or refuses");
+        effect.params.insert(
+            "runner".into(),
+            Param::Path(PathBuf::from(&activation.argv_prefix[3])),
+        );
+        effect.params.insert(
+            "node_bin".into(),
+            Param::Paths(activation.path_prefix.into_iter().collect()),
+        );
+        for (name, value) in activation.vars {
+            let (param, value) = match name.to_str() {
+                Some("AGENT_IDE_RUNNER_REQUIREMENTS") => (
+                    "requirements",
+                    Param::Token(value.to_string_lossy().into_owned()),
+                ),
+                Some("AGENT_IDE_RUNNER_TYPESCRIPT") => {
+                    ("verifier", Param::Path(PathBuf::from(value)))
+                }
+                Some("AGENT_IDE_RUNNER_NODE_IDENTITY") => (
+                    "node_identity",
+                    Param::Token(value.to_string_lossy().into_owned()),
+                ),
+                _ => unreachable!("runner activation carries only fixed guard inputs"),
+            };
+            effect.params.insert(param.into(), value);
+        }
+        return Ok(Some(effect.clone()));
+    }
     if effect
         .as_ref()
         .is_some_and(|effect| effect.recipe != "prettier-npx")
@@ -636,8 +705,8 @@ pub fn configured_effect(
     Ok(effect)
 }
 
-/// The recipe request of a formatter or probe argument vector the in-process support builds
-/// ([`crate::support`]); `None` for any other shape, which the core then refuses.
+/// The recipe request of a test, formatter or probe argv built by in-process support.
+/// Prepared runner paths are supplied by [`configured_effect`]; other shapes are unclaimed.
 pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
     let words: Vec<&str> = argv.iter().map(String::as_str).collect();
     let token = |value: &str| Param::Token(value.to_owned());
@@ -659,7 +728,7 @@ pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
                 ("files", files(rest)),
             ],
         ),
-        ["npx", runner @ ("vitest" | "jest"), rest @ ..] => {
+        [runner @ ("vitest" | "jest"), rest @ ..] => {
             let rest = if *runner == "vitest" {
                 match rest {
                     ["run", rest @ ..] => rest,
@@ -679,7 +748,7 @@ pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
                 (_, true) => "test-jest-named",
             };
             let mut params = vec![
-                ("npx", Param::Executable("npx".to_owned())),
+                ("node", Param::Executable("node".into())),
                 ("files", files(selected)),
             ];
             if let Some(pattern) = pattern {
@@ -1561,10 +1630,6 @@ mod tests {
                 "--test-name-pattern=adds|sub tracts",
                 "test/a.test.mjs",
             ],
-            vec!["npx", "vitest", "run", "src/a.test.ts"],
-            vec!["npx", "vitest", "run", "src/a.test.ts", "-t", "x y"],
-            vec!["npx", "jest", "src/a.test.ts"],
-            vec!["npx", "jest", "src/a.test.ts", "-t", "-leading dash"],
         ] {
             let argv: Vec<String> = argv.into_iter().map(str::to_owned).collect();
             let effect = interactive_effect(&argv).expect("a recipe request");

@@ -24,7 +24,10 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 /// Adapter exit status reserved for a refused compiler read or filesystem probe.
 const READ_RESTRICTED_STATUS: i32 = 77;
 /// First-party adapter embedded into the private cache for each compiler run.
-const ADAPTER: &str = include_str!("typescript_adapter.js");
+const ADAPTER: &str = concat!(
+    include_str!("version_range.js"),
+    include_str!("typescript_adapter.js")
+);
 /// Unique temporary adapter names within one daemon process.
 static ADAPTER_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Ordered footer labels emitted by pinned TypeScript 5.9.3 with `--diagnostics`.
@@ -191,11 +194,30 @@ pub(crate) fn compiler_fact(
             ));
         }
     }
+    qualify_library(&library, read_denies)?;
+    // Byte-equality with the qualified closure IS the version fact: no extra metadata read.
+    Ok(CompilerFact::Project {
+        cli,
+        version: Some(QUALIFIED_TYPESCRIPT_VERSION.to_owned()),
+    })
+}
+
+/// Proves a regular, readable compiler library is the qualified TypeScript byte closure.
+pub(crate) fn qualify_library(
+    library: &Path,
+    read_denies: &[ReadDeny],
+) -> Result<(), (UnavailableReason, String)> {
+    if !regular_allowed(library, read_denies) {
+        return Err((
+            UnavailableReason::ReadRestricted,
+            "project TypeScript compiler must be regular and link-free".into(),
+        ));
+    }
     let (_, digest, length) = crate::backend::TYPESCRIPT_CLOSURE_V1
         .iter()
         .find(|(name, _, _)| *name == "typescript.js")
         .expect("compiled TypeScript closure includes its compiler");
-    let metadata = fs::metadata(&library).map_err(|_| {
+    let metadata = fs::metadata(library).map_err(|_| {
         (
             UnavailableReason::ReadRestricted,
             "project TypeScript compiler cannot be read".to_owned(),
@@ -208,7 +230,7 @@ pub(crate) fn compiler_fact(
                 .to_owned(),
         ));
     }
-    let bytes = fs::read(&library).map_err(|_| {
+    let bytes = fs::read(library).map_err(|_| {
         (
             UnavailableReason::ReadRestricted,
             "project TypeScript compiler cannot be read".to_owned(),
@@ -221,11 +243,7 @@ pub(crate) fn compiler_fact(
                 .to_owned(),
         ));
     }
-    // Byte-equality with the qualified closure IS the version fact: no extra metadata read.
-    Ok(CompilerFact::Project {
-        cli,
-        version: Some(QUALIFIED_TYPESCRIPT_VERSION.to_owned()),
-    })
+    Ok(())
 }
 
 /// Runs a root `tsconfig.json` or `jsconfig.json` under the shared confinement seam.

@@ -34,10 +34,12 @@ const PROVIDER_TESTS: [&str; 4] = [
     "configured_product_claude_returns_real_pyright_semantic_context_diff_and_stop",
 ];
 /// Non-Rust tooling source is prohibited outside these declared product assets: the embedded
-/// TypeScript adapter ships inside the binary via `include_str!`, and `record.mjs` is the
-/// rust-analyzer outline-corpus regeneration utility (both LANG-03 exceptions).
-const ALLOWED_NON_RUST: [&str; 2] = [
+/// TypeScript checker, shared version predicate and runner prelude ship inside the binary via
+/// `include_str!`; `record.mjs` is the Rust outline-corpus utility (LANG-03 exceptions).
+const ALLOWED_NON_RUST: [&str; 4] = [
     "crates/agent-ide-lang-typescript/src/typescript_adapter.js",
+    "crates/agent-ide-lang-typescript/src/version_range.js",
+    "crates/agent-ide-lang-typescript/src/runner_guard.js",
     "crates/agent-ide-lang-rust/tests/fixtures/lexical/record.mjs",
 ];
 
@@ -556,7 +558,9 @@ mod tests {
             found,
             vec![
                 "crates/agent-ide-lang-rust/tests/fixtures/lexical/record.mjs".to_owned(),
+                "crates/agent-ide-lang-typescript/src/runner_guard.js".to_owned(),
                 "crates/agent-ide-lang-typescript/src/typescript_adapter.js".to_owned(),
+                "crates/agent-ide-lang-typescript/src/version_range.js".to_owned(),
             ]
         );
         Ok(())

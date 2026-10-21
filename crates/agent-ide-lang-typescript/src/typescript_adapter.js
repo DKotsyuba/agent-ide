@@ -283,10 +283,7 @@ const system = Object.assign(ts.sys, {
  * fail closed with a bounded environment cause; they never select or install another tool.
  */
 function versionAllowed(label, requested, installed) {
-  if (requested === undefined) return true;
-  const range = typeof requested === "string" && requested.trim().length > 0 && requested.length <= 512
-    ? ts.VersionRange.tryParse(requested.trim()) : undefined;
-  if (range && range.test(new ts.Version(installed))) return true;
+  if (versionMatches(ts, requested, installed)) return true;
   process.stderr.write(`error: project environment ${label} requirement is unsupported or does not allow installed ${installed}; prepare a matching toolchain.\n`);
   return false;
 }

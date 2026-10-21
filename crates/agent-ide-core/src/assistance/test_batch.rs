@@ -348,7 +348,12 @@ fn run_outcome(run: usize, ran: Option<&Ran>) -> String {
     match ran {
         Some(Ran::Result(result)) => {
             let report = &result.report;
-            if summary_absent(result) {
+            if result.environment_unavailable().is_some() {
+                format!(
+                    "run {number} — {}",
+                    super::super::test_fact::summary_text(result)
+                )
+            } else if summary_absent(result) {
                 let exit = result
                     .exit
                     .map_or_else(|| "unavailable".to_owned(), |code| code.to_string());
@@ -432,6 +437,42 @@ mod batch_tests {
             budget: Duration::from_secs(5),
             detail_ref: "batch-ref".into(),
         }
+    }
+
+    /// A refused prelude followed by an executed test retains both target facts and counts.
+    #[tokio::test]
+    async fn mixed_batch_preserves_environment_refusal_and_executed_tests() {
+        let scratch = crate::scratch::ScratchDir::new("batch-environment");
+        let root = scratch.to_path_buf();
+        let owner = BindingRef::fixture("batch-environment", "channel", 1);
+        let runs = TestRuns::default();
+        let StartResult::Started(id) = runs.start_batch(root.clone(), &owner, plan(
+            &[("guarded", None), ("executed", None)],
+            vec![shell(vec![0], "printf 'error: agent-ide test environment unavailable: incompatible Node\\n' >&2; exit 78"), shell(vec![1], "printf 'pass\\n'")],
+        )) else { panic!("batch starts"); };
+        let result = settled(&runs, &root, id, &owner).await;
+        assert_eq!((result.report.passed, result.report.failed), (1, 0));
+        assert!(result.report.incomplete);
+        assert_eq!(result.exit, Some(78));
+        assert!(result.environment_unavailable().is_none());
+        assert!(result.targets[0].contains("environment unavailable (exit 78)"));
+        assert!(result.targets[1].contains("1 passed, 0 failed"));
+        assert!(result.output.contains("incompatible Node") && result.output.contains("pass\n"));
+        let fact = crate::assistance::test_fact::terminal_fact(id, &result, true);
+        assert!(
+            fact.summary.starts_with("1 passed, 0 failed")
+                && fact.summary.contains("partial counts"),
+            "{fact:?}"
+        );
+        assert!(
+            fact.detail.contains("environment unavailable") && fact.detail.contains("1 passed")
+        );
+        assert!(
+            result
+                .command
+                .iter()
+                .any(|arg| arg.contains("exit 78") && arg.contains("pass"))
+        );
     }
 
     /// An explicit check with no parsed tests reports its real exit and unavailable counts,

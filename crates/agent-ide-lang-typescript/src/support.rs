@@ -448,8 +448,9 @@ impl LanguageSupport for TypeScript {
                     .any(|part| part.as_os_str() == "__tests__"))
     }
 
-    /// Runner from the `test_runner` fact (`node` when absent): `npx vitest run`, `npx jest` or
-    /// `node --test`. A symbol target runs the distinct files of its referencing tests filtered
+    /// Runner from the `test_runner` fact (`node` when absent): `vitest run`, `jest` or
+    /// `node --test`. Activation binds prepared runner bins to the configured Node without a
+    /// package manager or download. A symbol target runs the distinct files of its referencing tests filtered
     /// by `-t` (`--test-name-pattern=` for node) with their names as an escaped regex
     /// alternation (`describe > it` becomes the runner's space-joined `describe it`); beyond
     /// `MAX_NAMED_TESTS` only the files run. A symbol no test references is
@@ -457,7 +458,8 @@ impl LanguageSupport for TypeScript {
     /// it by convention (`*.test.*`, `*.spec.*`, under `__tests__/`); a directory target selects
     /// the test files inside it; a non-test script file is [`LangError::Unsupported`]. Several
     /// file targets (`Files`) are one runner invocation over all of them, each checked as a file
-    /// target. Patterns pass through unescaped.
+    /// target. Leading-dash file arguments get a `./` prefix so they remain positional;
+    /// patterns pass through unescaped.
     fn test_selection(
         &self,
         project: &LanguageProject,
@@ -495,10 +497,17 @@ impl LanguageSupport for TypeScript {
             TestTarget::Pattern(pattern) => (Vec::new(), Vec::new(), Some(pattern.clone())),
         };
         let mut command: Vec<String> = match runner {
-            "vitest" => vec!["npx".into(), "vitest".into(), "run".into()],
-            "jest" => vec!["npx".into(), "jest".into()],
+            "vitest" => vec!["vitest".into(), "run".into()],
+            "jest" => vec!["jest".into()],
             _ => vec!["node".into(), "--test".into()],
         };
+        let files = files.into_iter().map(|file| {
+            if file.starts_with('-') {
+                format!("./{file}")
+            } else {
+                file
+            }
+        });
         match pattern {
             Some(pattern) if matches!(runner, "vitest" | "jest") => {
                 command.extend(files);
@@ -2123,7 +2132,6 @@ src/transport.ts  (29 lines, typescript)
         assert_eq!(
             vitest.command,
             argv(&[
-                "npx",
                 "vitest",
                 "run",
                 "src/math.test.ts",
@@ -2135,12 +2143,12 @@ src/transport.ts  (29 lines, typescript)
         let jest = TypeScript
             .test_selection(&project(&[("test_runner", "jest")]), &file)
             .unwrap();
-        assert_eq!(jest.command, argv(&["npx", "jest", "src/a.test.ts"]));
+        assert_eq!(jest.command, argv(&["jest", "src/a.test.ts"]));
         let pattern = TestTarget::Pattern("adds".to_owned());
         let jest = TypeScript
             .test_selection(&project(&[("test_runner", "jest")]), &pattern)
             .unwrap();
-        assert_eq!(jest.command, argv(&["npx", "jest", "-t", "adds"]));
+        assert_eq!(jest.command, argv(&["jest", "-t", "adds"]));
         let node = TypeScript.test_selection(&project(&[]), &pattern).unwrap();
         assert_eq!(
             node.command,
@@ -2158,7 +2166,7 @@ src/transport.ts  (29 lines, typescript)
             .unwrap();
         assert_eq!(
             vitest.command,
-            argv(&["npx", "vitest", "run", "src/a.test.ts", "src/__tests__"])
+            argv(&["vitest", "run", "src/a.test.ts", "src/__tests__"])
         );
         assert!(matches!(
             TypeScript.test_selection(

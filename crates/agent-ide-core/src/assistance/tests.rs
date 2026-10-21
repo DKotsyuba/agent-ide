@@ -29,6 +29,28 @@ const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// At most this many completed jobs remain per worktree.
 const COMPLETED_PER_WORKTREE: usize = 4;
 
+/// Reserved evidence from a trusted runner prelude that refused before loading any tests.
+const ENVIRONMENT_REFUSAL: &str = "error: agent-ide test environment unavailable:";
+
+impl RunResult {
+    /// Returns a captured environment refusal only with its reserved exit and absent counts.
+    /// The real exit, stderr tail and replay remain available after this classification.
+    pub(super) fn environment_unavailable(&self) -> Option<&str> {
+        if self.exit != Some(78)
+            || !self.report.incomplete
+            || self.report.passed != 0
+            || self.report.failed != 0
+            || self.report.ignored != 0
+            || !self.report.failures.is_empty()
+        {
+            return None;
+        }
+        self.output
+            .lines()
+            .find_map(|line| line.strip_prefix(ENVIRONMENT_REFUSAL).map(str::trim))
+    }
+}
+
 /// One daemon's monotonically numbered test jobs, independent of host binding lifetimes.
 #[derive(Clone)]
 pub struct TestRuns(
@@ -1297,6 +1319,16 @@ async fn run_child_cancellable(
                 report = parsed;
             }
         }
+    }
+    if status.as_ref().and_then(|status| status.code()) == Some(78)
+        && output
+            .lines()
+            .any(|line| line.starts_with(ENVIRONMENT_REFUSAL))
+    {
+        report = TestReport {
+            incomplete: true,
+            ..TestReport::default()
+        };
     }
     report.incomplete |= stopped || status.is_none();
     address_failures(root, &mut report).await;

@@ -26,6 +26,17 @@ proofs (Codex and Claude) passed, so the superseded IDE-run delivery code was re
 Bridge route a result stays retained under its `detail_ref` and is read with `ide.inspect`.
 See [launcher configuration](assistance-launcher.md) and the active [tool contract](contracts/tools-v0.4.md).
 
+TypeScript test planning binds prepared project-local Vitest/Jest package bins to the
+launcher's configured Node in both native and module execution, with that Node's directory
+leading child `PATH`. Contained pnpm package aliases are supported; missing, malformed,
+read-denied or escaping runners are unavailable. No package manager or download is used;
+unbound `npx vitest`/`npx jest` commands remain refused. Jev candidates use this same
+test-selection and admitted `TestRuns` path.
+Declared Node ranges are checked by a fixed prelude on that same admitted Node before the
+runner loads. It shares the qualified TypeScript `VersionRange` predicate with project checks;
+incompatible or unprovable requirements retain an environment-unavailable result, exit and
+stderr, with no inferred test counts.
+
 ## Component contracts
 
 - [Shared vocabulary and failure semantics](contracts/common.md)

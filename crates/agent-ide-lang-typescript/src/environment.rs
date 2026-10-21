@@ -40,6 +40,13 @@ use agent_ide_core::modules::contract::ModuleConfig;
 
 use crate::checks::{CompilerFact, ProjectTypeScriptChecksConfig, compiler_fact};
 
+/// Fixed prelude, shared with static recipes; it leaves the runner's main-module argv intact.
+pub(crate) const RUNNER_PRELUDE: &str = concat!(
+    "data:text/javascript,",
+    include_str!("version_range.js"),
+    include_str!("runner_guard.js")
+);
+
 /// The operator-accepted tools of this request, from whichever launcher section carries them:
 /// the confined check's Node and TypeScript CLI, or the provider OPTION `node` when no check
 /// section configures tools. The measured identity and digest travel only when they belong to
@@ -460,14 +467,24 @@ pub fn command_env(
 /// Activation for the full argument vector under this request's configured tools. The
 /// slot-resolution call (argv is exactly one slot name) answers the Launcher `node` slot with
 /// the configured Node alone — one prepared executable, no interpreter prefix, variables or
-/// `PATH` that a program slot cannot carry. A full argv answers per program: `tsc`/`node`
-/// activate the configured tools, an `npx` runner shape refuses (its runtime is not bound to
-/// the configured Node), and anything else is unclaimed.
+/// `PATH` that a program slot cannot carry. A full argv binds `tsc`/`node` and prepared
+/// project-local Vitest/Jest bins to the configured Node. Unbound `npx` runners refuse;
+/// The private `runner_node` slot resolves only the executable after preparing its mandatory
+/// recipe guard; raw `node`/`tsc` keep their stricter pre-admission pin checks.
 pub fn command_argv(
     worktree: &Path,
     argv: &[String],
     config: &ModuleConfig,
 ) -> Result<Option<agent_ide_core::lang::environment::CommandEnv>, LangError> {
+    if argv == ["runner_node"] {
+        let tools = configured_tools(config)
+            .ok_or_else(|| LangError::Environment("no configured runner Node".into()))?;
+        runner_guard(worktree, &tools, config)?;
+        return Ok(Some(agent_ide_core::lang::environment::CommandEnv {
+            argv_prefix: vec![tools.node.into_os_string()],
+            ..Default::default()
+        }));
+    }
     if let [name] = argv
         && name == "node"
     {
@@ -491,7 +508,197 @@ pub fn command_argv(
     let Some(program) = argv.first() else {
         return Ok(None);
     };
+    if matches!(program.as_str(), "vitest" | "jest") {
+        let unavailable = || {
+            LangError::Environment(format!(
+                "project-local {program} runner is missing, read restricted or untrusted; prepare its package and configured Node, or run tests natively; no ambient fallback"
+            ))
+        };
+        let tools = configured_tools(config).ok_or_else(unavailable)?;
+        let vars = runner_guard(worktree, &tools, config)?;
+        let package = worktree.join("node_modules").join(program);
+        let manifest = runner_input(worktree, &package.join("package.json"), &config.read_denies)
+            .ok_or_else(unavailable)?;
+        let manifest: Value =
+            agent_ide_core::lang::environment::read_input(&manifest, &config.read_denies)
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .ok_or_else(unavailable)?;
+        if manifest.get("name").and_then(Value::as_str) != Some(program.as_str()) {
+            return Err(unavailable());
+        }
+        let bin = manifest
+            .get("bin")
+            .and_then(|bin| {
+                bin.as_str()
+                    .or_else(|| bin.get(program).and_then(Value::as_str))
+            })
+            .ok_or_else(unavailable)?;
+        let bin = Path::new(bin);
+        if bin.as_os_str().is_empty()
+            || bin.is_absolute()
+            || bin.components().any(|part| {
+                !matches!(
+                    part,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+            || !matches!(
+                bin.extension().and_then(|ext| ext.to_str()),
+                Some("js" | "mjs" | "cjs")
+            )
+        {
+            return Err(unavailable());
+        }
+        let cli = runner_input(worktree, &package.join(bin), &config.read_denies)
+            .ok_or_else(unavailable)?;
+        return Ok(Some(agent_ide_core::lang::environment::CommandEnv {
+            argv_prefix: vec![
+                tools.node.clone().into_os_string(),
+                "--import".into(),
+                RUNNER_PRELUDE.into(),
+                cli.into_os_string(),
+            ],
+            path_prefix: tools.node.parent().map(Path::to_path_buf),
+            vars,
+        }));
+    }
     command_env(worktree, program, config)
+}
+
+/// Snapshots Node constraints under the read policy and prepares the fixed runtime proof.
+/// Ranges use the qualified compiler's VersionRange on the actual Node before the runner loads.
+fn runner_guard(
+    worktree: &Path,
+    tools: &ConfiguredTools,
+    config: &ModuleConfig,
+) -> Result<Vec<(std::ffi::OsString, std::ffi::OsString)>, LangError> {
+    let unavailable = || {
+        LangError::Environment("runner Node requirements or qualified TypeScript verifier are missing, malformed or read restricted; use native tooling".into())
+    };
+    if let Some((_, cause)) = obstruction(worktree, tools, &config.read_denies) {
+        return Err(LangError::Environment(cause));
+    }
+    verify_configured_node(&tools.node, config, &config.read_denies)
+        .map_err(|(_, cause)| LangError::Environment(cause))?;
+    let mut requirements = Vec::new();
+    let manifest = worktree.join("package.json");
+    if manifest.symlink_metadata().is_ok() {
+        let path =
+            runner_input(worktree, &manifest, &config.read_denies).ok_or_else(unavailable)?;
+        let package: Value =
+            agent_ide_core::lang::environment::read_input(&path, &config.read_denies)
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .ok_or_else(unavailable)?;
+        if let Some(pin) = package
+            .get("engines")
+            .and_then(|engines| engines.get("node"))
+        {
+            requirements.push(pin.as_str().ok_or_else(unavailable)?.to_owned());
+        }
+    }
+    for name in [".nvmrc", ".node-version"] {
+        let path = worktree.join(name);
+        match path.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(unavailable()),
+            Ok(_) => {}
+        }
+        let path = runner_input(worktree, &path, &config.read_denies).ok_or_else(unavailable)?;
+        let pin = agent_ide_core::lang::environment::read_input(&path, &config.read_denies)
+            .ok_or_else(unavailable)?;
+        requirements.push(pin.trim().trim_start_matches('v').to_owned());
+        break;
+    }
+    let mut vars = vec![("AGENT_IDE_RUNNER_REQUIREMENTS".into(), "[]".into())];
+    if requirements.iter().all(|pin| plain_version(pin).is_some()) {
+        admit_effects(worktree, config)?;
+        if !requirements.is_empty() {
+            let admitted = tools
+                .node_identity
+                .as_deref()
+                .and_then(measured_version)
+                .ok_or_else(unavailable)?;
+            if requirements.iter().any(|pin| {
+                let pin = plain_version(pin).expect("plain requirements checked above");
+                !admitted.starts_with(&pin)
+            }) {
+                return Err(unavailable());
+            }
+        }
+        return Ok(vars);
+    }
+    let identity = tools
+        .node_identity
+        .as_deref()
+        .and_then(measured_version)
+        .filter(|version| version.len() == 3)
+        .ok_or_else(unavailable)?;
+    let cli = tools.tsc_cli.as_ref().ok_or_else(unavailable)?;
+    let cli = match compiler_fact(worktree, cli, &config.read_denies)
+        .map_err(|(_, cause)| LangError::Environment(cause))?
+    {
+        CompilerFact::Operator(cli) | CompilerFact::Project { cli, .. } => cli,
+    };
+    let library = cli.with_file_name("typescript.js");
+    crate::checks::qualify_library(&library, &config.read_denies)
+        .map_err(|(_, cause)| LangError::Environment(cause))?;
+    vars[0].1 = serde_json::to_string(&requirements)
+        .expect("Node requirements are strings")
+        .into();
+    vars.push((
+        "AGENT_IDE_RUNNER_TYPESCRIPT".into(),
+        library.into_os_string(),
+    ));
+    vars.push((
+        "AGENT_IDE_RUNNER_NODE_IDENTITY".into(),
+        identity
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+            .into(),
+    ));
+    Ok(vars)
+}
+
+/// Resolves a prepared runner file within the worktree, allowing contained pnpm aliases.
+/// Denies apply to both spellings and their ancestors before any content is read.
+fn runner_input(worktree: &Path, path: &Path, denies: &[ReadDeny]) -> Option<PathBuf> {
+    let denied = |path: &Path| {
+        path.ancestors()
+            .any(|prefix| denies.iter().any(|deny| deny.matches(prefix)))
+    };
+    if denied(path) {
+        return None;
+    }
+    let resolved = path.canonicalize().ok()?;
+    (resolved.starts_with(worktree.canonicalize().ok()?)
+        && !denied(&resolved)
+        && agent_ide_core::lang::environment::readable(&resolved, denies))
+    .then_some(resolved)
+}
+
+/// Host-owned recipe roots from the same accepted runner activation, even with a relocated
+/// IDE home. Refused environments grant nothing; module-supplied paths never establish roots.
+pub fn accepted_runner_roots(worktree: &Path, config: &ModuleConfig) -> Vec<PathBuf> {
+    let Some(tools) = configured_tools(config) else {
+        return Vec::new();
+    };
+    let Ok(vars) = runner_guard(worktree, &tools, config) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<_> = tools
+        .node
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    for (name, value) in vars {
+        if name == "AGENT_IDE_RUNNER_TYPESCRIPT" {
+            roots.push(PathBuf::from(value));
+        }
+    }
+    roots
 }
 
 /// The exact runner-shape refusal shared by the native argv route and the module's effect
@@ -1160,6 +1367,177 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A detected runner's prepared package bin binds to the configured Node in both routes.
+    #[test]
+    fn prepared_test_runner_binds_both_routes() {
+        use agent_ide_core::lang::{LanguageSupport, TestTarget};
+        let root = scratch("prepared-runner");
+        let (node, tsc) = tools(&root);
+        let config = config_with(&node, &tsc);
+        for runner in ["vitest", "jest"] {
+            put(
+                &root,
+                "package.json",
+                &format!(r#"{{"devDependencies":{{"{runner}":"1"}}}}"#),
+            );
+            put(
+                &root,
+                &format!("node_modules/{runner}/package.json"),
+                &format!(r#"{{"name":"{runner}","bin":{{"{runner}":"./cli.cjs"}}}}"#),
+            );
+            put(
+                &root,
+                &format!("node_modules/{runner}/cli.cjs"),
+                "console.log('prepared');",
+            );
+            let project = crate::support::TypeScript.detect(&root).unwrap();
+            let selection = crate::support::TypeScript
+                .test_selection(&project, &TestTarget::Pattern("-exact pattern 🦀".into()))
+                .unwrap();
+            let activation = command_argv(&root, &selection.command, &config)
+                .unwrap()
+                .expect("prepared runner activation");
+            assert_eq!(
+                activation.argv_prefix,
+                [
+                    node.clone().into_os_string(),
+                    "--import".into(),
+                    RUNNER_PRELUDE.into(),
+                    root.join(format!("node_modules/{runner}/cli.cjs"))
+                        .into_os_string()
+                ]
+            );
+            assert_eq!(activation.path_prefix, node.parent().map(Path::to_path_buf));
+            let effect = crate::module::configured_effect(&selection.command, &config, &root)
+                .unwrap()
+                .expect("prepared runner recipe");
+            assert_eq!(effect.recipe, format!("test-{runner}-named"));
+            let programs = [("runner_node".into(), node.clone())];
+            let admission = agent_ide_core::modules::recipe::Admission {
+                worktree: &root,
+                cache_dir: &root,
+                read_denies: &[],
+                home: Some(&root),
+                launcher_roots: &[],
+                developer_dirs: &[],
+                programs: &programs,
+                timeout: std::time::Duration::from_secs(30),
+            };
+            let spec = agent_ide_core::modules::recipe::expand(
+                crate::module::RECIPES,
+                &effect,
+                &admission,
+            )
+            .unwrap();
+            assert_eq!(spec.program, node);
+            let expected: Vec<std::ffi::OsString> = activation.argv_prefix[1..]
+                .iter()
+                .cloned()
+                .chain(selection.command[1..].iter().map(Into::into))
+                .collect();
+            assert_eq!(spec.args, expected);
+            let mut escaping = effect;
+            escaping.params.insert(
+                "runner".into(),
+                agent_ide_core::modules::payload::Param::Path(
+                    node.parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .with_file_name("outside")
+                        .join("cli.mjs"),
+                ),
+            );
+            assert!(
+                agent_ide_core::modules::recipe::expand(
+                    crate::module::RECIPES,
+                    &escaping,
+                    &admission
+                )
+                .is_err()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Invalid package metadata, denied inputs and escaping aliases refuse in both routes.
+    #[test]
+    fn prepared_test_runner_rejects_untrusted_or_unreadable_inputs() {
+        let root = scratch("runner-refusals");
+        let (node, tsc) = tools(&root);
+        let baseline = config_with(&node, &tsc);
+        let argv = vec!["vitest".into(), "run".into(), "a.test.ts".into()];
+        let package = "node_modules/vitest/package.json";
+        let cli = "node_modules/vitest/cli.mjs";
+        let valid = r#"{"name":"vitest","bin":"./cli.mjs"}"#;
+        put(&root, "package.json", "{}");
+        for case in [
+            "missing",
+            "malformed",
+            "wrong-name",
+            "wrong-bin",
+            "escape-bin",
+            "shell-bin",
+            "missing-cli",
+            "denied-manifest",
+            "denied-cli",
+            "denied-parent",
+            "unconfigured",
+            "changed-node",
+            "escaping-link",
+        ] {
+            put(&root, package, valid);
+            put(&root, cli, "console.log('unused');");
+            let mut config = baseline.clone();
+            match case {
+                "missing" => std::fs::remove_file(root.join(package)).unwrap(),
+                "malformed" => put(&root, package, "{"),
+                "wrong-name" => put(&root, package, r#"{"name":"other","bin":"cli.mjs"}"#),
+                "wrong-bin" => put(
+                    &root,
+                    package,
+                    r#"{"name":"vitest","bin":{"other":"cli.mjs"}}"#,
+                ),
+                "escape-bin" => put(&root, package, r#"{"name":"vitest","bin":"../other.mjs"}"#),
+                "shell-bin" => put(&root, package, r#"{"name":"vitest","bin":"cli.sh"}"#),
+                "missing-cli" => std::fs::remove_file(root.join(cli)).unwrap(),
+                "denied-manifest" | "denied-cli" | "denied-parent" => {
+                    config.read_denies = vec![ReadDeny::Path(root.join(match case {
+                        "denied-manifest" => package,
+                        "denied-cli" => cli,
+                        _ => "node_modules",
+                    }))]
+                }
+                "unconfigured" => config = ModuleConfig::default(),
+                "changed-node" => std::fs::write(&node, "changed-node").unwrap(),
+                "escaping-link" => {
+                    std::fs::remove_file(root.join(cli)).unwrap();
+                    std::os::unix::fs::symlink("/usr/bin/true", root.join(cli)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    command_argv(&root, &argv, &config),
+                    Err(LangError::Environment(_))
+                ),
+                "native {case}"
+            );
+            assert!(
+                matches!(
+                    crate::module::configured_effect(&argv, &config, &root),
+                    Err(LangError::Environment(_))
+                ),
+                "module {case}"
+            );
+            std::fs::write(&node, "node-stub-v1\n").unwrap();
+            if case == "escaping-link" {
+                std::fs::remove_file(root.join(cli)).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The Launcher `node` slot resolves to the request's CONFIGURED Node — the fixture's

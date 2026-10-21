@@ -1339,10 +1339,10 @@ async fn runner_transcript(runner: &str, env: &[(&str, &str)]) -> (Vec<String>, 
     (replies, fixture.base.join("npx-invoked").exists())
 }
 
-/// Unbound Vitest and Jest recipes refuse consistently without invoking ambient `npx`; a plain
+/// Unprepared Vitest and Jest recipes refuse consistently without invoking ambient `npx`; a plain
 /// source file still reports that it has no tests.
 #[tokio::test]
-async fn typescript_test_runners_refuse_unbound_npx() {
+async fn typescript_test_runners_refuse_unprepared_packages() {
     for runner in ["vitest", "jest"] {
         let (in_process, in_process_invoked) = runner_transcript(runner, &[IN_PROCESS]).await;
         let (moduled, moduled_invoked) = runner_transcript(runner, &[]).await;
@@ -1352,7 +1352,9 @@ async fn typescript_test_runners_refuse_unbound_npx() {
         let all = moduled.join("\n");
         assert!(all.contains("provider_unavailable"), "{runner}:\n{all}");
         assert!(
-            all.contains("npx-based vitest/jest runs are not bound to the configured Node"),
+            all.contains(&format!(
+                "project-local {runner} runner is missing, read restricted or untrusted"
+            )),
             "{runner}:\n{all}"
         );
         assert!(!all.contains("1 passed, 0 failed"), "{runner}:\n{all}");
@@ -1365,11 +1367,11 @@ async fn typescript_test_runners_refuse_unbound_npx() {
 /// sentinel) leads the daemon's `PATH`: the test passes via nodeA, the nodeB sentinel is
 /// absent, the process tree contains no stub, and the test file itself records
 /// `process.execPath` (nodeA) and spawns a bare-`node` child whose `execPath` is also nodeA.
-/// An `npx vitest` selection refuses in both routes with the environment cause and never
-/// spawns any runner. A fake npx sentinel prevents package preparation on a regression.
+/// Prepared Vitest/Jest stand-ins in a contained pnpm layout exercise the real test execution
+/// path and record exact file/pattern argv; missing packages refuse without ambient npx.
 #[ignore = "requires accepted AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER"]
 #[tokio::test]
-async fn configured_node_wins_over_ambient_and_npx_refuses() {
+async fn configured_node_executes_prepared_runners_without_ambient_npx() {
     let fixture = node_fixture(true);
     let sentinel = fixture.base.join("nodeB-ran");
     let ambient_bin = fixture.base.join("ambient-bin");
@@ -1473,32 +1475,194 @@ test('records exec paths', () => {{
         let package_path = fixture.root.join("package.json");
         let mut package: Value =
             serde_json::from_str(&std::fs::read_to_string(&package_path).unwrap()).unwrap();
-        package["devDependencies"] = serde_json::json!({"vitest": "1.0.0"});
-        package["scripts"]["test"] = serde_json::json!("vitest run");
-        std::fs::write(&package_path, package.to_string()).unwrap();
-        let (refusal, refusal_text) = run_tests(
-            &mut session,
-            &fixture,
-            json!({"path":"test/exec-path.test.mjs"}),
-        )
-        .await;
-        let all_text = refusal_text
-            + refusal
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-        assert!(
-            all_text.contains("not bound to the configured Node"),
-            "expected the exact npx runner Environment refusal in {:?}: {all_text}",
-            mode_env,
-        );
-        assert!(
-            !sentinel.exists(),
-            "the npx refusal must not spawn any runner in {:?}",
-            mode_env,
-        );
+        for runner in ["vitest", "jest"] {
+            package["devDependencies"] = json!({runner: "1.0.0"});
+            package["scripts"]["test"] = json!(runner);
+            package["engines"]["node"] = json!(">=16.9.0");
+            std::fs::write(&package_path, package.to_string()).unwrap();
+            let runner_link = fixture.root.join(format!("node_modules/{runner}"));
+            let _ = std::fs::remove_file(&runner_link);
+            let (_, missing) = run_tests(
+                &mut session,
+                &fixture,
+                json!({"path":"test/exec-path.test.mjs"}),
+            )
+            .await;
+            assert!(
+                missing.contains(&format!("project-local {runner} runner is missing")),
+                "{mode_env:?}: {missing}"
+            );
+
+            let relative = format!("node_modules/.pnpm/{runner}@1/node_modules/{runner}");
+            put_test_file(
+                &fixture,
+                &format!("{relative}/package.json"),
+                &format!(
+                    r#"{{"name":"{runner}","bin":{{"{runner}":"bin/cli.{}"}}}}"#,
+                    if runner == "vitest" { "mjs" } else { "cjs" }
+                ),
+            );
+            let record = fixture.root.join("runner-record.json");
+            let script = format!(
+                r#"
+{imports}
+const child = spawnSync('node', ['-p', 'process.execPath'], {{encoding:'utf8'}});
+if (child.status !== 0) throw new Error('child Node failed: ' + child.stderr);
+writeFileSync('runner-record.json', JSON.stringify({{node:process.execPath, child:child.stdout.trim(), args:process.argv.slice(2)}}));
+console.log({summary});
+"#,
+                imports = if runner == "vitest" {
+                    "import {spawnSync} from 'node:child_process'; import {writeFileSync} from 'node:fs'; import {pathToFileURL} from 'node:url'; if (import.meta.url !== pathToFileURL(process.argv[1]).href) throw new Error('ESM entry changed');"
+                } else {
+                    "const {spawnSync} = require('node:child_process'); const {writeFileSync} = require('node:fs'); if (require.main !== module) throw new Error('CJS entry changed');"
+                },
+                summary = serde_json::to_string(if runner == "vitest" {
+                    "Tests  1 passed (1)"
+                } else {
+                    "Tests: 1 passed, 1 total"
+                })
+                .unwrap()
+            );
+            put_test_file(
+                &fixture,
+                &format!(
+                    "{relative}/bin/cli.{}",
+                    if runner == "vitest" { "mjs" } else { "cjs" }
+                ),
+                &script,
+            );
+            std::os::unix::fs::symlink(
+                format!(".pnpm/{runner}@1/node_modules/{runner}"),
+                &runner_link,
+            )
+            .unwrap();
+            put_test_file(
+                &fixture,
+                "-dash test.test.ts",
+                "test('stand-in', () => {});\n",
+            );
+            for (arguments, mut expected) in [
+                (
+                    json!({"path":"-dash test.test.ts"}),
+                    vec!["./-dash test.test.ts"],
+                ),
+                (
+                    json!({"pattern":"-leading 🦀 [a-z]"}),
+                    vec!["-t", "-leading 🦀 [a-z]"],
+                ),
+                (
+                    json!({"path":"test/exec-path.test.mjs"}),
+                    vec!["test/exec-path.test.mjs"],
+                ),
+            ] {
+                if runner == "vitest" {
+                    expected.insert(0, "run");
+                }
+                let _ = std::fs::remove_file(&record);
+                let (_, text) = run_tests(&mut session, &fixture, arguments).await;
+                assert!(
+                    text.contains("1 passed, 0 failed,") && text.contains("(exit 0)"),
+                    "{runner} {mode_env:?}: {text}"
+                );
+                let observed: Value =
+                    serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+                assert_eq!(observed["args"], json!(expected), "{runner} {mode_env:?}");
+                for field in ["node", "child"] {
+                    assert_eq!(
+                        Path::new(observed[field].as_str().unwrap())
+                            .canonicalize()
+                            .unwrap(),
+                        Path::new(&real_node).canonicalize().unwrap(),
+                        "{runner} {field} {mode_env:?}"
+                    );
+                }
+                assert!(
+                    !sentinel.exists(),
+                    "ambient Node/npx executed: {runner} {mode_env:?}"
+                );
+            }
+            for requirement in [">=999", "unknown-node-alias", ""] {
+                package["engines"]["node"] = json!(requirement);
+                std::fs::write(&package_path, package.to_string()).unwrap();
+                std::fs::remove_file(&record).unwrap();
+                let (_, refused) = run_tests(
+                    &mut session,
+                    &fixture,
+                    json!({"path":"test/exec-path.test.mjs"}),
+                )
+                .await;
+                assert!(
+                    refused.contains("environment unavailable (exit 78)")
+                        && !refused.contains("0 passed"),
+                    "{runner} {requirement} {mode_env:?}: {refused}"
+                );
+                assert!(!record.exists(), "refused environment loaded {runner}");
+                // Keep the next iteration's record removal deterministic without executing the runner.
+                std::fs::write(&record, "refused").unwrap();
+            }
+            package["engines"]["node"] = json!(">=16.9.0");
+            std::fs::write(&package_path, package.to_string()).unwrap();
+            std::fs::remove_file(&record).unwrap();
+            let tsc = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap())
+                .with_file_name("tsc.js");
+            let config = agent_ide_core::modules::contract::ModuleConfig {
+                checks: Some(json!({"node":real_node,"tsc_cli":tsc})),
+                provider: Some(json!({"node":accepted_program(&real_node,"24.4.0")})),
+                ..Default::default()
+            };
+            let argv = if runner == "vitest" {
+                vec![
+                    runner.into(),
+                    "run".into(),
+                    "test/exec-path.test.mjs".into(),
+                ]
+            } else {
+                vec![runner.into(), "test/exec-path.test.mjs".into()]
+            };
+            for case in ["unknown-identity", "denied-verifier", "denied-runner"] {
+                let mut rejected = config.clone();
+                match case {
+                    "unknown-identity" => {
+                        rejected.provider.as_mut().unwrap()["node"]["identity"] = json!("unknown")
+                    }
+                    "denied-verifier" => {
+                        rejected.read_denies =
+                            vec![agent_ide_core::execution::seatbelt::ReadDeny::Path(
+                                tsc.with_file_name("typescript.js"),
+                            )]
+                    }
+                    _ => {
+                        rejected.read_denies =
+                            vec![agent_ide_core::execution::seatbelt::ReadDeny::Path(
+                                runner_link.canonicalize().unwrap(),
+                            )]
+                    }
+                }
+                assert!(
+                    agent_ide_lang_typescript::environment::command_argv(
+                        &fixture.root,
+                        &argv,
+                        &rejected
+                    )
+                    .is_err(),
+                    "native {case}"
+                );
+                assert!(
+                    agent_ide_lang_typescript::module::configured_effect(
+                        &argv,
+                        &rejected,
+                        &fixture.root
+                    )
+                    .is_err(),
+                    "module {case}"
+                );
+                assert!(!record.exists(), "{case} loaded {runner}");
+            }
+            std::fs::remove_file(&runner_link).unwrap();
+        }
         package["devDependencies"] = serde_json::json!({});
         package["scripts"]["test"] = serde_json::json!("node --test");
+        package.as_object_mut().unwrap().remove("engines");
         std::fs::write(&package_path, package.to_string()).unwrap();
         session.close(&fixture).await;
     }

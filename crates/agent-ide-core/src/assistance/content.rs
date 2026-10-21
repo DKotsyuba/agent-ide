@@ -275,6 +275,18 @@ fn edit_outcome_failed(outcome: EditOutcome) -> bool {
 /// session plate or a pending result is not a failure.
 fn reports_failure(reply: &PeerReply) -> bool {
     match reply {
+        PeerReply::Complete {
+            kind: super::reply::ResultKind::Test,
+            text,
+            ..
+        } => text
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("tests #"))
+            .and_then(|line| line.split_once(": "))
+            .is_some_and(|(id, status)| {
+                id.parse::<u64>().is_ok() && status.starts_with("environment unavailable (exit 78)")
+            }),
         PeerReply::Error { .. } | PeerReply::InvalidParameters { .. } => true,
         PeerReply::Edit { result, .. } => edit_outcome_failed(result.outcome),
         PeerReply::EditBatch { outcome, .. } => *outcome != EditBatchOutcome::Applied,
@@ -666,6 +678,24 @@ mod refusal_table;
 
 #[cfg(test)]
 mod tests {
+
+    /// A retained environment refusal uses the business-refusal envelope in every host mode.
+    #[test]
+    fn test_environment_refusal_sets_is_error() {
+        for envelope in [Envelope::TextOnly, Envelope::WithStructured] {
+            let reply = PeerReply::Complete {
+                kind: ResultKind::Test,
+                text: "tests #4: environment unavailable (exit 78), 0 s — incompatible Node".into(),
+                detail_ref: Some("test-ref".into()),
+                truncated: false,
+                continuation: false,
+            };
+            assert_eq!(
+                render_with_status(reply, None, envelope).unwrap().is_error,
+                Some(true)
+            );
+        }
+    }
 
     /// Source fitting includes production framing and status before claiming delivery, without
     /// counting the test-only oracle twice. The complete oracle still obeys the transport cap.

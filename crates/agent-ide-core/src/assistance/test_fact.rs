@@ -125,6 +125,7 @@ struct Entry {
 /// - owner cancellation: `cancelled — P passed, F failed so far (exit C)`;
 /// - the budget killed the run: `stopped at budget B s — P passed, F failed so far (exit C)`;
 ///   either state says `test counts unavailable` or `exit unavailable` when not observed;
+/// - the trusted runner prelude refused: `environment unavailable (exit 78)`, with its cause;
 /// - no recognised summary, so only the exit status is known: `exit C, S s`, followed by the
 ///   last output lines;
 /// - a non-zero exit with no counted test: `no test results (exit C), S s — runner said: …`;
@@ -218,6 +219,11 @@ pub(super) fn summary_text(result: &RunResult) -> String {
             "stopped at budget {} s — {partial_counts} (exit {exit})",
             result.budget.as_secs(),
         )
+    } else if let Some(cause) = result.environment_unavailable() {
+        format!(
+            "environment unavailable (exit {exit}), {seconds} s — {}",
+            clean(cause, MAX_EXCERPT_BYTES)
+        )
     } else if summary_absent(result) {
         let exit = result
             .exit
@@ -238,6 +244,15 @@ pub(super) fn summary_text(result: &RunResult) -> String {
                 .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
         )
     };
+    if report.incomplete
+        && counted
+        && result
+            .targets
+            .iter()
+            .any(|target| target.contains("environment unavailable (exit 78)"))
+    {
+        base.push_str("; partial counts, another target's environment unavailable");
+    }
     if let Some(label) = &result.environment_label {
         base.push_str(" · env ");
         base.push_str(label);
@@ -803,5 +818,28 @@ mod tests {
             terminal_fact(1, &result, true),
             terminal_fact(1, &result, true)
         );
+    }
+
+    /// Runtime environment refusals retain exit/output/replay without inventing test counts.
+    #[test]
+    fn environment_refusal_is_distinct_from_test_failure() {
+        let mut result = run(0, 0, vec![]);
+        result.report.incomplete = true;
+        result.exit = Some(78);
+        result.output = "error: agent-ide test environment unavailable: incompatible Node\n".into();
+        let fact = terminal_fact(1, &result, true);
+        assert!(
+            fact.summary
+                .starts_with("environment unavailable (exit 78)"),
+            "{fact:?}"
+        );
+        assert!(!fact.summary.contains("passed") && !fact.summary.contains("failed"));
+        assert!(
+            fact.detail.contains("incompatible Node")
+                && fact.detail.contains("full output")
+                && fact.detail.contains("rerun:")
+        );
+        result.exit = Some(1);
+        assert!(!summary_text(&result).starts_with("environment unavailable"));
     }
 }
