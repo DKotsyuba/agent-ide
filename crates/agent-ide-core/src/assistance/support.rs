@@ -7,6 +7,10 @@ use super::*;
 #[path = "support/client.rs"]
 mod client;
 
+#[cfg(feature = "jev-pilot")]
+#[path = "support/packet.rs"]
+mod packet;
+
 /// Optional helper owner; OFF allocates neither a client nor an asynchronous task.
 pub(super) struct Pilot {
     /// Safe startup disposition; configuration errors never reject core startup.
@@ -970,8 +974,9 @@ async fn compute(
         }
         let plan = plan(shared, input, focus).await;
         let (candidates, actions) = options(input, focus, 2 - budget.calls, plan.as_ref());
-        let state = serde_json::json!({"task":config.task,"binding":blake3::Hash::from_bytes(input.authority.binding().fingerprint()).to_hex().to_string(),"generation":input.authority.epoch(),"activation":input.authority.activation_id(),"changed":input.changed,"scope":input.sources[focus].path(),"file_version":input.sources[focus].version(),"source":fragment(&bodies[focus],input.span.as_ref().filter(|span|span.path==input.sources[focus].path()).map_or(0,|span|span.offset)),"confirmed_change":input.span.as_ref().and_then(|span|input.sources.iter().position(|source|source.path()==span.path).map(|index|serde_json::json!({"path":span.path,"before_hash":blake3::Hash::from_bytes(span.before).to_hex().to_string(),"after_hash":blake3::Hash::from_bytes(span.after).to_hex().to_string(),"first_differing_byte":span.offset,"current":fragment(&bodies[index],span.offset)}))),"coverage":"bounded observed files only; other relations unavailable","graphs":"unavailable; no ready graph borrowed","budget":{"decisions_remaining":2-budget.calls,"auto_tests_remaining":1,"files":input.sources.len(),"read_bytes":budget.read_bytes},"run_facts":"no support test started"}).to_string();
-        if state.len() > 8 * 1024 || candidates.len() > 12 {
+        let state = serde_json::json!({"task":config.task,"binding":blake3::Hash::from_bytes(input.authority.binding().fingerprint()).to_hex().to_string(),"generation":input.authority.epoch(),"activation":input.authority.activation_id(),"changed":input.changed,"scope":input.sources[focus].path(),"file_version":input.sources[focus].version(),"source":fragment(&bodies[focus],input.span.as_ref().filter(|span|span.path==input.sources[focus].path()).map_or(0,|span|span.offset)),"confirmed_change":input.span.as_ref().and_then(|span|input.sources.iter().position(|source|source.path()==span.path).map(|index|serde_json::json!({"path":span.path,"before_hash":blake3::Hash::from_bytes(span.before).to_hex().to_string(),"after_hash":blake3::Hash::from_bytes(span.after).to_hex().to_string(),"first_differing_byte":span.offset,"current":fragment(&bodies[index],span.offset)}))),"coverage":"bounded observed files only; other relations unavailable","graphs":"unavailable; no ready graph borrowed","budget":{"decisions_remaining":2-budget.calls,"auto_tests_remaining":1,"files":input.sources.len(),"read_bytes":budget.read_bytes},"run_facts":"no support test started"});
+        let state = packet::encode(&state)?;
+        if candidates.len() > 12 {
             return Err("state_budget");
         }
         let evidence = serde_json::json!({"state":state,"options":candidates.iter().map(|candidate| serde_json::json!({"id":candidate.id,"description":candidate.description,"auto_test":candidate.auto_test})).collect::<Vec<_>>()});
