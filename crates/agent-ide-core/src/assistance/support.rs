@@ -299,8 +299,8 @@ struct State {
     pending: Option<Input>,
     /// Last real version triggering work, suppressing the same early/terminal receipt replay.
     last_change: Option<SourceObservation>,
-    /// Verified write span only; never caches a second source body or changes main receipts.
-    span: Option<Span>,
+    /// At most eight latest verified write spans, retaining multi-file change geometry only.
+    spans: Vec<Span>,
     /// Exact generation owning all optional work.
     owner: Option<BindingRef>,
     /// Sole owned async episode, joined at main-test priority, stop or shutdown.
@@ -352,7 +352,7 @@ struct Span {
     offset: usize,
 }
 
-/// Borrows existing verified write bytes to retain only bounded change geometry and hashes.
+/// Retains bounded change geometry for the latest eight verified files, never their bodies.
 /// This performs no read, registration, model call or delivery bookkeeping.
 pub(super) fn note_span(
     shared: &Shared,
@@ -366,7 +366,13 @@ pub(super) fn note_span(
         && before != after
         && let Ok(mut state) = shared.support.state.lock()
     {
-        state.span = Some(Span {
+        state
+            .spans
+            .retain(|span| span.binding != *binding || span.path != observed.path());
+        if state.spans.len() == 8 {
+            state.spans.remove(0);
+        }
+        state.spans.push(Span {
             binding: binding.clone(),
             path: observed.path().to_owned(),
             before: *blake3::hash(before).as_bytes(),
@@ -432,9 +438,10 @@ impl Input {
             epoch: shared.outbox.current_epoch(authority.binding()),
             span: shared.support.state.lock().ok().and_then(|state| {
                 state
-                    .span
-                    .as_ref()
-                    .filter(|span| {
+                    .spans
+                    .iter()
+                    .rev()
+                    .find(|span| {
                         span.binding == *authority.binding()
                             && span.path == source.path()
                             && source
@@ -633,11 +640,13 @@ struct Plan {
     language: Language,
 }
 
-/// Offers at most twelve options in stable order, with exactly one optional run capability.
+/// Offers at most twelve options with stable IDs/order and one optional run capability.
+/// A current window is already visible; private reads require a later decision to use them.
 #[cfg(feature = "jev-pilot")]
 fn options(
     input: &Input,
     focus: usize,
+    decisions_remaining: usize,
     plan: Option<&Plan>,
 ) -> (Vec<client::Candidate>, Vec<Action>) {
     let mut entries = vec![
@@ -670,6 +679,9 @@ fn options(
     let mut candidates = Vec::new();
     let mut actions = Vec::new();
     for (index, (description, action)) in entries.into_iter().enumerate() {
+        if matches!(action, Action::Focus(source) if source == focus || decisions_remaining < 2) {
+            continue;
+        }
         candidates.push(client::Candidate {
             id: format!("a{index}"),
             description,
@@ -896,7 +908,8 @@ fn fragment(source: &str, offset: usize) -> Value {
     serde_json::json!({"text":&source[start..end],"start_byte":start,"end_byte":end,"first_line":source[..start].bytes().filter(|byte|*byte==b'\n').count()+1,"coverage":"partial current source window"})
 }
 
-/// Computes no more than two decisions, retaining alternative scopes when the initial one is wrong.
+/// Computes at most two decisions: an optional new evidence window, then an external action.
+/// Final private reads and already displayed windows are not useful local capabilities.
 /// Only a validated Choice >=0.5 and independent test Noul >=0.8 may return an admitted plan.
 #[cfg(feature = "jev-pilot")]
 async fn compute(
@@ -947,7 +960,7 @@ async fn compute(
             return Err("busy_foreign_or_main");
         }
         let plan = plan(shared, input, focus).await;
-        let (candidates, actions) = options(input, focus, plan.as_ref());
+        let (candidates, actions) = options(input, focus, 2 - budget.calls, plan.as_ref());
         let state = serde_json::json!({"task":config.task,"binding":blake3::Hash::from_bytes(input.authority.binding().fingerprint()).to_hex().to_string(),"generation":input.authority.epoch(),"activation":input.authority.activation_id(),"changed":input.changed,"scope":input.sources[focus].path(),"file_version":input.sources[focus].version(),"source":fragment(&bodies[focus],input.span.as_ref().filter(|span|span.path==input.sources[focus].path()).map_or(0,|span|span.offset)),"confirmed_change":input.span.as_ref().and_then(|span|input.sources.iter().position(|source|source.path()==span.path).map(|index|serde_json::json!({"path":span.path,"before_hash":blake3::Hash::from_bytes(span.before).to_hex().to_string(),"after_hash":blake3::Hash::from_bytes(span.after).to_hex().to_string(),"first_differing_byte":span.offset,"current":fragment(&bodies[index],span.offset)}))),"coverage":"bounded observed files only; other relations unavailable","graphs":"unavailable; no ready graph borrowed","budget":{"decisions_remaining":2-budget.calls,"auto_tests_remaining":1,"files":input.sources.len(),"read_bytes":budget.read_bytes},"run_facts":"no support test started"}).to_string();
         if state.len() > 8 * 1024 || candidates.len() > 12 {
             return Err("state_budget");
@@ -1034,6 +1047,7 @@ async fn compute(
             .position(|candidate| candidate.id == selected.selected_id)
             .and_then(|index| actions.get(index))
             .ok_or("unknown_id")?;
+        trace.record(serde_json::json!({"event":"decision_selected","decision":budget.calls,"selected_id":selected.selected_id,"confidence":selected.confidence,"auto_test_probability":selected.auto_test_probability,"action":match action {Action::Inactive=>"inactive",Action::Suggest=>"suggest",Action::Focus(_)=>"focus",Action::Run=>"test"},"scope":input.sources[focus].path()}))?;
         match action {
             Action::Inactive => return Ok(None),
             Action::Suggest => {

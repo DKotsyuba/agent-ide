@@ -383,6 +383,27 @@ async fn wrong_scope_expands_private_facts_without_main_source_receipt() {
             .starts_with("private:")
     );
     assert_ne!(states[0]["source"], states[1]["source"]);
+    let menus = records
+        .iter()
+        .filter_map(|record| record["options"].as_array())
+        .collect::<Vec<_>>();
+    assert!(
+        menus[0].iter().all(|option| option["id"] != "a2"),
+        "current scope has no new facts"
+    );
+    assert!(
+        menus[1]
+            .iter()
+            .all(|option| !matches!(option["id"].as_str(), Some("a2" | "a3"))),
+        "final private reads cannot benefit a later decision"
+    );
+    assert!(
+        menus[1]
+            .iter()
+            .any(|option| option["id"] == "a4" && option["auto_test"] == true),
+        "test capability keeps its stable ID"
+    );
+
     assert!(
         harness
             .handle
@@ -403,7 +424,7 @@ async fn wrong_scope_expands_private_facts_without_main_source_receipt() {
 }
 
 /// Every closed refusal remains fail-open after the real edit, consumes one choice and never
-/// retries or launches a test. Two inspect decisions exhaust the same fixed episode budget.
+/// retries or launches a test. Unoffered private reads cannot consume another useful action.
 #[tokio::test]
 async fn failures_low_confidence_unknown_id_and_budget_remain_inactive() {
     for decisions in [
@@ -622,11 +643,11 @@ fn malformed_helper_is_safe_and_closed() {
     );
 }
 
-/// Both full-content and batched line edits show the actual changed region past the first 4 KiB,
+/// Full-content, batched line and multi-file edits retain the changed region past the first 4 KiB,
 /// using the existing verified before/after hook rather than an invented source-diff authority.
 #[tokio::test]
 async fn actual_change_window_covers_single_and_batch_edit_beyond_prefix() {
-    for batch in [false, true] {
+    for batch in [0, 1, 2] {
         let harness = Harness::new(
             "jev",
             Vec::new(),
@@ -640,16 +661,26 @@ async fn actual_change_window_covers_single_and_batch_edit_beyond_prefix() {
                 .repeat(100)
         );
         std::fs::write(harness.root.join("main.gamma"), &before).unwrap();
-        if batch {
+        if batch != 0 {
             let read = harness
                 .call(
                     AssistanceTool::Read,
-                    serde_json::json!({"items":[{"path":"main.gamma"}]}),
+                    serde_json::json!({"items":[{"path":"main.gamma"},{"path":"cache.gamma"}]}),
                     "batch-read",
                 )
                 .await;
             assert!(matches!(read, PeerReply::Complete { .. }), "{read:?}");
-            let reply=harness.call(AssistanceTool::Edit,serde_json::json!({"path":"main.gamma","operation_id":"batch-span","changes":[{"lines":"101-101","content":"sym new"}]}),"batch-edit").await;
+            let parameters = if batch == 2 {
+                serde_json::json!({"operation_id":"multi-span","files":[
+                    {"path":"main.gamma","changes":[{"old":"sym old","new":"sym new"}]},
+                    {"path":"cache.gamma","changes":[{"old":"sym unrelated","new":"sym changed"}]}
+                ]})
+            } else {
+                serde_json::json!({"path":"main.gamma","operation_id":"batch-span","changes":[{"lines":"101-101","content":"sym new"}]})
+            };
+            let reply = harness
+                .call(AssistanceTool::Edit, parameters, "batch-edit")
+                .await;
             assert!(
                 matches!(reply, PeerReply::EditBatch { .. } | PeerReply::Edit { .. }),
                 "{reply:?}"

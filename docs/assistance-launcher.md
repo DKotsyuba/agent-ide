@@ -355,7 +355,9 @@ One real confirmed edit starts a 250 ms coalesced optional episode. Native chang
 qualify only after normal MCP authorization/reconciliation. The episode binds
 exact task, activation, binding generation, source versions and change epoch.
 Verified edit geometry supplies a bounded window around the actual changed byte;
-missing geometry is explicitly unavailable. Scope alternatives remain selectable.
+missing geometry is explicitly unavailable. The latest eight verified file spans
+are retained independently, so a multi-file edit cannot overwrite the changed
+file's geometry with another file's span. Scope alternatives remain selectable.
 Only previously observed or explicitly scoped files are read: at most eight unique
 files and 2 MiB aggregate bytes including freshness rereads, under the existing
 1 MiB per-file reader ceiling.
@@ -366,7 +368,10 @@ explicitly partial. No new provider warming or source index is introduced.
 At most two decisions, including test choice, run within five seconds of compute;
 each HTTP exchange has a 1.5-second total deadline. The helper may inspect, expand
 or reopen existing snapshots, suggest a next-natural-reply review, remain inactive,
-or choose one existing core-admitted test. The run option names the actual observed
+or choose one existing core-admitted test. The currently displayed window is not
+offered again; private scope changes require a subsequent decision and are omitted
+from the final choice. Surviving options preserve their local IDs and order.
+The run option names the actual observed
 test target; source-to-test relation is unverified. Without an admitted recipe no
 automatic test is offered. Choice confidence must be at least 0.5 and an independent
 usefulness Noul at least 0.8. A test uses existing admission, output/replay retention
