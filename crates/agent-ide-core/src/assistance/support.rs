@@ -54,6 +54,15 @@ impl Pilot {
         }
     }
 
+    /// Requests verified write geometry independently of the main agent's read-memory epoch.
+    /// OFF retains the ordinary no-context fast path and performs no helper-only base read.
+    pub(super) fn needs_geometry(&self) -> bool {
+        #[cfg(feature = "jev-pilot")]
+        return self.config.is_some();
+        #[cfg(not(feature = "jev-pilot"))]
+        false
+    }
+
     /// Reports an owned optional task, so idle shutdown does not abandon cleanup.
     pub(super) fn is_busy(&self) -> bool {
         #[cfg(feature = "jev-pilot")]

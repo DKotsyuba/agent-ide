@@ -407,7 +407,9 @@ impl Worker<'_> {
     }
 
     /// Captures exact source bytes for guard refresh without replacing a physical write's base.
-    /// A known context and observation matching `base`'s worktree/path/state/bytes are required.
+    /// A known context or enabled helper needs this snapshot, but the observation must always
+    /// match `base`'s worktree/path/state/bytes. Unknown main context still prevents guard refresh;
+    /// the helper only borrows verified geometry. OFF keeps its no-context fast path.
     /// Failure returns `None`; the ordinary write remains stale-safe and old guards are preserved.
     pub(super) async fn read_guard_write_base(
         &mut self,
@@ -415,7 +417,9 @@ impl Worker<'_> {
         base: &SourceObservation,
     ) -> Option<Vec<u8>> {
         let binding = job.invocation.binding_ref();
-        self.context_epoch(binding)?;
+        if self.context_epoch(binding).is_none() && !self.shared.support.needs_geometry() {
+            return None;
+        }
         let (observed, bytes) = self
             .observe(binding, base.path().to_path_buf())
             .await

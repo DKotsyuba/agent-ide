@@ -14,6 +14,8 @@ struct Harness {
     handle: WorkerHandle,
     /// Canonical project directory beneath the configured allowed root.
     root: PathBuf,
+    /// Whether the host has supplied a protected context hook; independent of write authority.
+    context_known: bool,
 }
 
 impl Harness {
@@ -77,6 +79,7 @@ impl Harness {
             scratch,
             handle,
             root,
+            context_known: true,
         };
         let start = harness
             .call(
@@ -117,7 +120,9 @@ impl Harness {
     /// Sends one actual worker operation with its host-authorized binding and fixed trusted target.
     async fn call(&self, tool: AssistanceTool, parameters: Value, id: &str) -> PeerReply {
         let invocation = self.invocation(id);
-        self.handle.note_hook(invocation.binding_ref());
+        if self.context_known {
+            self.handle.note_hook(invocation.binding_ref());
+        }
         self.handle
             .submit(invocation, tool, parameters, "pilot", None)
             .await
@@ -716,6 +721,88 @@ async fn actual_change_window_covers_single_and_batch_edit_beyond_prefix() {
         );
         harness.handle.shutdown().await.unwrap();
     }
+}
+
+/// A real patch with an unknown main context still supplies its verified geometry to the helper,
+/// while the missing main read-memory epoch remains unknown and no receipt is fabricated.
+#[tokio::test]
+async fn unknown_main_context_keeps_verified_helper_change_geometry() {
+    let mut harness = Harness::new(
+        "jev",
+        Vec::new(),
+        vec![choice("a0", 1.0, None)],
+        "printf pass",
+    )
+    .await;
+    harness.context_known = false;
+    harness
+        .handle
+        .shared
+        .ledger
+        .lock()
+        .unwrap()
+        .context_epochs
+        .clear();
+    let before = format!(
+        "{}sym old\nend\n",
+        "// unchanged source padding before the actual changed region\n".repeat(100)
+    );
+    std::fs::write(harness.root.join("main.gamma"), before).unwrap();
+    let read = harness
+        .call(
+            AssistanceTool::Read,
+            serde_json::json!({"items":[{"path":"main.gamma","lines":"101-101"}]}),
+            "partial-read",
+        )
+        .await;
+    assert!(matches!(read, PeerReply::Complete { .. }), "{read:?}");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-sym old\n+sym new\n*** End Patch",
+        harness.root.join("main.gamma").display()
+    );
+    let reply = harness
+        .call(
+            AssistanceTool::Edit,
+            serde_json::json!({"operation_id":"unknown-context-patch","patch":patch}),
+            "patch",
+        )
+        .await;
+    assert!(
+        matches!(reply, PeerReply::EditBatch { .. } | PeerReply::Edit { .. }),
+        "{reply:?}"
+    );
+    harness.join().await;
+    let records = harness.records();
+    let state: Value = serde_json::from_str(
+        records
+            .iter()
+            .find_map(|record| record["state"].as_str())
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        state["confirmed_change"]["first_differing_byte"]
+            .as_u64()
+            .is_some_and(|offset| offset > 4096),
+        "{state}"
+    );
+    assert!(
+        state["confirmed_change"]["current"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("sym new")
+    );
+    assert!(
+        harness
+            .handle
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .context_epochs
+            .is_empty()
+    );
+    harness.handle.shutdown().await.unwrap();
 }
 
 /// Token totals distinguish reported counters from absent cache usage and interrupted attempts.
