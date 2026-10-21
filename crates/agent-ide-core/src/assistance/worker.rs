@@ -5196,6 +5196,10 @@ impl<'a> Worker<'a> {
             text.push_str("\n\n");
             text.push_str(&card);
         }
+        if let Some(context) = self.prepared_context(job, &authority).await {
+            text.push_str("\n\n");
+            text.push_str(&context);
+        }
         // The call-signature block always ends the reply, after the card and its servers line.
         text.push_str("\n\n");
         text.push_str(super::signature_card::signature_block());
@@ -7766,7 +7770,8 @@ async fn reprove_disclosure(
 /// An Activation status or completed Diff with recorded empty provenance contains no worktree
 /// source paths or bytes and needs no read-path proof; other path-less details retain the
 /// whole-tree proof requirement. A semantic Context also proves each retained definition and
-/// reference path, so a newly denied secondary file invalidates its cached page.
+/// reference path; multi-source results recheck every retained source before disclosure, so a
+/// changed or newly denied secondary file invalidates retrieval.
 /// Complete diff hunks on a delivered continuation join the binding's incremental memory;
 /// an authorization, freshness or encoding refusal never records that page as delivered.
 /// A cancelled inspection retains its composed source page for the next retrieval.
@@ -7935,7 +7940,7 @@ async fn serve_inspection(
             || matches!(&reply, PeerReply::EditBatch { outcome: super::reply::EditBatchOutcome::Applied, .. });
         if complete_edit {
             let mut sources: Vec<_> = source.iter().cloned().collect();
-            sources.extend(extra_sources);
+            sources.extend(extra_sources.iter().cloned());
             let current = match &authority {
                 Some(authority) => shared.committed_edit_proof_current(workspace, &request.binding,
                     &request.reference, authority, &sources).await,
@@ -7958,6 +7963,25 @@ async fn serve_inspection(
                 code: invalidate(error.code),
                 stage: error.stage,
             });
+        }
+        // A multi-source result may disclose any retained window, including one outside the
+        // primary file. Prove every additional source before returning even the first page.
+        for extra in &extra_sources {
+            if let Err(error) = reprove_disclosure(
+                workspace,
+                &shared.bindings,
+                &request.binding,
+                authority.as_ref(),
+                Some(extra),
+                None,
+            )
+            .await
+            {
+                return Err(InspectFailure {
+                    code: invalidate(error.code),
+                    stage: error.stage,
+                });
+            }
         }
         // Result and output references share the original ownership/authority proof above.
         // Reading a saved test result never consumes log pages or replays their last body.

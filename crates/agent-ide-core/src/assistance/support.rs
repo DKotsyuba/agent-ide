@@ -1,5 +1,6 @@
-//! Restart-only, fail-open Jev pilot. One task episode borrows existing source observations,
-//! admission, test ownership and completion delivery; it creates no main-agent source receipts.
+//! Restart-only, fail-open Jev pilot: validated prepared context at activation, or one
+//! post-edit episode borrowing existing observations and admission. Neither private path
+//! fabricates main-agent read-memory or a model invocation.
 
 use super::*;
 
@@ -58,11 +59,15 @@ impl Pilot {
         }
     }
 
-    /// Requests verified write geometry independently of the main agent's read-memory epoch.
+    /// Post-edit inference requests verified write geometry independently of main read memory.
+    /// Prepared early context needs no helper-only write-base read.
     /// OFF retains the ordinary no-context fast path and performs no helper-only base read.
     pub(super) fn needs_geometry(&self) -> bool {
         #[cfg(feature = "jev-pilot")]
-        return self.config.is_some();
+        return self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.prepared_context_file.is_none());
         #[cfg(not(feature = "jev-pilot"))]
         false
     }
@@ -158,7 +163,11 @@ pub(super) fn changed(
 ) {
     #[cfg(feature = "jev-pilot")]
     {
-        if shared.support.config.is_none()
+        if shared
+            .support
+            .config
+            .as_ref()
+            .is_none_or(|config| config.prepared_context_file.is_some())
             || authority.role() != crate::workspace::authority::StartRole::Writer
         {
             return;
@@ -235,6 +244,176 @@ pub(super) fn take_note(shared: &Shared, binding: &BindingRef) -> Option<String>
     }
 }
 
+/// Validates separately prepared evidence at activation, without network I/O or main read receipts.
+impl Worker<'_> {
+    /// Returns only a source-free ready/unavailable line; code is retained under normal inspection.
+    pub(super) async fn prepared_context(
+        &mut self,
+        job: &Job,
+        authority: &AuthorityStamp,
+    ) -> Option<String> {
+        #[cfg(feature = "jev-pilot")]
+        {
+            let config = self.shared.support.config.clone()?;
+            config.prepared_context_file.as_ref()?;
+            if authority.role() != crate::workspace::authority::StartRole::Writer {
+                return None;
+            }
+            if self
+                .shared
+                .support
+                .state
+                .lock()
+                .ok()
+                .is_none_or(|state| state.claimed || state.closed)
+            {
+                return None;
+            }
+            let budget = job
+                .deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_millis(200));
+            let outcome =
+                tokio::time::timeout(budget, self.collect_prepared(job, authority, &config))
+                    .await
+                    .unwrap_or(Err("prepared_budget"));
+            Some(match outcome {
+                Ok(reference) => format!(
+                    "Jev context ready: {reference}; partial source evidence, unresolved contract."
+                ),
+                Err(reason) => {
+                    operator_reason(reason);
+                    format!(
+                        "Jev context unavailable: {reason}; ordinary IDE operation remains available."
+                    )
+                }
+            })
+        }
+        #[cfg(not(feature = "jev-pilot"))]
+        {
+            let _ = (job, authority);
+            None
+        }
+    }
+
+    /// Observes each exact file through normal Workspace authority; private reads stay private.
+    #[cfg(feature = "jev-pilot")]
+    async fn collect_prepared(
+        &mut self,
+        job: &Job,
+        authority: &AuthorityStamp,
+        config: &Config,
+    ) -> Result<String, &'static str> {
+        let model = config.selected_route().model();
+        let prepared = packet::Prepared::load(
+            config
+                .prepared_context_file
+                .as_deref()
+                .ok_or("prepared_file")?,
+            &config.trace_dir,
+            &config.task,
+            model,
+        )?;
+        let binding = authority.binding();
+        let epoch = self.shared.outbox.current_epoch(binding);
+        let mut sources = BTreeMap::new();
+        for window in &prepared.evidence {
+            if sources.contains_key(&window.path) {
+                continue;
+            }
+            let (observed, bytes) = self
+                .observe_as(binding, window.path.clone(), false)
+                .await
+                .map_err(|_| "prepared_source")?;
+            if observed.authority_epoch() != authority.epoch()
+                || !prepared.matches(&window.path, &bytes)
+            {
+                return Err("prepared_stale");
+            }
+            sources.insert(window.path.clone(), observed);
+        }
+        let active = self.shared.active(binding).map_err(|_| "stopped")?;
+        self.workspace
+            .authorize(authority, &active)
+            .await
+            .map_err(|_| "authority_stale")?;
+        if self.shared.outbox.current_epoch(binding) != epoch
+            || sources.values().any(|source| !source_matches(source))
+        {
+            return Err("prepared_stale");
+        }
+        let text = prepared.render()?;
+        let input = Input {
+            authority: authority.clone(),
+            sources: sources
+                .values()
+                .cloned()
+                .map(|s| Snapshot::Observed(Box::new(s)))
+                .collect(),
+            changed: PathBuf::new(),
+            target: job.target.clone(),
+            epoch,
+            span: None,
+        };
+        let mut state = self
+            .shared
+            .support
+            .state
+            .lock()
+            .map_err(|_| "state_unavailable")?;
+        if state.claimed
+            || state.closed
+            || state.owner.as_ref().is_some_and(|owner| owner != binding)
+        {
+            return Err("already_claimed");
+        }
+        state.owner = Some(binding.clone());
+        state.claimed = true;
+        drop(state);
+        let reference =
+            reserve_result(&self.shared, &input, AssistanceTool::Inspect).ok_or("result_budget")?;
+        let mut sources = sources.into_values();
+        let primary = sources.next().ok_or("prepared_source")?;
+        self.shared.add_edit_sources(&reference, sources.collect());
+        self.shared.complete(
+            &reference,
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                text: text.clone(),
+                detail_ref: Some(reference.clone()),
+                truncated: false,
+                continuation: false,
+            },
+            Some(authority.clone()),
+            Some(primary),
+            epoch.native_epoch,
+        );
+        // A normal source-bearing job-ready fact uses the existing re-proof and Bridge owner.
+        self.shared.push_or_transfer(
+            std::slice::from_ref(binding),
+            super::super::outbox::FactDraft {
+                kind: super::super::outbox::FactKind::JobReady,
+                subject: "support context".into(),
+                summary: "ready: partial code evidence; intended contract unresolved".into(),
+                detail: Some(text),
+                detail_ref: Some(reference.clone()),
+                failed: false,
+                source_bearing: true,
+                fence_paths: input
+                    .sources
+                    .iter()
+                    .map(|source| super::super::outbox::FencedPath {
+                        path: source.path().to_string_lossy().into_owned(),
+                        digest: source.bytes().map(|bytes| *bytes.digest()),
+                    })
+                    .collect(),
+            },
+        );
+        operator_reason("prepared_context_ready");
+        Ok(reference)
+    }
+}
+
 /// Records only a fixed safe helper disposition in the existing operator journal.
 pub(super) fn operator_reason(reason: &'static str) {
     let detail = format!("jev_pilot:{reason}");
@@ -256,18 +435,39 @@ struct Config {
     /// Closed mode, default OFF; no model argument can opt in.
     #[serde(default)]
     mode: String,
-    /// Exactly opencode (development default) or typesafe (owner-selected comparison route).
+    /// Optional operator accounting label; it never selects a coded provider preset.
     #[serde(default)]
     route: String,
+    /// Credential-free HTTPS base URL; combined with api_path.
+    #[serde(default)]
+    base_url: String,
+    /// Relative System One request path, allowing compatible providers without rebuilding.
+    #[serde(default)]
+    api_path: String,
+    /// Exact model identifier to send.
+    #[serde(default)]
+    model: String,
+    /// Exact response identifier; defaults to model when omitted.
+    #[serde(default)]
+    response_model: Option<String>,
+    /// Optional operator tariff estimate; actual usage.cost is retained independently.
+    #[serde(default)]
+    input_usd_per_million: Option<f64>,
+    /// Validated transport cached after parsing; never deserialized from an actor input.
+    #[serde(skip)]
+    transport: Option<client::Transport>,
     /// Nonempty task text (at most 1024 bytes), also the stable one-shot task identity.
     #[serde(default)]
     task: String,
     /// Absolute private credential file; opened only after exclusive episode claim.
     #[serde(default)]
     credential_file: PathBuf,
-    /// Explicit operator permission to send bounded task/source context to OpenCode.
+    /// Explicit operator permission to send bounded task/source context to the configured endpoint.
     #[serde(default)]
     egress_allowed: bool,
+    /// Private precomputed context; when present it replaces post-edit inference for this pilot.
+    #[serde(default)]
+    prepared_context_file: Option<PathBuf>,
     /// Optional preferred observed paths; alternatives remain selectable when this scope is wrong.
     #[serde(default)]
     initial_scope: Vec<PathBuf>,
@@ -276,23 +476,36 @@ struct Config {
     trace_dir: PathBuf,
 }
 
+#[cfg(feature = "jev-pilot")]
+impl Config {
+    /// Borrows the transport established by successful configuration parsing.
+    fn selected_route(&self) -> &client::Transport {
+        self.transport
+            .as_ref()
+            .expect("enabled configuration has validated transport")
+    }
+}
+
 /// Parses configuration without any I/O; empty or OFF mode ignores credential-related values.
 #[cfg(feature = "jev-pilot")]
 fn parse_config(raw: Option<&Value>) -> Result<Option<Config>, &'static str> {
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let config: Config = serde_json::from_value(raw.clone()).map_err(|_| "config_invalid")?;
+    let mut config: Config = serde_json::from_value(raw.clone()).map_err(|_| "config_invalid")?;
     if config.mode.is_empty() || config.mode == "off" {
         return Ok(None);
     }
     if config.mode != "jev"
-        || !matches!(config.route.as_str(), "" | "opencode" | "typesafe")
         || !config.egress_allowed
         || config.task.trim().is_empty()
         || config.task.len() > 1024
         || !config.credential_file.is_absolute()
         || !config.trace_dir.is_absolute()
+        || config
+            .prepared_context_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
         || config.initial_scope.len() > 8
         || config
             .initial_scope
@@ -301,6 +514,14 @@ fn parse_config(raw: Option<&Value>) -> Result<Option<Config>, &'static str> {
     {
         return Err("config_incomplete");
     }
+    config.transport = Some(client::Transport::new(
+        &config.route,
+        &config.base_url,
+        &config.api_path,
+        &config.model,
+        config.response_model.as_deref(),
+        config.input_usd_per_million,
+    )?);
     Ok(Some(config))
 }
 
@@ -801,7 +1022,7 @@ async fn episode(
             return;
         }
     };
-    if trace.record(serde_json::json!({"route":if config.route == "typesafe" { "typesafe" } else { "opencode" },"task_digest":blake3::hash(config.task.as_bytes()).to_hex().to_string(),"activation":input.authority.activation_id(),"generation":input.authority.epoch()})).is_err() { return; }
+    if trace.record(serde_json::json!({"route":config.selected_route().name(),"task_digest":blake3::hash(config.task.as_bytes()).to_hex().to_string(),"activation":input.authority.activation_id(),"generation":input.authority.epoch()})).is_err() { return; }
     let mut budget = Budget {
         began: Some(std::time::Instant::now()),
         ..Default::default()
@@ -831,7 +1052,7 @@ async fn episode(
     let _ = trace.record(serde_json::json!({"event":"episode_summary","decisions":budget.calls,"physical_send_intents":budget.attempts,"unknown_attempts":budget.unknown_attempts,"tokens":token_totals(&budget),"request_bytes":budget.request_bytes,"response_bytes":budget.response_bytes,"latencies_ms":budget.latencies_ms,"known_estimated_usd":budget.estimated_usd,"actual_provider_charge":Value::Null,"read_bytes":budget.read_bytes}));
 }
 
-/// Retains actual transport/usage facts and a dated primary-tariff estimate, never actual billing.
+/// Retains transport/usage facts, a tariff estimate and a validated provider-reported charge.
 /// Missing usage remains unknown even for a free route; cache tokens have no invented tariff.
 #[cfg(feature = "jev-pilot")]
 #[allow(
@@ -842,7 +1063,7 @@ fn record_attempt(
     trace: &mut Trace,
     budget: &mut Budget,
     decision: usize,
-    route: client::Route,
+    route: &client::Transport,
     attempt: &client::Attempt,
     usage: Option<&Value>,
     outcome: &str,
@@ -852,9 +1073,10 @@ fn record_attempt(
     let estimate = usage
         .and_then(|usage| usage.get("input_tokens"))
         .and_then(Value::as_u64)
-        .map(|input| match route {
-            client::Route::OpenCode => 0.0,
-            client::Route::TypeSafe => input as f64 * 0.042 / 1_000_000.0,
+        .and_then(|input| {
+            route
+                .input_usd_per_million
+                .map(|price| input as f64 * price / 1_000_000.0)
         });
     if attempt.physical_attempt {
         budget.usages.push(usage.cloned());
@@ -865,7 +1087,11 @@ fn record_attempt(
             budget.estimated_usd += cost;
         }
     }
-    trace.record(serde_json::json!({"event":"request_terminal","decision":decision,"physical_attempt":attempt.physical_attempt,"outcome":outcome,"http_status":attempt.status,"total_ms":attempt.total_ms,"headers_ms":Value::Null,"body_ms":Value::Null,"response_bytes":attempt.response_bytes,"request":request,"response":response,"usage":usage,"usage_unknown":usage.is_none(),"estimated_usd":estimate,"actual_provider_charge":Value::Null,"tariff":{"observed_date":"2026-10-20","model":route.model(),"input_usd_per_million":if matches!(route,client::Route::TypeSafe) {0.042} else {0.0},"output_usd_per_million":0.0,"cache_tariff":Value::Null,"source":if matches!(route,client::Route::TypeSafe) {"https://docs.typesafe.ai/models"} else {"https://opencode.ai/v2/docs/console/models/"}}}))
+    let reported_charge = usage
+        .and_then(|usage| usage.get("cost"))
+        .and_then(Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
+    trace.record(serde_json::json!({"event":"request_terminal","decision":decision,"physical_attempt":attempt.physical_attempt,"outcome":outcome,"http_status":attempt.status,"total_ms":attempt.total_ms,"headers_ms":Value::Null,"body_ms":Value::Null,"response_bytes":attempt.response_bytes,"request":request,"response":response,"usage":usage,"usage_unknown":usage.is_none(),"estimated_usd":estimate,"actual_provider_charge":reported_charge,"tariff":{"observed_date":"2026-10-21","model":route.model(),"input_usd_per_million":route.input_usd_per_million,"output_usd_per_million":0.0,"cache_tariff":Value::Null,"source":"operator_configuration"}}))
 }
 
 /// Aggregates reported token counters with exact decimal sums and explicit per-field coverage.
@@ -940,11 +1166,7 @@ async fn compute(
         .is_ok_and(|state| state.fixture.is_some());
     #[cfg(not(test))]
     let fixture = false;
-    let route = if config.route == "typesafe" {
-        client::Route::TypeSafe
-    } else {
-        client::Route::OpenCode
-    };
+    let route = config.selected_route();
     let client = if fixture {
         None
     } else {
@@ -989,7 +1211,7 @@ async fn compute(
         let before_send = |request: &Value| {
             trace.record(evidence).map_err(|_| ())?;
             let request_bytes = serde_json::to_vec(request).map_err(|_| ())?.len();
-            trace.record(serde_json::json!({"event":"request_pending","decision":decision,"task":config.task,"activation":input.authority.activation_id(),"generation":input.authority.epoch(),"route":if matches!(route,client::Route::TypeSafe){"typesafe"}else{"opencode"},"monotonic_since_episode_ms":budget.began.map(|began|began.elapsed().as_secs_f64()*1000.0),"endpoint":route.endpoint(),"model":route.model(),"wall_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|time| time.as_millis()),"request":request,"request_bytes":request_bytes,"usage_unknown":true,"estimated_usd":Value::Null,"actual_provider_charge":Value::Null})).map_err(|_| ())?;
+            trace.record(serde_json::json!({"event":"request_pending","decision":decision,"task":config.task,"activation":input.authority.activation_id(),"generation":input.authority.epoch(),"route":route.name(),"monotonic_since_episode_ms":budget.began.map(|began|began.elapsed().as_secs_f64()*1000.0),"endpoint":route.endpoint(),"model":route.model(),"wall_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|time| time.as_millis()),"request":request,"request_bytes":request_bytes,"usage_unknown":true,"estimated_usd":Value::Null,"actual_provider_charge":Value::Null})).map_err(|_| ())?;
             budget.attempts += 1;
             budget.unknown_attempts += 1;
             budget.request_bytes += request_bytes;
@@ -1168,7 +1390,7 @@ async fn run(
         {
             return;
         }
-        let Some(reference) = reserve_result(shared, input) else {
+        let Some(reference) = reserve_result(shared, input, AssistanceTool::Test) else {
             return;
         };
         let Some(config) = shared.support.config.as_ref() else {
@@ -1232,10 +1454,10 @@ async fn run(
     }
 }
 
-/// Reserves an ordinary bounded result slot for canonical test output/replay without a forged
+/// Reserves an ordinary bounded result slot for support output without a forged
 /// model invocation, a source receipt, or eviction of any main-agent work. Full means skip.
 #[cfg(feature = "jev-pilot")]
-fn reserve_result(shared: &Shared, input: &Input) -> Option<String> {
+fn reserve_result(shared: &Shared, input: &Input, carrier: AssistanceTool) -> Option<String> {
     let mut ledger = shared.ledger.lock().ok()?;
     if ledger.details.len() >= shared.launcher.limits.details {
         return None;
@@ -1254,7 +1476,7 @@ fn reserve_result(shared: &Shared, input: &Input) -> Option<String> {
             reply: PeerReply::Pending {
                 detail_ref: reference.clone(),
             },
-            selection: (AssistanceTool::Test, [0; 32]),
+            selection: (carrier, [0; 32]),
             authority: Some(input.authority.clone()),
             source: None,
             extra_sources: Vec::new(),

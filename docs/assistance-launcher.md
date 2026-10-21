@@ -332,7 +332,12 @@ section disables only the helper and records a fixed safe operator reason.
 ```json
 "jev_pilot": {
   "mode": "jev",
-  "route": "opencode",
+  "route": "openrouter",
+  "base_url": "https://openrouter.ai/api",
+  "api_path": "alpha/decisions",
+  "model": "typesafe/jev-1.13",
+  "response_model": "typesafe/jev-1.13-20260917",
+  "input_usd_per_million": 0.042,
   "task": "Review the changed behavior using observed project evidence.",
   "credential_file": "/absolute/private/key-file",
   "egress_allowed": true,
@@ -341,9 +346,17 @@ section disables only the helper and records a fixed safe operator reason.
 }
 ```
 
-`route` selects exactly `opencode` (default: OpenCode System One,
-`jev-1.13-free`) or `typesafe` (`https://api.typesafe.ai/v1/systemone`,
-`jev-1.13.0`). There are no custom endpoints, models, retries or provider fallbacks.
+`mode` is the sole runtime assistance switch: `off` (default) or `jev`.
+Both modes use the same feature-enabled binary. Configuration is read at daemon
+startup; changing it requires a new daemon/session, never a rebuild.
+`base_url` plus relative `api_path` selects a compatible System One endpoint;
+`model` is sent verbatim and `response_model` (default: `model`) is checked exactly.
+`route` is only an optional accounting label, not a coded provider selection.
+For direct TypeSafe use base `https://api.typesafe.ai`, path `v1/systemone`,
+model and response model `jev-1.13.0`. Credentials remain in `credential_file`.
+No redirects, retries or provider fallback are enabled. Invalid configuration
+disables only assistance; OFF ignores endpoint/key configuration without I/O.
+An optional input tariff is an estimate; provider-reported `usage.cost` is separate.
 The key file must be canonical, regular, owned by the current user, inaccessible
 to group/world and at most 4096 bytes. The existing trace directory must be
 canonical, owner-only and private. OFF never opens a key, constructs HTTP or sends.
@@ -351,7 +364,34 @@ The task is nonempty and at most 1024 UTF-8 bytes. Scope paths must be relative;
 only current writer authority can admit their bounded private source reads.
 Those reads never become main-agent source receipts.
 
-One real confirmed edit starts a 250 ms coalesced optional episode. Native changes
+
+### Prepared early context
+
+An operator may set optional prepared_context_file inside the private trace_dir.
+This selects early handoff instead of post-edit inference. The packet producer
+runs separately; activation performs no HTTP and never opens the credential file.
+It accepts a canonical owner-only regular artifact up to 24 KiB with schema
+jev-prepared-context-v1, exact task/model, action bundle and confidence >= 0.5.
+
+The artifact contains evidence windows: path, full-file BLAKE3 version,
+source_bytes, UTF-8 start_byte/end_byte, literal text, and relation
+"observed_only; not proof of test coverage"; plus run_facts and gaps.
+At most four windows of 2048 bytes from files up to 64 KiB are accepted.
+The producer must use legitimate task/worktree/public-check facts, never the
+evaluator/reference or a known mutation list. Its provider trace and elapsed/token
+costs remain separate evidence. A packet does not prove the current actor ran a test.
+
+Writer activation re-observes each file through Workspace authority and checks
+hashes/ranges and the activation/native epoch. It retains source-backed context
+under a detail handle and returns a "Jev context ready" line. The existing Bridge
+job-ready path may hand it over; with no route, ide.inspect retrieves it normally.
+Publication and inspection re-prove every source. Private preparation creates
+neither main read-memory nor a full-file replacement base. OFF and read-only do
+not load the artifact. Invalid, stale, unsafe or over-budget input reports context
+unavailable while ordinary activation succeeds, without post-edit fallback.
+This mode introduces no autonomous tests, new tools, Bridge kind or sender.
+
+Without prepared early context, one real confirmed edit starts a 250 ms coalesced optional episode. Native changes
 qualify only after normal MCP authorization/reconciliation. The episode binds
 exact task, activation, binding generation, source versions and change epoch.
 Verified edit geometry supplies a bounded window around the actual changed byte;

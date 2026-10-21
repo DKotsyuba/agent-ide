@@ -1,5 +1,5 @@
-//! Bounded packet serialization and the offline early-context prototype.
-//! Callers retain source authority/freshness; this unit does no I/O or delivery accounting.
+//! Bounded packet serialization, private prepared-artifact loading and the offline prototype.
+//! Artifact loading grants no source access; callers prove source authority and delivery.
 
 use serde_json::Value;
 
@@ -12,8 +12,156 @@ pub(super) fn encode(state: &Value) -> Result<String, &'static str> {
     Ok(encoded)
 }
 
-/// First-slice executable prototype, deliberately not admitted by the runtime yet.
-/// Promotion needs the real authorized activation and source-backed outbox integration.
+/// Trusted operator output from a separately measured Jev context selection.
+/// It grants no source access: activation re-observes every file and verifies every window.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Prepared {
+    /// Fixed private artifact format, independent from the model's response protocol.
+    schema: String,
+    /// Exact main-task text that produced the context.
+    task: String,
+    /// The existing configured route's exact model identifier.
+    model: String,
+    /// Only a selected code-bearing bundle is deliverable.
+    selected_id: String,
+    /// Validated Choice confidence, not an estimate of coding quality.
+    confidence: f64,
+    /// Complete byte identities plus the exact partial windows to disclose.
+    pub(super) evidence: Vec<PreparedWindow>,
+    /// Observed public run facts, not evidence that this actor performed a test.
+    run_facts: Value,
+    /// Explicit unresolved coverage and contract questions.
+    gaps: Vec<String>,
+}
+
+/// One prepared excerpt; all fields are checked against an authorized source read.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreparedWindow {
+    /// Worktree-relative path, never a provider-generated command or absolute path.
+    pub(super) path: std::path::PathBuf,
+    /// BLAKE3 of the complete file, rather than only this excerpt.
+    version: String,
+    /// Exact UTF-8 window bounds, in bytes.
+    start_byte: usize,
+    /// Exclusive UTF-8 end of the partial window.
+    end_byte: usize,
+    /// Literal project text; it cannot change an execution recipe.
+    text: String,
+    /// This slice makes no stronger semantic or test-coverage claim.
+    relation: String,
+    /// Actual complete file length expected at activation.
+    source_bytes: usize,
+}
+
+impl Prepared {
+    /// Reads one private no-follow operator artifact; never constructs a client or opens a key.
+    pub(super) fn load(
+        path: &std::path::Path,
+        trace_dir: &std::path::Path,
+        task: &str,
+        model: &str,
+    ) -> Result<Self, &'static str> {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        if !path.is_absolute()
+            || path.canonicalize().ok().as_deref() != Some(path)
+            || trace_dir.canonicalize().ok().as_deref() != Some(trace_dir)
+            || !path.starts_with(trace_dir)
+        {
+            return Err("prepared_path");
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| "prepared_file")?;
+        let metadata = file.metadata().map_err(|_| "prepared_file")?;
+        // SAFETY: geteuid only returns this process's effective user identity.
+        let uid = unsafe { libc::geteuid() };
+        let directory = std::fs::metadata(trace_dir).map_err(|_| "prepared_path")?;
+        if !directory.is_dir() || directory.uid() != uid || directory.mode() & 0o077 != 0 {
+            return Err("prepared_path");
+        }
+        if !metadata.is_file()
+            || metadata.uid() != uid
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() == 0
+            || metadata.len() > 24 * 1024
+        {
+            return Err("prepared_file");
+        }
+        let mut bytes = Vec::new();
+        file.take(24 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "prepared_file")?;
+        if bytes.len() > 24 * 1024 {
+            return Err("prepared_budget");
+        }
+        let prepared: Self = serde_json::from_slice(&bytes).map_err(|_| "prepared_format")?;
+        if prepared.schema != "jev-prepared-context-v1"
+            || prepared.task != task
+            || prepared.model != model
+            || prepared.selected_id != "bundle"
+            || !(0.5..=1.0).contains(&prepared.confidence)
+        {
+            return Err("prepared_identity");
+        }
+        if prepared.evidence.is_empty() || prepared.evidence.len() > 4 {
+            return Err("prepared_budget");
+        }
+        for window in &prepared.evidence {
+            if !crate::workspace::observation::valid_relative_path(&window.path)
+                || window.source_bytes > 64 * 1024
+                || window.start_byte > window.end_byte
+                || window.end_byte > window.source_bytes
+                || window.text.len() > 2048
+                || window.relation != "observed_only; not proof of test coverage"
+            {
+                return Err("prepared_window");
+            }
+        }
+        prepared.render()?;
+        Ok(prepared)
+    }
+
+    /// Refuses stale bytes and partial UTF-8 before any prepared code can be retained or sent.
+    pub(super) fn matches(&self, path: &std::path::Path, bytes: &[u8]) -> bool {
+        let digest = blake3::hash(bytes).to_hex().to_string();
+        let windows: Vec<_> = self
+            .evidence
+            .iter()
+            .filter(|window| window.path == path)
+            .collect();
+        !windows.is_empty()
+            && windows.into_iter().all(|window| {
+                bytes.len() == window.source_bytes
+                    && digest == window.version
+                    && std::str::from_utf8(bytes)
+                        .ok()
+                        .and_then(|source| source.get(window.start_byte..window.end_byte))
+                        == Some(window.text.as_str())
+            })
+    }
+
+    /// Renders evidence only; original fixture authority and provider claims are never replayed.
+    pub(super) fn render(&self) -> Result<String, &'static str> {
+        let value = serde_json::json!({
+            "source_windows":self.evidence,
+            "observed_public_run_facts":self.run_facts,
+            "gaps":self.gaps,
+            "coverage":"partial source evidence; not a task-completion verdict",
+        });
+        let encoded = encode(&value)?;
+        Ok(format!(
+            "Jev context evidence (partial; intended contract unresolved):\n{encoded}"
+        ))
+    }
+}
+
+/// Off-model packet-construction prototype and operator measurement.
+/// Runtime consumes only the separately validated Prepared artifact through real authority.
 #[cfg(test)]
 mod prototype {
     use super::*;
@@ -397,152 +545,280 @@ mod prototype {
         let packet = Packet::build(frame(), "Task", &[path], &[window], Value::Null).unwrap();
         assert!(packet.encoded.len() <= 8192);
     }
-    #[tokio::test]
-    #[ignore = "operator-only free Jev measurement; not an offline or automatic gate"]
-    /// Records one real free-route selection from public observations, with no project writes.
-    async fn manual_free_context_selection_measurement() {
-        use super::super::{Budget, Trace, record_attempt, token_totals};
+    /// Reads one current tracked public source without symlinks, bounded to receiver capacity.
+    fn public_source(root: &Path, path: &Path, tracked: &[u8]) -> Result<String, &'static str> {
+        use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
-
-        let root =
-            std::path::PathBuf::from(std::env::var("AGENT_IDE_JEV_PACKET_PROBE_ROOT").unwrap());
-        assert_eq!(root.canonicalize().unwrap(), root);
-        let output =
-            std::path::PathBuf::from(std::env::var("AGENT_IDE_JEV_PACKET_PROBE_OUT").unwrap());
-        assert!(output.starts_with("/Users/pluto/projects/tmp/agent-ide"));
-        assert_eq!(output.canonicalize().unwrap(), output);
-        let key =
-            std::path::PathBuf::from(std::env::var("AGENT_IDE_JEV_PACKET_PROBE_KEYFILE").unwrap());
-        let client =
-            client::JevClient::from_credential_file(&key, client::Route::OpenCode).unwrap();
-        let paths = [
-            PathBuf::from("src/request.ts"),
-            PathBuf::from("src/request.test.ts"),
-        ];
-        let bodies: Vec<_> = paths
-            .iter()
-            .map(|path| {
-                assert!(root.join(path).canonicalize().unwrap().starts_with(&root));
-                std::fs::read_to_string(root.join(path)).unwrap()
-            })
-            .collect();
-        let windows: Vec<_> = paths
-            .iter()
-            .zip(&bodies)
-            .zip([(205, 240), (245, 275)])
-            .map(|((path, text), (first, last))| {
-                let start = text
-                    .split_inclusive('\n')
-                    .take(first - 1)
-                    .map(str::len)
-                    .sum();
-                let end = text.split_inclusive('\n').take(last).map(str::len).sum();
-                Window::capture(path, text, start..end).unwrap()
-            })
-            .collect();
-        let packet = Packet::build(frame(),
-            "Restore this project to a reliable, usable state. Preserve its intended public functionality and compatibility.",
-            &paths, &windows, serde_json::json!({
-                "status":"failed", "provenance":"previously observed public test output; not evaluator controls",
-                "message":"TypeError: Body is unusable: Body has already been read",
-                "frame":"src/request.ts:226:38",
-                "intended_behavior":"unresolved"
-            })).unwrap();
+        if !crate::workspace::observation::valid_relative_path(path)
+            || !tracked
+                .split(|byte| *byte == 0)
+                .any(|item| item == path.as_os_str().as_encoded_bytes())
+            || root.join(path).canonicalize().ok() != Some(root.join(path))
+        {
+            return Err("source_not_tracked_canonical");
+        }
         let file = std::fs::OpenOptions::new()
-            .write(true)
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(root.join(path))
+            .map_err(|_| "source_open")?;
+        if !file.metadata().map_err(|_| "source_metadata")?.is_file() {
+            return Err("source_type");
+        }
+        let mut bytes = Vec::new();
+        file.take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "source_read")?;
+        if bytes.len() > 65536 {
+            return Err("source_budget");
+        }
+        String::from_utf8(bytes).map_err(|_| "source_utf8")
+    }
+
+    /// Selects a small real failure-line window; a filename counterpart is only a lexical relation.
+    fn public_window(path: &Path, text: &str, line: usize) -> Result<Window, &'static str> {
+        let start = text
+            .split_inclusive('\n')
+            .take(line.saturating_sub(9))
+            .map(str::len)
+            .sum::<usize>();
+        let mut end = (start + 1536).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        Window::capture(path, text, start..end)
+    }
+
+    /// Runs a generic two-choice operator episode from actual public failures; never edits code.
+    #[tokio::test]
+    #[ignore = "operator-only configured context preparation; explicit offline or live invocation"]
+    async fn manual_configured_context_preparation() {
+        use super::super::{Budget, Trace, parse_config, record_attempt, token_totals};
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let read_json = |name: &str| -> Value {
+            let path = std::env::var(name).unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            assert!(bytes.len() <= 24 * 1024);
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        let input = read_json("AGENT_IDE_JEV_CONTEXT_INPUT");
+        let mut settings = read_json("AGENT_IDE_JEV_CONTEXT_CONFIG");
+        let config = parse_config(Some(&settings)).unwrap().unwrap();
+        assert_eq!(input["schema"], "jev-cold-public-input-v1");
+        assert_eq!(input["task"], config.task);
+        let output = PathBuf::from(std::env::var("AGENT_IDE_JEV_CONTEXT_OUT").unwrap());
+        assert_eq!(output.canonicalize().unwrap(), output);
+        assert!(output.starts_with("/Users/pluto/projects/tmp/agent-ide/jev-context"));
+        let root = PathBuf::from(input["worktree"].as_str().unwrap());
+        assert_eq!(root.canonicalize().unwrap(), root);
+        let git = |args: &[&str]| {
+            let reply = std::process::Command::new("/usr/bin/git")
+                .args(["-C"])
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(reply.status.success());
+            reply.stdout
+        };
+        assert_eq!(
+            String::from_utf8(git(&["rev-parse", "HEAD"]))
+                .unwrap()
+                .trim(),
+            input["root_commit"].as_str().unwrap()
+        );
+        assert!(git(&["status", "--porcelain"]).is_empty());
+        let tracked = git(&["ls-files", "-z"]);
+        let candidates = input["candidates"].as_array().unwrap();
+        assert!(!candidates.is_empty() && candidates.len() <= 10);
+        let mut options = vec![client::Candidate {
+            id: "none".into(),
+            description: "No useful supported context action".into(),
+            auto_test: false,
+        }];
+        for candidate in candidates {
+            let path = Path::new(candidate["path"].as_str().unwrap());
+            assert!(crate::workspace::observation::valid_relative_path(path));
+            options.push(client::Candidate { id:candidate["id"].as_str().unwrap().into(),
+                description:format!("Read observed public-failure candidate {path:?}; fault and intended contract unproven"), auto_test:false });
+        }
+        let route = config.selected_route();
+        let file = std::fs::OpenOptions::new()
             .create_new(true)
+            .write(true)
             .mode(0o600)
-            .open(output.join("probe.jsonl"))
+            .open(output.join("episode.jsonl"))
             .unwrap();
         let mut trace = Trace(file);
-        let mut budget = Budget {
-            calls: 1,
-            ..Budget::default()
-        };
-        trace.record(serde_json::json!({
-            "event":"utility_probe_inputs", "measurement":"operator-only packet prototype, not IDE handoff",
-            "state":packet.encoded, "options":packet.candidates.iter()
-                .map(|c|serde_json::json!({"id":c.id,"description":c.description,"auto_test":c.auto_test})).collect::<Vec<_>>()
-        })).unwrap();
-        let selection =
-            client
-                .decide(&packet.encoded, &packet.candidates, |request| {
-                    let bytes = serde_json::to_vec(request).map_err(|_| ())?.len();
-                    trace.record(serde_json::json!({
-                "event":"request_pending","decision":1,"route":"opencode","request":request,
-                "request_bytes":bytes,"usage_unknown":true,"estimated_usd":Value::Null
-            })).map_err(|_| ())?;
-                    budget.attempts += 1;
-                    budget.unknown_attempts += 1;
-                    budget.request_bytes += bytes;
-                    Ok(())
-                })
-                .await;
-        let disposition = match selection {
-            Ok(selection) => {
-                record_attempt(
-                    &mut trace,
-                    &mut budget,
-                    1,
-                    client::Route::OpenCode,
-                    &selection.attempt,
-                    selection.usage.as_ref(),
-                    "success",
-                    selection.request.clone(),
-                    Some(selection.response.clone()),
-                )
-                .unwrap();
-                let fresh: Vec<_> = paths
-                    .iter()
-                    .map(|path| std::fs::read_to_string(root.join(path)).unwrap())
-                    .collect();
-                let sources: Vec<_> = paths
-                    .iter()
-                    .zip(&fresh)
-                    .map(|(p, t)| (p.as_path(), t.as_str()))
-                    .collect();
-                let effect = match packet.select(&selection, &frame(), &sources) {
-                    Ok(Some(Effect::Bundle(bundle))) => {
-                        serde_json::json!({"kind":"bundle","bundle":bundle})
-                    }
-                    Ok(Some(Effect::Read(index))) => {
-                        serde_json::json!({"kind":"read_candidate","index":index})
-                    }
-                    Ok(None) => serde_json::json!({"kind":"inactive"}),
-                    Err(reason) => serde_json::json!({"kind":"refused","reason":reason}),
-                };
-                serde_json::json!({"selected_id":selection.selected_id,"confidence":selection.confidence,"effect":effect})
-            }
-            Err(failure) => {
-                let usage = if failure.usage_unknown {
-                    None
-                } else {
-                    failure.response.as_ref().and_then(|r| r.get("usage"))
-                };
-                record_attempt(
-                    &mut trace,
-                    &mut budget,
-                    1,
-                    client::Route::OpenCode,
-                    &failure.attempt,
-                    usage,
-                    failure.category,
-                    failure.request.clone().unwrap_or(Value::Null),
-                    failure.response.clone(),
-                )
-                .unwrap();
-                serde_json::json!({"kind":"transport_failure","reason":failure.category})
-            }
-        };
+        let live = std::env::var("AGENT_IDE_JEV_CONTEXT_LIVE").unwrap() == "1";
         trace
-            .record(serde_json::json!({"event":"utility_probe_disposition","result":disposition}))
+            .record(
+                serde_json::json!({"event":"operator_context_inputs","live":live,"input":input,
+            "endpoint":route.endpoint(),"model":route.model(),"main_delivery":"not_recorded"}),
+            )
             .unwrap();
-        trace.record(serde_json::json!({
-            "event":"episode_summary","decisions":budget.calls,"physical_send_intents":budget.attempts,
-            "unknown_attempts":budget.unknown_attempts,"tokens":token_totals(&budget),
-            "request_bytes":budget.request_bytes,"response_bytes":budget.response_bytes,
-            "latencies_ms":budget.latencies_ms,"known_estimated_usd":budget.estimated_usd,
-            "actual_provider_charge":Value::Null
-        })).unwrap();
+        let client = live.then(|| {
+            client::JevClient::from_credential_file(&config.credential_file, route).unwrap()
+        });
+        let began = std::time::Instant::now();
+        let mut budget = Budget::default();
+        let mut state = input.clone();
+        state.as_object_mut().unwrap().remove("worktree");
+        state.as_object_mut().unwrap().remove("root_commit");
+        let mut windows: Vec<Window> = Vec::new();
+        let mut published = false;
+        for decision in 1..=2 {
+            assert!(began.elapsed() < std::time::Duration::from_secs(5));
+            for window in &windows {
+                let text = public_source(&root, &window.path, &tracked).unwrap();
+                assert_eq!(
+                    blake3::hash(text.as_bytes()).to_hex().as_str(),
+                    window.version
+                );
+            }
+            let encoded = encode(&state).unwrap();
+            let selection = if let Some(client) = &client {
+                budget.calls += 1;
+                let result = client.decide(&encoded,&options,|request| {
+                    trace.record(serde_json::json!({"event":"before_send","decision":decision,"request":request,"usage_unknown":true})).map_err(|_| ())?;
+                    budget.attempts += 1; budget.unknown_attempts += 1;
+                    budget.request_bytes += serde_json::to_vec(request).map_err(|_| ())?.len();
+                    Ok(())
+                }).await;
+                match result {
+                    Ok(value) => {
+                        record_attempt(
+                            &mut trace,
+                            &mut budget,
+                            decision,
+                            route,
+                            &value.attempt,
+                            value.usage.as_ref(),
+                            "success",
+                            value.request.clone(),
+                            Some(value.response.clone()),
+                        )
+                        .unwrap();
+                        value
+                    }
+                    Err(failure) => {
+                        let usage = if failure.usage_unknown {
+                            None
+                        } else {
+                            failure.response.as_ref().and_then(|v| v.get("usage"))
+                        };
+                        record_attempt(
+                            &mut trace,
+                            &mut budget,
+                            decision,
+                            route,
+                            &failure.attempt,
+                            usage,
+                            failure.category,
+                            failure.request.clone().unwrap_or(Value::Null),
+                            failure.response.clone(),
+                        )
+                        .unwrap();
+                        break;
+                    }
+                }
+            } else {
+                let id = if decision == 1 {
+                    candidates[0]["id"].as_str().unwrap()
+                } else {
+                    "bundle"
+                };
+                trace.record(serde_json::json!({"event":"offline_scripted_choice","decision":decision,"id":id})).unwrap();
+                selected(id, 0.75)
+            };
+            if began.elapsed() >= std::time::Duration::from_secs(5) || selection.confidence < 0.5 {
+                break;
+            }
+            if selection.selected_id == "none" {
+                break;
+            }
+            if decision == 1 {
+                let item = candidates
+                    .iter()
+                    .find(|v| v["id"].as_str() == Some(selection.selected_id.as_str()))
+                    .unwrap();
+                let path = PathBuf::from(item["path"].as_str().unwrap());
+                let mut paths = vec![(path.clone(), item["line"].as_u64().unwrap() as usize)];
+                let spelling = path.to_str().unwrap();
+                let counterpart = if spelling.ends_with(".test.ts") {
+                    spelling.replace(".test.ts", ".ts")
+                } else {
+                    spelling.trim_end_matches(".ts").to_owned() + ".test.ts"
+                };
+                if tracked
+                    .split(|b| *b == 0)
+                    .any(|p| p == counterpart.as_bytes())
+                {
+                    let line = candidates
+                        .iter()
+                        .find(|v| v["path"].as_str() == Some(counterpart.as_str()))
+                        .and_then(|v| v["line"].as_u64())
+                        .unwrap_or(1);
+                    paths.push((PathBuf::from(counterpart), line as usize));
+                }
+                for (path, line) in paths {
+                    let text = public_source(&root, &path, &tracked).unwrap();
+                    windows.push(public_window(&path, &text, line).unwrap());
+                }
+                let mut facts = input["run_facts"].clone();
+                if let Some(failures) = facts["failures"].as_array_mut() {
+                    for failure in failures {
+                        if let Some(text) = failure["failure"].as_str() {
+                            failure["failure"] =
+                                serde_json::json!(text.chars().take(350).collect::<String>());
+                        }
+                    }
+                }
+                state = serde_json::json!({"phase":"context","task":config.task,"evidence":windows,"run_facts":facts,
+                    "gaps":["Public tests may be incomplete or incorrect; intended public contracts remain unresolved.","Filename counterpart is lexical evidence, not proven test coverage."],"main_delivery":"not_recorded"});
+                options = vec![client::Candidate{id:"none".into(),description:"No useful evidence to give the coding agent".into(),auto_test:false},
+                    client::Candidate{id:"bundle".into(),description:"Give the coding agent these concrete source windows and public failure facts, with explicit unresolved contracts".into(),auto_test:false}];
+            } else if selection.selected_id == "bundle" {
+                for window in &windows {
+                    let text = public_source(&root, &window.path, &tracked).unwrap();
+                    assert_eq!(
+                        blake3::hash(text.as_bytes()).to_hex().as_str(),
+                        window.version
+                    );
+                }
+                let prepared = serde_json::json!({"schema":"jev-prepared-context-v1","task":config.task,"model":route.model(),
+                    "selected_id":"bundle","confidence":selection.confidence,"evidence":windows,
+                    "run_facts":state["run_facts"],"gaps":state["gaps"]});
+                let artifact = output.join("prepared.json");
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&artifact)
+                    .unwrap();
+                file.write_all(&serde_json::to_vec(&prepared).unwrap())
+                    .unwrap();
+                super::Prepared::load(&artifact, &output, &config.task, route.model()).unwrap();
+                settings["trace_dir"] = serde_json::json!(output);
+                settings["prepared_context_file"] = serde_json::json!(artifact);
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(output.join("launcher-section.json"))
+                    .unwrap();
+                file.write_all(&serde_json::to_vec_pretty(&settings).unwrap())
+                    .unwrap();
+                published = true;
+            }
+        }
+        trace.record(serde_json::json!({"event":"operator_context_summary","live":live,"prepared":published,"decisions":budget.calls,
+            "physical_attempts":budget.attempts,"unknown_attempts":budget.unknown_attempts,"tokens":token_totals(&budget),
+            "latencies_ms":budget.latencies_ms,"estimated_usd":budget.estimated_usd,"seconds":began.elapsed().as_secs_f64()})).unwrap();
+        assert!(
+            published,
+            "No prepared context; preserved disposition is not a successful Jev-assisted trial"
+        );
     }
 }

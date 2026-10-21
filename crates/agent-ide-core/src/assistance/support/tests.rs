@@ -16,6 +16,8 @@ struct Harness {
     root: PathBuf,
     /// Whether the host has supplied a protected context hook; independent of write authority.
     context_known: bool,
+    /// Original activation response, used to prove early handoff without any edit.
+    activation: PeerReply,
 }
 
 impl Harness {
@@ -25,6 +27,17 @@ impl Harness {
         scope: Vec<&str>,
         decisions: Vec<Result<client::Selection, client::Failure>>,
         script: &str,
+    ) -> Self {
+        Self::new_with_prepared(mode, scope, decisions, script, None).await
+    }
+
+    /// Same actual worker, with an operator packet created before activation, never a model call.
+    async fn new_with_prepared(
+        mode: &str,
+        scope: Vec<&str>,
+        decisions: Vec<Result<client::Selection, client::Failure>>,
+        script: &str,
+        prepared_case: Option<&str>,
     ) -> Self {
         crate::lang::testing::install();
         let scratch = crate::scratch::ScratchDir::new("jev-wiring");
@@ -45,10 +58,53 @@ impl Harness {
         );
         std::fs::write(root.join("main.gamma"), "sym old\nend\n").unwrap();
         std::fs::write(root.join("cache.gamma"), "sym unrelated\nend\n").unwrap();
+        let prepared_path = trace.join("prepared.json");
+        let task = "Review the changed behavior using the observed project evidence.";
+        if let Some(case) = prepared_case {
+            let mut packet = serde_json::json!({
+                "schema":"jev-prepared-context-v1", "task":task, "model":"jev-1.13-free",
+                "selected_id":"bundle", "confidence":0.73,
+                "evidence":[{"path":"main.gamma","version":blake3::hash(b"sym old\nend\n").to_hex().to_string(),
+                    "start_byte":0,"end_byte":8,"text":"sym old\n",
+                    "relation":"observed_only; not proof of test coverage","source_bytes":12}],
+                "run_facts":{"current_actor_runs":"unknown"},"gaps":["contract unresolved"]
+            });
+            packet["evidence"].as_array_mut().unwrap().push(serde_json::json!({
+                "path":"cache.gamma","version":blake3::hash(b"sym unrelated\nend\n").to_hex().to_string(),
+                "start_byte":0,"end_byte":14,"text":"sym unrelated\n",
+                "relation":"observed_only; not proof of test coverage","source_bytes":18
+            }));
+            match case {
+                "stale" => packet["evidence"][0]["version"] = serde_json::json!("0".repeat(64)),
+                "wrong_text" => packet["evidence"][0]["text"] = serde_json::json!("sym lie\n"),
+                "wrong_task" => packet["task"] = serde_json::json!("another task"),
+                "outside" => packet["evidence"][0]["path"] = serde_json::json!("../outside.gamma"),
+                "low_confidence" => packet["confidence"] = serde_json::json!(0.49),
+                _ => {}
+            }
+            std::fs::write(&prepared_path, serde_json::to_vec(&packet).unwrap()).unwrap();
+            std::fs::set_permissions(
+                &prepared_path,
+                std::fs::Permissions::from_mode(if case == "public" { 0o644 } else { 0o600 }),
+            )
+            .unwrap();
+        }
+        if prepared_case == Some("source_link") {
+            let outside = scratch.join("outside.gamma");
+            std::fs::write(&outside, "PRIVATE_OUTSIDE_PROJECT\n").unwrap();
+            std::fs::remove_file(root.join("main.gamma")).unwrap();
+            std::os::unix::fs::symlink(outside, root.join("main.gamma")).unwrap();
+        }
+        if prepared_case == Some("symlink") {
+            let real = trace.join("real-prepared.json");
+            std::fs::rename(&prepared_path, &real).unwrap();
+            std::os::unix::fs::symlink(real, &prepared_path).unwrap();
+        }
         let launcher = LauncherConfig::parse(serde_json::to_vec(&serde_json::json!({
             "version":1,"limits":{"queued":8,"details":16,"operation_ms":5000,"output_bytes":32768},"allowed_roots":[root],
             "targets":[{"attachment":"pilot","candidate":root,"git":{"path":"/usr/bin/git","identity":"fixture-git","blake3":blake3::hash(&std::fs::read("/usr/bin/git").unwrap()).to_hex().to_string()},"providers":[]}],
-            "jev_pilot":{"mode":mode,"task":"Review the changed behavior using the observed project evidence.","credential_file":scratch.join("credential-never-created"),"egress_allowed":true,"trace_dir":trace,"initial_scope":scope}
+            "jev_pilot":{"mode":mode,"task":"Review the changed behavior using the observed project evidence.","base_url":"https://fixture.invalid", "api_path":"v1/systemone", "model":"jev-1.13-free",
+            "credential_file":scratch.join("credential-never-created"),"egress_allowed":true,"trace_dir":trace,"initial_scope":scope,"prepared_context_file":prepared_case.map(|_|prepared_path)}
         })).unwrap().as_slice()).unwrap();
         let handle = WorkerHandle::new(
             Arc::new(Mutex::new(HostBindingGuard::default())),
@@ -75,16 +131,19 @@ impl Harness {
             )),
         });
         handle.start(&runtime).await.unwrap();
-        let harness = Self {
+        let mut harness = Self {
             scratch,
             handle,
             root,
             context_known: true,
+            activation: PeerReply::Pending {
+                detail_ref: "not-started".into(),
+            },
         };
         let start = harness
             .call(
                 AssistanceTool::Start,
-                serde_json::json!({"activation_id":"pilot-start"}),
+                serde_json::json!({"activation_id":"pilot-start","read_only":prepared_case==Some("reader")}),
                 "start",
             )
             .await;
@@ -98,6 +157,7 @@ impl Harness {
             ),
             "{start:?}"
         );
+        harness.activation = start;
         harness
     }
 
@@ -975,4 +1035,181 @@ async fn started_optional_result_is_historical_after_real_source_change() {
         assert!(text.contains("cancelled"));
     }
     harness.handle.shutdown().await.unwrap();
+}
+
+/// Reads the actual early detail handle from the completed activation, never from private state.
+fn early_reference(harness: &Harness) -> Option<String> {
+    let PeerReply::Complete { text, .. } = &harness.activation else {
+        return None;
+    };
+    text.lines()
+        .find_map(|line| line.strip_prefix("Jev context ready: "))
+        .and_then(|line| line.split(';').next())
+        .map(str::to_owned)
+}
+
+/// The real activation retains a source-backed result before any code edit or model inference.
+#[tokio::test]
+async fn prepared_context_is_early_private_and_inspectable() {
+    let harness =
+        Harness::new_with_prepared("jev", vec![], vec![], "printf pass", Some("valid")).await;
+    let reference = early_reference(&harness).expect("activation must expose the ready handle");
+    let binding = harness.invocation("prepared-context").binding_ref().clone();
+    {
+        let ledger = harness.handle.shared.ledger.lock().unwrap();
+        assert!(
+            ledger.read_memory.is_empty(),
+            "private reads cannot become main read receipts"
+        );
+        let detail = &ledger.details[&reference];
+        assert_eq!(detail.selection.0, AssistanceTool::Inspect);
+        assert!(
+            admitted_edit_source(detail, &binding, &reference, "main.gamma").is_none(),
+            "a partial context must not authorize a full-file replacement"
+        );
+    }
+    let reply = harness
+        .handle
+        .inspect(binding.clone(), reference, "pilot", None)
+        .await;
+    let text = reply.encode().unwrap();
+    assert!(text.as_str().contains("sym old"), "{text:?}");
+    assert!(text.as_str().contains("unresolved"));
+    assert!(
+        harness
+            .handle
+            .shared
+            .support
+            .state
+            .lock()
+            .unwrap()
+            .task
+            .is_none()
+    );
+    assert!(harness.handle.shared.test_runs.settled_result(1).is_none());
+    harness.handle.shutdown().await.unwrap();
+}
+
+/// Task mismatch, stale sources, low confidence and unsafe artifacts fail open with no code body.
+#[tokio::test]
+async fn prepared_context_refusals_preserve_normal_activation() {
+    for case in [
+        "stale",
+        "wrong_task",
+        "outside",
+        "low_confidence",
+        "public",
+        "symlink",
+        "source_link",
+        "wrong_text",
+    ] {
+        let harness =
+            Harness::new_with_prepared("jev", vec![], vec![], "printf pass", Some(case)).await;
+        assert!(early_reference(&harness).is_none(), "{case}");
+        let text = harness.activation.encode().unwrap();
+        assert!(
+            text.as_str().contains("Jev context unavailable"),
+            "{case}: {text:?}"
+        );
+        assert!(!text.as_str().contains("source_windows"));
+        assert!(
+            harness
+                .handle
+                .shared
+                .ledger
+                .lock()
+                .unwrap()
+                .read_memory
+                .is_empty()
+        );
+        assert!(
+            harness
+                .handle
+                .shared
+                .support
+                .state
+                .lock()
+                .unwrap()
+                .task
+                .is_none()
+        );
+        harness.handle.shutdown().await.unwrap();
+    }
+}
+
+/// An outside/native source change after preparation suppresses the retained stale body.
+#[tokio::test]
+async fn prepared_context_native_write_is_reproved_on_inspection() {
+    let harness =
+        Harness::new_with_prepared("jev", vec![], vec![], "printf pass", Some("valid")).await;
+    let reference = early_reference(&harness).unwrap();
+    std::fs::write(harness.root.join("main.gamma"), "sym foreign\nend\n").unwrap();
+    let binding = harness
+        .invocation("native-after-context")
+        .binding_ref()
+        .clone();
+    let reply = harness
+        .handle
+        .inspect(binding, reference, "pilot", None)
+        .await;
+    assert!(matches!(reply, PeerReply::Error { .. }), "{reply:?}");
+    assert!(!reply.encode().unwrap().as_str().contains("sym old"));
+    harness.handle.shutdown().await.unwrap();
+}
+
+/// OFF and read-only activations do not load or publish a prepared source packet.
+#[tokio::test]
+async fn prepared_context_off_and_reader_remain_inactive() {
+    for (mode, case) in [("off", "public"), ("jev", "reader")] {
+        let harness =
+            Harness::new_with_prepared(mode, vec![], vec![], "printf pass", Some(case)).await;
+        assert!(early_reference(&harness).is_none());
+        assert!(
+            !harness
+                .activation
+                .encode()
+                .unwrap()
+                .as_str()
+                .contains("Jev context")
+        );
+        {
+            let ledger = harness.handle.shared.ledger.lock().unwrap();
+            assert!(ledger.read_memory.is_empty());
+            assert!(
+                ledger
+                    .details
+                    .values()
+                    .all(|detail| detail.source.is_none())
+            );
+        }
+        harness.handle.shutdown().await.unwrap();
+    }
+}
+
+/// Configuration alone toggles assistance and selects unrelated compatible transports; no I/O.
+#[test]
+fn mode_and_provider_are_configuration_only() {
+    let off = Pilot::new(Some(&serde_json::json!({"mode":"off"})));
+    assert!(off.config.is_none());
+    let invalid_off = Pilot::new(Some(
+        &serde_json::json!({"mode":"off", "base_url":"not a URL",
+        "credential_file":"/nonexistent/key"}),
+    ));
+    assert!(invalid_off.config.is_none());
+    for label in ["provider-a", "provider-b"] {
+        let enabled = Pilot::new(Some(&serde_json::json!({"mode":"jev", "route":label,
+            "base_url":format!("https://{label}.invalid/api"), "api_path":"decide",
+            "model":format!("{label}-classifier"), "credential_file":"/nonexistent/key",
+            "task":"Review behavior", "trace_dir":"/nonexistent/trace", "egress_allowed":true})));
+        let config = enabled.config.unwrap();
+        assert_eq!(config.selected_route().name(), label);
+        assert_eq!(
+            config.selected_route().model(),
+            format!("{label}-classifier")
+        );
+        assert_eq!(
+            config.selected_route().endpoint(),
+            format!("https://{label}.invalid/api/decide")
+        );
+    }
 }

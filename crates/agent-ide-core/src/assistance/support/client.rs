@@ -1,4 +1,4 @@
-//! Bounded, opt-in System One transport; two fixed routes, no retries or fallback.
+//! Bounded, opt-in System One transport configured by the operator; no retries or fallback.
 //!
 //! Wire contracts: <https://dev.opencode.ai/v2/docs/console/models>,
 //! <https://docs.typesafe.ai/primitives/choice> and
@@ -13,32 +13,113 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-/// Restart-only trusted selection of exactly one documented endpoint/model pair.
-/// Neither route can fall back to the other; callers must opt in with its matching key.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum Route {
-    /// Free OpenCode route for development qualification, using an OpenCode Console key.
-    OpenCode,
-    /// Direct TypeSafe route for the owner-authorized comparison, using its separate key.
-    TypeSafe,
+/// Operator-configured compatible System One transport; no provider registry or fallback.
+#[derive(Clone)]
+pub(super) struct Transport {
+    name: String,
+    endpoint: String,
+    model: String,
+    response_model: String,
+    pub(super) input_usd_per_million: Option<f64>,
 }
 
-impl Route {
-    /// Returns the sole HTTPS endpoint admitted for this trusted selection.
-    pub(super) fn endpoint(self) -> &'static str {
-        match self {
-            Self::OpenCode => "https://opencode.ai/inference/systemone/v1/systemone",
-            Self::TypeSafe => "https://api.typesafe.ai/v1/systemone",
+impl Transport {
+    /// Validates a credential-free HTTPS base and relative API path without I/O.
+    pub(super) fn new(
+        name: &str,
+        base: &str,
+        path: &str,
+        model: &str,
+        response_model: Option<&str>,
+        input_price: Option<f64>,
+    ) -> Result<Self, &'static str> {
+        let valid_model = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value.bytes().all(|byte| byte.is_ascii_graphic())
+        };
+        let expected = response_model.unwrap_or(model);
+        if name.len() > 64
+            || !valid_model(model)
+            || !valid_model(expected)
+            || base.len() > 2048
+            || path.is_empty()
+            || path.len() > 256
+            || path.starts_with('/')
+            || path.contains(['?', '#', ':', '\\'])
+            || path.split('/').any(|part| part == ".." || part == ".")
+            || input_price.is_some_and(|price| !price.is_finite() || price < 0.0)
+        {
+            return Err("transport_config_invalid");
         }
+        let mut base = reqwest::Url::parse(base).map_err(|_| "transport_config_invalid")?;
+        if base.scheme() != "https"
+            || base.host_str().is_none()
+            || !base.username().is_empty()
+            || base.password().is_some()
+            || base.query().is_some()
+            || base.fragment().is_some()
+        {
+            return Err("transport_config_invalid");
+        }
+        base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
+        let endpoint = base.join(path).map_err(|_| "transport_config_invalid")?;
+        if endpoint.origin() != base.origin() {
+            return Err("transport_config_invalid");
+        }
+        Ok(Self {
+            name: name.into(),
+            endpoint: endpoint.into(),
+            model: model.into(),
+            response_model: expected.into(),
+            input_usd_per_million: input_price,
+        })
     }
+    /// Exact HTTPS request target derived only from trusted configuration.
+    pub(super) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+    /// Exact configured model sent to the provider.
+    pub(super) fn model(&self) -> &str {
+        &self.model
+    }
+    /// Exact configured response identity; no aliases are guessed.
+    pub(super) fn response_model(&self) -> &str {
+        &self.response_model
+    }
+    /// Operator label for private accounting, not a provider capability selector.
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+}
 
-    /// Returns the exact requested and accepted response-model identifier for this route.
-    pub(super) fn model(self) -> &'static str {
-        match self {
-            Self::OpenCode => "jev-1.13-free",
-            Self::TypeSafe => "jev-1.13.0",
-        }
-    }
+/// Test fixtures only: production endpoints/models must come from launcher configuration.
+#[cfg(test)]
+pub(super) fn fixture_transport(name: &str) -> Transport {
+    let (base, path, model, expected, price) = match name {
+        "typesafe" => (
+            "https://api.typesafe.ai",
+            "v1/systemone",
+            "jev-1.13.0",
+            "jev-1.13.0",
+            0.042,
+        ),
+        "openrouter" => (
+            "https://openrouter.ai/api",
+            "alpha/decisions",
+            "typesafe/jev-1.13",
+            "typesafe/jev-1.13-20260917",
+            0.042,
+        ),
+        _ => (
+            "https://opencode.ai",
+            "inference/systemone/v1/systemone",
+            "jev-1.13-free",
+            "jev-1.13-free",
+            0.0,
+        ),
+    };
+    Transport::new(name, base, path, model, Some(expected), Some(price)).unwrap()
 }
 /// Total connect, headers and streamed-body deadline, including a stalled body.
 const DEADLINE: Duration = Duration::from_millis(1_500);
@@ -147,8 +228,8 @@ pub(super) struct JevClient {
     /// Read once from the explicitly configured private file; never exported or logged.
     credential: String,
     /// Trusted route fixes both request model and strict response-model validation.
-    route: Route,
-    /// Fixed production endpoint, replaceable only by this module's unit fixtures.
+    route: Transport,
+    /// Exact configured HTTPS endpoint; unit fixtures alone may replace it with loopback HTTP.
     endpoint: String,
 }
 
@@ -158,7 +239,7 @@ impl JevClient {
     /// empty/non-ASCII/header-unsafe contents and I/O failures without exposing the path.
     /// `route` fixes the destination/model; the file must contain that service's key.
     /// Call only after explicit opt-in: construction reads the file but performs no network I/O.
-    pub(super) fn from_credential_file(path: &Path, route: Route) -> Result<Self, Failure> {
+    pub(super) fn from_credential_file(path: &Path, route: &Transport) -> Result<Self, Failure> {
         let invalid = || Failure::before_send("credential_invalid");
         if !path.is_absolute() || path.canonicalize().map_err(|_| invalid())? != path {
             return Err(invalid());
@@ -195,7 +276,7 @@ impl JevClient {
         Ok(Self {
             http,
             credential,
-            route,
+            route: route.clone(),
             endpoint: route.endpoint().to_owned(),
         })
     }
@@ -213,7 +294,7 @@ impl JevClient {
         candidates: &[Candidate],
         before_send: impl FnOnce(&Value) -> Result<(), ()>,
     ) -> Result<Selection, Failure> {
-        let request = make_request(state, candidates, self.route)?;
+        let request = make_request(state, candidates, &self.route)?;
         let bytes =
             serde_json::to_vec(&request).map_err(|_| Failure::before_send("request_invalid"))?;
         if bytes.len() > REQUEST_LIMIT {
@@ -307,7 +388,7 @@ impl JevClient {
             ));
         }
         let (selected_id, confidence, auto_test_probability) =
-            validate_response(&response, candidates, self.route).map_err(|category| {
+            validate_response(&response, candidates, &self.route).map_err(|category| {
                 failed(
                     category,
                     Some(response.clone()),
@@ -347,7 +428,11 @@ fn network_category(error: &reqwest::Error) -> &'static str {
 
 /// Creates one bounded request with sorted opaque option keys; semantics live in descriptions.
 /// Rejects invalid local options and oversized inputs before copying unbounded state.
-fn make_request(state: &str, candidates: &[Candidate], route: Route) -> Result<Value, Failure> {
+fn make_request(
+    state: &str,
+    candidates: &[Candidate],
+    route: &Transport,
+) -> Result<Value, Failure> {
     if state.len() > REQUEST_LIMIT {
         return Err(Failure::before_send("request_too_large"));
     }
@@ -394,9 +479,9 @@ fn make_request(state: &str, candidates: &[Candidate], route: Route) -> Result<V
 fn validate_response(
     response: &Value,
     candidates: &[Candidate],
-    route: Route,
+    route: &Transport,
 ) -> Result<(String, f64, Option<f64>), &'static str> {
-    if response.get("model").and_then(Value::as_str) != Some(route.model()) {
+    if response.get("model").and_then(Value::as_str) != Some(route.response_model()) {
         return Err("response_model_invalid");
     }
     let answers = response
@@ -544,7 +629,7 @@ mod tests {
 
     /// Native response fixture with Choice confidence, independent Noul and actual usage shape.
     fn response() -> Value {
-        json!({"model": Route::OpenCode.model(), "answers": {
+        json!({"model": fixture_transport("opencode").model(), "answers": {
             "q0": {"type": "choice", "choice": "c001", "confidence": 0.9, "probabilities": {"c000": 0.1, "c001": 0.9}},
             "q1": {"type": "noul", "noul": 0.95}},
             "usage": {"input_tokens": 40, "output_tokens": 9}})
@@ -554,8 +639,9 @@ mod tests {
     #[test]
     fn request_is_native_independent_and_bounded() {
         let options = candidates();
-        let request = make_request("edited function", &options, Route::OpenCode).unwrap();
-        assert_eq!(request["model"], Route::OpenCode.model());
+        let request =
+            make_request("edited function", &options, &fixture_transport("opencode")).unwrap();
+        assert_eq!(request["model"], fixture_transport("opencode").model());
         assert_eq!(
             request["questions"]["q0"]["criteria"]["c001"],
             options[1].description
@@ -564,15 +650,19 @@ mod tests {
         assert!(instruction.contains(&options[1].description));
         assert!(instruction.contains("independently"));
         assert_eq!(
-            make_request(&"x".repeat(REQUEST_LIMIT + 1), &options, Route::OpenCode)
-                .unwrap_err()
-                .category,
+            make_request(
+                &"x".repeat(REQUEST_LIMIT + 1),
+                &options,
+                &fixture_transport("opencode")
+            )
+            .unwrap_err()
+            .category,
             "request_too_large"
         );
         let mut invalid = candidates();
         invalid[1].id = invalid[0].id.clone();
         assert_eq!(
-            make_request("state", &invalid, Route::OpenCode)
+            make_request("state", &invalid, &fixture_transport("opencode"))
                 .unwrap_err()
                 .category,
             "candidates_invalid"
@@ -580,7 +670,7 @@ mod tests {
         invalid = candidates();
         invalid[0].auto_test = true;
         assert_eq!(
-            make_request("state", &invalid, Route::OpenCode)
+            make_request("state", &invalid, &fixture_transport("opencode"))
                 .unwrap_err()
                 .category,
             "candidates_invalid"
@@ -592,7 +682,7 @@ mod tests {
     fn response_contract_rejects_untrusted_fields() {
         let options = candidates();
         assert_eq!(
-            validate_response(&response(), &options, Route::OpenCode).unwrap(),
+            validate_response(&response(), &options, &fixture_transport("opencode")).unwrap(),
             ("test".into(), 0.9, Some(0.95))
         );
         for (pointer, invalid) in [
@@ -616,23 +706,23 @@ mod tests {
             let mut value = response();
             *value.pointer_mut(pointer).unwrap() = invalid;
             assert!(
-                validate_response(&value, &options, Route::OpenCode).is_err(),
+                validate_response(&value, &options, &fixture_transport("opencode")).is_err(),
                 "accepted invalid {pointer}"
             );
         }
         let mut value = response();
         value["answers"].as_object_mut().unwrap().remove("q1");
-        assert!(validate_response(&value, &options, Route::OpenCode).is_err());
+        assert!(validate_response(&value, &options, &fixture_transport("opencode")).is_err());
         let mut value = response();
         value["answers"]["unexpected"] = json!({});
-        assert!(validate_response(&value, &options, Route::OpenCode).is_err());
+        assert!(validate_response(&value, &options, &fixture_transport("opencode")).is_err());
         let mut value = response();
         value["answers"]["q0"]["probabilities"] = json!({"c000": 0.1, "foreign": 0.9});
-        assert!(validate_response(&value, &options, Route::OpenCode).is_err());
+        assert!(validate_response(&value, &options, &fixture_transport("opencode")).is_err());
         assert!(serde_json::from_str::<Value>("{bad JSON}").is_err());
         let mut value = response();
         value.as_object_mut().unwrap().remove("usage");
-        assert!(validate_response(&value, &options, Route::OpenCode).is_ok());
+        assert!(validate_response(&value, &options, &fixture_transport("opencode")).is_ok());
         assert!(valid_usage(&value).is_none());
     }
 
@@ -646,25 +736,29 @@ mod tests {
         }
     }
 
-    /// Both fixed routes require their own exact model; choosing a route never aliases a reply.
+    /// Fixed routes require their published response model; latest and other versions refuse.
     #[test]
     fn fixed_routes_validate_only_the_selected_model() {
         let options = candidates();
         assert_eq!(
-            Route::OpenCode.endpoint(),
+            fixture_transport("opencode").endpoint(),
             "https://opencode.ai/inference/systemone/v1/systemone"
         );
         assert_eq!(
-            Route::TypeSafe.endpoint(),
+            fixture_transport("typesafe").endpoint(),
             "https://api.typesafe.ai/v1/systemone"
         );
-        for route in [Route::OpenCode, Route::TypeSafe] {
+        for route in [
+            &fixture_transport("opencode"),
+            &fixture_transport("typesafe"),
+            &fixture_transport("openrouter"),
+        ] {
             assert_eq!(
                 make_request("state", &options, route).unwrap()["model"],
                 route.model()
             );
             let mut value = response();
-            value["model"] = json!(route.model());
+            value["model"] = json!(route.response_model());
             assert!(validate_response(&value, &options, route).is_ok());
             value["model"] = json!("jev-latest");
             assert_eq!(
@@ -672,7 +766,7 @@ mod tests {
                 "response_model_invalid"
             );
         }
-        assert!(validate_response(&response(), &options, Route::TypeSafe).is_err());
+        assert!(validate_response(&response(), &options, &fixture_transport("typesafe")).is_err());
     }
 
     /// Fixture server owner: termination is signaled explicitly and its task must be joined.
@@ -752,13 +846,18 @@ mod tests {
             JevClient {
                 http: http_builder().no_proxy().build().unwrap(),
                 credential: "offline-fixture-secret".into(),
-                route: Route::OpenCode,
+                route: fixture_transport("opencode"),
                 endpoint: self.endpoint.clone(),
             }
         }
 
         /// Stops and joins the server, asserting a single physical HTTP attempt and native body.
         async fn finish(self) {
+            self.finish_with_model("jev-1.13-free").await;
+        }
+
+        /// Joins the responder and checks the exact configured request-model identity.
+        async fn finish_with_model(self, expected_model: &str) {
             let _ = self.stop.send(());
             let requests = tokio::time::timeout(Duration::from_secs(5), self.task)
                 .await
@@ -776,8 +875,65 @@ mod tests {
                 .unwrap()
                 + 4;
             let body: Value = serde_json::from_slice(&request[split..]).unwrap();
-            assert_eq!(body["model"], Route::OpenCode.model());
+            assert_eq!(body["model"], expected_model);
             assert!(body.get("messages").is_none());
+        }
+    }
+
+    /// Two distinct configured model/endpoint pairs use the same client code without inference.
+    #[tokio::test]
+    async fn configured_transports_switch_without_provider_code() {
+        for (name, model, expected) in [
+            ("provider-a", "classifier-a", "snapshot-a"),
+            ("provider-b", "classifier-b", "snapshot-b"),
+        ] {
+            let route = Transport::new(
+                name,
+                "https://example.invalid/custom",
+                "decide",
+                model,
+                Some(expected),
+                None,
+            )
+            .unwrap();
+            assert_eq!(route.endpoint(), "https://example.invalid/custom/decide");
+            let mut value = response();
+            value["model"] = json!(expected);
+            let server = Server::start(http_response("200 OK", &value.to_string(), "")).await;
+            let mut client = server.client();
+            client.route = route;
+            let selected = client
+                .decide("same state", &candidates(), |_| Ok(()))
+                .await
+                .unwrap();
+            assert_eq!(selected.request["model"], model);
+            assert_eq!(selected.response["model"], expected);
+            server.finish_with_model(model).await;
+        }
+        for base in [
+            "http://example.invalid",
+            "https://secret@example.invalid",
+            "https://example.invalid/?key=x",
+        ] {
+            assert!(Transport::new("label", base, "decide", "classifier", None, None).is_err());
+        }
+        for path in [
+            "../decide",
+            "//other.invalid/decide",
+            "https://other.invalid/",
+            "decide?key=x",
+        ] {
+            assert!(
+                Transport::new(
+                    "label",
+                    "https://example.invalid",
+                    path,
+                    "classifier",
+                    None,
+                    None
+                )
+                .is_err()
+            );
         }
     }
 
@@ -798,7 +954,7 @@ mod tests {
         let client = server.client();
         let result = client
             .decide("edited function", &candidates(), |request| {
-                assert_eq!(request["model"], Route::OpenCode.model());
+                assert_eq!(request["model"], fixture_transport("opencode").model());
                 Ok(())
             })
             .await
@@ -926,7 +1082,7 @@ mod tests {
         let client = JevClient {
             http: http_builder().no_proxy().build().unwrap(),
             credential: "offline-fixture-secret".into(),
-            route: Route::OpenCode,
+            route: fixture_transport("opencode"),
             endpoint: format!("http://{}/systemone", listener.local_addr().unwrap()),
         };
         let failure = client
@@ -958,10 +1114,10 @@ mod tests {
         let path = root.join("credential");
         std::fs::write(&path, "offline-fixture-secret\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(JevClient::from_credential_file(&path, Route::OpenCode).is_ok());
+        assert!(JevClient::from_credential_file(&path, &fixture_transport("opencode")).is_ok());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
-            JevClient::from_credential_file(&path, Route::OpenCode)
+            JevClient::from_credential_file(&path, &fixture_transport("opencode"))
                 .err()
                 .unwrap()
                 .category,
@@ -970,15 +1126,17 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let link = root.join("link");
         symlink(&path, &link).unwrap();
-        assert!(JevClient::from_credential_file(&link, Route::OpenCode).is_err());
-        assert!(JevClient::from_credential_file(&root, Route::OpenCode).is_err());
+        assert!(JevClient::from_credential_file(&link, &fixture_transport("opencode")).is_err());
+        assert!(JevClient::from_credential_file(&root, &fixture_transport("opencode")).is_err());
         for contents in [
             "".to_owned(),
             "key\nheader".into(),
             "x".repeat(CREDENTIAL_LIMIT + 1),
         ] {
             std::fs::write(&path, contents).unwrap();
-            assert!(JevClient::from_credential_file(&path, Route::OpenCode).is_err());
+            assert!(
+                JevClient::from_credential_file(&path, &fixture_transport("opencode")).is_err()
+            );
         }
         std::fs::remove_dir_all(root).unwrap();
     }
