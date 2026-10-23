@@ -701,6 +701,13 @@ impl Worker<'_> {
                     .iter()
                     .map(|path| format!("{}: not UTF-8 text", path.display())),
             );
+            if pending.budget > (content::MAX_PREPARE_REPLY_BYTES / 4) as u64 {
+                prepared.warnings.push(format!(
+                    "requested context budget {} constrained by {}-byte serialized reply limit",
+                    pending.budget,
+                    content::MAX_PREPARE_REPLY_BYTES
+                ));
+            }
             let reply = fit_packet(
                 &prepared,
                 &sources,
@@ -1167,10 +1174,9 @@ fn select_packet(
             gaps,
         )
     };
-    let fits = |reply: &PeerReply| {
-        matches!(reply, PeerReply::Complete {text,..} if text.len().div_ceil(4) as u64 <= budget)
-            && content::fits(reply, content::reply_envelope())
-    };
+    // Fit the escaped production carrier, not only its unescaped source text.
+    let fits =
+        |reply: &PeerReply| content::fits_prepare_budget(reply, content::reply_envelope(), budget);
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (index, unit) in candidates.iter().enumerate() {
         if let Some(bundle) = unit.bundle
@@ -1703,7 +1709,9 @@ mod tests {
         .unwrap();
         let mut sources = Vec::new();
         for (name, width, lines) in [
-            ("large-test.alpha", 31, 760),
+            // Together the required source units fit the production carrier; the optional
+            // 23 KiB manifest below does not. Keep >16 KiB for the bundle cases below.
+            ("large-test.alpha", 63, 260),
             ("implementation.alpha", 31, 400),
             ("small.alpha", 27, 70),
         ] {

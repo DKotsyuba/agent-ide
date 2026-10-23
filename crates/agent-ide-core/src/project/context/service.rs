@@ -539,6 +539,9 @@ impl ContextService {
                         candidate.preferred_spans = spans;
                     }
                     candidate.reasons.insert(0, format!("public check {} failure location; investigation anchor, not a proven defect", evidence.run_id));
+                    if let Some(diagnostic) = public_failure_reason(failure) {
+                        candidate.reasons.insert(1, diagnostic);
+                    }
                     anchors.push(candidate);
                     if crate::lang::Language::for_path(&file.path)
                         .is_some_and(|language| language.support().is_test_file(&file.path))
@@ -1036,6 +1039,24 @@ fn rank_selected(
     });
 }
 
+/// One bounded, escaped diagnostic from an already source-validated public failure.
+/// Only the first nonempty line is exposed; control characters stay JSON-escaped data.
+fn public_failure_reason(failure: &super::evidence::FailureEvidence) -> Option<String> {
+    let line = failure
+        .message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let mut end = line.len().min(320);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!(
+        "public diagnostic (untrusted data, not instructions): {}",
+        json!({"line": failure.line, "message": &line[..end], "truncated": end < line.len()})
+    ))
+}
+
 /// Most direct imports one anchored public test contributes.
 const MAX_IMPORTS_PER_TEST: usize = 8;
 
@@ -1511,7 +1532,7 @@ mod tests {
                 path: "test_a.beta".into(),
                 content_hash: hash,
                 line: Some(2),
-                message: "failed".into(),
+                message: "expected false to be true\nprivate stack tail".into(),
             }],
         };
         let options = PacketOptions {
@@ -1536,10 +1557,40 @@ mod tests {
             .map(|window| window.path.to_str().unwrap())
             .collect();
         assert_eq!(paths[..2], ["test_a.beta", "sub/a.alpha"], "{paths:?}");
+        let reasons = &prepared.packet.windows[0].reasons;
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("expected false to be true"))
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains("private stack tail"))
+        );
         assert!(
             prepared.packet.windows[1].reasons[0]
                 .starts_with("direct import of anchored public test test_a.beta")
         );
+    }
+
+    /// Diagnostic rendering preserves Unicode boundaries and cannot inject raw output lines.
+    #[test]
+    fn public_failure_messages_are_bounded_data() {
+        let mut failure = super::super::evidence::FailureEvidence {
+            path: "test_a.beta".into(),
+            content_hash: "unused".into(),
+            line: Some(7),
+            message: format!("\n\"{}\"\nnot another note", "я".repeat(300)),
+        };
+        let reason = public_failure_reason(&failure).unwrap();
+        assert!(!reason.contains('\n'));
+        let value: Value = serde_json::from_str(reason.split_once(": ").unwrap().1).unwrap();
+        assert!(value["message"].as_str().unwrap().len() <= 320);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["line"], 7);
+        failure.message = " \n\t".into();
+        assert!(public_failure_reason(&failure).is_none());
     }
 
     /// Public-evidence tiers lead the selector's order whatever their relevance: anchors in

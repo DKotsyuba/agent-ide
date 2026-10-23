@@ -17,6 +17,14 @@ use crate::changes::edit::EditOutcome;
 /// The test-only structured oracle remains subject to the complete transport ceiling separately.
 const MAX_SOURCE_REPLY_BYTES: usize = 8 * 1024;
 
+/// Serialized production Prepare carrier ceiling, including text-only MCP framing and any status
+/// plate. A Codex exec cell forwards one output item whole only up to its default 10 000-token
+/// cap, which it estimates as UTF-8 bytes / 4 (40 000 bytes); beyond that it clips the item in the
+/// middle. The 2 000-byte margin covers the cell's own framing. Bytes / 4 is that host's estimate
+/// convention, not a tokenizer fact. Distinct from Read's [`MAX_SOURCE_REPLY_BYTES`]; the
+/// test-only structured oracle is measured against the transport ceiling only.
+pub(crate) const MAX_PREPARE_REPLY_BYTES: usize = 38_000;
+
 /// Build-embedded MiniJinja source projecting every closed [`PeerReply`] state into its compact
 /// model-facing text; the template owns the presentation so daemon code never formats reply text.
 const REPLY_TEMPLATE: &str = include_str!("../../../../assets/mcp/reply.jinja");
@@ -105,6 +113,22 @@ pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
 pub(crate) fn fits_with_status(reply: &PeerReply, status: &str, envelope: Envelope) -> bool {
     project(reply, Some(status), envelope, None, None)
         .is_some_and(|rendered| reply_fits(reply, &rendered))
+}
+
+/// Reports whether one unchanged Prepare reply fits the caller's `requested_tokens` and the final
+/// carrier: the production text-only serialization (framing included), estimated at bytes / 4,
+/// stays within `requested_tokens`, and [`fits`] accepts the reply for `envelope`, which also holds
+/// it to [`MAX_PREPARE_REPLY_BYTES`]. Never shrinks text; packing selects what to omit.
+#[cfg(any(feature = "jev-pilot", test))]
+pub(crate) fn fits_prepare_budget(
+    reply: &PeerReply,
+    envelope: Envelope,
+    requested_tokens: u64,
+) -> bool {
+    project(reply, None, Envelope::TextOnly, None, None)
+        .and_then(|production| serde_json::to_vec(&production).ok())
+        .is_some_and(|bytes| bytes.len().div_ceil(4) as u64 <= requested_tokens)
+        && fits(reply, envelope)
 }
 
 /// Projects one unchanged reply into compact content plus, per `envelope`, the complete typed
@@ -533,26 +557,29 @@ fn render_text(context: &serde_json::Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-/// Checks the complete carrier against the transport ceiling, then Read's production text-only
-/// carrier against the source budget. The test-only structured oracle does not reduce source
-/// page size. Status and text framing count in both budgets; other result kinds retain only the
-/// transport budget. Serialization failure refuses the reply without cutting source or state.
+/// Checks the complete carrier against the transport ceiling, then the production text-only
+/// carrier of Read against the source budget and of Prepare against
+/// [`MAX_PREPARE_REPLY_BYTES`]. The test-only structured oracle does not reduce either. Status
+/// and text framing count in every budget; other result kinds retain only the transport budget.
+/// Serialization failure refuses the reply without cutting source or state.
 fn reply_fits(reply: &PeerReply, rendered: &CallToolResult) -> bool {
     if !call_tool_result_fits(rendered) {
         return false;
     }
-    if !matches!(
-        reply,
+    let ceiling = match reply {
         PeerReply::Complete {
             kind: ResultKind::Read,
             ..
-        }
-    ) {
-        return true;
-    }
+        } => MAX_SOURCE_REPLY_BYTES,
+        PeerReply::Complete {
+            kind: ResultKind::Prepare,
+            ..
+        } => MAX_PREPARE_REPLY_BYTES,
+        _ => return true,
+    };
     let mut production = rendered.clone();
     production.structured_content = None;
-    serde_json::to_vec(&production).is_ok_and(|bytes| bytes.len() <= MAX_SOURCE_REPLY_BYTES)
+    serde_json::to_vec(&production).is_ok_and(|bytes| bytes.len() <= ceiling)
 }
 
 /// Returns whether the serialized final MCP carrier stays below the Assistance reply ceiling.
@@ -695,6 +722,61 @@ mod tests {
                 Some(true)
             );
         }
+    }
+
+    /// Prepare is held to its own serialized production carrier, framing and status included:
+    /// escaping that grows the carrier past [`MAX_PREPARE_REPLY_BYTES`] refuses a text whose raw
+    /// length fits, the structured oracle does not halve the budget, Read keeps its 8 KiB, and the
+    /// requested token budget is checked on the same serialized bytes.
+    #[test]
+    fn prepare_budget_measures_the_serialized_production_carrier() {
+        let prepare = |text: String| PeerReply::Complete {
+            kind: ResultKind::Prepare,
+            text,
+            detail_ref: None,
+            truncated: false,
+            continuation: false,
+        };
+        let carrier = |reply: &PeerReply| {
+            serde_json::to_vec(&project(reply, None, Envelope::TextOnly, None, None).unwrap())
+                .unwrap()
+                .len()
+        };
+        // 36 000 raw bytes; each newline and quote doubles when serialized.
+        let escaped = prepare("\"x\"\n".repeat(9_000));
+        assert!(carrier(&escaped) > MAX_PREPARE_REPLY_BYTES);
+        for envelope in [Envelope::TextOnly, Envelope::WithStructured] {
+            assert!(!fits(&escaped, envelope));
+            assert!(!fits_prepare_budget(&escaped, envelope, 32_000));
+        }
+        let plain = prepare("x".repeat(30_000));
+        assert!(carrier(&plain) <= MAX_PREPARE_REPLY_BYTES);
+        for envelope in [Envelope::TextOnly, Envelope::WithStructured] {
+            assert!(fits(&plain, envelope), "{envelope:?}");
+            assert!(fits_prepare_budget(&plain, envelope, 9_500));
+            assert!(!fits_prepare_budget(&plain, envelope, 6_000));
+            assert!(!fits_with_status(&plain, &"s".repeat(9_000), envelope));
+            assert!(fits_with_status(
+                &plain,
+                "<agent-ide>checking</agent-ide>",
+                envelope
+            ));
+        }
+        let oracle = project(&plain, None, Envelope::WithStructured, None, None).unwrap();
+        assert!(serde_json::to_vec(&oracle).unwrap().len() > MAX_PREPARE_REPLY_BYTES);
+        let read = PeerReply::Complete {
+            kind: ResultKind::Read,
+            text: "x".repeat(30_000),
+            detail_ref: Some("source-budget-ref".into()),
+            truncated: false,
+            continuation: false,
+        };
+        assert!(!fits(&read, Envelope::TextOnly));
+        assert!(render_with_status(escaped, None, Envelope::TextOnly).is_none());
+        let mut exact = plain.clone();
+        assert!(!exact.shrink_text());
+        assert_eq!(carrier(&exact), carrier(&plain));
+        assert!(render_with_status(plain, Some(&"s".repeat(9_000)), Envelope::TextOnly).is_none());
     }
 
     /// Source fitting includes production framing and status before claiming delivery, without

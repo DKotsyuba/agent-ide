@@ -717,8 +717,20 @@ impl PeerReply {
         }
     }
     /// Reduces only owner text while preserving UTF-8 and explicitly marking omitted content.
-    /// Returns false for non-text results or already empty text; callers then fail closed.
+    /// Returns false for fitted Prepare source packets, non-text results or empty text;
+    /// callers retain a due status plate or fail closed without falsifying source delivery.
     pub(crate) fn shrink_text(&mut self) -> bool {
+        // Prepare has already fitted source units and recorded their delivery. Cutting it here
+        // would invalidate those receipts; a status plate must remain due instead.
+        if matches!(
+            self,
+            Self::Complete {
+                kind: ResultKind::Prepare,
+                ..
+            }
+        ) {
+            return false;
+        }
         let (Self::Complete {
             text, truncated, ..
         }
