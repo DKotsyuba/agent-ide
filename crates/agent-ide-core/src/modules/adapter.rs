@@ -312,6 +312,21 @@ impl SupportServer {
                     let text = Self::text(&source, request)?;
                     encode(&support.syntax_verdict(&source.path, &text))
                 }
+                SyntaxQuery::ContextProbeResult {
+                    source,
+                    output,
+                    anchors,
+                } => {
+                    let text = Self::text(&source, request)?;
+                    encode(&if output.len() <= 256 * 1024
+                        && !anchors.is_empty()
+                        && anchors.len() <= 32
+                    {
+                        support.source_context_probe_result(&source.path, &text, &output, &anchors)
+                    } else {
+                        None
+                    })
+                }
                 SyntaxQuery::OutlineProbeResult { source, output } => {
                     let text = Self::text(&source, request)?;
                     encode(&if output.len() <= 256 * 1024 {
@@ -326,9 +341,16 @@ impl SupportServer {
                     root,
                     file,
                     configured,
+                    anchors,
                 } => encode(
                     &support
-                        .source_outline_probe_command(&project, &root, &file, configured.as_ref())
+                        .source_outline_probe_command(
+                            &project,
+                            &root,
+                            &file,
+                            configured.as_ref(),
+                            &anchors,
+                        )
                         .map(|argv| self.plan(&argv, &config, &root))
                         .transpose(),
                 ),

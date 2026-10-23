@@ -3947,8 +3947,7 @@ impl Worker<'_> {
         language.server()?.probe_programs(launch)
     }
 
-    /// Obtains per-file syntax from an admitted stdin probe without admitting semantic resolution.
-    /// Only the current source is supplied; invalid output, unavailable tools and timeouts preserve fallback.
+    /// Parses source outline through its owning module after admitted stdin execution.
     #[cfg(feature = "jev-pilot")]
     pub(super) async fn source_probe_outline(
         &self,
@@ -3957,6 +3956,67 @@ impl Worker<'_> {
         source: &str,
         budget: Duration,
     ) -> (Option<Outline>, String) {
+        let (output, note) = self
+            .source_probe_output(job, observed, source, budget, &[])
+            .await;
+        let Some(output) = output else {
+            return (None, note);
+        };
+        let Some(language) = Lang::for_path(observed.path()) else {
+            return (None, note);
+        };
+        match crate::modules::calls::source_outline_probe_result(
+            language,
+            observed.worktree().worktree_path(),
+            observed.path(),
+            source,
+            &output,
+        )
+        .await
+        {
+            Ok(Some(outline)) => (Some(outline), note),
+            _ => (None, "source probe outline not verified".into()),
+        }
+    }
+
+    /// Returns only validated contextual spans; refusal preserves the original selection.
+    #[cfg(feature = "jev-pilot")]
+    pub(super) async fn source_probe_context(
+        &self,
+        job: &Job,
+        observed: &SourceObservation,
+        source: &str,
+        budget: Duration,
+        anchors: &[u32],
+    ) -> Option<Vec<lang::LineRange>> {
+        let (output, _) = self
+            .source_probe_output(job, observed, source, budget, anchors)
+            .await;
+        let language = Lang::for_path(observed.path())?;
+        crate::modules::calls::source_context_probe_result(
+            language,
+            observed.worktree().worktree_path(),
+            observed.path(),
+            source,
+            &output?,
+            anchors,
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Obtains per-file syntax from an admitted stdin probe without admitting semantic resolution.
+    /// Only the current source is supplied; invalid output, unavailable tools and timeouts preserve fallback.
+    #[cfg(feature = "jev-pilot")]
+    async fn source_probe_output(
+        &self,
+        job: &Job,
+        observed: &SourceObservation,
+        source: &str,
+        budget: Duration,
+        anchors: &[u32],
+    ) -> (Option<String>, String) {
         if budget.is_zero() {
             return (None, "probe budget exhausted".into());
         }
@@ -3983,6 +4043,7 @@ impl Worker<'_> {
             file,
             configured.as_ref(),
             &config,
+            anchors,
         )
         .await;
         let argv = match plan {
@@ -4010,12 +4071,7 @@ impl Worker<'_> {
         let Ok(text) = std::str::from_utf8(&output.stdout) else {
             return (None, "source probe output is not UTF-8".into());
         };
-        match crate::modules::calls::source_outline_probe_result(language, root, file, source, text)
-            .await
-        {
-            Ok(Some(outline)) => (Some(outline), "syntax-only source probe".into()),
-            _ => (None, "source probe outline not verified".into()),
-        }
+        (Some(text.to_owned()), "syntax-only source probe".into())
     }
 
     /// The structural verdict for one text: the in-process check first, else its stdin probe run

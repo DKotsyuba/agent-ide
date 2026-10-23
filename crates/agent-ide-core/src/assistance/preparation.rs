@@ -61,7 +61,7 @@ struct Config {
 }
 
 impl Worker<'_> {
-    /// Uses complete source-backed test units when available; otherwise preserves the original selection.
+    /// Localizes public tests and supported source members; refusal preserves the original selection.
     /// Provider startup is awaited normally, never cancelled while its backend is out of its slot.
     #[cfg(feature = "jev-pilot")]
     async fn localize_public_tests(
@@ -78,9 +78,7 @@ impl Worker<'_> {
             let Some(language) = crate::lang::Language::for_path(&source.path) else {
                 continue;
             };
-            if !language.support().is_test_file(&source.path) {
-                continue;
-            }
+            let is_test = language.support().is_test_file(&source.path);
             let lines: Vec<u32> = anchors
                 .iter()
                 .filter(|anchor| anchor.path == source.path && anchor.hash == source.hash)
@@ -95,6 +93,50 @@ impl Worker<'_> {
                 continue;
             };
             if lines.is_empty() {
+                continue;
+            }
+            if !is_test {
+                let budget = until.saturating_duration_since(tokio::time::Instant::now());
+                let spans = self
+                    .source_probe_context(job, &source.observed, &source.text, budget, &lines)
+                    .await;
+                if *job.cancel.borrow() {
+                    return Err(FailureCode::Cancelled);
+                }
+                if let Some(spans) = spans {
+                    let offsets: Vec<_> = std::iter::once(0)
+                        .chain(source.text.match_indices('\n').map(|(at, _)| at + 1))
+                        .collect();
+                    let ranges: Option<Vec<_>> = spans
+                        .iter()
+                        .map(|span| {
+                            let start = *offsets.get(span.start.checked_sub(1)? as usize)?;
+                            let end = offsets
+                                .get(span.end as usize)
+                                .copied()
+                                .unwrap_or(source.text.len());
+                            (start < end && end <= source.text.len()).then_some((start, end))
+                        })
+                        .collect();
+                    if let Some(ranges) = ranges {
+                        original.required =
+                            units.iter().any(|unit| unit.file == file && unit.required);
+                        units.retain(|unit| unit.file != file);
+                        for range in ranges {
+                            let mut unit = original.clone();
+                            unit.range = range;
+                            unit.complete = true;
+                            unit.bundle = Some(file);
+                            unit.symbol = None;
+                            unit.reasons.push("source members with syntactic callers, dependencies and surrounding state".into());
+                            units.push(unit);
+                        }
+                        prepared.warnings.push(format!(
+                            "{}: public source context localized",
+                            source.path.display()
+                        ));
+                    }
+                }
                 continue;
             }
             let whole = units

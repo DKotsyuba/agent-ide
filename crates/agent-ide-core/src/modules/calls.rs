@@ -1274,7 +1274,11 @@ pub async fn syntax_probe_command(
     }
 }
 
-/// `LanguageSupport::source_outline_probe_command`.
+/// `LanguageSupport::source_outline_probe_command`; nonempty anchors select source context.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "existing admitted probe contract plus public anchors"
+)]
 pub async fn source_outline_probe_command(
     language: Language,
     worktree: &Path,
@@ -1283,11 +1287,12 @@ pub async fn source_outline_probe_command(
     file: &Path,
     configured: Option<&ProbePrograms>,
     config: &ModuleConfig,
+    anchors: &[u32],
 ) -> Routed<Result<Option<StdinRun>, LangError>> {
     match module(language) {
         None => Ok(language
             .support()
-            .source_outline_probe_command(project, root, file, configured)
+            .source_outline_probe_command(project, root, file, configured, anchors)
             .map(|argv| {
                 let environment = language
                     .support()
@@ -1306,6 +1311,7 @@ pub async fn source_outline_probe_command(
                     worktree,
                     Capability::Syntax,
                     encode(&SyntaxQuery::OutlineProbePlan {
+                        anchors: anchors.to_vec(),
                         config: config.clone(),
                         project: Box::new(project.clone()),
                         root: root.to_path_buf(),
@@ -1359,6 +1365,40 @@ pub async fn source_outline_probe_result(
                 encode(&SyntaxQuery::OutlineProbeResult {
                     source,
                     output: output.into(),
+                }),
+                attachments,
+            )
+            .await
+        }
+    }
+}
+
+/// Validates a bounded context selection through the owning language module.
+pub async fn source_context_probe_result(
+    language: Language,
+    worktree: &Path,
+    path: &Path,
+    text: &str,
+    output: &str,
+    anchors: &[u32],
+) -> Routed<Option<Vec<crate::lang::LineRange>>> {
+    if output.len() > 256 * 1024 || anchors.is_empty() || anchors.len() > 32 {
+        return Ok(None);
+    }
+    match module(language) {
+        None => Ok(language
+            .support()
+            .source_context_probe_result(path, text, output, anchors)),
+        Some(host) => {
+            let (source, attachments) = source(path, text);
+            host.request(
+                language,
+                worktree,
+                Capability::Syntax,
+                encode(&SyntaxQuery::ContextProbeResult {
+                    source,
+                    output: output.into(),
+                    anchors: anchors.to_vec(),
                 }),
                 attachments,
             )

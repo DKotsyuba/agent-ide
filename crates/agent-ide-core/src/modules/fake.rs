@@ -231,6 +231,9 @@ impl FakeModule {
             }
             Capability::Syntax => match decode::<SyntaxQuery>(payload)? {
                 SyntaxQuery::Verdict { .. } => encode(&SyntaxVerdict::Clean),
+                SyntaxQuery::ContextProbeResult { .. } => {
+                    encode(&Option::<Vec<crate::lang::LineRange>>::None)
+                }
                 SyntaxQuery::OutlineProbeResult { .. } => {
                     encode(&Option::<crate::lang::Outline>::None)
                 }

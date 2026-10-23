@@ -23,7 +23,18 @@ const chunks = [];
 process.stdin.on('data', (chunk) => chunks.push(chunk)).on('end', () => {
   try {
     const text = Buffer.concat(chunks).toString('utf8');
-    const name = '/__agent_ide_outline__/' + (process.argv[2] || 'source.ts');
+    const argument = process.argv[2] || 'source.ts';
+    if (argument.startsWith('{')) {
+      const request = JSON.parse(argument);
+      if (typeof request.file !== 'string' || !Array.isArray(request.anchors)
+        || !request.anchors.length || request.anchors.length > 32
+        || request.anchors.some((at) => !Number.isSafeInteger(at) || at < 1)) process.exit(4);
+      const file = ts.createSourceFile(request.file, text, ts.ScriptTarget.Latest, true);
+      const context = file.parseDiagnostics.length ? null : classContext(ts, file, request.anchors.map((at) => at - 1));
+      process.stdout.write(JSON.stringify({v: 1, context}) + '\n');
+      return;
+    }
+    const name = '/__agent_ide_outline__/' + argument;
     const snapshot = ts.ScriptSnapshot.fromString(text);
     const host = {
       getCompilationSettings: () => ({ noResolve: true, noLib: true, types: [], allowJs: true }),

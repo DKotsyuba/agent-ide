@@ -792,15 +792,17 @@ pub trait LanguageSupport: Send + Sync {
     }
 
     /// Optional stdin-only source-outline probe using the same admitted programs as syntax checks.
-    /// It must parse the supplied text without loading project configuration or resolving imports.
+    /// Nonempty 1-based anchors request contextual spans instead of an outline. It must parse
+    /// supplied text without loading project configuration or resolving imports.
     fn source_outline_probe_command(
         &self,
         project: &LanguageProject,
         root: &Path,
         file: &Path,
         configured: Option<&ProbePrograms>,
+        anchors: &[u32],
     ) -> Option<Vec<String>> {
-        let _ = (project, root, file, configured);
+        let _ = (project, root, file, configured, anchors);
         None
     }
 
@@ -813,6 +815,19 @@ pub trait LanguageSupport: Send + Sync {
         output: &str,
     ) -> Option<Outline> {
         let _ = (file, source, output);
+        None
+    }
+
+    /// Validates a source-context probe against source and 1-based failure anchors.
+    /// Returns complete selected line spans, or `None` to preserve the original selection.
+    fn source_context_probe_result(
+        &self,
+        file: &Path,
+        source: &str,
+        output: &str,
+        anchors: &[u32],
+    ) -> Option<Vec<LineRange>> {
+        let _ = (file, source, output, anchors);
         None
     }
 

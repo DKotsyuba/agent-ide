@@ -293,6 +293,9 @@ pub enum SyntaxQuery {
         file: PathBuf,
         /// Accepted programs, if configured.
         configured: Option<ProbePrograms>,
+        /// Empty for outline; otherwise 1-based public source anchors.
+        #[serde(default)]
+        anchors: Vec<u32>,
     },
     /// Validates bounded probe output against exact supplied source; answers `Option<Outline>`.
     OutlineProbeResult {
@@ -300,6 +303,15 @@ pub enum SyntaxQuery {
         source: SourceRef,
         /// UTF-8 stdout, capped by the core before transport.
         output: String,
+    },
+    /// Validates selected context lines from the same admitted source-only probe.
+    ContextProbeResult {
+        /// Exact source bytes supplied to the probe.
+        source: SourceRef,
+        /// Bounded stdout.
+        output: String,
+        /// Public failure lines, 1-based.
+        anchors: Vec<u32>,
     },
 }
 

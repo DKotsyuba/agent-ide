@@ -52,7 +52,11 @@ pub const TS_PROBE: &str = "let ts;try{ts=require(process.argv[1])}catch(e){proc
 /// the source on stdin, as LSP document symbols converted the way typescript-language-server
 /// converts tsserver's navtree. Same argv shape as [`TS_PROBE`]; a syntactic language service over
 /// one in-memory snapshot, so no program, configuration, type package or `node_modules` is read.
-pub const TS_OUTLINE_PROBE: &str = include_str!("outline_probe.js");
+pub const TS_OUTLINE_PROBE: &str = concat!(
+    include_str!("class_context.js"),
+    "\n",
+    include_str!("outline_probe.js")
+);
 /// Largest accepted outline probe reply.
 const MAX_OUTLINE_PROBE_BYTES: usize = 256 * 1024;
 /// Most document symbols accepted from one outline probe reply.
@@ -669,8 +673,57 @@ impl LanguageSupport for TypeScript {
         root: &Path,
         file: &Path,
         configured: Option<&ProbePrograms>,
+        anchors: &[u32],
     ) -> Option<Vec<String>> {
-        probe_argv(TS_OUTLINE_PROBE, root, file, configured)
+        if anchors.len() > 32 || anchors.contains(&0) {
+            return None;
+        }
+        let mut argv = probe_argv(TS_OUTLINE_PROBE, root, file, configured)?;
+        if !anchors.is_empty() {
+            let name = argv.last()?.clone();
+            *argv.last_mut()? = serde_json::json!({"file": name, "anchors": anchors}).to_string();
+        }
+        Some(argv)
+    }
+
+    /// Accepts only ordered, in-source line spans covering every requested public anchor.
+    fn source_context_probe_result(
+        &self,
+        _file: &Path,
+        source: &str,
+        output: &str,
+        anchors: &[u32],
+    ) -> Option<Vec<LineRange>> {
+        if output.len() > MAX_OUTLINE_PROBE_BYTES || anchors.is_empty() || anchors.len() > 32 {
+            return None;
+        }
+        let value: Value = serde_json::from_str(output).ok()?;
+        let object = value.as_object()?;
+        if object.len() != 2 || object.get("v") != Some(&Value::from(1)) {
+            return None;
+        }
+        let raw: Vec<[u32; 2]> = serde_json::from_value(object.get("context")?.clone()).ok()?;
+        if raw.is_empty() || raw.len() > 512 {
+            return None;
+        }
+        let count = source.lines().count();
+        let mut end = None;
+        let mut spans = Vec::new();
+        for [first, last] in raw {
+            if first > last || last as usize >= count || end.is_some_and(|end| first <= end) {
+                return None;
+            }
+            spans.push(LineRange::new(first.checked_add(1)?, last.checked_add(1)?));
+            end = Some(last);
+        }
+        anchors
+            .iter()
+            .all(|at| {
+                spans
+                    .iter()
+                    .any(|span| span.start <= *at && *at <= span.end)
+            })
+            .then_some(spans)
     }
 
     /// The outline probe's reply as this language's outline, through the same position handling
@@ -2162,7 +2215,7 @@ export interface Options {
         std::fs::write(local.join("typescript.js"), "export {};\n").unwrap();
         let file = Path::new("src/a.test.ts");
         let outline = TypeScript
-            .source_outline_probe_command(&project, &root, file, None)
+            .source_outline_probe_command(&project, &root, file, None, &[])
             .unwrap();
         let syntax = TypeScript
             .syntax_probe_command(&project, &root, file, None)
@@ -2173,10 +2226,143 @@ export interface Options {
         assert!(!outline[2].contains("createProgram"));
         assert_eq!((&outline[..2], &outline[3..]), (&syntax[..2], &syntax[3..]));
         assert_eq!(
-            TypeScript.source_outline_probe_command(&project, &root, Path::new("src/a.py"), None),
+            TypeScript.source_outline_probe_command(
+                &project,
+                &root,
+                Path::new("src/a.py"),
+                None,
+                &[]
+            ),
             None
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Context replies must be bounded, ordered, within source, and cover every anchor.
+    #[test]
+    fn source_context_probe_rejects_unverified_ranges() {
+        let file = Path::new("a.ts");
+        let source = "a\nb\nc\n";
+        let good = r#"{"v":1,"context":[[0,0],[2,2]]}"#;
+        assert_eq!(
+            TypeScript.source_context_probe_result(file, source, good, &[1, 3]),
+            Some(vec![LineRange::new(1, 1), LineRange::new(3, 3)])
+        );
+        assert!(
+            TypeScript
+                .source_context_probe_result(file, source, good, &[2])
+                .is_none()
+        );
+        for output in [
+            r#"{"v":1,"context":null}"#,
+            r#"{"v":1,"context":[[0,3]]}"#,
+            r#"{"v":1,"context":[[1,0]]}"#,
+            r#"{"v":1,"context":[[0,1],[1,2]]}"#,
+            r#"{"v":1,"context":[[0,2]],"extra":true}"#,
+            "not json",
+        ] {
+            assert!(
+                TypeScript
+                    .source_context_probe_result(file, source, output, &[1])
+                    .is_none(),
+                "{output}"
+            );
+        }
+    }
+
+    /// Operator-only AST proof: preserve state/wrappers/overloads, refuse unknown receiver flow.
+    #[test]
+    #[ignore = "requires AGENT_IDE_NODE and AGENT_IDE_TSSERVER"]
+    fn source_context_probe_runs_on_the_accepted_compiler() {
+        use std::io::Write;
+        let node = std::env::var("AGENT_IDE_NODE").unwrap();
+        let module = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap())
+            .with_file_name("typescript.js");
+        let source = "class Box {\n  value = 1\n  constructor() { this.value = 2 }\n  #read = () => { return this.value }\n  read() { return this.#read() }\n  other(x: string): string\n  other(x: number): number\n  other(x: unknown) { return x }\n}\n";
+        for (text, anchor, allowed) in [
+            (source.to_owned(), 4, true),
+            (source.to_owned(), 8, true),
+            (
+                source.replace("return this.#read()", "consume(this); return this.#read()"),
+                4,
+                false,
+            ),
+            (
+                source.replace("return this.value", "const {value} = this; return value"),
+                4,
+                true,
+            ),
+            (
+                source.replace("return this.value", "return this['value']"),
+                4,
+                false,
+            ),
+            (
+                source.replace("return this.value", "return consume(this)"),
+                4,
+                false,
+            ),
+            (
+                source.replace("return this.value", "const self = this; return self.value"),
+                4,
+                false,
+            ),
+            (
+                source.replace("class Box {", "class Box extends Parent {"),
+                4,
+                false,
+            ),
+            (source.replace("return x }\n}", "return x } }"), 4, false),
+        ] {
+            let mut child = std::process::Command::new(&node)
+                .args(["-e", TS_OUTLINE_PROBE])
+                .arg(&module)
+                .arg(serde_json::json!({"file":"a.ts", "anchors":[anchor]}).to_string())
+                .env_clear()
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            let spans = TypeScript.source_context_probe_result(
+                Path::new("a.ts"),
+                &text,
+                std::str::from_utf8(&output.stdout).unwrap(),
+                &[anchor],
+            );
+            assert_eq!(spans.is_some(), allowed, "{text}");
+            if let Some(spans) = spans {
+                let lines: Vec<_> = text.lines().collect();
+                let selected = spans
+                    .iter()
+                    .flat_map(|span| {
+                        lines[(span.start - 1) as usize..span.end as usize]
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(selected.contains("constructor()") && selected.contains("value = 1"));
+                if anchor == 4 {
+                    assert!(selected.contains("#read =") && selected.contains("read()"));
+                    assert!(!selected.contains("other("));
+                } else {
+                    assert!(
+                        selected.contains("other(x: string)")
+                            && selected.contains("other(x: number)")
+                            && selected.contains("other(x: unknown)")
+                    );
+                    assert!(!selected.contains("#read ="));
+                }
+            }
+        }
     }
 
     /// Operator-only: the actual probe on the accepted Node and compiler turns a suite read from
