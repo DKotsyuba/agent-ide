@@ -450,7 +450,8 @@ impl PublicCheckReport {
     }
 
     /// Converts to the context-retrieval evidence: failure locations then frames, each bound to
-    /// its observed hash, at most 32 entries inside the 12 KiB budget. `None` without anchors.
+    /// its observed hash and carrying its failure's bounded error line (the failure name when
+    /// none was printed), at most 32 entries inside the 12 KiB budget. `None` without anchors.
     pub(super) fn retrieval_evidence(
         &self,
     ) -> Option<crate::project::context::evidence::PublicEvidence> {
@@ -458,6 +459,15 @@ impl PublicCheckReport {
         let mut failures: Vec<FailureEvidence> = Vec::new();
         let mut used = 0;
         let mut seen = BTreeSet::new();
+        // Every anchor carries its failure's observed error, not only the test name; the name
+        // stands in only when the runner printed no error line.
+        fn observed(failure: &FailedTest) -> &str {
+            if failure.message.trim().is_empty() {
+                &failure.name
+            } else {
+                &failure.message
+            }
+        }
         let candidates = self
             .failures
             .iter()
@@ -465,12 +475,13 @@ impl PublicCheckReport {
                 failure
                     .location
                     .as_ref()
-                    .map(|frame| (frame, failure.message.as_str()))
+                    .map(|frame| (frame, observed(failure)))
             })
-            .chain(self.frames.iter().map(|frame| {
-                let failure = &self.failures[frame.failure];
-                (frame, failure.name.as_str())
-            }));
+            .chain(
+                self.frames
+                    .iter()
+                    .map(|frame| (frame, observed(&self.failures[frame.failure]))),
+            );
         for (frame, message) in candidates {
             if failures.len() == MAX_ANCHORS {
                 break;

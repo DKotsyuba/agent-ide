@@ -221,6 +221,47 @@ This error originated in \"src/test_broken.alpha\" test file.
     );
     assert_eq!(report.unresolved_frames, 1);
     assert!(report.errors.is_empty(), "{:?}", report.errors);
+    // Every retrieval anchor carries its own failure's observed error line, never only a test
+    // or section name: the unhandled rejection's frames say what was rejected.
+    let anchors = |report: &PublicCheckReport| -> Vec<(PathBuf, Option<u32>, String)> {
+        report
+            .retrieval_evidence()
+            .unwrap()
+            .failures
+            .into_iter()
+            .map(|f| (f.path, f.line, f.message))
+            .collect()
+    };
+    let body = "TypeError: Body is unusable: Body has already been read";
+    assert_eq!(
+        anchors(&report),
+        [
+            (
+                PathBuf::from("src/test_request.alpha"),
+                Some(4),
+                "AssertionError: expected false to be true // Object.is equality".to_owned()
+            ),
+            (PathBuf::from("src/request.alpha"), Some(1), body.to_owned()),
+            (
+                PathBuf::from("src/test_request.alpha"),
+                Some(3),
+                body.to_owned()
+            ),
+            (
+                PathBuf::from("src/compose.alpha"),
+                Some(3),
+                "Error: boom".to_owned()
+            ),
+        ]
+    );
+    // Without a printed error line the failure name remains the anchor's message.
+    let mut silent = report.clone();
+    silent.failures[0].message = String::new();
+    silent.failures[1].message = " ".into();
+    let silent = anchors(&silent);
+    // The typed location (first anchor) and a plain frame fall back alike.
+    assert_eq!(silent[0].2, "Request > parses");
+    assert_eq!(silent[1].2, "Unhandled Rejection");
 }
 
 /// A real unhandled error without any source frame stays a failure (with no anchor); only the
@@ -601,12 +642,12 @@ fn retrieval_handoff_is_bounded_and_hash_bound() {
             (
                 Path::new("src/request.alpha"),
                 Some(1),
-                "FAIL  src/test_broken.alpha [ src/test_broken.alpha ]"
+                "Error: Transform failed"
             ),
             (
                 Path::new("src/test_request.alpha"),
                 Some(4),
-                "Request > parses"
+                "AssertionError: expected 1 to be 2"
             ),
         ]
     );
