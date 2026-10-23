@@ -1,7 +1,7 @@
 //! Python conformance for `symbol-address-v1`: region fixture over a server-shaped outline.
 //!
-//! Python has no source outline (symbols come from Pyright), so the fixture builds the symbols
-//! Pyright would report and runs them through the language's own region rules.
+//! The server-shaped fixture pins Pyright region compatibility independently of the new
+//! source-only syntax outline; source-outline tests check its own address coverage.
 
 use std::path::Path;
 

@@ -524,7 +524,7 @@ pub async fn command_env_argv(
     match module(language) {
         None => Ok(language
             .support()
-            .configured_command_argv(worktree, cwd, argv, config)),
+            .configured_test_command_argv(worktree, cwd, argv, config)),
         Some(host) => {
             host.request::<CommandEnvAnswer>(
                 language,
@@ -796,6 +796,17 @@ fn plan_admitted_configured(
     budget: std::time::Duration,
     config: &ModuleConfig,
 ) -> Routed<(Vec<String>, PlannedStart)> {
+    // The module may echo only this invocation's trusted worker setting, never arbitrary
+    // extra runner arguments through an environment recipe parameter.
+    if let Some(value) = effect.params.get("test_workers") {
+        let valid = config.test_workers.is_some_and(|count| {
+            matches!(value, super::payload::Param::Token(value)
+                if value == &count.to_string() || value == &format!("-n {count}"))
+        });
+        if !valid {
+            return Err(policy_refused(language));
+        }
+    }
     let tests: Vec<super::payload::EffectRecipe> = super::recipe::declared(language.name())
         .iter()
         .filter(|recipe| recipe.class == super::payload::RunClass::Test)

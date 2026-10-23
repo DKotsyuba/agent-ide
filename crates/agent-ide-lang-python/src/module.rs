@@ -349,6 +349,11 @@ const fn test_run(id: &'static str, program: &'static str, args: &'static [Arg])
         program,
         args,
         env: &[
+            EnvRule::Param {
+                name: "PYTEST_ADDOPTS",
+                param: "test_workers",
+                optional: true,
+            },
             EnvRule::Home { name: "HOME" },
             EnvRule::SearchPath {
                 name: "PATH",

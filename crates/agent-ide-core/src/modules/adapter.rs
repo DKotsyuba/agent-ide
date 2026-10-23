@@ -265,7 +265,7 @@ impl SupportServer {
                 } => {
                     replace_selections(&worktree, self.language, selections);
                     let argv = std::iter::once(program).chain(args).collect::<Vec<_>>();
-                    encode(&support.configured_command_argv(&worktree, &cwd, &argv, &config))
+                    encode(&support.configured_test_command_argv(&worktree, &cwd, &argv, &config))
                 }
                 ProjectQuery::TestToolchain { program } => {
                     encode(&support.test_toolchain(&program))
@@ -356,12 +356,21 @@ impl SupportServer {
                     &support
                         .test_selection(&project, &target)
                         .and_then(|selection| {
+                            let mut effect = self.plan(
+                                &selection.command,
+                                &config,
+                                config.worktree.as_deref().unwrap_or(Path::new(".")),
+                            )?;
+                            if let Some(setting) = config.test_workers.and_then(|workers| {
+                                support.test_worker_setting(&selection.command, workers)
+                            }) {
+                                effect.params.insert(
+                                    "test_workers".into(),
+                                    super::payload::Param::Token(setting.value().to_owned()),
+                                );
+                            }
                             Ok(TestRun {
-                                effect: self.plan(
-                                    &selection.command,
-                                    &config,
-                                    config.worktree.as_deref().unwrap_or(Path::new(".")),
-                                )?,
+                                effect,
                                 tests: selection.tests,
                             })
                         }),

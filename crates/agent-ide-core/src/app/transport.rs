@@ -124,6 +124,8 @@ impl OpaqueJson {
 pub enum AssistanceMethod {
     /// Separate sanitized hook-observation ingress; never a generic event subscription.
     HookSubmit,
+    /// Task-context preparation with operator-configured optional model backends.
+    Prepare,
     /// Current v0.1 `ide.start` method dispatch.
     Start,
     /// Current v0.1 `ide.context` method dispatch.
@@ -154,7 +156,7 @@ impl AssistanceMethod {
         match self {
             Self::Edit | Self::Outline | Self::Read | Self::Symbol => 3,
             Self::Test => 4,
-            Self::Graph => 5,
+            Self::Graph | Self::Prepare => 5,
             _ => 2,
         }
     }
@@ -162,6 +164,7 @@ impl AssistanceMethod {
     /// Parses only the method tag paired with its assigned wire version.
     pub(crate) fn from_dispatch_tag(value: &str, version: u64) -> Option<Self> {
         match value {
+            "prepare" if version == 5 => Some(Self::Prepare),
             "start" => Some(Self::Start),
             "context" => Some(Self::Context),
             "diff" => Some(Self::Diff),

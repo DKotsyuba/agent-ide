@@ -265,6 +265,15 @@ impl LanguageSupport for TypeScript {
         true
     }
 
+    /// Reuses tokenization for templates, regular expressions and JSX instead of reading literals.
+    fn source_import_spans(&self, file: &Path, source: &str) -> Option<Vec<LineRange>> {
+        Some(crate::names::source_import_spans(
+            file,
+            source,
+            self.region_rules(),
+        ))
+    }
+
     /// Top-level declarations recognized from the text alone, for callers the server cannot
     /// answer (a file whose `tsconfig.json` lives below the worktree root). Each column-0
     /// `function`, `class`, `interface`, `type`, `enum`, `namespace` or `const`/`let`/`var`
@@ -520,6 +529,27 @@ impl LanguageSupport for TypeScript {
             None => command.extend(files),
         }
         Ok(TestSelection { tests, command })
+    }
+
+    /// Supplies the native engine's concurrency option for generated test commands.
+    fn test_worker_setting(
+        &self,
+        argv: &[String],
+        workers: std::num::NonZeroU16,
+    ) -> Option<agent_ide_core::execution::test_workers::WorkerSetting> {
+        let prefix = match argv.first().map(String::as_str) {
+            Some("vitest" | "jest") => "--maxWorkers=",
+            Some("node") if argv.get(1).is_some_and(|word| word == "--test") => {
+                "--test-concurrency="
+            }
+            _ => return None,
+        };
+        Some(
+            agent_ide_core::execution::test_workers::WorkerSetting::Argument {
+                prefix,
+                value: workers.to_string(),
+            },
+        )
     }
 
     /// Reads (after stripping ANSI colours) the vitest `Tests  N failed | M passed (T)` or jest

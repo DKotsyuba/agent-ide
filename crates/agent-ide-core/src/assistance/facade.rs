@@ -1,6 +1,6 @@
 //! Bounded MCP discovery, finite Application routing, and fail-open Assistance feedback.
 //!
-//! This module has no peer-domain implementation of its own. It advertises ten public tools and
+//! This module has no peer-domain implementation of its own. It advertises eleven public tools and
 //! validates their inputs plus the private Context transport, carries trusted host context, and
 //! honestly reports an unavailable or
 //! incomplete result until Workspace, Intelligence, and Changes return their typed facts.
@@ -74,6 +74,8 @@ const MAX_HOOK_BYTES: usize = 64 * 1024;
 pub enum AssistanceTool {
     /// Creates or retries one bounded Workspace activation operation.
     Start,
+    /// Prepares a task-focused source packet under current workspace authority.
+    Prepare,
     /// Private engine operation reused by inspect diagnostics/problems; never a public MCP route.
     Context,
     /// Requests a bounded Changes diff when that peer is available.
@@ -102,6 +104,7 @@ impl AssistanceTool {
     pub const fn mcp_name(self) -> &'static str {
         match self {
             Self::Start => "ide.start",
+            Self::Prepare => "ide.prepare",
             Self::Context => "ide.context",
             Self::Diff => "ide.diff",
             Self::Inspect => "ide.inspect",
@@ -118,7 +121,10 @@ impl AssistanceTool {
     /// Reports whether this tool has any binding/worktree/run mutation operation. For a
     /// validated concrete request use mutates_with, which excludes read-only test queries.
     pub const fn mutates(self) -> bool {
-        matches!(self, Self::Start | Self::Stop | Self::Edit | Self::Test)
+        matches!(
+            self,
+            Self::Start | Self::Prepare | Self::Stop | Self::Edit | Self::Test
+        )
     }
 
     /// Classifies a validated request for lost-reply handling. Test history/result/output queries
@@ -136,6 +142,7 @@ impl AssistanceTool {
     const fn transport_method(self) -> AssistanceMethod {
         match self {
             Self::Start => AssistanceMethod::Start,
+            Self::Prepare => AssistanceMethod::Prepare,
             Self::Context => AssistanceMethod::Context,
             Self::Diff => AssistanceMethod::Diff,
             Self::Inspect => AssistanceMethod::Inspect,
@@ -163,6 +170,7 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
             | (AssistanceTool::Stop, ResultKind::Stop)
             | (AssistanceTool::Outline, ResultKind::Outline)
             | (AssistanceTool::Read, ResultKind::Read)
+            | (AssistanceTool::Prepare, ResultKind::Prepare)
             | (AssistanceTool::Edit, ResultKind::EditProgress)
             | (AssistanceTool::Symbol, ResultKind::Symbol)
             | (AssistanceTool::Graph, ResultKind::Graph)
@@ -229,9 +237,9 @@ fn describe_languages(description: &str) -> String {
         .replace("{manifests_tail}", &tail)
 }
 
-/// Returns ten public schemas and the private Context validation schema, independent of availability.
+/// Returns eleven public schemas and the private Context validation schema, independent of availability.
 /// Public router registration and catalog projection exclude Context; stable indexes remain internal.
-pub fn tool_schemas() -> [ToolSchema; 11] {
+pub fn tool_schemas() -> [ToolSchema; 12] {
     let mut environment_languages = checked_language_ids();
     environment_languages.sort_unstable();
     let example_language = environment_languages.first().copied().unwrap_or("language");
@@ -405,6 +413,13 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "targets": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_TEST_TARGETS, "items":{"type":"object", "additionalProperties":false, "minProperties":1, "maxProperties":1, "properties":{"symbol":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "path":{"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES}, "pattern":{"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES}, "command":{"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_COMMAND_BYTES}}}}, "description":"Up to 8."}
                 }
             }),
+        ),
+        schema(
+            AssistanceTool::Prepare,
+            json!({"type":"object","additionalProperties":false,"required":["task"],"properties":{
+                "task":{"type":"string","minLength":1,"maxLength":16384},
+                "token_budget":{"type":"integer","minimum":1024,"maximum":32000,"default":12000}
+            }}),
         ),
     ]
 }
@@ -717,6 +732,7 @@ pub(crate) fn request_form(tool: AssistanceTool, parameters: &Value) -> String {
 fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
     match tool {
         AssistanceTool::Start => &["activation_id", "root", "read_only", "environment"],
+        AssistanceTool::Prepare => &["task", "token_budget"],
         AssistanceTool::Context => &[
             "path",
             "byte_offset",
@@ -804,6 +820,9 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
 /// Returns the hard argument-object byte limit of one logical tool's non-batch forms; a batch
 /// form (`super::batch::batch_key`) is bounded by `super::batch::MAX_BATCH_PARAMETER_BYTES`.
 fn parameter_limit(tool: AssistanceTool) -> usize {
+    if tool == AssistanceTool::Prepare {
+        return 100 * 1024;
+    }
     match tool {
         AssistanceTool::Edit => crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES,
         AssistanceTool::Test => MAX_TEST_PARAMETERS_BYTES,
@@ -997,6 +1016,22 @@ pub(crate) fn validate_normalized_call(
     match tool {
         AssistanceTool::Outline if object.contains_key("paths") || object.contains_key("glob") => {
             super::batch::validate_outline(object)?;
+        }
+        AssistanceTool::Prepare => {
+            let task = required_string(object, "task", 16384)?;
+            if task.trim().is_empty() {
+                return Err(invalid_field("task", FieldRule::OneOf("nonempty task")));
+            }
+            if object.get("token_budget").is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|budget| !(1024..=32000).contains(&budget))
+            }) {
+                return Err(invalid_field(
+                    "token_budget",
+                    FieldRule::OneOf("integer 1024..32000"),
+                ));
+            }
         }
         AssistanceTool::Outline => {
             if !object.contains_key("path") {
@@ -3171,7 +3206,7 @@ fn codex_route_identity(meta: &Map<String, Value>) -> Option<CodexRouteIdentity>
     CodexRouteIdentity::new(root_session, actor).ok()
 }
 
-/// Hosts the static ten-tool public rmcp surface even without a trusted host attachment.
+/// Hosts the static eleven-tool public rmcp surface even without a trusted host attachment.
 #[derive(Clone)]
 pub struct StdioFacade {
     /// Connect-only Application endpoint and finite deadline.
@@ -3189,7 +3224,7 @@ pub struct StdioFacade {
     publisher: Option<SharedCodexPublisher>,
     /// Optional protected Bridge registration client; no workspace authority is delegated.
     bridge: Option<Arc<super::bridge::BridgeClient>>,
-    /// Which per-host catalog and paragraph answer discovery. Both have ten public tools; only
+    /// Which per-host catalog and paragraph answer discovery. Both have eleven public tools; only
     /// patch advertisement differs. Private Context validation remains outside the rmcp router.
     catalog_host: CatalogHost,
     /// Generated static tool router; independent of daemon availability.
@@ -3210,7 +3245,7 @@ impl StdioFacade {
         }
     }
 
-    /// Creates a disconnected ten-tool facade for managed startup failure.
+    /// Creates a disconnected eleven-tool facade for managed startup failure.
     ///
     /// Discovery remains static and calls validate normally before returning unavailable. The
     /// facade contains neither a host attachment nor an IPC path, so it cannot disclose request
@@ -5221,7 +5256,7 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
 }
 
 impl StdioFacade {
-    /// Builds the ten-tool public router with the language-derived description phrases filled in
+    /// Builds the eleven-tool public router with the language-derived description phrases filled in
     /// from the registered languages (see [`describe_languages`]).
     pub(super) fn described_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         let mut router = Self::tool_router();
@@ -5236,8 +5271,19 @@ impl StdioFacade {
 
 #[tool_router]
 impl StdioFacade {
-    /// Activate the IDE for this worktree once per task; replies with the project card and the
-    /// batch call forms.
+    /// Task source packet in one call; operator-configured models. Check gaps; tokens are estimated.
+    #[tool(name = "ide.prepare", input_schema = tool_schemas()[11].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true))]
+    async fn prepare(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Prepare, parameters, context)
+            .await
+    }
+
+    /// Activate once per task; returns project card and batch call forms.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn start(
@@ -5248,8 +5294,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Start, parameters, context).await
     }
 
-    /// Changes since your last diff, paged; `mode` gives a whole comparison. Batch related paths
-    /// in one call; provenance:true adds the identity header.
+    /// Batch paths; paged changes since last diff. mode: whole comparison; provenance:true adds identity.
     #[tool(name = "ide.diff", input_schema = tool_schemas()[2].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn diff(
@@ -5260,8 +5305,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Diff, parameters, context).await
     }
 
-    /// Skeletons without bodies: symbol and region addresses, signatures and doc lines; batch
-    /// files with paths or glob.
+    /// Batch paths/glob: symbol and region addresses, signatures and docs, no bodies.
     #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn outline(
@@ -5273,10 +5317,7 @@ impl StdioFacade {
             .await
     }
 
-    /// Doc and body by address (`src/a.rs#Type/f`, window `…:3-5`, region `#@imports`,
-    /// `path:line`) or file lines; batch items: {symbol} or {path, offset, limit}. File lines answer
-    /// at once from source. An unchanged item you already hold is acknowledged; force:true
-    /// resends it.
+    /// Batch items: {symbol} or {path, offset, limit}. Addresses: file#Type/f, #@imports, path:line, …:3-5. Current source; unchanged acknowledged, force:true resends.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn read(
@@ -5287,9 +5328,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Read, parameters, context).await
     }
 
-    /// Symbol cards: signature, doc, definition, usages and immediate neighbors (direct only;
-    /// deeper chains: ide.graph). Batch with symbols; path with byte_offset resolves one UTF-8
-    /// use-site.
+    /// Batch symbols: definition, docs, usages, immediate neighbors; deeper chains: ide.graph. path+byte_offset resolves a UTF-8 use-site.
     #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn symbol(
@@ -5312,9 +5351,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Graph, parameters, context).await
     }
 
-    /// Batch up to 8 targets ({symbol}, {path}, {pattern} or {command:[argv]}) in order at worktree
-    /// root with one budget_s. Read result:N/history:true, cancel:N, or restore retained logs
-    /// with output:"<ref>/output/N".
+    /// Batch up to 8 targets at project root; budget_s bounds runtime. Read result:N/history:true, cancel:N, or output:"<ref>/output/N".
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false))]
     async fn test(
@@ -5325,9 +5362,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Test, parameters, context).await
     }
 
-    /// Saved detail by detail_ref, or a batch in detail_refs, and diagnostics; starts no check.
-    /// kind:diagnostics+path: a file's provider report; kind:problems: project check results.
-    /// Unknown never means clean.
+    /// Batch detail_refs or one detail_ref; kind:diagnostics+path or kind:problems. No check run; unknown is not clean.
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -5339,7 +5374,7 @@ impl StdioFacade {
             .await
     }
 
-    /// End this activation once, at task end; edited files stay, retained test outcomes and running commands are listed.
+    /// End activation once, at task end; keeps edits, lists retained tests and running commands.
     #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn stop(
@@ -5374,15 +5409,15 @@ pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE: discover needed e
 
 /// Which per-host catalog `tools/list` and the connect-time instructions answer with.
 ///
-/// Both catalogs expose the same ten public names; the owner removed public `ide.context`.
+/// Both catalogs expose the same eleven public names; the owner removed public `ide.context`.
 /// Its private transport remains reusable. Codex alone advertises native edit patches; legacy
 /// parameter compatibility such as `wait_ms` remains independent of public route removal.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CatalogHost {
-    /// Claude, Claude-compatible launchers and an unmanaged `mcp`: ten public tools.
+    /// Claude, Claude-compatible launchers and an unmanaged `mcp`: eleven public tools.
     #[default]
     Claude,
-    /// Managed Codex: the same ten public tools, with native edit patches advertised.
+    /// Managed Codex: the same eleven public tools, with native edit patches advertised.
     Codex,
 }
 
@@ -5801,7 +5836,7 @@ fn catalog_stays_within_the_budgets() {
     }
 }
 
-/// Both public catalogs have ten tools including graph, with no context route. Inspect modes
+/// Both public catalogs have eleven tools including graph, with no context route. Inspect modes
 /// reuse the private Context engine; positional Symbol targets cannot mix with address batches.
 /// Only Codex advertises native patches; compatibility validation accepts them on both hosts.
 #[test]
@@ -5813,10 +5848,10 @@ fn per_host_catalogs_differ_only_by_the_declared_subset() {
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>()
     };
-    assert_eq!(names(CatalogHost::Claude).len(), 10);
+    assert_eq!(names(CatalogHost::Claude).len(), 11);
     let codex = names(CatalogHost::Codex);
     assert_eq!(names(CatalogHost::Claude), codex);
-    assert_eq!(codex.len(), 10, "{codex:?}");
+    assert_eq!(codex.len(), 11, "{codex:?}");
     assert!(!codex.iter().any(|name| name == "ide.context"));
     assert!(codex.iter().any(|name| name == "ide.graph"));
     let inspect = CatalogHost::Codex
@@ -6057,7 +6092,7 @@ impl rmcp::ServerHandler for StdioFacade {
         .with_instructions(self.catalog_host.instructions())
     }
 
-    /// Serves the static ten-tool public catalogs for both hosts, with private
+    /// Serves the static eleven-tool public catalogs for both hosts, with private
     /// cache hints for modern requests only.
     ///
     /// The catalog is static per binary, but a short private TTL keeps a client from holding

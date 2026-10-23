@@ -783,6 +783,14 @@ fn live_agent_guidance_promotes_supported_batches() {
                     assert!(text.contains("once"), "{}: {text}", tool.name);
                     continue;
                 }
+                "ide.prepare" => {
+                    assert!(
+                        text.contains("task") && text.contains("one call"),
+                        "{}: {text}",
+                        tool.name
+                    );
+                    continue;
+                }
                 "ide.outline" => "paths",
                 "ide.symbol" | "ide.graph" => "symbols",
                 "ide.read" => "items",

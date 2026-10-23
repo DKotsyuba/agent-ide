@@ -13,6 +13,7 @@ pub mod checks;
 pub mod environment;
 pub mod module;
 pub mod profile;
+mod source_outline;
 pub mod support;
 
 /// Registration descriptor of the Python language.

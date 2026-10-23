@@ -428,3 +428,63 @@ provider charges remain unknown. A durable exclusive task/worktree claim and a
 flushed pre-send pending record prevent restart replay from hiding attempted work.
 Changing the task text creates a new task identity. Trace files contain private
 project context and are not sent to the main agent or ordinary logs.
+
+## Task context (experimental)
+
+`ide.prepare {"task":"exact user task","token_budget":12000}` prepares current source
+inside the active writer workspace. It does not execute tests or edit source, and it never
+builds or refreshes the index: it reads only the index the background indexer published.
+Without one it answers `prepare: not_ready` in the same call and names the cause. Index
+creation (by the background indexer) writes `.agent-ide/` and appends `/.agent-ide/` to
+`.gitignore`. Reader activations may prepare (a read-only call) but never start indexing. The `jev-pilot` build feature
+is required; existing IDE tools remain available when task context is disabled.
+
+The trusted launcher accepts a restart-only `task_context` object. Minimal offline setup:
+
+```json
+{"task_context":{"enabled":true,"models":{"embedding":null,"jev":null,"max_new_calls":0,"include_threshold":0.5}}}
+```
+
+Optional `models.embedding` uses `EmbeddingConfig`; optional `models.jev` uses `JevConfig`
+in `project/context`. Each route, model identity and private credential file is explicit.
+A null backend allocates no client and opens no credential. API egress requires the
+operator's `egress_allowed`; local embeddings accept literal loopback endpoints only.
+`max_new_calls` counts physical requests, including failed attempts, per preparation.
+Unknown or failed requests are journaled and never retried automatically.
+
+Background indexing is configured by `task_context.indexing` and is off by default:
+
+```json
+{"indexing":{"enabled":true,"max_new_calls":0,"max_input_bytes":0,"initial_allowed":false,"debounce_ms":750,"reconcile_ms":30000}}
+```
+
+One daemon thread indexes one active writer worktree at a time: after its `ide.start`, after a
+committed edit (debounced) and on a bounded periodic reconcile that also catches changes made
+outside the IDE. `max_new_calls` and `max_input_bytes` are totals for one activation, reduced
+by what each run actually sent; when they are spent, later runs still refresh local facts
+without any model call. A first full model indexing (nothing published yet in the configured
+embedding space) runs only with `initial_allowed`; until then each run prepares local facts
+only, the configured semantic index stays not ready (no lexical substitute) and the run records
+a free local estimate (fragments, input tokens, requests) that `ide.prepare` shows in its
+`not_ready` answer, so the operator can decide after seeing the cost. Without an embedding
+model (`models.embedding` null) the published index is the lexical one. Jev is never used for
+indexing. A failed run is not retried until the next `ide.start`. `ide.stop` and daemon
+shutdown cancel the running pass and wait for it.
+
+Preparation runs separately from the sequential worker. Stop cancels and joins owned work.
+Returned source is re-observed under current authority and refused if changed. The call waits
+up to 45 s and answers in one reply, never paged and never continued through `ide.inspect`:
+a status line (`complete`, `partial` or `needs_evidence`), the applicable `AGENTS.md`/`CLAUDE.md`
+rules and nearest manifests (first 32 KiB each; a longer file is cut on a line end and listed as omitted), numbered source per file
+with its line ranges, role and selection reasons (a partial file adds its header, imports and the
+signatures of declarations not shown), an explicit `omitted:` list and one usage line. Units leave one at a time
+when the reply would not fit: optional before required, latest rank first.
+The requested budget is kept; whatever leaves to fit the reply is named under `omitted:`.
+`complete` means
+the retriever reported no gap, every required unit is complete and nothing was left out or
+cut. Delivered rows are remembered like a read of them; every delivered file keeps its
+observation as a freshness fence. A preparation not ready within its compute budget ends in a final `deadline` refusal
+and is cancelled; the call never leaves a pending state behind.
+Private indexing/model reads do not create main-agent read receipts. It is a shortlist, not
+proof that every affected file was found.
+Unsupported source languages remain path-only entries. No new release/install is implied.

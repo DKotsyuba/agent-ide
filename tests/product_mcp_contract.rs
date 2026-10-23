@@ -1,5 +1,9 @@
 //! Executable MCP roundtrips for static discovery, separated ingress, and finite daemon routing.
 
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[path = "context_product/mod.rs"]
+mod context_product;
+
 /// Compact test results and explicit output-page product checks.
 #[path = "result_economy/mod.rs"]
 mod result_economy;
@@ -572,7 +576,7 @@ async fn both_hosts_publish_ten_tools_and_refuse_removed_context_before_dispatch
             .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
             .await;
         let tools = discovery["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10, "{host}: {discovery}");
+        assert_eq!(tools.len(), 11, "{host}: {discovery}");
         assert!(
             tools.iter().any(|tool| tool["name"] == "ide.graph"),
             "{host}: {discovery}"
@@ -860,6 +864,10 @@ fn assert_compact_envelope(reply: &Value) {
                 text.contains("committed:") && text.contains("stage:"),
                 "{reply}"
             );
+        }
+        // One-call packet: the status line leads and no page marker ever appears.
+        ("complete", Some("prepare")) => {
+            assert!(body.starts_with("prepare: "), "{reply}");
         }
         ("complete", Some("activation" | "diff" | "stop")) => {
             assert!(!body.is_empty(), "{reply}")
@@ -1268,8 +1276,7 @@ async fn binary_rejects_invalid_launcher_attachments_before_serving() {
 /// truthful annotation set (MCP-06): every unset hint stays the MCP default, `readOnlyHint` is
 /// claimed only by the read tools, `destructiveHint` only by ide.edit, `idempotentHint` only by
 /// the operations whose durable receipts make a same-argument repeat a no-op, ide.test (arbitrary
-/// project commands) claims no relaxation at all, and nothing claims
-/// an open world.
+/// project commands) claims no relaxation at all; prepare declares its optional external model calls.
 #[tokio::test]
 async fn server_identity_and_tool_annotations_are_pinned() {
     let runtime = runtime();
@@ -1314,6 +1321,10 @@ async fn server_identity_and_tool_annotations_are_pinned() {
         ),
         ("ide.test", json!({"readOnlyHint": false})),
         (
+            "ide.prepare",
+            json!({"readOnlyHint": false, "destructiveHint": false, "openWorldHint": true}),
+        ),
+        (
             "ide.edit",
             json!({
                 "readOnlyHint": false,
@@ -1355,6 +1366,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
             "ide.graph",
             "ide.inspect",
             "ide.outline",
+            "ide.prepare",
             "ide.read",
             "ide.start",
             "ide.stop",
@@ -1548,7 +1560,7 @@ async fn modern_tools_call_is_fail_open_and_selects_host_from_request_meta() {
     mcp.close().await;
 }
 
-/// Managed Codex startup failure retains the ten-tool Codex catalog and bounded fallback calls,
+/// Managed Codex startup failure retains the eleven-tool Codex catalog and bounded fallback calls,
 /// including graph, without advertising context or granting any daemon binding authority.
 #[tokio::test]
 async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
@@ -1574,6 +1586,7 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
             "ide.graph",
             "ide.inspect",
             "ide.outline",
+            "ide.prepare",
             "ide.read",
             "ide.start",
             "ide.stop",
@@ -5771,7 +5784,7 @@ async fn modern_managed_claude_keeps_hook_pairing_and_text_only_envelope() {
         .await;
     assert_eq!(
         catalog["result"]["tools"].as_array().map(Vec::len),
-        Some(10),
+        Some(11),
         "{catalog}"
     );
     let mut next = 30;
@@ -13658,7 +13671,8 @@ fn batch_python_fixture(interpreter: Option<&str>) -> ProductFixture {
 
 /// Case 8 (Python): the interpreter probe refuses a candidate Python cannot parse, exactly as
 /// the in-process Rust check does, and writes a good one; with no proven checker the same broken
-/// candidate proceeds (`Unchecked`), never blocking the edit.
+/// candidate proceeds (`Unchecked`), never blocking the edit. A valid source outline names the
+/// written function in its landing; an invalid unchecked source retains the physical line address.
 #[tokio::test]
 async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds_unchecked() {
     let interpreter = batch_python_interpreter();
@@ -13731,7 +13745,7 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
     assert_eq!(
         batch_without_status_plate(&written_text),
         format!(
-            "edit: replaced; path svc/app.py; {}\n  svc/app.py:5 (L5)  replaced (1 lines → 1)",
+            "edit: replaced; path svc/app.py; {}\n  svc/app.py#broken:1 (L5)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&written)
         ),
         "{written_text}"

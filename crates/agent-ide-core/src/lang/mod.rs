@@ -707,6 +707,35 @@ pub trait LanguageSupport: Send + Sync {
         target: &TestTarget,
     ) -> Result<TestSelection, LangError>;
 
+    /// Declares the engine-specific setting for an IDE-selected test worker count.
+    /// Unclaimed commands retain their exact behavior; this never installs runner plugins.
+    fn test_worker_setting(
+        &self,
+        _argv: &[String],
+        _workers: std::num::NonZeroU16,
+    ) -> Option<crate::execution::test_workers::WorkerSetting> {
+        None
+    }
+
+    /// Resolves a command and applies only its language-declared test concurrency setting.
+    /// A missing count preserves the existing environment and command byte for byte.
+    fn configured_test_command_argv(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        argv: &[String],
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Result<Option<environment::CommandEnv>, LangError> {
+        let env = self.configured_command_argv(worktree, cwd, argv, config)?;
+        match config
+            .test_workers
+            .and_then(|workers| self.test_worker_setting(argv, workers))
+        {
+            Some(setting) => Ok(Some(setting.apply(argv, env))),
+            None => Ok(env),
+        }
+    }
+
     /// Parses runner output into counts and the first failures; never infers success from silence.
     fn parse_test_output(&self, stdout: &str, stderr: &str) -> TestReport;
 
@@ -893,6 +922,35 @@ pub trait LanguageSupport: Send + Sync {
     fn file_doc(&self, text: &str) -> Option<String> {
         let _ = text;
         None
+    }
+
+    /// Collects requested source-only details from the same immutable bytes. Languages may
+    /// reuse one parser tree; disabled consumers are not invoked. Missing results are unavailable.
+    fn source_details(
+        &self,
+        file: &Path,
+        source: &str,
+        imports: bool,
+        outline: bool,
+    ) -> (Option<Vec<LineRange>>, Option<Outline>) {
+        (
+            imports
+                .then(|| self.source_import_spans(file, source))
+                .flatten(),
+            outline
+                .then(|| self.outline_from_source(file, source))
+                .flatten(),
+        )
+    }
+
+    /// Returns syntax-backed import statement spans for operator collection. No imports are
+    /// executed or resolved; `None` is unavailable, distinct from an available empty list.
+    fn source_import_spans(&self, file: &Path, source: &str) -> Option<Vec<LineRange>> {
+        let _ = file;
+        Some(regions::import_spans(
+            &source.lines().collect::<Vec<_>>(),
+            self.region_rules(),
+        ))
     }
 
     /// Outline computed from the text alone; `None` (the default) keeps outlines server-backed.

@@ -284,6 +284,9 @@ pub struct ModuleConfig {
     /// payloads carry no extra exclusions; check requests explicitly supply their own policy.
     #[serde(default)]
     pub read_denies: Vec<crate::execution::seatbelt::ReadDeny>,
+    /// IDE-selected test worker count; absent keeps the project runner defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_workers: Option<std::num::NonZeroU16>,
     /// The absolute canonical admitted root of this instance's scope.
     pub worktree: Option<std::path::PathBuf>,
     /// In current computation requests, the accepted provider declaration (executable,

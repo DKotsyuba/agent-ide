@@ -241,7 +241,10 @@ pub async fn resolve_command(
         |language| vec![language],
     );
     for language in languages {
-        let config = launcher.module_config(language, root, target);
+        let mut config = launcher.module_config(language, root, target);
+        if command_language.is_none() {
+            config.test_workers = None;
+        }
         match crate::modules::calls::command_env_argv(language, root, cwd, argv, &config).await? {
             Err(error) => return Ok(Err(error)),
             Ok(Some(env)) => {

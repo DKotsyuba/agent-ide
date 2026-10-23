@@ -573,6 +573,12 @@ struct RawConfig {
     /// Optional restart-only experimental helper input; malformed helper fields disable only it.
     #[serde(default)]
     jev_pilot: Option<Value>,
+    /// Restart-only task-context settings; absent disables indexing and model requests.
+    #[serde(default)]
+    task_context: Option<Value>,
+    /// Optional engine-level test concurrency; reloaded on daemon restart.
+    #[serde(default)]
+    test_execution: Option<crate::execution::test_workers::TestExecutionConfig>,
 }
 
 /// One validated trusted target; metadata alone never creates one of these values.
@@ -601,6 +607,10 @@ pub struct LauncherConfig {
     bridge: Option<super::bridge::BridgeConfig>,
     /// Untrusted helper-shaped configuration, validated separately without failing core startup.
     jev_pilot: Option<Value>,
+    /// Trusted task-context configuration, validated when explicitly requested.
+    task_context: Option<Value>,
+    /// Optional engine-level test concurrency; reloaded on daemon restart.
+    test_execution: Option<crate::execution::test_workers::TestExecutionConfig>,
     /// Retired settings identifiers whose provider entries were dropped, each once.
     retired: Vec<&'static RetiredSettings>,
 }
@@ -748,6 +758,8 @@ impl LauncherConfig {
             project_checks: raw.project_checks,
             bridge: raw.bridge,
             jev_pilot: raw.jev_pilot,
+            task_context: raw.task_context,
+            test_execution: raw.test_execution,
             retired,
         })
     }
@@ -760,6 +772,11 @@ impl LauncherConfig {
         self.bridge.as_ref()
     }
     /// Returns restart-only optional helper input; reading this value performs no credential I/O.
+    pub fn task_context(&self) -> Option<&Value> {
+        self.task_context.as_ref()
+    }
+
+    /// Returns the optional legacy helper configuration.
     pub fn jev_pilot(&self) -> Option<&Value> {
         self.jev_pilot.as_ref()
     }
@@ -926,6 +943,10 @@ impl LauncherConfig {
     ) -> crate::modules::contract::ModuleConfig {
         crate::modules::contract::ModuleConfig {
             read_denies: Vec::new(),
+            test_workers: self
+                .test_execution
+                .as_ref()
+                .map(|config| config.workers.resolve()),
             worktree: worktree.map(Path::to_path_buf),
             provider,
             checks: self

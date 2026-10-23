@@ -4,7 +4,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Changes since your last diff, paged; `mode` gives a whole comparison. Batch related paths\nin one call; provenance:true adds the identity header.",
+    "description": "Batch paths; paged changes since last diff. mode: whole comparison; provenance:true adds identity.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -111,7 +111,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Saved detail by detail_ref, or a batch in detail_refs, and diagnostics; starts no check.\nkind:diagnostics+path: a file's provider report; kind:problems: project check results.\nUnknown never means clean.",
+    "description": "Batch detail_refs or one detail_ref; kind:diagnostics+path or kind:problems. No check run; unknown is not clean.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -163,7 +163,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Skeletons without bodies: symbol and region addresses, signatures and doc lines; batch\nfiles with paths or glob.",
+    "description": "Batch paths/glob: symbol and region addresses, signatures and docs, no bodies.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -193,10 +193,35 @@
   },
   {
     "annotations": {
+      "destructiveHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Task source packet in one call; operator-configured models. Check gaps; tokens are estimated.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "task": {
+          "type": "string"
+        },
+        "token_budget": {
+          "default": 12000,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "task"
+      ],
+      "type": "object"
+    },
+    "name": "ide.prepare"
+  },
+  {
+    "annotations": {
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Doc and body by address (`src/a.rs#Type/f`, window `…:3-5`, region `#@imports`,\n`path:line`) or file lines; batch items: {symbol} or {path, lines:\"1-80\"}. File lines answer\nat once from source. An unchanged item you already hold is acknowledged; force:true\nresends it.",
+    "description": "Batch items: {symbol} or {path, lines:\"1-80\"}. Addresses: file#Type/f, #@imports, path:line, …:3-5. Current source; unchanged acknowledged, force:true resends.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -236,7 +261,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Activate the IDE for this worktree once per task; replies with the project card and the\nbatch call forms.",
+    "description": "Activate once per task; returns project card and batch call forms.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -270,7 +295,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "End this activation once, at task end; edited files stay, retained test outcomes and running commands are listed.",
+    "description": "End activation once, at task end; keeps edits, lists retained tests and running commands.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -287,7 +312,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Symbol cards: signature, doc, definition, usages and immediate neighbors (direct only;\ndeeper chains: ide.graph). Batch with symbols; path with byte_offset resolves one UTF-8\nuse-site.",
+    "description": "Batch symbols: definition, docs, usages, immediate neighbors; deeper chains: ide.graph. path+byte_offset resolves a UTF-8 use-site.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -336,7 +361,7 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Batch up to 8 targets ({symbol}, {path}, {pattern} or {command:[argv]}) in order at worktree\nroot with one budget_s. Read result:N/history:true, cancel:N, or restore retained logs\nwith output:\"<ref>/output/N\".",
+    "description": "Batch up to 8 targets at project root; budget_s bounds runtime. Read result:N/history:true, cancel:N, or output:\"<ref>/output/N\".",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

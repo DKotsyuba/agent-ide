@@ -335,6 +335,7 @@ fn reply_detail(reply: &PeerReply) -> Option<String> {
 pub(crate) fn tool_stage(tool: AssistanceTool) -> &'static str {
     match tool {
         AssistanceTool::Start => "start",
+        AssistanceTool::Prepare => "prepare",
         AssistanceTool::Context => "context",
         AssistanceTool::Diff => "diff",
         AssistanceTool::Inspect => "inspect",
@@ -537,6 +538,7 @@ pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
 fn tool_method(tool: AssistanceTool) -> ToolMethod {
     match tool {
         AssistanceTool::Start => ToolMethod::Start,
+        AssistanceTool::Prepare => ToolMethod::Context,
         AssistanceTool::Context => ToolMethod::Context,
         AssistanceTool::Diff => ToolMethod::Diff,
         AssistanceTool::Inspect => ToolMethod::Inspect,

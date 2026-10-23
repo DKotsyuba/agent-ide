@@ -48,7 +48,8 @@ const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
 
 /// Returns the reply budget of one method dispatch: [`METHOD_DISPATCH_BUDGET`], plus the call's
 /// own `wait_ms` when `method` is `inspect` (clamped to the outbox's 240 s maximum), so a bounded
-/// `ide.inspect` wait (OUTBOX-r3 §8.5) is never cut by the transport. `params` is the dispatch's
+/// `ide.inspect` wait (OUTBOX-r3 §8.5) is never cut by the transport, and the extra one-call wait
+/// of `prepare` beyond the ordinary inline wait. `params` is the dispatch's
 /// `params_json` object; anything unreadable adds nothing.
 fn method_dispatch_budget(method: &str, params: &Value) -> Duration {
     let wait = (method == "inspect")
@@ -56,7 +57,14 @@ fn method_dispatch_budget(method: &str, params: &Value) -> Duration {
         .flatten()
         .unwrap_or(0)
         .min(crate::assistance::outbox::MAX_WAIT_MS);
-    METHOD_DISPATCH_BUDGET + Duration::from_millis(wait)
+    // `ide.prepare` holds its call open longer than the ordinary inline wait (one-call packet).
+    let prepare = if method == "prepare" {
+        crate::assistance::worker::PREPARE_INLINE_WAIT
+            .saturating_sub(crate::assistance::worker::INLINE_REPLY_WAIT)
+    } else {
+        Duration::ZERO
+    };
+    METHOD_DISPATCH_BUDGET + Duration::from_millis(wait) + prepare
 }
 /// Total connect, request, and acknowledgement budget when a Codex MCP opens its client lease.
 const CLIENT_LEASE_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -787,6 +795,7 @@ pub async fn dispatch_method_if_running(
         AssistanceMethod::Edit => "edit",
         AssistanceMethod::Outline => "outline",
         AssistanceMethod::Read => "read",
+        AssistanceMethod::Prepare => "prepare",
         AssistanceMethod::Symbol => "symbol",
         AssistanceMethod::Graph => "graph",
         AssistanceMethod::Test => "test",
@@ -2018,6 +2027,7 @@ fn drop_reply_for_test(method: AssistanceMethod) -> bool {
         AssistanceMethod::Edit => "edit",
         AssistanceMethod::Outline => "outline",
         AssistanceMethod::Read => "read",
+        AssistanceMethod::Prepare => "prepare",
         AssistanceMethod::Symbol => "symbol",
         AssistanceMethod::Graph => "graph",
         AssistanceMethod::Test => "test",
@@ -2313,6 +2323,21 @@ mod tests {
         );
         assert_eq!(
             method_dispatch_budget("inspect", &json!({})),
+            METHOD_DISPATCH_BUDGET
+        );
+    }
+
+    /// `prepare` keeps its one call open past the ordinary inline wait, and the transport waits
+    /// longer than the worker so the packet is never cut into a pending reply by the transport.
+    #[test]
+    fn prepare_dispatch_budget_outlasts_its_inline_wait() {
+        use crate::assistance::facade::AssistanceTool;
+        use crate::assistance::worker::{INLINE_REPLY_WAIT, PREPARE_INLINE_WAIT, inline_wait};
+        assert_eq!(inline_wait(AssistanceTool::Prepare), PREPARE_INLINE_WAIT);
+        assert_eq!(inline_wait(AssistanceTool::Read), INLINE_REPLY_WAIT);
+        assert!(method_dispatch_budget("prepare", &json!({})) > PREPARE_INLINE_WAIT);
+        assert_eq!(
+            method_dispatch_budget("read", &json!({})),
             METHOD_DISPATCH_BUDGET
         );
     }

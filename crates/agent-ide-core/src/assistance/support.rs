@@ -5,8 +5,7 @@
 use super::*;
 
 #[cfg(feature = "jev-pilot")]
-#[path = "support/client.rs"]
-mod client;
+use crate::jev as client;
 
 #[cfg(feature = "jev-pilot")]
 #[path = "support/packet.rs"]

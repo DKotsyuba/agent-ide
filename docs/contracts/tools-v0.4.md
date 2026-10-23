@@ -668,3 +668,52 @@ Total: about two weeks; Rust is fully implemented by the end of the first week.
 1. Is the symbol path using `#` for the file and `/` for nesting accepted?
 2. Is the project card in the `ide.start` response (with `ide.project` to retrieve it again) accepted?
 3. Are the ceilings accepted: 16 KB per response, 30 usage lines, and a 120-second test budget?
+
+## ide.prepare
+
+Arguments: required nonempty `task` (up to 16384 UTF-8 bytes), optional `token_budget`
+(integer 1024..32000, default 12000).
+No caller-selected filesystem root or model route. Requires an active binding (a reader may prepare; only writers start background indexing) and
+enabled trusted `task_context` configuration; otherwise returns an explicit refusal.
+Creates/updates local index state and may call operator-enabled model backends.
+
+One call delivers the whole packet: the call waits up to 45 s for indexing and model work,
+and the reply is never paged and names no continuation. Text form:
+
+```text
+prepare: complete|partial|needs_evidence|not_ready; <n> files; ~<t> tokens (estimated)
+
+rules and manifests:
+--- AGENTS.md
+<verbatim, first 32 KiB; a longer file adds "(AGENTS.md: first X of Y bytes)" and is listed under omitted:>
+--- crates/x/Cargo.toml
+<verbatim>
+
+## src/scan.rs — lines 202-230, 312-356 of 409
+why: <selection reasons>
+202	<source line>
+…
+omitted:
+- <path>: <reason>
+usage: embeddings used|off, jev used|off; model calls N (replayed R, failed F); <ms> ms
+```
+
+Rules are `AGENTS.md`/`CLAUDE.md` at the worktree root and in every directory above a delivered
+file; manifests are the root one and the nearest one of each delivered file (regular files
+only, at most eight prelude files). A partially delivered file also shows its module header and imports
+(when not among the delivered rows) and `other declarations:` — every declaration whose rows are
+not delivered, with line range and one-line signature (160 characters at most). When the reply
+would not fit, whole selected units leave one at a time — optional before required, latest
+rank first — then prelude files, each listed under `omitted:`; nothing is cut silently. A
+required unit that is not a complete declaration also makes the packet `partial`.
+`complete` means the retriever reported no gap, no unanswered request for more evidence
+(those are listed under `omitted:`), no incomplete declaration list, and nothing was omitted
+or cut, prelude included; an empty packet is `needs_evidence`; anything else is `partial`.
+Without a published task-context index the call answers `not_ready` (nothing delivered, the
+background indexing state named); `ide.prepare` never builds or refreshes the index itself. Source freshness is
+checked again before delivery; a file that is not UTF-8 text is listed under `omitted:`
+instead of shown. The delivered rows are remembered exactly as a read of them
+would be, so unit and window edits work without another read; every delivered file, fragments
+included, keeps its observation as a freshness fence. A preparation not ready within its compute budget (below the call's wait)
+ends in a final `deadline` refusal — never a pending state to poll — and its work is cancelled
+and joined by the worker's cleanup.

@@ -10,6 +10,8 @@ rust-version = "1.98.1"
 license = "MIT"
 
 [workspace.dependencies]
+tree-sitter = "=0.27.1"
+tree-sitter-python = "=0.25.0"
 agent-ide-core = { path = "crates/agent-ide-core" }
 agent-ide-lang-css = { path = "crates/agent-ide-lang-css" }
 agent-ide-lang-html = { path = "crates/agent-ide-lang-html" }

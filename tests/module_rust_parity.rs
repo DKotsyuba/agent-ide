@@ -1584,6 +1584,7 @@ async fn the_module_process_starts_rust_analyzer_within_hello() {
         .unwrap();
     let offer = agent_ide_core::modules::contract::HelloOffer {
         config: agent_ide_core::modules::contract::ModuleConfig {
+            test_workers: None,
             read_denies: Vec::new(),
             worktree: Some(fixture.root.clone()),
             provider: Some(json!({

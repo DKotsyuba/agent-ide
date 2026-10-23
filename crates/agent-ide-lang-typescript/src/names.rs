@@ -896,6 +896,30 @@ fn words(text: &str) -> impl Iterator<Item = (usize, &str)> {
         .map(move |word| (word.as_ptr() as usize - text.as_ptr() as usize, word))
 }
 
+/// Builds code-only import scan input from the existing lexer, retaining physical line numbers.
+pub(crate) fn source_import_spans(
+    file: &Path,
+    source: &str,
+    rules: &agent_ide_core::lang::regions::RegionRules,
+) -> Vec<agent_ide_core::lang::LineRange> {
+    let jsx = file
+        .extension()
+        .is_some_and(|ext| ext == "jsx" || ext == "tsx");
+    let mut code: Vec<u8> = source
+        .bytes()
+        .map(|b| if b == b'\n' || b == b'\r' { b } else { b' ' })
+        .collect();
+    for token in tokens(source, jsx) {
+        match token {
+            Token::Word(span) => code[span.clone()].copy_from_slice(&source.as_bytes()[span]),
+            Token::Punct(byte, at) => code[at] = byte,
+            Token::Str(_) | Token::Template(_) => {}
+        }
+    }
+    let code = String::from_utf8(code).expect("source tokens preserve complete UTF-8 ranges");
+    agent_ide_core::lang::regions::import_spans_from_code(&code.lines().collect::<Vec<_>>(), rules)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

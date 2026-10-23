@@ -126,10 +126,10 @@ Preserve the safety invariants, required full gate and staged cutover qualificat
 
 `schemas/tools.json` exports the real binary's `tools/list` array for Claude;
 `schemas/tools-codex.json` exports Codex (`mcp --runtime-dir <dir> --host codex`).
-The current production source defines ten tools per host, including `ide.graph`.
-Both snapshots are generated from the rebuilt binary and contain the final ten names.
+The current production source defines eleven tools per host, including `ide.graph` and `ide.prepare`.
+Both snapshots are generated from the rebuilt binary and contain the eleven public names.
 The complete project gate remains required before claiming this candidate is done.
-Both source catalogs have the same ten public names. Public `ide.context` is
+Both source catalogs have the same eleven public names. Public `ide.context` is
 removed, including `tools/call`; only its private engine/transport remains. Source
 reads move to `ide.read {"items":[{"path":"src/a.rs"}]}` and skeletons to `ide.outline`.
 `ide.symbol {"path":"src/a.rs","byte_offset":42}` resolves an exact UTF-8 use-site
@@ -150,3 +150,10 @@ the managed launcher form. After any change to the tool surface in
 `crates/agent-ide-core/src/assistance/facade.rs`, run `cargo xtask contract
 update`, review the diff, and commit it together with the source change; CI
 and the gate fail on drift.
+
+`ide.prepare {"task":"…","token_budget":12000}` is the opt-in task reconnaissance
+call after `ide.start`. It returns one bounded text reply, without pagination or
+a required follow-up read. `partial` and `needs_evidence` are not successful
+reconnaissance. `complete` describes delivered selected evidence, not a proof that
+every edit location for an arbitrary task was discovered. Provider/key/root settings
+remain in the trusted launcher; the caller supplies only task and output budget.

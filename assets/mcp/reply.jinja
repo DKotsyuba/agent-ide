@@ -237,7 +237,7 @@ Result retained under {{ detail_ref }}. Bridge delivers it automatically.
 {%- if state == "complete" and (kind == "activation" or kind == "stop") -%}
 {{ text }}
 {%- endif -%}
-{%- if state == "complete" and (kind == "context" or kind == "diff" or kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect" or kind == "edit_progress") -%}
+{%- if state == "complete" and (kind == "prepare" or kind == "context" or kind == "diff" or kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect" or kind == "edit_progress") -%}
 {{ text }}
 {%- if truncated and detail_ref and continuation -%}
 {%- set next_tool = "ide." ~ kind if kind in ["read", "graph", "test"] else "ide.inspect" -%}

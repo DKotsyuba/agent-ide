@@ -4,6 +4,9 @@
 //! children run as ordinary processes of the daemon's user: the IDE's only path policy is the
 //! configured `allowed_roots` list, which Assistance enforces before a request reaches here.
 
+/// Configured runner worker counts and bounded load-aware selection.
+pub mod test_workers;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,

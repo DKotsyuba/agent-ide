@@ -912,6 +912,7 @@ mod tests {
     fn config_with(node: &Path, tsc_cli: &Path) -> ModuleConfig {
         ModuleConfig {
             worktree: None,
+            test_workers: None,
             // Shape projection of the accepted declaration: the provider OPTION `node` is
             // what the binding reads, and its digest is the ACTUAL hash of the fixture file
             // (a fake constant would make the bytes guard accept anything). This is a

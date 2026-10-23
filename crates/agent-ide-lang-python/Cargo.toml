@@ -11,6 +11,8 @@ description = "The Python language for Agent IDE: symbol support, Pyright checks
 path = "src/lib.rs"
 
 [dependencies]
+tree-sitter.workspace = true
+tree-sitter-python.workspace = true
 agent-ide-core.workspace = true
 async-lsp.workspace = true
 blake3.workspace = true

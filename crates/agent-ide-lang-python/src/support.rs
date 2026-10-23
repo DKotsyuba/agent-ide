@@ -423,6 +423,28 @@ impl LanguageSupport for Python {
         })
     }
 
+    /// Reuses one bounded CST for operator imports and skeletons; no semantic edit fallback.
+    fn source_details(
+        &self,
+        file: &Path,
+        source: &str,
+        imports: bool,
+        outline: bool,
+    ) -> (Option<Vec<LineRange>>, Option<Outline>) {
+        crate::source_outline::details(file, source, imports, outline)
+    }
+
+    /// Collects module-level imports from the CST, excluding all literal contents.
+    fn source_import_spans(&self, _file: &Path, source: &str) -> Option<Vec<LineRange>> {
+        crate::source_outline::imports(source)
+    }
+
+    /// Computes a source-only syntax outline without starting Pyright or executing project code.
+    /// Syntax errors and resource limits return `None`; server-loading edit fallbacks stay disabled.
+    fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
+        crate::source_outline::outline(file, source)
+    }
+
     /// Header = decorators directly above `def`/`class` (multi-line decorator arguments
     /// included); the docstring stays inside the body and its first paragraph becomes `doc`.
     /// Names a function binds (parameters, locals, `except as` bindings, comprehension
@@ -608,6 +630,27 @@ impl LanguageSupport for Python {
         command.extend(args);
         command.extend(PYTEST_FLAGS.map(String::from));
         Ok(TestSelection { tests, command })
+    }
+
+    /// Supplies the native engine's concurrency option for generated test commands.
+    fn test_worker_setting(
+        &self,
+        argv: &[String],
+        workers: std::num::NonZeroU16,
+    ) -> Option<agent_ide_core::execution::test_workers::WorkerSetting> {
+        (argv.first().is_some_and(|word| word == "pytest")
+            || argv
+                .get(1..3)
+                .is_some_and(|words| words == ["-m", "pytest"])
+            || argv
+                .get(..3)
+                .is_some_and(|words| words == ["uv", "run", "pytest"]))
+        .then(
+            || agent_ide_core::execution::test_workers::WorkerSetting::EnvironmentOptions {
+                name: "PYTEST_ADDOPTS",
+                value: format!("-n {workers}"),
+            },
+        )
     }
 
     /// Reads the last `N passed, M failed, K skipped in 0.1s` summary (errors count as failed,

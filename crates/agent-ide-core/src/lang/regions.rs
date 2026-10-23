@@ -160,6 +160,109 @@ pub fn scan_gap(
     out
 }
 
+/// Returns individual top-level import spans using the same rules as file-region discovery.
+/// Statements sharing one physical line remain together; blank/comment trivia is excluded.
+pub fn import_spans(lines: &[&str], rules: &RegionRules) -> Vec<LineRange> {
+    let masked = import_code(lines, rules);
+    let lines = masked.lines().collect::<Vec<_>>();
+    import_spans_from_code(&lines, rules)
+}
+
+/// Finds imports in code whose literal spans have already been removed by its owning lexer.
+/// Physical line numbers must still correspond to the original source.
+pub fn import_spans_from_code(lines: &[&str], rules: &RegionRules) -> Vec<LineRange> {
+    let mut spans = Vec::new();
+    for region in scan_gap(lines, 1, lines.len() as u32, true, rules)
+        .into_iter()
+        .filter(|r| r.kind == RawKind::Imports)
+    {
+        let mut i = region.span.start as usize - 1;
+        let last = region.span.end as usize - 1;
+        let trivia = trivia_flags(lines, i, last, rules);
+        let first = i;
+        while i <= last {
+            if trivia[i - first] || !is_import_start(lines[i], rules) {
+                i += 1;
+                continue;
+            }
+            let end = statement_end(lines, i, last, rules, true);
+            spans.push(LineRange::new(i as u32 + 1, end as u32 + 1));
+            i = end + 1;
+        }
+    }
+    spans
+}
+
+/// Masks ordinary quoted literals/comments while preserving line numbers. Languages with raw
+/// or interpolated syntax supply their own lexer-backed spans before reaching this scanner.
+fn import_code(lines: &[&str], rules: &RegionRules) -> String {
+    let source = lines.join("\n");
+    let bytes = source.as_bytes();
+    let mut code = bytes.to_vec();
+    let mut at = 0;
+    let mut quote = None;
+    let mut block = 0usize;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        if block != 0 {
+            let (open, close) = rules
+                .block_comment
+                .expect("block exists only for configured markers");
+            if rest.starts_with(open.as_bytes()) {
+                block += 1;
+                at += open.len();
+                continue;
+            }
+            if rest.starts_with(close.as_bytes()) {
+                block -= 1;
+                at += close.len();
+                continue;
+            }
+            at += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            if bytes[at] == b'\\' {
+                code[at] = b' ';
+                at += 1;
+                if at < bytes.len() && !matches!(bytes[at], b'\n' | b'\r') {
+                    code[at] = b' ';
+                }
+            } else if bytes[at] == q {
+                code[at] = b' ';
+                quote = None;
+            } else if !matches!(bytes[at], b'\n' | b'\r') {
+                code[at] = b' ';
+            }
+            at += 1;
+            continue;
+        }
+        if let Some((open, _)) = rules.block_comment
+            && rest.starts_with(open.as_bytes())
+        {
+            block = 1;
+            at += open.len();
+            continue;
+        }
+        if rules
+            .line_comments
+            .iter()
+            .any(|prefix| rest.starts_with(prefix.as_bytes()))
+        {
+            while at < bytes.len() && bytes[at] != b'\n' {
+                at += 1;
+            }
+            continue;
+        }
+        if matches!(bytes[at], b'\'' | b'"' | b'`') {
+            quote = Some(bytes[at]);
+            code[at] = b' ';
+        }
+        at += 1;
+    }
+    String::from_utf8(code).expect("masking replaces entire literal bytes with ASCII spaces")
+}
+
 /// Builds a region from 0-based inclusive line indices.
 fn raw(kind: RawKind, start: usize, end: usize, leader: String) -> RawRegion {
     RawRegion {

@@ -13,6 +13,15 @@
 //! Both keep every literal rendering rule (merge order, `—` for absent, per-language lines for a
 //! shared kind, the size ceiling) without inventing per-language prose this module cannot own.
 
+/// Configurable read-only trees with optional source headers, skeletons and Git counts.
+pub mod structure;
+
+/// Model-independent size estimates for rendered context and caller-supplied token budgets.
+pub mod token_estimate;
+
+/// Task-oriented source indexing, retrieval and bounded context packets.
+pub mod context;
+
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::Write as _;

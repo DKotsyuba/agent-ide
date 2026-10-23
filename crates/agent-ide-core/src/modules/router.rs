@@ -331,6 +331,7 @@ impl ModuleHost {
         }
         let config = ModuleConfig {
             read_denies: Vec::new(),
+            test_workers: None,
             worktree: Some(worktree.to_path_buf()),
             provider: None,
             checks: None,

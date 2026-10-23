@@ -5,9 +5,6 @@
 //! <https://docs.typesafe.ai/primitives/noul>. Only the selected route's exact
 //! model identifier is accepted; no undocumented response alias mapping.
 
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Duration;
 
@@ -128,7 +125,8 @@ const REQUEST_LIMIT: usize = 24 * 1024;
 /// Maximum response bytes accumulated from bounded streaming chunks.
 const RESPONSE_LIMIT: usize = 16 * 1024;
 /// Maximum credential-file bytes, including an optional trailing line ending.
-const CREDENTIAL_LIMIT: usize = 4096;
+#[cfg(test)]
+const CREDENTIAL_LIMIT: usize = crate::model_io::CREDENTIAL_LIMIT;
 
 /// One locally authorized option; its ID is local, while its description supplies semantics.
 pub(super) struct Candidate {
@@ -156,6 +154,26 @@ pub(super) struct Selection {
     pub(super) usage: Option<Value>,
     /// Facts measured at the transport boundary for this single physical attempt.
     pub(super) attempt: Attempt,
+}
+
+/// Validated HTTP exchange; question-specific checks remain the caller's responsibility.
+pub(crate) struct Evaluation {
+    pub(crate) request: Value,
+    pub(crate) response: Value,
+    pub(crate) usage: Option<Value>,
+    pub(crate) attempt: Attempt,
+}
+impl Evaluation {
+    /// Preserves observed accounting when a semantic response check rejects the answer.
+    fn failure(self, category: &'static str) -> Failure {
+        Failure {
+            category,
+            request: Some(self.request),
+            response: Some(self.response),
+            usage_unknown: self.usage.is_none(),
+            attempt: self.attempt,
+        }
+    }
 }
 
 /// Header-free transport observations; zero/default represents a request never sent.
@@ -240,35 +258,7 @@ impl JevClient {
     /// `route` fixes the destination/model; the file must contain that service's key.
     /// Call only after explicit opt-in: construction reads the file but performs no network I/O.
     pub(super) fn from_credential_file(path: &Path, route: &Transport) -> Result<Self, Failure> {
-        let invalid = || Failure::before_send("credential_invalid");
-        if !path.is_absolute() || path.canonicalize().map_err(|_| invalid())? != path {
-            return Err(invalid());
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|_| invalid())?;
-        let metadata = file.metadata().map_err(|_| invalid())?;
-        // SAFETY: geteuid only reports this process's effective user ID.
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-            || metadata.len() > CREDENTIAL_LIMIT as u64
-        {
-            return Err(invalid());
-        }
-        let mut credential = String::new();
-        file.take(CREDENTIAL_LIMIT as u64 + 1)
-            .read_to_string(&mut credential)
-            .map_err(|_| invalid())?;
-        if credential.len() > CREDENTIAL_LIMIT {
-            return Err(invalid());
-        }
-        let credential = credential.trim_end_matches(['\r', '\n']).to_owned();
-        if credential.is_empty() || !credential.bytes().all(|byte| byte.is_ascii_graphic()) {
-            return Err(invalid());
-        }
+        let credential = crate::model_io::credential(path).map_err(Failure::before_send)?;
         let http = http_builder()
             .https_only(true)
             .build()
@@ -295,16 +285,97 @@ impl JevClient {
         before_send: impl FnOnce(&Value) -> Result<(), ()>,
     ) -> Result<Selection, Failure> {
         let request = make_request(state, candidates, &self.route)?;
+        if candidates
+            .iter()
+            .any(|candidate| candidate.id.contains(&self.credential))
+        {
+            return Err(Failure::before_send("request_contains_secret"));
+        }
+        let received = self.send(request, before_send).await?;
+        let (selected_id, confidence, auto_test_probability) =
+            match validate_response(&received.response, candidates, &self.route) {
+                Ok(selection) => selection,
+                Err(category) => return Err(received.failure(category)),
+            };
+        Ok(Selection {
+            selected_id,
+            confidence,
+            auto_test_probability,
+            request: received.request,
+            response: received.response,
+            usage: received.usage,
+            attempt: received.attempt,
+        })
+    }
+
+    /// Evaluates independently named Noul questions against one complete caller-built state.
+    /// No IDs are translated: the returned keys are precisely the displayed question keys.
+    pub(crate) async fn evaluate_noul(
+        &self,
+        state: &Value,
+        questions: &[(String, String)],
+        before_send: impl FnOnce(&Value) -> Result<(), ()>,
+    ) -> Result<Evaluation, Failure> {
+        if questions.is_empty() || questions.len() > 128 {
+            return Err(Failure::before_send("questions_invalid"));
+        }
+        let mut named = Map::new();
+        for (id, instructions) in questions {
+            if id.is_empty()
+                || id.len() > 128
+                || !id.bytes().all(|byte| byte.is_ascii_graphic())
+                || instructions.trim().is_empty()
+                || named
+                    .insert(
+                        id.clone(),
+                        json!({"type":"noul","instructions":instructions}),
+                    )
+                    .is_some()
+            {
+                return Err(Failure::before_send("questions_invalid"));
+            }
+        }
+        let request = json!({"model":self.route.model,"state":state,"questions":named});
+        let received = self.send(request, before_send).await?;
+        if received.response.get("model").and_then(Value::as_str)
+            != Some(self.route.response_model.as_str())
+        {
+            return Err(received.failure("model_mismatch"));
+        }
+        let valid =
+            received
+                .response
+                .get("answers")
+                .and_then(Value::as_object)
+                .is_some_and(|answers| {
+                    answers.len() == questions.len()
+                        && questions.iter().all(|(id, _)| {
+                            answers.get(id).is_some_and(|answer| {
+                                answer.get("type").and_then(Value::as_str) == Some("noul")
+                                    && answer.get("noul").and_then(Value::as_f64).is_some_and(
+                                        |value| value.is_finite() && (0.0..=1.0).contains(&value),
+                                    )
+                            })
+                        })
+                });
+        if !valid {
+            return Err(received.failure("answers_invalid"));
+        }
+        Ok(received)
+    }
+
+    /// Common recorded exchange, with unchanged request/body/deadline and accounting policy.
+    async fn send(
+        &self,
+        request: Value,
+        before_send: impl FnOnce(&Value) -> Result<(), ()>,
+    ) -> Result<Evaluation, Failure> {
         let bytes =
             serde_json::to_vec(&request).map_err(|_| Failure::before_send("request_invalid"))?;
         if bytes.len() > REQUEST_LIMIT {
             return Err(Failure::before_send("request_too_large"));
         }
-        if contains_secret(&request, &self.credential)
-            || candidates
-                .iter()
-                .any(|candidate| candidate.id.contains(&self.credential))
-        {
+        if contains_secret(&request, &self.credential) {
             return Err(Failure::before_send("request_contains_secret"));
         }
         let mut authorization =
@@ -387,20 +458,8 @@ impl JevClient {
                 body.len(),
             ));
         }
-        let (selected_id, confidence, auto_test_probability) =
-            validate_response(&response, candidates, &self.route).map_err(|category| {
-                failed(
-                    category,
-                    Some(response.clone()),
-                    Some(status.as_u16()),
-                    body.len(),
-                )
-            })?;
         let usage = valid_usage(&response);
-        Ok(Selection {
-            selected_id,
-            confidence,
-            auto_test_probability,
+        Ok(Evaluation {
             request,
             response,
             usage,
@@ -411,10 +470,7 @@ impl JevClient {
 
 /// Builds the common deadline/no-redirect/no-retry policy without changing system proxy defaults.
 fn http_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .timeout(DEADLINE)
+    crate::model_io::http_builder(DEADLINE)
 }
 
 /// Maps transport failures to safe categories without retaining request URLs or provider errors.
@@ -943,6 +999,36 @@ mod tests {
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n{extra_headers}\r\n{body}",
             body.len()
         )
+    }
+
+    /// Dynamic questions retain visible IDs and reject missing/extra answers without retry.
+    #[tokio::test]
+    async fn named_noul_questions_validate_exact_response_keys() {
+        let questions = vec![
+            ("include_file_a".into(), "Relevant to the task?".into()),
+            ("expand_file_a".into(), "Need more source?".into()),
+        ];
+        for valid in [true, false] {
+            let mut value = response();
+            value["answers"] = json!({"include_file_a":{"type":"noul","noul":0.9},"expand_file_a":{"type":"noul","noul":0.1}});
+            if !valid {
+                value["answers"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("expand_file_a");
+            }
+            let server = Server::start(http_response("200 OK", &value.to_string(), "")).await;
+            let result = server.client().evaluate_noul(&json!({"task":"retain request body","candidates":[{"id":"file_a","path":"src/request.ts"}]}), &questions, |request| {
+                assert!(request["questions"].get("include_file_a").is_some());
+                assert_eq!(request["state"]["candidates"][0]["id"], "file_a");
+                Ok(())
+            }).await;
+            assert_eq!(result.is_ok(), valid);
+            if let Err(error) = result {
+                assert_eq!(error.category, "answers_invalid");
+            }
+            server.finish().await;
+        }
     }
 
     /// Exercises real streamed HTTP success and redaction in values and keys before traces.

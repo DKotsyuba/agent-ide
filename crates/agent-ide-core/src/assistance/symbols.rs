@@ -461,7 +461,7 @@ impl Worker<'_> {
     /// otherwise only the source outline is requested, without starting or parking on an LSP.
     /// Unknown context, unsupported files or unavailable outlines leave memory unchanged.
     /// File snapshots have their own bounded retention; stop/compaction invalidate all reads.
-    async fn remember_file_read(
+    pub(super) async fn remember_file_read(
         &mut self,
         job: &mut Job,
         observed: &SourceObservation,

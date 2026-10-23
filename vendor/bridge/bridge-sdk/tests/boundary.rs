@@ -259,3 +259,40 @@ fn public_sdk_boundary() {
         .is_err()
     );
 }
+
+/// A service that answers and closes at once is read on the first connection: the answer is
+/// returned and no second connection (a replayed request) is ever made.
+#[test]
+fn immediate_close_after_answer_is_not_retried() {
+    let socket = path("fast-close");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let worker = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request = decode_request(line.trim_end().as_bytes()).unwrap();
+        let mut stream = stream;
+        stream.write_all(&acknowledge(&request)).unwrap();
+        drop(stream);
+        listener.set_nonblocking(true).unwrap();
+        // Give a retry every chance to arrive before checking that none did.
+        thread::sleep(Duration::from_millis(200));
+        assert!(listener.accept().is_err(), "the request was replayed");
+    });
+    let client = Client::new(
+        Config::new(
+            &socket,
+            &socket,
+            Secret::new("never-log-this-credential"),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let received = client.publish("fast-close", publication()).unwrap();
+    assert!(received.replayed);
+    worker.join().unwrap();
+    fs::remove_file(&socket).unwrap();
+}

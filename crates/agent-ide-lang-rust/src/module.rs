@@ -542,6 +542,11 @@ const fn passed(name: &'static str) -> EnvRule {
 
 /// The complete environment of a [`test_run`].
 const TEST_RUN_ENV: &[EnvRule] = &[
+    EnvRule::Param {
+        name: "RUST_TEST_THREADS",
+        param: "test_workers",
+        optional: true,
+    },
     EnvRule::Literal {
         name: "CARGO_NET_OFFLINE",
         value: "true",

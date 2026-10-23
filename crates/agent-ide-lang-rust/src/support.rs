@@ -171,6 +171,17 @@ impl LanguageSupport for RustSupport {
         }
     }
 
+    /// Reuses the language lexer to keep raw strings, lifetimes and comments out of imports.
+    fn source_import_spans(&self, _file: &Path, source: &str) -> Option<Vec<LineRange>> {
+        let code: String = crate::module_graph::blanked_code(&source.chars().collect::<Vec<_>>())
+            .into_iter()
+            .collect();
+        Some(agent_ide_core::lang::regions::import_spans_from_code(
+            &code.lines().collect::<Vec<_>>(),
+            self.region_rules(),
+        ))
+    }
+
     /// Outline computed from the text alone (the `lexical` module parses it with `syn` and
     /// rebuilds rust-analyzer's document symbols, which this type's `normalize` then converts),
     /// so a cold rust-analyzer can still answer `ide.outline`, `ide.read` and symbol-addressed
@@ -363,6 +374,22 @@ impl LanguageSupport for RustSupport {
                 })
             }
         }
+    }
+
+    /// Supplies the native engine's concurrency option for generated test commands.
+    fn test_worker_setting(
+        &self,
+        argv: &[String],
+        workers: std::num::NonZeroU16,
+    ) -> Option<agent_ide_core::execution::test_workers::WorkerSetting> {
+        (argv.first().is_some_and(|word| word == "cargo")
+            && argv.get(1).is_some_and(|word| word == "test"))
+        .then(
+            || agent_ide_core::execution::test_workers::WorkerSetting::Environment {
+                name: "RUST_TEST_THREADS",
+                value: workers.to_string(),
+            },
+        )
     }
 
     /// Parses libtest output (stdout, then stderr).

@@ -222,6 +222,7 @@ fn log_binding_unavailable(
 ) {
     let method = match tool {
         super::facade::AssistanceTool::Start => errorlog::Method::Start,
+        super::facade::AssistanceTool::Prepare => errorlog::Method::Context,
         super::facade::AssistanceTool::Context => errorlog::Method::Context,
         super::facade::AssistanceTool::Diff => errorlog::Method::Diff,
         super::facade::AssistanceTool::Inspect => errorlog::Method::Inspect,
@@ -892,6 +893,7 @@ impl ProductDispatcher {
                     AssistanceMethod::Edit => super::facade::AssistanceTool::Edit,
                     AssistanceMethod::Outline => super::facade::AssistanceTool::Outline,
                     AssistanceMethod::Read => super::facade::AssistanceTool::Read,
+                    AssistanceMethod::Prepare => super::facade::AssistanceTool::Prepare,
                     AssistanceMethod::Symbol => super::facade::AssistanceTool::Symbol,
                     AssistanceMethod::Graph => super::facade::AssistanceTool::Graph,
                     AssistanceMethod::Test => super::facade::AssistanceTool::Test,
@@ -1289,6 +1291,7 @@ impl ProductDispatcher {
                             | AssistanceMethod::Diff
                             | AssistanceMethod::Inspect
                             | AssistanceMethod::Read
+                            | AssistanceMethod::Prepare
                             | AssistanceMethod::Symbol
                     )
                     && !is_problems_context(method.method(), call.parameters())
@@ -1521,6 +1524,7 @@ impl AssistanceDispatcher for ProductDispatcher {
                     AssistanceMethod::Edit => Some(super::facade::AssistanceTool::Edit),
                     AssistanceMethod::Outline => Some(super::facade::AssistanceTool::Outline),
                     AssistanceMethod::Read => Some(super::facade::AssistanceTool::Read),
+                    AssistanceMethod::Prepare => Some(super::facade::AssistanceTool::Prepare),
                     AssistanceMethod::Symbol => Some(super::facade::AssistanceTool::Symbol),
                     AssistanceMethod::Graph => Some(super::facade::AssistanceTool::Graph),
                     AssistanceMethod::Test => Some(super::facade::AssistanceTool::Test),

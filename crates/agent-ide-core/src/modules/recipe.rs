@@ -462,7 +462,10 @@ fn expand_staged_at(
     let mut declared: Vec<&str> = vec![recipe.program];
     for arg in recipe.args {
         match arg {
-            Arg::Param(name) | Arg::Each(name) | Arg::Joined(_, name) => declared.push(name),
+            Arg::Param(name)
+            | Arg::Each(name)
+            | Arg::Joined(_, name)
+            | Arg::OptionalJoined(_, name) => declared.push(name),
             Arg::Literal(_) => {}
         }
     }
@@ -568,6 +571,11 @@ fn expand_staged_at(
                 None => {}
                 Some(_) => return Err(Refusal::WrongKind((*name).to_owned())),
             },
+            Arg::OptionalJoined(prefix, name) => {
+                if let Some(value) = single(name)? {
+                    args.push(format!("{prefix}{value}").into());
+                }
+            }
             Arg::Joined(prefix, name) => args.push(
                 format!(
                     "{prefix}{}",

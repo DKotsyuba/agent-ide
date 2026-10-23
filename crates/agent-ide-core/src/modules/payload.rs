@@ -795,6 +795,8 @@ pub enum Arg {
     Each(&'static str),
     /// `--flag=<value>`-style concatenation of a literal prefix and a named parameter.
     Joined(&'static str, &'static str),
+    /// Joined option omitted when its parameter is absent.
+    OptionalJoined(&'static str, &'static str),
 }
 
 /// Where an admitted path may be. The core checks the path as given against its own resolution
@@ -1591,6 +1593,7 @@ mod tests {
         assert_eq!(decode::<DescribeQuery>(encode(&query)), Ok(query));
         let config = crate::modules::contract::ModuleConfig {
             read_denies: Vec::new(),
+            test_workers: None,
             worktree: Some("/w".into()),
             provider: None,
             checks: Some(serde_json::json!({})),

@@ -57,6 +57,12 @@ mod links;
 mod navigation;
 #[path = "worker/patch_edit.rs"]
 mod patch_edit;
+// Runs real jobs only with task context (`jev-pilot`); other builds keep a disabled supervisor.
+#[cfg_attr(not(feature = "jev-pilot"), allow(dead_code))]
+#[path = "indexing.rs"]
+mod indexing;
+#[path = "preparation.rs"]
+mod preparation;
 #[path = "progress.rs"]
 mod progress;
 #[path = "providers.rs"]
@@ -95,6 +101,20 @@ const EDIT_CHECK_WAIT: Duration = Duration::from_secs(90);
 const PROJECT_CARD_BUDGET: Duration = Duration::from_secs(5);
 /// Maximum time an initial tool call waits for its job before returning its retained detail.
 pub const INLINE_REPLY_WAIT: Duration = Duration::from_secs(8);
+/// How long `ide.prepare` holds its one call open: the packet is the whole point of the call, so
+/// it waits for indexing and model work instead of leaving the agent to poll `ide.inspect`.
+/// Stays below the hosts' MCP tool-call timeouts; the job's own operation deadline still applies.
+pub const PREPARE_INLINE_WAIT: Duration = Duration::from_secs(45);
+
+/// The inline wait of one submitted `tool`: [`PREPARE_INLINE_WAIT`] for `ide.prepare`,
+/// [`INLINE_REPLY_WAIT`] for every other tool.
+pub(crate) fn inline_wait(tool: AssistanceTool) -> Duration {
+    if tool == AssistanceTool::Prepare {
+        PREPARE_INLINE_WAIT
+    } else {
+        INLINE_REPLY_WAIT
+    }
+}
 /// The honest per-language server state the start card prints while no language server has been
 /// launched: which tools already answer from source, and which ones only the server can answer
 /// (see [`project::not_started_state`]).
@@ -2056,6 +2076,7 @@ impl WorkerHandle {
                 if fault_seam("worker_construct") {
                     panic!("agent-ide test seam: deliberate worker construction panic");
                 }
+                let indexing = preparation::indexing_supervisor(shared.launcher.task_context());
                 Worker {
                     admission: shared.admission.clone(),
                     shared,
@@ -2063,6 +2084,9 @@ impl WorkerHandle {
                     observations,
                     edits,
                     grants: BTreeMap::new(),
+                    #[cfg(feature = "jev-pilot")]
+                    preparations: BTreeMap::new(),
+                    indexing,
                     leases: BTreeMap::new(),
                     pending_revocations: std::collections::BTreeSet::new(),
                     stop_cause: None,
@@ -2288,7 +2312,7 @@ impl WorkerHandle {
                 request,
             )
         }) {
-            Ok((reference, permit)) => match tokio::time::timeout(INLINE_REPLY_WAIT, wait).await {
+            Ok((reference, permit)) => match tokio::time::timeout(inline_wait(tool), wait).await {
                 Ok(Ok(reply)) => reply,
                 _ => {
                     let reply = self
@@ -3217,6 +3241,11 @@ struct Worker<'a> {
     edits: EditReceiptStore<'a>,
     /// Recoverable committed activation receipts, at most one for each live host binding.
     grants: BTreeMap<BindingRef, StartReceipt>,
+    /// Independently executing task-context jobs, joined before their authority is revoked.
+    #[cfg(feature = "jev-pilot")]
+    preparations: BTreeMap<String, preparation::Pending>,
+    /// Background task-context indexing of active writer worktrees; disabled by default.
+    indexing: indexing::Supervisor,
     /// Retention lease of each granted binding's worktree, taken before its activation commits
     /// and released only with its binding state, so no sweep claims an activated worktree's caches.
     leases: BTreeMap<BindingRef, crate::retention::Lease>,
@@ -3936,6 +3965,8 @@ impl<'a> Worker<'a> {
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
             {
+                self.cancel_preparations(None).await;
+                self.stop_indexing(None).await;
                 self.release_all_live().await;
                 if let Err(code) = self.close_all_providers().await
                     && let Ok(mut failure) = self.shared.shutdown_failure.lock()
@@ -4247,6 +4278,7 @@ impl<'a> Worker<'a> {
                 match job.tool {
                     AssistanceTool::Edit => Box::pin(self.edit(job)).await,
                     AssistanceTool::Start => Box::pin(self.activate(job)).await,
+                    AssistanceTool::Prepare => Box::pin(self.prepare_context(job)).await,
                     AssistanceTool::Context => Box::pin(self.context(job)).await,
                     AssistanceTool::Inspect
                         if matches!(
@@ -4281,6 +4313,9 @@ impl<'a> Worker<'a> {
             && (job.park_until.is_some() || matches!(result, Err(FailureCode::ProviderLoading)))
         {
             self.answer_while_loading(job).await;
+        }
+        if job.tool == AssistanceTool::Prepare && job.park_until.is_none() && result.is_err() {
+            self.cancel_preparations(Some(&binding)).await;
         }
         if job.park_until.is_some() {
             if job.stage.is_none()
@@ -4376,6 +4411,12 @@ impl<'a> Worker<'a> {
                 }
                 _ => {}
             }
+        }
+        if let PeerReply::Edit { result, .. } = &reply
+            && result.outcome.has_post_source()
+            && let Some(receipt) = self.grants.get(&binding)
+        {
+            self.indexing.dirty(receipt.worktree().worktree_path());
         }
         if let PeerReply::Edit { result, .. } = &reply {
             let lifetime = Duration::from_millis(self.shared.launcher.limits.operation_ms);
@@ -4506,7 +4547,10 @@ impl<'a> Worker<'a> {
             let carries_feedback = matches!(
                 reply,
                 PeerReply::Complete {
-                    kind: ResultKind::Context | ResultKind::Symbol | ResultKind::Inspect,
+                    kind: ResultKind::Context
+                        | ResultKind::Prepare
+                        | ResultKind::Symbol
+                        | ResultKind::Inspect,
                     ..
                 }
             );
@@ -4930,19 +4974,19 @@ impl<'a> Worker<'a> {
                 ));
                 return Err(FailureCode::WorkspaceActivation);
             }
-            Err(crate::workspace::durable::DurableError::CorruptState) => {
+            Err(error @ crate::workspace::durable::DurableError::CorruptState) => {
                 self.uncertain.insert(binding.clone());
-                job.failure_detail = Some(
-                    "start:durable_state: the durable activation state refused or failed"
-                        .to_owned(),
-                );
+                job.failure_detail = Some(format!(
+                    "start:durable_state: the durable activation state refused or failed ({})",
+                    durable_refusal(&error)
+                ));
                 return Err(FailureCode::WorkspaceActivation);
             }
-            Err(_) => {
-                job.failure_detail = Some(
-                    "start:durable_state: the durable activation state refused or failed"
-                        .to_owned(),
-                );
+            Err(error) => {
+                job.failure_detail = Some(format!(
+                    "start:durable_state: the durable activation state refused or failed ({})",
+                    durable_refusal(&error)
+                ));
                 return Err(FailureCode::WorkspaceActivation);
             }
         };
@@ -4951,6 +4995,17 @@ impl<'a> Worker<'a> {
         let reused_activation = receipt.operation() != requested_operation;
         let next_role = receipt.role();
         let activation_operation = receipt.operation().to_owned();
+        // Background indexing follows the writer: a moved activation leaves its old worktree.
+        let index_root = receipt.worktree().worktree_path().to_path_buf();
+        if let Some(previous) = self.grants.get(&binding)
+            && previous.worktree().worktree_path() != index_root
+        {
+            self.indexing
+                .deactivate(previous.worktree().worktree_path());
+        }
+        if next_role == crate::workspace::authority::StartRole::Writer {
+            self.indexing.activate(&index_root);
+        }
         self.grants.insert(binding.clone(), receipt);
         self.leases.insert(binding.clone(), lease);
         // The session's outbox exists from activation on, so deferred facts have a recipient.
@@ -7601,6 +7656,8 @@ impl<'a> Worker<'a> {
         binding: &BindingRef,
         uncollected: &[String],
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        self.cancel_preparations(Some(binding)).await;
+        self.stop_indexing(Some(binding)).await;
         self.stop_cause = None;
         let revoked = self.settle_revocation(binding).await?;
         if self.uncertain.contains(binding) {
@@ -8179,7 +8236,10 @@ async fn serve_inspection(
     let carries_feedback = matches!(
         reply,
         PeerReply::Complete {
-            kind: ResultKind::Context | ResultKind::Symbol | ResultKind::Inspect,
+            kind: ResultKind::Context
+                | ResultKind::Prepare
+                | ResultKind::Symbol
+                | ResultKind::Inspect,
             ..
         }
     );
@@ -8943,6 +9003,36 @@ fn store_failure(
     }
 }
 
+/// Names the closed variant of a durable start refusal for the failure detail, so a generic
+/// `durable_state` refusal still says which admission step refused it.
+///
+/// Returns a fixed `durable:` tag only: never the error's `Debug` text, an actor, a path or a
+/// holder. A store failure is named by [`store_failure`] instead and maps to `durable:store`.
+fn durable_refusal(error: &crate::workspace::durable::DurableError) -> &'static str {
+    use crate::workspace::authority::AuthorityError;
+    use crate::workspace::durable::DurableError;
+    match error {
+        DurableError::Application(_) => "durable:store",
+        DurableError::Migration(_) => "durable:migration",
+        DurableError::OperationConflict => "durable:operation_conflict",
+        DurableError::IdentityUnavailable { .. } => "durable:identity_unavailable",
+        DurableError::CorruptState => "durable:corrupt_state",
+        DurableError::InvalidCapture => "durable:invalid_capture",
+        DurableError::Authority(error) => match error {
+            AuthorityError::InvalidWorktreeIdentity => "durable:authority_invalid_worktree",
+            AuthorityError::InvalidActivationId => "durable:authority_invalid_activation_id",
+            AuthorityError::BindingMismatch => "durable:authority_binding_mismatch",
+            AuthorityError::ActivationConflict => "durable:authority_activation_conflict",
+            AuthorityError::ActivationStopped => "durable:authority_activation_stopped",
+            AuthorityError::WorktreeOwned => "durable:authority_worktree_owned",
+            AuthorityError::ActorAlreadyOwnsWorktree => "durable:authority_actor_owns_worktree",
+            AuthorityError::StaleAuthority => "durable:authority_stale",
+            AuthorityError::BindingNotCurrent => "durable:authority_binding_not_current",
+            AuthorityError::EpochExhausted => "durable:authority_epoch_exhausted",
+        },
+    }
+}
+
 /// Maps one durable stop failure to its failure code and typed `stop:` cause, so a store
 /// problem is never reported as an authority problem (F-12).
 ///
@@ -9099,6 +9189,7 @@ fn spawn_detail(error: &crate::execution::ProcessError) -> String {
 fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
     match tool {
         AssistanceTool::Start => crate::errorlog::Method::Start,
+        AssistanceTool::Prepare => crate::errorlog::Method::Context,
         AssistanceTool::Context => crate::errorlog::Method::Context,
         AssistanceTool::Diff => crate::errorlog::Method::Diff,
         AssistanceTool::Inspect => crate::errorlog::Method::Inspect,
@@ -11965,6 +12056,9 @@ mod stop_retry_tests {
             observations: WorkspaceStore::new(store),
             edits: EditReceiptStore::new(store),
             grants: BTreeMap::new(),
+            #[cfg(feature = "jev-pilot")]
+            preparations: BTreeMap::new(),
+            indexing: indexing::Supervisor::disabled(),
             leases: BTreeMap::new(),
             pending_revocations: std::collections::BTreeSet::new(),
             stop_cause: None,
@@ -12702,6 +12796,119 @@ mod stop_retry_tests {
             before + 2,
             "the symbol form must observe once to resolve and splice, once to refresh"
         );
+    }
+
+    /// Real authority and background indexing deliver only current source; a changed result is refused.
+    #[cfg(feature = "jev-pilot")]
+    #[tokio::test]
+    async fn task_context_worker_checks_authority_and_delivery_freshness() {
+        crate::lang::testing::install();
+        for outcome in 0..3 {
+            let stale = outcome == 1;
+            let fixture = Fixture::new();
+            let store = fixture.store();
+            let workspace = DurableWorkspace::open(&store).await.unwrap();
+            let mut worker = worker(&store, workspace, fixture.root.clone());
+            Arc::get_mut(&mut worker.shared).unwrap().launcher = LauncherConfig::parse(serde_json::json!({
+                "version":1,"limits":{"queued":8,"details":8,"operation_ms":10000,"output_bytes":4096},
+                "allowed_roots":[fixture.root.parent().unwrap()],"targets":[],
+                "task_context":{"enabled":true,"models":{"embedding":null,"jev":null,"max_new_calls":0,"include_threshold":0.5}}
+            }).to_string().as_bytes()).unwrap();
+            worker.observations.install_schema().await.unwrap();
+            std::fs::write(fixture.root.join("context.alpha"), "task context source\n").unwrap();
+            let mut index = crate::project::context::ContextIndex::open(&fixture.root).unwrap();
+            let service = crate::project::context::service::ContextService::new(
+                crate::project::context::service::ModelConfig {
+                    embedding: None,
+                    jev: None,
+                    max_new_calls: 0,
+                    include_threshold: 0.5,
+                },
+            )
+            .unwrap();
+            service
+                .index_project(
+                    &mut index,
+                    &crate::project::structure::StructureOptions::default(),
+                    &crate::project::context::DocumentOptions::default(),
+                    &crate::project::context::indexer::IndexBudget {
+                        max_new_calls: 0,
+                        max_input_bytes: 0,
+                    },
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            drop(index);
+            let (binding, _) =
+                production_start(&mut worker, "context-actor", "context-start").await;
+            let (mut job, _cancel) = start_job(
+                &worker,
+                "context-actor",
+                "context-query",
+                serde_json::json!({"task":"context.alpha"}),
+            );
+            job.tool = AssistanceTool::Prepare;
+            assert!(
+                !worker
+                    .shared
+                    .ledger
+                    .lock()
+                    .unwrap()
+                    .read_memory
+                    .contains_key(&binding),
+                "background indexing must not fabricate main-agent read receipts"
+            );
+            let first = worker.prepare_context(&mut job).await.unwrap();
+            assert!(matches!(first.0, PeerReply::Pending { .. }));
+            if outcome == 2 {
+                worker.revoke(&binding, &[]).await.unwrap();
+                assert!(
+                    worker.preparations.is_empty(),
+                    "stop must join its context task"
+                );
+                continue;
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !worker.preparations[&job.reference]
+                .handle
+                .as_ref()
+                .unwrap()
+                .is_finished()
+            {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if stale {
+                std::fs::write(fixture.root.join("context.alpha"), "changed\n").unwrap();
+            }
+            job.park_until = None;
+            let result = worker.prepare_context(&mut job).await;
+            if stale {
+                assert!(
+                    matches!(result, Err(FailureCode::SourceUnavailable)),
+                    "{result:?}"
+                );
+            } else {
+                let (reply, authority, source) = result.unwrap();
+                assert!(authority.is_some() && source.is_some());
+                assert!(
+                    matches!(reply,PeerReply::Complete {text,..} if text.contains("context.alpha") && text.contains("task context source"))
+                );
+                assert!(
+                    !worker
+                        .shared
+                        .ledger
+                        .lock()
+                        .unwrap()
+                        .read_memory
+                        .contains_key(&binding),
+                    "the fixture without a source outline must not fabricate address receipts"
+                );
+            }
+            assert!(worker.preparations.is_empty());
+            worker.revoke(&binding, &[]).await.unwrap();
+        }
     }
 
     /// Runs one Read job to completion, retrying while it parks, and retains its completed
@@ -13749,6 +13956,46 @@ mod stop_retry_tests {
                 store_failure(&error, FailureCode::SourceUnavailable),
                 expected,
                 "{error:?}"
+            );
+        }
+    }
+
+    /// A generic durable start refusal names its closed variant as a fixed tag: identity
+    /// holder facts, store causes and authority details never leak into the detail.
+    #[test]
+    fn durable_start_refusals_name_their_closed_variant() {
+        use crate::workspace::authority::AuthorityError;
+        use crate::workspace::durable::DurableError;
+        let cases = [
+            (DurableError::CorruptState, "durable:corrupt_state"),
+            (DurableError::InvalidCapture, "durable:invalid_capture"),
+            (
+                DurableError::IdentityUnavailable {
+                    step: "identity_changed",
+                    holder: None,
+                },
+                "durable:identity_unavailable",
+            ),
+            (
+                DurableError::Authority(AuthorityError::BindingNotCurrent),
+                "durable:authority_binding_not_current",
+            ),
+            (
+                DurableError::Authority(AuthorityError::StaleAuthority),
+                "durable:authority_stale",
+            ),
+            (
+                DurableError::Application(crate::app::store::StoreError::Unavailable),
+                "durable:store",
+            ),
+        ];
+        for (error, expected) in cases {
+            let tag = durable_refusal(&error);
+            assert_eq!(tag, expected, "{error:?}");
+            assert!(
+                tag.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b':'),
+                "closed tag only: {tag}"
             );
         }
     }

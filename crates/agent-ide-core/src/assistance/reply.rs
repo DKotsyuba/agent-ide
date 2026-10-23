@@ -305,6 +305,8 @@ impl ExecutionProfileCause {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultKind {
+    /// A task-selected current source packet from ide.prepare.
+    Prepare,
     /// Nonterminal edit progress, naming requested paths, confirmed commits and current stage.
     EditProgress,
     /// Durable Workspace activated and authorized the exact binding.
