@@ -124,6 +124,10 @@ impl Worker<'_> {
                 continue;
             };
             let mut localized = None;
+            let began = tokio::time::Instant::now();
+            let mut outline_reason = String::from("outline budget exhausted before request");
+            let mut test_symbols = 0;
+            let mut attempts = 0;
             // At most two ordinary outline requests: the first can start a cold provider;
             // only an already-owned session is waited on before the second request.
             for attempt in 0..2 {
@@ -133,6 +137,7 @@ impl Worker<'_> {
                 if tokio::time::Instant::now() >= until {
                     break;
                 }
+                attempts = attempt + 1;
                 let failure = job.failure_detail.take();
                 let parked = job.park_until.take();
                 let owner = job.session_binding.clone();
@@ -145,9 +150,32 @@ impl Worker<'_> {
                 if *job.cancel.borrow() || matches!(&answer, Err(FailureCode::Cancelled)) {
                     return Err(FailureCode::Cancelled);
                 }
-                let Ok((outline, _, lexical)) = &answer else {
-                    break;
+                let (outline, _, lexical) = match &answer {
+                    Ok(outline) => outline,
+                    Err(code) => {
+                        outline_reason = format!("outline refused: {code:?}");
+                        break;
+                    }
                 };
+                outline_reason = match lexical {
+                    None => "exact outline".into(),
+                    Some(symbols::Lexical::Loading) => "source outline while provider loads".into(),
+                    Some(symbols::Lexical::Unavailable { module }) => module
+                        .clone()
+                        .unwrap_or_else(|| "source outline; provider unavailable".into()),
+                    Some(symbols::Lexical::Exchange { cause }) => {
+                        format!("source outline; exchange: {cause}")
+                    }
+                    Some(symbols::Lexical::Unverified { cause }) => {
+                        format!("source outline; resolution: {cause}")
+                    }
+                };
+                test_symbols = 0;
+                for symbol in &outline.symbols {
+                    symbol.walk(&mut |symbol| {
+                        test_symbols += usize::from(symbol.kind == crate::lang::SymbolKind::Test);
+                    });
+                }
                 // Source-backed parsers can prove complete test units without a live server.
                 // The localizer refuses outlines that do not contain the enclosing tests.
                 localized =
@@ -203,13 +231,14 @@ impl Worker<'_> {
                 ));
             } else {
                 prepared.warnings.push(format!(
-                    "{}: test blocks not localized; {} retained",
+                    "{}: test blocks not localized; {} retained ({outline_reason}; {test_symbols} test symbols; {attempts} requests; {}ms)",
                     source.path.display(),
                     if whole {
                         "whole-file candidate"
                     } else {
                         "incomplete selected fragments"
-                    }
+                    },
+                    began.elapsed().as_millis()
                 ));
             }
         }
