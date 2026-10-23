@@ -568,7 +568,7 @@ fn extract(root: &Path, run_id: u64, result: &RunResult, before: SystemTime) -> 
         out.failures.push(FailedTest {
             kind: block.kind,
             name: typed.map_or_else(
-                || bounded(lines[block.start].trim(), 256),
+                || bounded(header_title(lines[block.start]), 256),
                 |failure| bounded(&failure.name, 256),
             ),
             test_file,
@@ -621,7 +621,7 @@ struct Block {
 
 /// Finds blocks: each typed failure at the occurrence of its name opening the block with the
 /// most locations (progress and summary lines open empty blocks), header-only `FAIL` lines,
-/// and unhandled-error sections. Passing tests never open a block; blocks stop at passes.
+/// and each unhandled-error rule. Passing tests never open a block; blocks stop at passes.
 fn failure_blocks(
     lines: &[&str],
     report: &TestReport,
@@ -644,7 +644,12 @@ fn failure_blocks(
         let trimmed = line.trim();
         if trimmed.starts_with("FAIL ") {
             starts.entry(index).or_insert((FailureKind::Suite, None));
-        } else if is_rule(trimmed) && trimmed.contains("Unhandled Error") {
+        } else if is_rule(trimmed)
+            && (trimmed.contains("Unhandled ") || trimmed.contains("Uncaught "))
+        {
+            // The section rule and each per-error rule (`Unhandled Rejection`, `Uncaught
+            // Exception`, `Unhandled Error`) open blocks; only the plural section summary
+            // without any location is dropped below.
             starts
                 .entry(index)
                 .or_insert((FailureKind::Unhandled, None));
@@ -659,7 +664,10 @@ fn failure_blocks(
             let empty = lines[start + 1..end]
                 .iter()
                 .all(|line| line.trim().is_empty());
-            (failure.is_some() || !empty).then_some(Block {
+            let summary = kind == FailureKind::Unhandled
+                && header_title(lines[start]).eq_ignore_ascii_case("Unhandled Errors")
+                && !block_tokens(&lines[start + 1..end]).any(|(_, line)| line.is_some());
+            (failure.is_some() || (!empty && !summary)).then_some(Block {
                 kind,
                 start,
                 end,
@@ -716,6 +724,13 @@ fn block_end(lines: &[&str], start: usize, heads: &[usize]) -> usize {
                 .any(|marker| trimmed.starts_with(marker))
         })
         .unwrap_or(limit)
+}
+
+/// A block header without surrounding rule characters (`⎯⎯ Unhandled Rejection ⎯⎯`).
+fn header_title(line: &str) -> &str {
+    line.trim()
+        .trim_matches(|c| matches!(c, '⎯' | '═' | '━' | '─' | '-' | '=' | '_' | '~'))
+        .trim()
 }
 
 /// A separator: at least three leading rule characters.

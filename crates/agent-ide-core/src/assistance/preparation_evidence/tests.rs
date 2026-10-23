@@ -109,6 +109,195 @@ fn failed_report() -> TestReport {
     }
 }
 
+/// The layout of a real runner log: a failed test under a project label, then an unhandled
+/// section whose summary precedes one titled rule per error. Each error is its own block; the
+/// summary is not; passing output stays out.
+#[test]
+fn each_unhandled_error_is_its_own_block() {
+    let (_scratch, root) = project();
+    let before = after_writes();
+    let output = " ✓ src/test_ok.alpha (1 test) 2ms
+stdout | src/test_ok.alpha > ok > logs
+    at src/hono_base.alpha:1:1
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL   main  src/test_request.alpha > Request > parses
+AssertionError: expected false to be true // Object.is equality
+ ❯ src/test_request.alpha:4:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+⎯⎯⎯⎯⎯⎯ Unhandled Errors ⎯⎯⎯⎯⎯⎯
+
+Vitest caught 2 unhandled errors during the test run.
+This might cause false positive tests.
+
+⎯⎯⎯⎯ Unhandled Rejection ⎯⎯⎯⎯⎯
+TypeError: Body is unusable: Body has already been read
+ ❯ consumeBody node:internal/deps/undici/undici:6197:15
+ ❯ Request.text src/request.alpha:1:38
+ ❯ src/test_request.alpha:3:34
+ ❯ Proxy.assertThrows node_modules/.pnpm/chai/index.js:2798:5
+
+This error originated in \"src/test_request.alpha\" test file. It doesn't mean the error was thrown inside the file itself, but while it was running.
+
+⎯⎯⎯⎯ Uncaught Exception ⎯⎯⎯⎯⎯
+Error: boom
+ ❯ Compose.run src/compose.alpha:3:1
+
+This error originated in \"src/test_broken.alpha\" test file.
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  1 failed | 1 passed (2)
+     Errors  2 errors
+";
+    let report = TestReport {
+        passed: 1,
+        failed: 1,
+        ignored: 0,
+        failures: vec![TestFailure {
+            name: "Request > parses".into(),
+            location: Some((PathBuf::from("src/test_request.alpha"), 4)),
+            message: "AssertionError: expected false to be true // Object.is equality".into(),
+        }],
+        incomplete: false,
+    };
+    let report = extract(
+        &root,
+        9,
+        &settled(output, report, Some(1), false, false),
+        before,
+    );
+    let failures: Vec<(FailureKind, &str, Option<&Path>, &str)> = report
+        .failures
+        .iter()
+        .map(|f| {
+            (
+                f.kind,
+                f.name.as_str(),
+                f.test_file.as_deref(),
+                f.message.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        failures,
+        [
+            (
+                FailureKind::Test,
+                "Request > parses",
+                Some(Path::new("src/test_request.alpha")),
+                "AssertionError: expected false to be true // Object.is equality"
+            ),
+            (
+                FailureKind::Unhandled,
+                "Unhandled Rejection",
+                Some(Path::new("src/test_request.alpha")),
+                "TypeError: Body is unusable: Body has already been read"
+            ),
+            (
+                FailureKind::Unhandled,
+                "Uncaught Exception",
+                Some(Path::new("src/test_broken.alpha")),
+                "Error: boom"
+            ),
+        ]
+    );
+    let frames: Vec<(&Path, u32, usize)> = report
+        .frames
+        .iter()
+        .map(|f| (f.path.as_path(), f.line, f.failure))
+        .collect();
+    assert_eq!(
+        frames,
+        [
+            (Path::new("src/test_request.alpha"), 4, 0),
+            (Path::new("src/request.alpha"), 1, 1),
+            (Path::new("src/test_request.alpha"), 3, 1),
+            (Path::new("src/compose.alpha"), 3, 2),
+        ]
+    );
+    assert_eq!(report.unresolved_frames, 1);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+}
+
+/// A real unhandled error without any source frame stays a failure (with no anchor); only the
+/// plural section summary without locations is dropped, and passing output stays out.
+#[test]
+fn unlocated_unhandled_errors_remain_failures() {
+    let (_scratch, root) = project();
+    let before = after_writes();
+    let output = " ✓ src/test_ok.alpha (1 test) 2ms
+stdout | src/test_ok.alpha > ok > logs
+    at src/hono_base.alpha:1:1
+
+⎯⎯⎯⎯⎯⎯ Unhandled Errors ⎯⎯⎯⎯⎯⎯
+
+Vitest caught 2 unhandled errors during the test run.
+
+⎯⎯⎯⎯ Uncaught Exception ⎯⎯⎯⎯⎯
+Error: worker exited unexpectedly
+
+⎯⎯⎯⎯ Unhandled Error ⎯⎯⎯⎯⎯
+TypeError: fetch failed
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+ Test Files  1 passed (1)
+      Tests  1 passed (1)
+     Errors  2 errors
+";
+    let report = extract(
+        &root,
+        10,
+        &settled(
+            output,
+            TestReport {
+                passed: 1,
+                ..TestReport::default()
+            },
+            Some(1),
+            false,
+            false,
+        ),
+        before,
+    );
+    assert_eq!(report.outcome, CheckOutcome::Failed);
+    let failures: Vec<(FailureKind, &str, Option<&Path>, &str)> = report
+        .failures
+        .iter()
+        .map(|f| {
+            (
+                f.kind,
+                f.name.as_str(),
+                f.test_file.as_deref(),
+                f.message.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        failures,
+        [
+            (
+                FailureKind::Unhandled,
+                "Uncaught Exception",
+                None,
+                "Error: worker exited unexpectedly"
+            ),
+            (
+                FailureKind::Unhandled,
+                "Unhandled Error",
+                None,
+                "TypeError: fetch failed"
+            ),
+        ]
+    );
+    assert!(report.frames.is_empty() && report.unresolved_frames == 0);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.retrieval_evidence().is_none());
+}
+
 /// Only an explicit, bounded, public operator setting enables the collector.
 #[test]
 fn config_is_operator_only_and_bounded() {
