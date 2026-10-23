@@ -1,5 +1,6 @@
 //! Operator entry point for task-context retrieval, using the same service as ide.prepare.
 //! Run with --features jev-pilot --example task_context -- ROOT TASK_FILE [MODELS_JSON].
+//! Optional --evidence FILE after MODELS_JSON uses source-bound public-check observations.
 //! Build/estimate indexes separately with the project_index example.
 /// Queries an already published index without creating it or embedding source documents.
 #[cfg(feature = "jev-pilot")]
@@ -22,29 +23,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             include_threshold: 0.5,
         },
     };
-    let preview = match args.next() {
-        None => false,
-        Some(value) if value == "--preview" => true,
-        _ => return Err("expected --preview".into()),
+    let evidence = match args.next() {
+        None => None,
+        Some(value) if value == "--evidence" => Some(serde_json::from_slice::<
+            agent_ide::project::context::evidence::PublicEvidence,
+        >(&std::fs::read(
+            args.next().ok_or("evidence file required")?,
+        )?)?),
+        Some(value) if value == "--preview" => return Err("use project_index --estimate".into()),
+        _ => return Err("expected --evidence FILE".into()),
     };
     if args.next().is_some() {
         return Err("unexpected extra argument".into());
     }
-    if preview {
-        return Err("use project_index ROOT MODELS_JSON --estimate for indexing preflight".into());
-    }
     let index = ContextIndex::open_existing(std::path::Path::new(&root))?
         .ok_or("context_index_not_ready")?;
     let service = ContextService::new(models)?;
-    let packet = service
-        .prepare(
-            &index,
-            &task,
-            &PacketOptions::default(),
-            &DocumentOptions::default(),
-            &tokio_util::sync::CancellationToken::new(),
-        )
-        .await?;
+    let options = PacketOptions::default();
+    let documents = DocumentOptions::default();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let packet = if let Some(evidence) = evidence {
+        service
+            .prepare_with_evidence(&index, &task, &evidence, &options, &documents, &cancel)
+            .await?
+    } else {
+        service
+            .prepare(&index, &task, &options, &documents, &cancel)
+            .await?
+    };
     println!("{}", serde_json::to_string_pretty(&packet)?);
     Ok(())
 }

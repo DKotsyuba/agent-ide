@@ -1,4 +1,5 @@
 //! Explicit operator index preflight/build. Example: project_index ROOT MODELS_JSON --estimate [USD_PER_MILLION [MAX_INPUT_BYTES]].
+//! --reuse-from SOURCE_ROOT copies matching cached vectors offline; --index then publishes readiness.
 //! --index is the explicit write/network action; --estimate never creates clients or reads credentials.
 #[cfg(feature = "jev-pilot")]
 #[tokio::main(flavor = "current_thread")]
@@ -21,6 +22,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = args
         .next()
         .ok_or("explicit --estimate or --index required")?;
+    if mode == "--reuse-from" {
+        let source_root = args.next().ok_or("expected source project root")?;
+        if args.next().is_some() {
+            return Err("unexpected vector reuse argument".into());
+        }
+        let embedding = config
+            .embedding
+            .as_ref()
+            .ok_or("embedding config required")?;
+        let space = embedding.space_id()?;
+        let source = ContextIndex::open_existing(std::path::Path::new(&source_root))?
+            .ok_or("source index does not exist")?;
+        let mut destination = ContextIndex::open(std::path::Path::new(&root))?;
+        let scope = StructureOptions {
+            max_depth: 64,
+            max_nodes: 100000,
+            ..Default::default()
+        };
+        let docs = DocumentOptions {
+            max_input_bytes: DocumentOptions::default()
+                .max_input_bytes
+                .min(embedding.max_input_bytes),
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        estimate_indexing(&mut destination, &scope, &docs, Some(embedding), &cancel)?;
+        let copied = destination.reuse_vectors(&source, &space, embedding.dimensions, &docs)?;
+        let remaining =
+            estimate_indexing(&mut destination, &scope, &docs, Some(embedding), &cancel)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "vectors_reused": copied, "remaining": remaining,
+                "network_requests": 0, "credentials_read": false,
+                "publication_required": true
+            }))?
+        );
+        return Ok(());
+    }
     if mode == "--release-unresolved" {
         if args.next().as_deref()
             != Some(std::ffi::OsStr::new("--accept-possible-duplicate-charge"))

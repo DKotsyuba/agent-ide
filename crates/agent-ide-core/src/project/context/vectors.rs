@@ -495,6 +495,35 @@ impl ContextIndex {
         .transpose()
     }
 
+    /// Reuses validated vectors from an operator-selected index for current destination payloads.
+    /// Call refresh first. Only exact content IDs in the requested model space are copied;
+    /// root identity, published generations, read receipts and request journals stay local.
+    /// A later normal indexing pass revalidates sources and publishes ready documents.
+    /// Returns the number of newly cached vectors; partial copies are safe to retry offline.
+    pub fn reuse_vectors(
+        &self,
+        source: &ContextIndex,
+        space: &str,
+        dimensions: usize,
+        options: &DocumentOptions,
+    ) -> io::Result<usize> {
+        if space.is_empty() || space.len() > 128 || !(1..=8192).contains(&dimensions) {
+            return Err(io::Error::other("invalid vector reuse model space"));
+        }
+        let batch = self.documents(options)?;
+        let mut copied = 0;
+        for document in batch.documents {
+            if self.vector(space, &document.id, dimensions)?.is_some() {
+                continue;
+            }
+            if let Some(vector) = source.vector(space, &document.id, dimensions)? {
+                self.store_vector(space, &document.id, &vector)?;
+                copied += 1;
+            }
+        }
+        Ok(copied)
+    }
+
     /// Performs exact cosine lookup over current documents; missing embeddings remain absent.
     pub fn semantic_search(
         &self,

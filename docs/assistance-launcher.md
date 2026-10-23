@@ -471,6 +471,30 @@ model (`models.embedding` null) the published index is the lexical one. Jev is n
 indexing. A failed run is not retried until the next `ide.start`. `ide.stop` and daemon
 shutdown cancel the running pass and wait for it.
 
+An optional operator-selected public check can ground preparation before retrieval:
+
+```json
+{"evidence":{"enabled":true,"target":{"files":["src/lib.rs"]},"budget_ms":30000}}
+```
+
+The setting belongs inside `task_context`; it is off when absent. A target is either
+`files` (1–64 worktree-relative paths) or `pattern` (a runner filter). The existing
+language test planner must support it. Only writer authority starts a check. Its result
+is collected within the same `ide.prepare` call; failed test locations and failure-block
+stack frames are source-validated investigation anchors, not instructions or proven defects.
+Unchanged-at-run and current source checks reject stale observations. The check has a
+maximum 30 s budget and leaves 10 s of the preparation deadline for retrieval. An explicit
+agent test preempts only preparation-owned work. Missing/busy/unsupported checks are
+reported in notes and ordinary retrieval remains available; unavailable evidence is not
+a successful test. No additional model wakeup or public tool is introduced.
+
+Operators may seed a fresh project from already paid vectors with
+`project_index ROOT MODELS_JSON --reuse-from SOURCE_ROOT`, before its daemon starts.
+This offline operation copies only vectors matching current payload hashes and the exact
+model space; it imports no source history, readiness state or delivery receipts. Follow
+with the normal indexing pass to revalidate and publish readiness. Its estimate lists
+remaining missing fragments; a fully reused index needs no document API calls.
+
 Preparation runs separately from the sequential worker. Stop cancels and joins owned work.
 Returned source is re-observed under current authority and refused if changed. The call waits
 up to 45 s and answers in one reply, never paged and never continued through `ide.inspect`:

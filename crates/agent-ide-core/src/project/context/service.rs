@@ -292,8 +292,16 @@ impl ContextService {
         document_options: &DocumentOptions,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> io::Result<Preparation> {
-        self.prepare_inner(index, task, packet_options, document_options, cancel, true)
-            .await
+        self.prepare_inner(
+            index,
+            task,
+            packet_options,
+            document_options,
+            cancel,
+            true,
+            None,
+        )
+        .await
     }
 
     /// Collects complete bounded evidence for a caller-owned carrier. The caller MUST enforce
@@ -306,11 +314,86 @@ impl ContextService {
         document_options: &DocumentOptions,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> io::Result<Preparation> {
-        self.prepare_inner(index, task, packet_options, document_options, cancel, false)
-            .await
+        self.prepare_inner(
+            index,
+            task,
+            packet_options,
+            document_options,
+            cancel,
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// Produces a bounded JSON packet grounded in current public-check observations.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "existing preparation contract plus explicit public evidence"
+    )]
+    pub async fn prepare_with_evidence(
+        &self,
+        index: &ContextIndex,
+        task: &str,
+        evidence: &super::evidence::PublicEvidence,
+        packet_options: &PacketOptions,
+        document_options: &DocumentOptions,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> io::Result<Preparation> {
+        let mut result = self
+            .prepare_with_evidence_for_delivery(
+                index,
+                task,
+                evidence,
+                packet_options,
+                document_options,
+                cancel,
+            )
+            .await?;
+        result.fit(packet_options)?;
+        Ok(result)
+    }
+
+    /// Grounds retrieval and Jev in current public-check failures while preserving the owner's task.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "existing preparation contract plus explicit public evidence"
+    )]
+    pub async fn prepare_with_evidence_for_delivery(
+        &self,
+        index: &ContextIndex,
+        task: &str,
+        evidence: &super::evidence::PublicEvidence,
+        packet_options: &PacketOptions,
+        document_options: &DocumentOptions,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> io::Result<Preparation> {
+        let query = evidence.retrieval_query(index, task)?;
+        let mut result = self
+            .prepare_inner(
+                index,
+                &query,
+                packet_options,
+                document_options,
+                cancel,
+                false,
+                Some(evidence),
+            )
+            .await?;
+        result.packet.task = task.to_owned();
+        result.warnings.push(format!(
+            "retrieval grounded in public check {} ({} failure locations)",
+            evidence.run_id,
+            evidence.failures.len()
+        ));
+        Ok(result)
     }
 
     /// Shares retrieval and model effects; only the final public representation's fitting differs.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "shared preparation includes optional source-validated evidence"
+    )]
     async fn prepare_inner(
         &self,
         index: &ContextIndex,
@@ -319,6 +402,7 @@ impl ContextService {
         document_options: &DocumentOptions,
         cancel: &tokio_util::sync::CancellationToken,
         fit_json: bool,
+        evidence: Option<&super::evidence::PublicEvidence>,
     ) -> io::Result<Preparation> {
         let began = Instant::now();
         if task.trim().is_empty() || task.len() > 64 * 1024 {
@@ -402,6 +486,67 @@ impl ContextService {
                     "semantic index coverage is partial; lexical candidates were retained".into(),
                 );
             }
+        }
+        if let Some(evidence) = evidence {
+            // Actual failure locations must reach the selector even if similarity ranks them poorly.
+            let records = index.records()?;
+            let mut anchors = Vec::new();
+            for failure in &evidence.failures {
+                if anchors
+                    .iter()
+                    .any(|c: &super::Candidate| c.file.path == failure.path)
+                {
+                    continue;
+                }
+                if let Some(file) = records.iter().find(|r| r.path == failure.path) {
+                    let mut candidate = candidates
+                        .iter()
+                        .find(|c| c.file.path == file.path)
+                        .cloned()
+                        .unwrap_or_else(|| super::Candidate {
+                            file: file.clone(),
+                            lexical_score: 0,
+                            reasons: Vec::new(),
+                            preferred_spans: Vec::new(),
+                            whole_file: false,
+                        });
+                    let source = super::packet::read_current(
+                        &index.root,
+                        file,
+                        packet_options.max_file_bytes,
+                        &mut 0,
+                    )?;
+                    let mut offsets = vec![0];
+                    offsets.extend(source.match_indices('\n').map(|(at, _)| at + 1));
+                    // Failure lines override unrelated semantic windows; packet construction
+                    // expands them to complete enclosing declarations where the parser can.
+                    let spans: Vec<_> = evidence
+                        .failures
+                        .iter()
+                        .filter(|f| f.path == file.path)
+                        .filter_map(|f| f.line)
+                        .filter_map(|line| {
+                            let start = *offsets.get(line as usize - 1)?;
+                            let end = offsets.get(line as usize).copied().unwrap_or(source.len());
+                            (start < end).then_some((start, end))
+                        })
+                        .collect();
+                    if !spans.is_empty() {
+                        candidate.preferred_spans = spans;
+                    }
+                    candidate.reasons.push(format!("public check {} failure location; investigation anchor, not a proven defect", evidence.run_id));
+                    anchors.push(candidate);
+                }
+            }
+            candidates.retain(|c| !anchors.iter().any(|a| a.file.path == c.file.path));
+            anchors.extend(candidates);
+            if evidence.failures.len() > packet_options.candidates {
+                result
+                    .warnings
+                    .push("public failure locations exceed candidate budget".into());
+            }
+            anchors.truncate(packet_options.candidates);
+            candidates = anchors;
         }
         let ready_files: BTreeSet<_> = ready.documents.iter().map(|d| &d.path).collect();
         candidates.retain(|c| ready_files.contains(&c.file.path));
@@ -798,6 +943,22 @@ fn candidate_evidence(
                 spans
             };
             for (start, end) in spans {
+                // A stack-frame line alone often hides the operation and its setup.
+                // Include nearby code while keeping the existing per-card byte ceiling.
+                let (mut start, mut end) = if end - start < 512 {
+                    (
+                        start.saturating_sub(512),
+                        end.saturating_add(512).min(source.len()),
+                    )
+                } else {
+                    (start, end)
+                };
+                while !source.is_char_boundary(start) {
+                    start += 1;
+                }
+                while !source.is_char_boundary(end) {
+                    end -= 1;
+                }
                 let excerpt = prefix(&source[start..end], 1536);
                 evidence.push_str(&format!(
                     "Source bytes {}..{}:\n{}\n",

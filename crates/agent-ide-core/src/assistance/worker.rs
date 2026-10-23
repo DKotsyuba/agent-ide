@@ -63,6 +63,12 @@ mod patch_edit;
 mod indexing;
 #[path = "preparation.rs"]
 mod preparation;
+#[cfg(feature = "jev-pilot")]
+#[path = "preparation_checks.rs"]
+mod preparation_checks;
+#[cfg(feature = "jev-pilot")]
+#[path = "preparation_evidence.rs"]
+mod preparation_evidence;
 #[path = "progress.rs"]
 mod progress;
 #[path = "providers.rs"]
@@ -900,6 +906,9 @@ struct Shared {
     project_feed: Option<Arc<ProjectProblemFeed>>,
     /// Explicitly requested background test processes, retained until daemon shutdown.
     test_runs: TestRuns,
+    /// Owned public-check jobs for preparation; explicit main tests preempt only these jobs.
+    #[cfg(feature = "jev-pilot")]
+    preparation_checks: preparation_checks::State,
     /// Optional one-episode helper; owns its task, cancellation and exact test origin separately.
     support: support::Pilot,
     /// Undelivered one-shot `git: HEAD moved …` plate lines keyed by binding fingerprint.
@@ -1775,6 +1784,8 @@ impl WorkerHandle {
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 shutdown_failure: Mutex::new(None),
                 test_runs: TestRuns::new(admission.clone()),
+                #[cfg(feature = "jev-pilot")]
+                preparation_checks: preparation_checks::State::default(),
                 support,
                 admission,
                 telemetry,
@@ -2213,6 +2224,8 @@ impl WorkerHandle {
             && tool.mutates_with(&parameters)
             && parameters.get("cancel").is_none()
         {
+            #[cfg(feature = "jev-pilot")]
+            preparation_checks::interrupt(&self.shared, Some(&binding)).await;
             support::interrupt(&self.shared, Some(&binding), "main_test").await;
         }
         let expected = Some((tool, selection(&parameters)));
@@ -12042,6 +12055,8 @@ mod stop_retry_tests {
                 problem_source: None,
                 project_feed: None,
                 test_runs: TestRuns::default(),
+                #[cfg(feature = "jev-pilot")]
+                preparation_checks: preparation_checks::State::default(),
                 support: support::Pilot::new(None),
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),

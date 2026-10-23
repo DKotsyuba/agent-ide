@@ -68,3 +68,6 @@ pub mod service;
 /// Background source embedding and offline cost preflight; never called by task queries.
 #[cfg(feature = "jev-pilot")]
 pub mod indexer;
+
+/// Source-validated public check facts used to ground task retrieval.
+pub mod evidence;

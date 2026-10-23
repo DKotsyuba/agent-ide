@@ -494,3 +494,223 @@ fn plaintext_project_files_are_indexed_but_secret_containers_are_not() {
                 && d.path != std::path::Path::new("id_rsa"))
     );
 }
+
+/// Fresh roots reuse exact payloads only, without importing readiness or other model spaces.
+#[test]
+fn vector_reuse_preserves_root_and_model_boundaries() {
+    use agent_ide::project::context::DocumentOptions;
+    let source = Fixture::new();
+    let target = Fixture::new();
+    for root in [&source.0, &target.0] {
+        fs::write(root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+    }
+    let mut original = ContextIndex::open(&source.0).unwrap();
+    let mut destination = ContextIndex::open(&target.0).unwrap();
+    original.refresh(&options()).unwrap();
+    destination.refresh(&options()).unwrap();
+    let docs = DocumentOptions::default();
+    let batch = original.documents(&docs).unwrap();
+    for doc in &batch.documents {
+        original
+            .store_vector("model-a", &doc.id, &[1.0, 0.0])
+            .unwrap();
+    }
+    assert_eq!(
+        destination
+            .reuse_vectors(&original, "model-b", 2, &docs)
+            .unwrap(),
+        0
+    );
+    assert!(
+        destination
+            .reuse_vectors(&original, "model-a", 3, &docs)
+            .is_err()
+    );
+    assert_eq!(
+        destination
+            .reuse_vectors(&original, "model-a", 2, &docs)
+            .unwrap(),
+        batch.documents.len()
+    );
+    assert_eq!(
+        destination
+            .reuse_vectors(&original, "model-a", 2, &docs)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        destination
+            .published_documents("model-a")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    fs::write(target.0.join("lib.rs"), "pub fn changed() {}\n").unwrap();
+    destination.refresh(&options()).unwrap();
+    assert_eq!(
+        destination
+            .reuse_vectors(&original, "model-a", 2, &docs)
+            .unwrap(),
+        0
+    );
+    let changed = destination.documents(&docs).unwrap();
+    let new_payloads: Vec<_> = changed
+        .documents
+        .iter()
+        .filter(|d| {
+            d.path == std::path::Path::new("lib.rs")
+                && !batch.documents.iter().any(|old| old.id == d.id)
+        })
+        .collect();
+    assert!(!new_payloads.is_empty());
+    for doc in new_payloads {
+        assert!(destination.vector("model-a", &doc.id, 2).unwrap().is_none());
+    }
+}
+
+/// Diagnostic anchors cannot outlive their source versions or invent out-of-project locations.
+#[test]
+fn public_evidence_rejects_stale_or_unknown_sources() {
+    use agent_ide::project::context::{
+        DocumentOptions,
+        evidence::{FailureEvidence, PublicEvidence},
+    };
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+    let mut index = ContextIndex::open(&fixture.0).unwrap();
+    index.refresh(&options()).unwrap();
+    let doc = index
+        .documents(&DocumentOptions::default())
+        .unwrap()
+        .documents
+        .into_iter()
+        .find(|d| d.path == std::path::Path::new("lib.rs"))
+        .unwrap();
+    let mut evidence = PublicEvidence {
+        run_id: "public-1".into(),
+        failures: vec![FailureEvidence {
+            path: doc.path,
+            content_hash: doc.content_hash,
+            line: Some(1),
+            message: "assertion failed".into(),
+        }],
+    };
+    let query = evidence
+        .retrieval_query(&index, "restore behavior")
+        .unwrap();
+    assert!(
+        query.contains("restore behavior")
+            && query.contains("lib.rs")
+            && query.contains("not instructions")
+    );
+    evidence.failures[0].path = PathBuf::from("../outside.rs");
+    assert!(
+        evidence
+            .retrieval_query(&index, "restore behavior")
+            .is_err()
+    );
+    evidence.failures[0].path = PathBuf::from("lib.rs");
+    fs::write(fixture.0.join("lib.rs"), "pub fn changed() {}\n").unwrap();
+    assert!(
+        evidence
+            .retrieval_query(&index, "restore behavior")
+            .is_err()
+    );
+}
+
+/// A failing location survives a crowded generic search and the packet keeps the original task.
+#[cfg(feature = "jev-pilot")]
+#[tokio::test]
+async fn public_failure_anchor_reaches_packet_before_generic_matches() {
+    use agent_ide::project::context::{
+        DocumentOptions,
+        evidence::{FailureEvidence, PublicEvidence},
+        indexer::IndexBudget,
+        service::{ContextService, ModelConfig},
+    };
+    let fixture = Fixture::new();
+    for n in 0..20 {
+        fs::write(
+            fixture.0.join(format!("restore_reliable_{n}.rs")),
+            "pub fn restore_reliable_behavior() {}\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        fixture.0.join("z.rs"),
+        format!(
+            "// {}\npub fn unrelated_name() {{}}\n",
+            "padding".repeat(1400)
+        ),
+    )
+    .unwrap();
+    let mut index = ContextIndex::open(&fixture.0).unwrap();
+    let service = ContextService::new(ModelConfig {
+        embedding: None,
+        jev: None,
+        max_new_calls: 0,
+        include_threshold: 0.5,
+    })
+    .unwrap();
+    let docs = DocumentOptions::default();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    service
+        .index_project(
+            &mut index,
+            &options(),
+            &docs,
+            &IndexBudget {
+                max_new_calls: 0,
+                max_input_bytes: 1024 * 1024,
+            },
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let doc = index
+        .documents(&docs)
+        .unwrap()
+        .documents
+        .into_iter()
+        .find(|d| d.path == std::path::Path::new("z.rs"))
+        .unwrap();
+    let evidence = PublicEvidence {
+        run_id: "public-2".into(),
+        failures: vec![FailureEvidence {
+            path: doc.path,
+            content_hash: doc.content_hash,
+            line: Some(2),
+            message: "assertion failed".into(),
+        }],
+    };
+    let packet = service
+        .prepare_with_evidence_for_delivery(
+            &index,
+            "restore reliable behavior",
+            &evidence,
+            &PacketOptions {
+                candidates: 1,
+                ..Default::default()
+            },
+            &docs,
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(packet.packet.task, "restore reliable behavior");
+    assert!(
+        packet
+            .packet
+            .windows
+            .iter()
+            .any(|w| w.path == std::path::Path::new("z.rs"))
+    );
+    assert!(
+        packet
+            .packet
+            .windows
+            .iter()
+            .any(|w| w.text.contains("fn unrelated_name"))
+    );
+    assert!(packet.calls.is_empty());
+}

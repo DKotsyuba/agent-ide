@@ -827,3 +827,91 @@ async fn task_context_mcp_live_example() {
         "{packet}"
     );
 }
+
+/// Exercises one prepare with either an admitted failure or an unavailable public target.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+async fn public_check_roundtrip(target: Value, expect_failure: bool) {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n#[test]\nfn public_failure() { assert_eq!(value(), 2); }\n",
+    )
+    .unwrap();
+    configure_prepared_rust_checks(&fixture);
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["task_context"] = json!({"enabled":true,
+        "models":{"embedding":null,"jev":null,"max_new_calls":0,"include_threshold":0.5},
+        "indexing":offline_indexing(),
+        "evidence":{"enabled":true,"target":target,"budget_ms":30000}});
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "public-evidence-one-call").await;
+    let started = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let ready = agent_ide::project::context::ContextIndex::open_existing(&fixture.root)
+            .ok()
+            .flatten()
+            .is_some_and(|index| index.index_report("lexical").ok().flatten().is_some());
+        if ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background index did not publish"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let before = actor.next;
+    let raw = actor
+        .call_raw(
+            &fixture,
+            "ide.prepare",
+            json!({"task":if expect_failure { "Restore reliable behavior." } else { "Inspect value in src/lib.rs" },"token_budget":12000}),
+        )
+        .await;
+    assert_eq!(actor.next, before + 1);
+    let reply = &raw["result"]["structuredContent"];
+    assert_eq!(reply["state"], "complete", "{raw}");
+    let text = reply["text"].as_str().unwrap();
+    if expect_failure {
+        assert!(
+            text.contains("public check") && text.contains("failed 1"),
+            "{text}"
+        );
+    } else {
+        assert!(text.contains("public check unavailable:"), "{text}");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("note: public check ") && line.contains("; passed ")),
+            "unavailable is not a clean test: {text}"
+        );
+    }
+    assert!(
+        text.contains("src/lib.rs") && text.contains("pub fn value"),
+        "{text}"
+    );
+    assert_ne!(reply["continuation"], true, "{raw}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A single prepare executes the admitted check and returns its source-bound failure context.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn task_context_public_check_is_collected_in_one_call() {
+    public_check_roundtrip(json!({"files":["src/lib.rs"]}), true).await;
+}
+
+/// Unsupported optional checks leave ordinary source context usable and expose the missing evidence.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn task_context_public_check_unavailable_keeps_source_context() {
+    public_check_roundtrip(json!({"files":["README.md"]}), false).await;
+}

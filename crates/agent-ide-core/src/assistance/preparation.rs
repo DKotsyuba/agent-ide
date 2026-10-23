@@ -37,6 +37,9 @@ impl Drop for Pending {
 struct Config {
     enabled: bool,
     models: ModelConfig,
+    /// Optional operator-selected public check used to ground the task before retrieval.
+    #[serde(default)]
+    evidence: Option<Value>,
     /// Background indexing; disabled unless the operator enables it.
     #[serde(default)]
     indexing: super::indexing::IndexingConfig,
@@ -47,6 +50,7 @@ impl Worker<'_> {
     pub(super) async fn cancel_preparations(&mut self, binding: Option<&BindingRef>) {
         #[cfg(feature = "jev-pilot")]
         {
+            preparation_checks::interrupt(&self.shared, binding).await;
             let keys: Vec<_> = self
                 .preparations
                 .iter()
@@ -141,6 +145,19 @@ impl Worker<'_> {
                 let deadline = job
                     .deadline
                     .min(tokio::time::Instant::now() + PREPARE_COMPUTE_BUDGET);
+                let check_config = preparation_evidence::EvidenceConfig::parse(
+                    config.evidence.as_ref(),
+                )
+                .map_err(|reason| {
+                    job.failure_detail = Some(reason.into());
+                    FailureCode::LauncherConfiguration
+                })?;
+                let shared = self.shared.clone();
+                let check_authority = authority.clone();
+                let check_epoch = self.shared.outbox.current_epoch(&binding);
+                let check_ticket = self.shared.preparation_checks.ticket(&binding);
+                let target = job.target.clone();
+                let daemon_runtime = tokio::runtime::Handle::current();
                 let handle = tokio::task::spawn_blocking(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -175,23 +192,104 @@ impl Worker<'_> {
                                 "context_index_not_ready",
                             ));
                         }
+                        let mut check_notes = Vec::new();
+                        let public_report = if let Some(mut check_config) = check_config {
+                            // Keep time for retrieval and response construction even after a slow check.
+                            let check_deadline = deadline - Duration::from_secs(10);
+                            if tokio::time::Instant::now() >= check_deadline {
+                                check_notes
+                                    .push("public check skipped: retrieval time reserved".into());
+                                None
+                            } else {
+                                check_config.budget = check_config.budget.min(
+                                    check_deadline
+                                        .saturating_duration_since(tokio::time::Instant::now()),
+                                );
+                                let check_task = task.clone();
+                                let check_cancel = cancelled.clone();
+                                let outcome = daemon_runtime
+                                    .spawn(async move {
+                                        preparation_checks::collect(
+                                            &shared,
+                                            &check_authority,
+                                            check_epoch,
+                                            check_ticket,
+                                            &check_task,
+                                            &check_config,
+                                            &target,
+                                            &check_cancel,
+                                            check_deadline,
+                                        )
+                                        .await
+                                    })
+                                    .await;
+                                match outcome {
+                                    Ok(Ok(report)) => Some(report),
+                                    Ok(Err(error)) => {
+                                        check_notes
+                                            .push(format!("public check unavailable: {error}"));
+                                        None
+                                    }
+                                    Err(_) => {
+                                        check_notes.push("public check task failed".into());
+                                        None
+                                    }
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if cancelled.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                            return Err(std::io::Error::other("context cancelled"));
+                        }
                         let service = ContextService::new(config.models)?;
-                        tokio::time::timeout_at(
-                            deadline,
-                            service.prepare_for_delivery(
-                                &index,
-                                &task,
-                                &PacketOptions {
-                                    context_tokens: budget,
-                                    reserved_tokens: 512,
-                                    ..Default::default()
-                                },
-                                &DocumentOptions::default(),
-                                &cancelled,
-                            ),
-                        )
+                        let options = PacketOptions {
+                            context_tokens: budget,
+                            reserved_tokens: 512,
+                            ..Default::default()
+                        };
+                        let docs = DocumentOptions::default();
+                        let evidence = public_report
+                            .as_ref()
+                            .and_then(|report| report.retrieval_evidence())
+                            .filter(|evidence| match evidence.retrieval_query(&index, &task) {
+                                Ok(_) => true,
+                                Err(error) => {
+                                    check_notes
+                                        .push(format!("public evidence unavailable: {error}"));
+                                    false
+                                }
+                            });
+                        let mut prepared = tokio::time::timeout_at(deadline, async {
+                            if let Some(evidence) = &evidence {
+                                service
+                                    .prepare_with_evidence_for_delivery(
+                                        &index, &task, evidence, &options, &docs, &cancelled,
+                                    )
+                                    .await
+                            } else {
+                                service
+                                    .prepare_for_delivery(
+                                        &index, &task, &options, &docs, &cancelled,
+                                    )
+                                    .await
+                            }
+                        })
                         .await
-                        .map_err(std::io::Error::other)?
+                        .map_err(std::io::Error::other)??;
+                        prepared.warnings.extend(check_notes);
+                        if let Some(report) = public_report {
+                            prepared.warnings.push(format!(
+                                "public check {}: {:?}; passed {}; failed {}; elapsed {}ms",
+                                report.run_id,
+                                report.outcome,
+                                report.passed,
+                                report.failed,
+                                report.elapsed_ms
+                            ));
+                            prepared.warnings.extend(report.errors);
+                        }
+                        Ok(prepared)
                     })
                 });
                 self.preparations.insert(
