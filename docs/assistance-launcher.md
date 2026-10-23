@@ -501,8 +501,12 @@ up to 45 s and answers in one reply, never paged and never continued through `id
 a status line (`complete`, `partial` or `needs_evidence`), the applicable `AGENTS.md`/`CLAUDE.md`
 rules and nearest manifests (first 32 KiB each; a longer file is cut on a line end and listed as omitted), numbered source per file
 with its line ranges, role and selection reasons (a partial file adds its header, imports and the
-signatures of declarations not shown), an explicit `omitted:` list and one usage line. Units leave one at a time
-when the reply would not fit: optional before required, latest rank first.
+signatures of declarations not shown), an explicit `omitted:` list and one usage line.
+Source units are admitted in required-first, rank order using the actual rendered size;
+an oversized unit does not exclude smaller later units. Rules and explicitly named manifests
+have priority; other manifest context uses remaining space after source. If protected context
+alone prevents a bounded answer, its removal is disclosed rather than silently dropping code.
+Omission text counts toward both limits, and rows covered by another unit are not called omitted.
 The requested budget is kept; whatever leaves to fit the reply is named under `omitted:`.
 `complete` means
 the retriever reported no gap, every required unit is complete and nothing was left out or

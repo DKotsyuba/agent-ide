@@ -454,46 +454,14 @@ impl Worker<'_> {
                     .iter()
                     .map(|path| format!("{}: not UTF-8 text", path.display())),
             );
-            let reply = loop {
-                let files = delivered_files(&sources, &units);
-                let text = render_packet(&prepared, &sources, &files, &prelude, &units, &omitted);
-                let reply = PeerReply::Complete {
-                    kind: ResultKind::Prepare,
-                    text,
-                    detail_ref: None,
-                    truncated: false,
-                    continuation: false,
-                };
-                // Both bounds at once: the real MCP carrier and the requested token budget
-                // (estimated at four bytes per token over the whole rendered text).
-                let estimated = match &reply {
-                    PeerReply::Complete { text, .. } => text.len().div_ceil(4) as u64,
-                    _ => u64::MAX,
-                };
-                if estimated <= pending.budget && content::fits(&reply, content::reply_envelope()) {
-                    break reply;
-                }
-                // Never cut silently: optional units leave before required ones, the latest rank
-                // first, then prelude files, then the last unit; each is named in `omitted`.
-                if units.len() > 1 {
-                    let victim = drop_order(&units).ok_or(FailureCode::Internal)?;
-                    let unit = units.remove(victim);
-                    omitted.push(format!(
-                        "{}: omitted to fit one reply",
-                        unit_label(&sources[unit.file], &unit)
-                    ));
-                } else if let Some(file) = prelude.pop() {
-                    omitted.push(format!("{}: omitted to fit one reply", file.path.display()));
-                } else if let Some(unit) = units.pop() {
-                    // A budget below the smallest selected unit delivers nothing rather than a cut.
-                    omitted.push(format!(
-                        "{}: larger than the requested token_budget",
-                        unit_label(&sources[unit.file], &unit)
-                    ));
-                } else {
-                    return Err(FailureCode::Capacity);
-                }
-            };
+            let reply = fit_packet(
+                &prepared,
+                &sources,
+                &mut units,
+                &mut prelude,
+                &mut omitted,
+                pending.budget,
+            )?;
             // Read memory gets exactly the delivered rows, so unit and window edits see what the
             // agent saw.
             let files = delivered_files(&sources, &units);
@@ -772,6 +740,7 @@ struct SourceFile {
 
 /// One selected unit (a declaration, a range or a whole file) of a [`SourceFile`].
 #[cfg(feature = "jev-pilot")]
+#[derive(Clone)]
 struct Unit {
     file: usize,
     range: (usize, usize),
@@ -833,15 +802,186 @@ fn delivered_files(sources: &[SourceFile], units: &[Unit]) -> Vec<DeliveredFile>
         .collect()
 }
 
-/// Index of the unit to leave out next: an optional one before any required one, the latest
-/// rank first, and among equal ranks the latest selected.
+/// Keeps rules first; if protected context alone prevents a bounded answer, disclose its removal.
 #[cfg(feature = "jev-pilot")]
-fn drop_order(units: &[Unit]) -> Option<usize> {
-    units
+fn fit_packet(
+    prepared: &Preparation,
+    sources: &[SourceFile],
+    units: &mut Vec<Unit>,
+    prelude: &mut Vec<PreludeFile>,
+    omitted: &mut Vec<String>,
+    budget: u64,
+) -> Result<PeerReply, FailureCode> {
+    let candidates = std::mem::take(units);
+    let mut available = std::mem::take(prelude);
+    let mut gaps = std::mem::take(omitted);
+    loop {
+        *units = candidates.clone();
+        *prelude = available.clone();
+        *omitted = gaps.clone();
+        match select_packet(prepared, sources, units, prelude, omitted, budget) {
+            Ok(reply) => return Ok(reply),
+            Err(FailureCode::Capacity) => {
+                let victim = prelude.last().ok_or(FailureCode::Capacity)?.path.clone();
+                let position = available
+                    .iter()
+                    .position(|file| file.path == victim)
+                    .ok_or(FailureCode::Internal)?;
+                available.remove(position);
+                gaps.push(format!(
+                    "{}: protected context omitted to fit the requested budget",
+                    victim.display()
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Recognizes an explicit relative path token, not a suffix inside an unrelated nested path.
+#[cfg(feature = "jev-pilot")]
+fn task_names_path(task: &str, path: &std::path::Path) -> bool {
+    let path = path.to_string_lossy();
+    let path_char = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\');
+    [path.to_string(), format!("./{path}")].iter().any(|name| {
+        task.match_indices(name.as_str()).any(|(at, _)| {
+            let tail = &task[at + name.len()..];
+            let end_boundary = !tail.chars().next().is_some_and(path_char)
+                || tail
+                    .strip_prefix('.')
+                    .is_some_and(|rest| !rest.chars().next().is_some_and(path_char));
+            !task[..at].chars().next_back().is_some_and(path_char) && end_boundary
+        })
+    })
+}
+
+/// Builds a bounded reply by admitting ranked units, then optional manifest context.
+/// All possible omissions are budgeted from the start; only retained bytes receive receipts.
+#[cfg(feature = "jev-pilot")]
+fn select_packet(
+    prepared: &Preparation,
+    sources: &[SourceFile],
+    units: &mut Vec<Unit>,
+    prelude: &mut Vec<PreludeFile>,
+    omitted: &mut Vec<String>,
+    budget: u64,
+) -> Result<PeerReply, FailureCode> {
+    let mut candidates = std::mem::take(units);
+    candidates.sort_by_key(|unit| (!unit.required, unit.rank));
+    let (rules, manifests): (Vec<_>, Vec<_>) =
+        std::mem::take(prelude).into_iter().partition(|file| {
+            file.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| RULE_FILES.contains(&name))
+                || task_names_path(&prepared.packet.task, &file.path)
+        });
+    *prelude = rules;
+    let base_omitted = std::mem::take(omitted);
+    let notes: Vec<_> = candidates
         .iter()
-        .enumerate()
-        .max_by_key(|(index, unit)| (!unit.required, unit.rank, *index))
-        .map(|(index, _)| index)
+        .map(|unit| {
+            format!(
+                "{}: omitted to fit one reply",
+                unit_label(&sources[unit.file], unit)
+            )
+        })
+        .chain(
+            manifests
+                .iter()
+                .map(|file| format!("{}: omitted to fit one reply", file.path.display())),
+        )
+        .collect();
+    let mut included = vec![false; notes.len()];
+    let assemble = |units: &[Unit], prelude: &[PreludeFile], included: &[bool]| {
+        let gaps: Vec<_> = base_omitted
+            .iter()
+            .cloned()
+            .chain(
+                notes
+                    .iter()
+                    .zip(included)
+                    .filter(|(_, kept)| !**kept)
+                    .map(|(note, _)| note.clone()),
+            )
+            .collect();
+        let files = delivered_files(sources, units);
+        let text = render_packet(prepared, sources, &files, prelude, units, &gaps);
+        (
+            PeerReply::Complete {
+                kind: ResultKind::Prepare,
+                text,
+                detail_ref: None,
+                truncated: false,
+                continuation: false,
+            },
+            gaps,
+        )
+    };
+    let fits = |reply: &PeerReply| {
+        matches!(reply, PeerReply::Complete {text,..} if text.len().div_ceil(4) as u64 <= budget)
+            && content::fits(reply, content::reply_envelope())
+    };
+    let source_count = candidates.len();
+    let requested: Vec<_> = candidates
+        .iter()
+        .map(|unit| (unit.file, unit.range))
+        .collect();
+    included[..source_count].fill(true);
+    if fits(&assemble(&candidates, prelude, &included).0) {
+        // Overlapping units can be cheaper together than their separate omission labels.
+        *units = candidates;
+    } else {
+        included[..source_count].fill(false);
+        for (position, unit) in candidates.into_iter().enumerate() {
+            included[position] = true;
+            units.push(unit);
+            if !fits(&assemble(units, prelude, &included).0) {
+                units.pop();
+                included[position] = false;
+            }
+        }
+    }
+    for (position, file) in manifests.into_iter().enumerate() {
+        let slot = source_count + position;
+        included[slot] = true;
+        // A manifest already delivered whole as ranked source needs no duplicate prelude.
+        let already_delivered = delivered_files(sources, units).iter().any(|delivered| {
+            let source = &sources[delivered.source];
+            delivered.whole
+                && source.path == file.path
+                && source.text.len() == file.total
+                && source.text.starts_with(&file.head)
+        });
+        if already_delivered {
+            continue;
+        }
+        prelude.push(file);
+        if !fits(&assemble(units, prelude, &included).0) {
+            prelude.pop();
+            included[slot] = false;
+        }
+    }
+    // A skipped unit may still be delivered by later overlapping selections.
+    let delivered = delivered_files(sources, units);
+    for (slot, (file, range)) in requested.into_iter().enumerate() {
+        let (first, last) = line_span(&sources[file].text, range.0, range.1);
+        if delivered.iter().any(|item| {
+            item.source == file
+                && item
+                    .spans
+                    .iter()
+                    .any(|&(start, end)| start <= first && end >= last)
+        }) {
+            included[slot] = true;
+        }
+    }
+    let (reply, gaps) = assemble(units, prelude, &included);
+    if !fits(&reply) {
+        return Err(FailureCode::Capacity);
+    }
+    *omitted = gaps;
+    Ok(reply)
 }
 
 /// `path#symbol` for a declaration unit, else `path lines a-b`.
@@ -858,6 +998,7 @@ fn unit_label(source: &SourceFile, unit: &Unit) -> String {
 
 /// One rule or manifest file and the verbatim head the packet carries.
 #[cfg(feature = "jev-pilot")]
+#[derive(Clone)]
 struct PreludeFile {
     path: std::path::PathBuf,
     head: String,
@@ -1272,6 +1413,242 @@ fn render_packet(
 mod tests {
     use super::*;
 
+    /// A large optional manifest must not displace useful code and leave most of the budget idle.
+    #[test]
+    fn packing_keeps_code_instead_of_a_large_manifest() {
+        use crate::project::context::{ContextBundle, IndexSnapshot};
+        use crate::workspace::observation::{
+            ObservationRef, ObservedState, SourceBytes, SourceCoverage, SourceRevision,
+        };
+        let scratch = crate::scratch::ScratchDir::new("packing");
+        let root = scratch.to_path_buf();
+        let worktree = crate::workspace::authority::WorktreeRef::from_discovery(
+            root.clone(),
+            root.clone(),
+            ".git".into(),
+            1,
+        )
+        .unwrap();
+        let mut sources = Vec::new();
+        for (name, width, lines) in [
+            ("large-test.alpha", 31, 760),
+            ("implementation.alpha", 31, 400),
+            ("small.alpha", 27, 70),
+        ] {
+            let text = (format!("{}\n", "x".repeat(width))).repeat(lines);
+            let path: std::path::PathBuf = name.into();
+            let observed = SourceObservation::new(
+                worktree.clone(),
+                1,
+                1,
+                ObservationRef::new(name).unwrap(),
+                path.clone(),
+                Some(SourceBytes::from_bytes(text.as_bytes())),
+                SourceRevision::new(name).unwrap(),
+                SourceCoverage::Complete,
+                ObservedState::Present,
+            )
+            .unwrap();
+            sources.push(SourceFile {
+                path,
+                hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
+                observed,
+                text,
+            });
+        }
+        let mut prepared = Preparation {
+            packet: ContextBundle {
+                task: "Repair observed failures".into(),
+                snapshot: IndexSnapshot {
+                    generation: 1,
+                    root,
+                    files: 3,
+                    reused_files: 3,
+                    scope: Default::default(),
+                    discovery_complete: true,
+                    details_complete: true,
+                    warnings: vec![],
+                },
+                windows: vec![],
+                file_facts: vec![],
+                gaps: vec![],
+                estimated_tokens: 0,
+                accounting_is_estimated: true,
+            },
+            embedding_used: false,
+            embedding_complete: true,
+            jev_used: false,
+            calls: vec![],
+            warnings: vec![],
+            elapsed_ms: 0.0,
+        };
+        let mut units: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(file, source)| Unit {
+                file,
+                range: (0, source.text.len()),
+                role: "primary".into(),
+                rank: file as u32,
+                required: file < 2,
+                complete: true,
+                symbol: None,
+                reasons: vec![],
+            })
+            .collect();
+        let mut prelude = vec![
+            PreludeFile::new("AGENTS.md".into(), b"Keep the public behavior.\n"),
+            PreludeFile::new("package.json".into(), ("m".repeat(23102) + "\n").as_bytes()),
+        ];
+        let original_units = units.clone();
+        let original_prelude = prelude.clone();
+        let mut omitted = Vec::new();
+        let reply = fit_packet(
+            &prepared,
+            &sources,
+            &mut units,
+            &mut prelude,
+            &mut omitted,
+            12000,
+        )
+        .unwrap();
+        let PeerReply::Complete { text, .. } = &reply else {
+            panic!("expected packet")
+        };
+        assert!(
+            text.contains("## implementation.alpha"),
+            "useful implementation was dropped"
+        );
+        assert!(
+            text.contains("## small.alpha"),
+            "smaller lower-ranked unit should use remaining capacity"
+        );
+        assert!(text.contains("--- AGENTS.md"), "rules must remain");
+        assert!(
+            !text.contains("--- package.json"),
+            "optional manifest displaced code"
+        );
+        assert!(omitted.iter().any(|line| line.contains("package.json")));
+        assert!(
+            text.len().div_ceil(4) <= 12000 && content::fits(&reply, content::reply_envelope())
+        );
+        // Required implementation wins over a higher-ranked optional test under a tight cap.
+        let mut tight_units = original_units.clone();
+        tight_units[0].required = false;
+        let mut tight_prelude = original_prelude.clone();
+        let mut tight_omitted = Vec::new();
+        let tight = fit_packet(
+            &prepared,
+            &sources,
+            &mut tight_units,
+            &mut tight_prelude,
+            &mut tight_omitted,
+            5000,
+        )
+        .unwrap();
+        let PeerReply::Complete { text, .. } = tight else {
+            panic!("expected packet")
+        };
+        assert!(text.contains("## implementation.alpha") && !text.contains("## large-test.alpha"));
+        assert!(text.starts_with("prepare: partial"));
+
+        // Naming a manifest explicitly keeps it even when it only exists in the prelude.
+        prepared.packet.task = "Update the test script in package.json".into();
+        let mut named_units = original_units.clone();
+        let mut named_prelude = original_prelude.clone();
+        let named = fit_packet(
+            &prepared,
+            &sources,
+            &mut named_units,
+            &mut named_prelude,
+            &mut Vec::new(),
+            12000,
+        )
+        .unwrap();
+        let PeerReply::Complete { text, .. } = named else {
+            panic!("expected packet")
+        };
+        assert!(text.contains("--- package.json") && text.contains("--- AGENTS.md"));
+        assert!(text.len().div_ceil(4) <= 12000);
+
+        // The JSON carrier remains binding even when the requested token allowance is large.
+        prepared.packet.task = "Repair observed failures".into();
+        let mut wide_units = original_units;
+        let mut wide_prelude = original_prelude;
+        let wide = fit_packet(
+            &prepared,
+            &sources,
+            &mut wide_units,
+            &mut wide_prelude,
+            &mut Vec::new(),
+            100000,
+        )
+        .unwrap();
+        assert!(content::fits(&wide, content::reply_envelope()));
+        let mut small_units = units.clone();
+        let mut large_rules = vec![PreludeFile::new(
+            "AGENTS.md".into(),
+            ("r".repeat(11999) + "\n").as_bytes(),
+        )];
+        let mut small_gaps = Vec::new();
+        let small = fit_packet(
+            &prepared,
+            &sources,
+            &mut small_units,
+            &mut large_rules,
+            &mut small_gaps,
+            1024,
+        )
+        .unwrap();
+        let PeerReply::Complete { text, .. } = &small else {
+            panic!("expected bounded packet")
+        };
+        assert!(text.len().div_ceil(4) <= 1024 && !text.starts_with("prepare: complete"));
+        assert!(small_gaps.iter().any(|gap| gap.contains("AGENTS.md")));
+        assert!(content::fits(&small, content::reply_envelope()));
+        // A skipped unit is not omitted when a later whole-file selection covers its rows.
+        let mut costly = units[0].clone();
+        costly.range = (0, 32 * 50);
+        costly.reasons = vec!["explanation".repeat(6000)];
+        let mut whole = units[0].clone();
+        whole.rank = 1;
+        let mut overlap = vec![costly, whole];
+        let mut overlap_gaps = Vec::new();
+        let overlap_reply = fit_packet(
+            &prepared,
+            &sources,
+            &mut overlap,
+            &mut Vec::new(),
+            &mut overlap_gaps,
+            12000,
+        )
+        .unwrap();
+        assert_eq!(
+            overlap.len(),
+            1,
+            "the oversized explanation should have been skipped"
+        );
+        assert!(
+            overlap_gaps.is_empty(),
+            "covered source rows must not be labelled omitted"
+        );
+        let PeerReply::Complete { text, .. } = overlap_reply else {
+            panic!("expected packet")
+        };
+        assert!(text.starts_with("prepare: complete"));
+    }
+
+    /// Explicit manifest names do not accidentally protect a different root manifest.
+    #[test]
+    fn manifest_names_are_path_tokens() {
+        let path = std::path::Path::new("package.json");
+        assert!(task_names_path("Update `package.json`", path));
+        assert!(task_names_path("Update ./package.json", path));
+        assert!(task_names_path("Update package.json.", path));
+        assert!(!task_names_path("Update packages/web/package.json", path));
+        assert!(!task_names_path("Update package.json.backup", path));
+    }
+
     /// Overlapping and touching windows merge; separate ones stay apart in byte order.
     #[test]
     fn windows_of_one_file_merge_into_ordered_ranges() {
@@ -1297,33 +1674,6 @@ mod tests {
         let file = PreludeFile::new("AGENTS.md".into(), line.repeat(100).as_bytes());
         assert!(file.head.len() <= PRELUDE_FILE_BYTES && file.head.ends_with('\n'));
         assert_eq!(file.total, 10_000);
-    }
-
-    /// Optional units leave before required ones, the latest rank first; equal ranks leave
-    /// latest-selected first.
-    #[test]
-    fn optional_units_leave_before_required_ones() {
-        let unit = |rank, required| Unit {
-            file: 0,
-            range: (0, 1),
-            role: String::new(),
-            rank,
-            required,
-            complete: true,
-            symbol: None,
-            reasons: Vec::new(),
-        };
-        let units = [
-            unit(9, true),
-            unit(1, false),
-            unit(3, false),
-            unit(3, false),
-        ];
-        assert_eq!(drop_order(&units), Some(3));
-        assert_eq!(drop_order(&units[..3]), Some(2));
-        assert_eq!(drop_order(&units[..2]), Some(1));
-        assert_eq!(drop_order(&[unit(1, true), unit(5, true)]), Some(1));
-        assert_eq!(drop_order(&[]), None);
     }
 
     /// Declaration lines carry a bounded one-line signature, or kind and name without one.
