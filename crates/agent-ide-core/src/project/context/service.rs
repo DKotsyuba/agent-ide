@@ -558,6 +558,7 @@ impl ContextService {
                 &sources,
                 &mut result.warnings,
                 cancel,
+                task,
             )
             .await?;
             pinned = anchors
@@ -582,6 +583,9 @@ impl ContextService {
         }
         let ready_files: BTreeSet<_> = ready.documents.iter().map(|d| &d.path).collect();
         candidates.retain(|c| ready_files.contains(&c.file.path));
+        if self.jev.is_none() {
+            rank_without_selector(&mut candidates, &pinned);
+        }
         if let Some(client) = &self.jev {
             let journal = journal.as_ref().expect("model journal constructed");
             // The main agent's output budget must not hide candidates from the selector.
@@ -1026,11 +1030,30 @@ fn apply_assessments(
     }
 }
 
-/// Orders the selector's survivors: public-evidence tiers first in their evidence order
-/// (failure anchors 0, direct imports of anchored tests 1, of other anchors 2), then
-/// task-named paths (3), proven type-only imports (4), then the rest (5). The first three
-/// tiers keep evidence order; later tiers sort by descending `relevance`.
-/// Scores and reasons are untouched.
+/// Rank discovered imports without replacing the existing lexical/hybrid order of other files.
+fn rank_without_selector(candidates: &mut [super::Candidate], pinned: &BTreeMap<PathBuf, u8>) {
+    let tier = |candidate: &super::Candidate| {
+        pinned
+            .get(&candidate.file.path)
+            .copied()
+            .map(import_priority)
+            .unwrap_or(5)
+    };
+    candidates.sort_by(|a, b| {
+        let (left, right) = (tier(a), tier(b));
+        left.cmp(&right).then_with(|| {
+            if matches!(left, 1 | 4) {
+                b.lexical_score.cmp(&a.lexical_score)
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+    });
+}
+
+/// Keeps failure anchors in evidence order, then ranks runtime/unknown imports together by
+/// relevance regardless of their test/source provenance. Task-named paths, proven type-only
+/// imports and other candidates follow. Lexical score breaks relevance ties; reasons stay intact.
 fn rank_selected(
     candidates: &mut [super::Candidate],
     pinned: &BTreeMap<PathBuf, u8>,
@@ -1047,15 +1070,22 @@ fn rank_selected(
         }
     };
     candidates.sort_by(|a, b| {
-        let (left, right) = (tier(a), tier(b));
+        let (left, right) = (import_priority(tier(a)), import_priority(tier(b)));
         left.cmp(&right).then_with(|| {
-            if left < 3 {
+            if left == 0 {
                 std::cmp::Ordering::Equal
             } else {
-                relevance(b).total_cmp(&relevance(a))
+                relevance(b)
+                    .total_cmp(&relevance(a))
+                    .then_with(|| b.lexical_score.cmp(&a.lexical_score))
             }
         })
     });
+}
+
+/// Runtime/unknown imports share priority regardless of whether a test or source referenced them.
+fn import_priority(tier: u8) -> u8 {
+    if tier == 2 { 1 } else { tier }
 }
 
 /// One bounded, escaped diagnostic from an already source-validated public failure.
@@ -1094,6 +1124,10 @@ const MAX_IMPORTED_FILES: usize = 16;
 /// # Errors
 ///
 /// `Interrupted` when `cancel` fires: no further extraction starts.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded import evidence carries explicit query, source and cancellation inputs"
+)]
 async fn anchored_imports(
     root: &Path,
     records: &[super::FileRecord],
@@ -1102,6 +1136,7 @@ async fn anchored_imports(
     sources: &[(PathBuf, String, bool)],
     warnings: &mut Vec<String>,
     cancel: &tokio_util::sync::CancellationToken,
+    task: &str,
 ) -> io::Result<Vec<(super::Candidate, u8)>> {
     use crate::lang::names::{Certainty, Role, ns};
     /// Lightweight proposal; clone file metadata only after shared admission limits pass.
@@ -1112,7 +1147,10 @@ async fn anchored_imports(
         tier: u8,
         certainty: Certainty,
         assumption: Option<&'static str>,
+        score: usize,
     }
+    let terms = super::storage::lexical_terms(task);
+    let mut scores = BTreeMap::new();
     let mut proposed = Vec::new();
     for (origin, (path, source, is_test)) in sources.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -1200,7 +1238,11 @@ async fn anchored_imports(
             } else {
                 2
             };
+            let score = *scores
+                .entry(record)
+                .or_insert_with(|| super::storage::lexical_reasons(&records[record], &terms).len());
             proposed.push(Import {
+                score,
                 record,
                 origin,
                 line: fact.line,
@@ -1218,7 +1260,12 @@ async fn anchored_imports(
     }
     // Rank before applying either cap: an early type-only import must not consume a slot
     // needed by a later runtime reference, including another reference to the same file.
-    proposed.sort_by_key(|item| item.tier);
+    proposed.sort_by(|a, b| {
+        import_priority(a.tier)
+            .cmp(&import_priority(b.tier))
+            .then_with(|| b.score.cmp(&a.score))
+            .then(a.tier.cmp(&b.tier))
+    });
     let mut imported = Vec::new();
     let mut seen = BTreeSet::new();
     let mut admitted = vec![0; sources.len()];
@@ -1247,11 +1294,12 @@ async fn anchored_imports(
             .cloned()
             .unwrap_or_else(|| super::Candidate {
                 file: record.clone(),
-                lexical_score: 0,
-                reasons: Vec::new(),
+                lexical_score: item.score,
+                reasons: super::storage::lexical_reasons(record, &terms),
                 preferred_spans: Vec::new(),
                 whole_file: false,
             });
+        candidate.lexical_score = item.score;
         let anchor = if *is_test {
             "anchored public test"
         } else {
@@ -1571,6 +1619,7 @@ mod tests {
             &[(PathBuf::from("test_a.beta"), test.clone(), true)],
             &mut warnings,
             &tokio_util::sync::CancellationToken::new(),
+            "",
         )
         .await
         .unwrap();
@@ -1616,6 +1665,7 @@ mod tests {
             &[(PathBuf::from("test_a.beta"), test, true)],
             &mut Vec::new(),
             &cancelled,
+            "",
         )
         .await
         .unwrap_err();
@@ -1756,6 +1806,7 @@ mod tests {
             &sources,
             &mut warnings,
             &tokio_util::sync::CancellationToken::new(),
+            "",
         )
         .await
         .unwrap();
@@ -1815,6 +1866,7 @@ mod tests {
         let mut candidates = vec![
             candidate("high.x", 9),
             candidate("import.x", 1),
+            candidate("source-import.x", 8),
             candidate("named.x", 2),
             candidate("anchor-b.x", 3),
             candidate("low.x", 0),
@@ -1824,6 +1876,7 @@ mod tests {
             (PathBuf::from("anchor-b.x"), 0),
             (PathBuf::from("anchor-a.x"), 0),
             (PathBuf::from("import.x"), 1),
+            (PathBuf::from("source-import.x"), 2),
         ]);
         rank_selected(&mut candidates, &pinned, "fix named.x", |candidate| {
             candidate.lexical_score as f64 / 10.0
@@ -1837,6 +1890,7 @@ mod tests {
             [
                 "anchor-b.x",
                 "anchor-a.x",
+                "source-import.x",
                 "import.x",
                 "named.x",
                 "high.x",
@@ -1844,11 +1898,29 @@ mod tests {
             ]
         );
         assert_eq!(candidates[0].reasons, ["reason anchor-b.x"]);
+        // A semantic retrieval order may intentionally put a low lexical score first.
+        let mut hybrid = vec![
+            candidate("semantic-first.x", 0),
+            candidate("lexical-second.x", 9),
+        ];
+        rank_without_selector(&mut hybrid, &BTreeMap::new());
+        assert_eq!(hybrid[0].file.path, Path::new("semantic-first.x"));
+        hybrid.push(candidate("pinned-import.x", 2));
+        rank_without_selector(
+            &mut hybrid,
+            &BTreeMap::from([(PathBuf::from("pinned-import.x"), 2)]),
+        );
+        assert_eq!(
+            hybrid
+                .iter()
+                .map(|candidate| candidate.file.path.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["pinned-import.x", "semantic-first.x", "lexical-second.x"]
+        );
     }
 
     /// A non-test failure location contributes its own direct imports one tier after the
-    /// anchored tests' imports: test anchors are read first and keep priority in the shared cap,
-    /// whatever the evidence order, and the reason names the kind of anchor.
+    /// anchored tests' imports when relevance ties; reasons preserve the kind of anchor.
     #[tokio::test]
     async fn non_test_anchors_contribute_their_imports_after_test_imports() {
         let files = [
@@ -1881,6 +1953,7 @@ mod tests {
             ],
             &mut Vec::new(),
             &tokio_util::sync::CancellationToken::new(),
+            "",
         )
         .await
         .unwrap();

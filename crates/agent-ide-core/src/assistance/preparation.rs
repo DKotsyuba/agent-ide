@@ -1691,6 +1691,180 @@ fn render_packet(
 mod tests {
     use super::*;
 
+    /// Model-free retrieval and final carrier packing must keep a relevant dependency even when
+    /// it was outside the initial shortlist and an earlier test imported a less relevant file.
+    #[tokio::test]
+    async fn relevant_source_dependency_survives_the_final_carrier() {
+        use crate::project::context::evidence::{FailureEvidence, PublicEvidence};
+        use crate::project::context::service::{ContextService, ModelConfig};
+        use crate::project::context::{ContextIndex, DocumentOptions, PacketOptions};
+        use crate::workspace::observation::{
+            ObservationRef, ObservedState, SourceBytes, SourceCoverage, SourceRevision,
+        };
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new("dependency-carrier");
+        let imports = |start| {
+            format!(
+                "{}\nfail\n",
+                (start..start + 8)
+                    .map(|n| format!("ref:noise-{n:02}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        let mut files = vec![
+            ("test_a.beta".to_owned(), imports(0)),
+            ("test_b.beta".to_owned(), imports(8)),
+            (
+                "lib.beta".to_owned(),
+                "ref:needle-worker\nfail\n".to_owned(),
+            ),
+            (
+                "needle-worker.alpha".to_owned(),
+                "needle implementation row\n".repeat(150),
+            ),
+            ("needle-00.alpha".to_owned(), "unrelated\n".to_owned()),
+        ];
+        files.extend((0..16).map(|n| (format!("noise-{n:02}.alpha"), "n".repeat(6000))));
+        for (path, text) in &files {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        let service = ContextService::new(ModelConfig {
+            embedding: None,
+            jev: None,
+            max_new_calls: 0,
+            include_threshold: 0.5,
+        })
+        .unwrap();
+        let mut index = ContextIndex::open(&root).unwrap();
+        service
+            .index_project(
+                &mut index,
+                &crate::project::structure::StructureOptions {
+                    respect_gitignore: false,
+                    ..Default::default()
+                },
+                &DocumentOptions::default(),
+                &crate::project::context::indexer::IndexBudget {
+                    max_new_calls: 0,
+                    max_input_bytes: 0,
+                },
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            index.search("needle", 1).unwrap()[0].file.path,
+            std::path::Path::new("needle-00.alpha")
+        );
+        let evidence = PublicEvidence {
+            run_id: "public-1".into(),
+            failures: ["test_a.beta", "test_b.beta", "lib.beta"]
+                .into_iter()
+                .map(|path| FailureEvidence {
+                    path: path.into(),
+                    content_hash: blake3::hash(&std::fs::read(root.join(path)).unwrap())
+                        .to_hex()
+                        .to_string(),
+                    line: Some(2),
+                    message: "observed failure".into(),
+                })
+                .collect(),
+        };
+        let prepared = service
+            .prepare_with_evidence_for_delivery(
+                &index,
+                "needle",
+                &evidence,
+                &PacketOptions {
+                    candidates: 1,
+                    ..Default::default()
+                },
+                &DocumentOptions::default(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let worktree = crate::workspace::authority::WorktreeRef::from_discovery(
+            root.to_path_buf(),
+            root.to_path_buf(),
+            ".git".into(),
+            1,
+        )
+        .unwrap();
+        let mut sources: Vec<SourceFile> = Vec::new();
+        let mut units = Vec::new();
+        for window in &prepared.packet.windows {
+            let file =
+                if let Some(file) = sources.iter().position(|source| source.path == window.path) {
+                    file
+                } else {
+                    let text = std::fs::read_to_string(root.join(&window.path)).unwrap();
+                    let observed = SourceObservation::new(
+                        worktree.clone(),
+                        1,
+                        1,
+                        ObservationRef::new(window.path.to_string_lossy()).unwrap(),
+                        window.path.clone(),
+                        Some(SourceBytes::from_bytes(text.as_bytes())),
+                        SourceRevision::new("fixture").unwrap(),
+                        SourceCoverage::Complete,
+                        ObservedState::Present,
+                    )
+                    .unwrap();
+                    sources.push(SourceFile {
+                        path: window.path.clone(),
+                        hash: window.content_hash.clone(),
+                        observed,
+                        text,
+                    });
+                    sources.len() - 1
+                };
+            units.push(Unit {
+                file,
+                range: (window.start_byte, window.end_byte),
+                role: window.role.clone(),
+                rank: window.rank,
+                required: window.required,
+                complete: window.unit_complete || window.complete_file,
+                bundle: None,
+                symbol: window.symbol.clone(),
+                reasons: window.reasons.clone(),
+            });
+        }
+        let mut gaps = prepared.packet.gaps.clone();
+        let reply = fit_packet(
+            &prepared,
+            &sources,
+            &mut units,
+            &mut Vec::new(),
+            &mut gaps,
+            2400,
+        )
+        .unwrap();
+        assert!(content::fits_prepare_budget(
+            &reply,
+            content::reply_envelope(),
+            2400
+        ));
+        let PeerReply::Complete { text, .. } = reply else {
+            panic!("expected packet")
+        };
+        assert!(
+            text.contains("## needle-worker.alpha") && text.contains("needle implementation row"),
+            "{text}"
+        );
+        assert!(text.contains("## test_a.beta") && text.contains("## lib.beta"));
+        assert!(
+            !gaps.iter().any(|gap| gap.contains("needle-worker.alpha")),
+            "{gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|gap| gap.contains("noise-")),
+            "competing import must actually exceed the carrier"
+        );
+    }
+
     /// A large optional manifest must not displace useful code and leave most of the budget idle.
     #[test]
     fn packing_keeps_code_instead_of_a_large_manifest() {

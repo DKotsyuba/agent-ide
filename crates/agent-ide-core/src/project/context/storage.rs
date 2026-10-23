@@ -547,11 +547,7 @@ impl ContextIndex {
                 "context index has no published generation",
             ));
         }
-        let terms: std::collections::BTreeSet<_> = task
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|s| s.chars().count() > 1)
-            .map(str::to_lowercase)
-            .collect();
+        let terms = lexical_terms(task);
         let mut statement=self.connection.prepare("SELECT record FROM files WHERE generation=CAST((SELECT value FROM meta WHERE key='generation') AS INTEGER) ORDER BY path").map_err(db)?;
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -560,12 +556,7 @@ impl ContextIndex {
         for row in rows {
             let record: FileRecord =
                 serde_json::from_str(&row.map_err(db)?).map_err(io::Error::other)?;
-            let card = search_text(&record).to_lowercase();
-            let reasons: Vec<_> = terms
-                .iter()
-                .filter(|term| card.contains(term.as_str()))
-                .map(|term| format!("literal term: {term}"))
-                .collect();
+            let reasons = lexical_reasons(&record, &terms);
             if !reasons.is_empty() {
                 candidates.push(Candidate {
                     file: record,
@@ -611,6 +602,27 @@ fn collect(node: &StructureNode, root: &Path, records: &mut Vec<FileRecord>, com
     for child in &node.children {
         collect(child, root, records, complete);
     }
+}
+
+/// Query terms shared by shortlist retrieval and directly discovered dependency scoring.
+pub(super) fn lexical_terms(task: &str) -> std::collections::BTreeSet<String> {
+    task.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|term| term.chars().count() > 1)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Scores a source-backed record even when it was outside the truncated initial shortlist.
+pub(super) fn lexical_reasons(
+    record: &FileRecord,
+    terms: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let card = search_text(record).to_lowercase();
+    terms
+        .iter()
+        .filter(|term| card.contains(term.as_str()))
+        .map(|term| format!("literal term: {term}"))
+        .collect()
 }
 
 /// Indexes source values rather than serialization field names and unavailable messages.
