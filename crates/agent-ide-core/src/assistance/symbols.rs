@@ -3999,7 +3999,10 @@ impl Worker<'_> {
             return (None, "source probe did not finish".into());
         };
         if output.status != Some(0) {
-            return (None, format!("source probe exit status {:?}", output.status));
+            return (
+                None,
+                format!("source probe exit status {:?}", output.status),
+            );
         }
         if output.stdout.len() > 256 * 1024 {
             return (None, "source probe output exceeds 256 KiB".into());

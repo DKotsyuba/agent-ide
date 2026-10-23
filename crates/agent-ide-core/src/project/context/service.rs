@@ -487,10 +487,14 @@ impl ContextService {
                 );
             }
         }
+        // Deterministic public-evidence tiers by path: failure anchors (0), then the direct
+        // imports of anchored tests (1). The selector never drops them and ranks them first.
+        let mut pinned: BTreeMap<PathBuf, u8> = BTreeMap::new();
         if let Some(evidence) = evidence {
             // Actual failure locations must reach the selector even if similarity ranks them poorly.
             let records = index.records()?;
             let mut anchors = Vec::new();
+            let mut tests = Vec::new();
             for failure in &evidence.failures {
                 if anchors
                     .iter()
@@ -536,8 +540,35 @@ impl ContextService {
                     }
                     candidate.reasons.insert(0, format!("public check {} failure location; investigation anchor, not a proven defect", evidence.run_id));
                     anchors.push(candidate);
+                    if crate::lang::Language::for_path(&file.path)
+                        .is_some_and(|language| language.support().is_test_file(&file.path))
+                    {
+                        tests.push((file.path.clone(), source));
+                    }
                 }
             }
+            // The code an anchored test exercises is usually what it imports, which a failure
+            // inside the test itself never names.
+            let imported = anchored_imports(
+                &index.root,
+                &records,
+                &candidates,
+                &anchors,
+                &tests,
+                &mut result.warnings,
+                cancel,
+            )
+            .await?;
+            pinned = anchors
+                .iter()
+                .map(|candidate| (candidate.file.path.clone(), 0))
+                .chain(
+                    imported
+                        .iter()
+                        .map(|candidate| (candidate.file.path.clone(), 1)),
+                )
+                .collect();
+            anchors.extend(imported);
             // Observed failure files supplement the ranked retrieval quota; they must not
             // evict its tail. Both inputs are already bounded, with a final packet safety cap.
             let (combined, omitted) = merge_anchor_candidates(anchors, candidates);
@@ -664,25 +695,19 @@ impl ContextService {
                 }
                 position = end;
             }
-            // Unknown and expansion-needed candidates survive. Explicitly named paths stay available.
+            // Unknown and expansion-needed candidates survive. Public-evidence tiers and
+            // explicitly named paths stay available.
             candidates.retain(|candidate| {
-                task.contains(candidate.file.path.to_string_lossy().as_ref())
+                pinned.contains_key(&candidate.file.path)
+                    || task.contains(candidate.file.path.to_string_lossy().as_ref())
                     || assessments.get(&candidate.file.id).is_none_or(|value| {
                         value.relevance >= self.config.include_threshold || value.expansion >= 0.5
                     })
             });
-            candidates.sort_by(|a, b| {
-                let named = |candidate: &super::Candidate| {
-                    task.contains(candidate.file.path.to_string_lossy().as_ref())
-                };
-                let relevance = |candidate: &super::Candidate| {
-                    assessments
-                        .get(&candidate.file.id)
-                        .map_or(0.5, |value| value.relevance)
-                };
-                named(b)
-                    .cmp(&named(a))
-                    .then_with(|| relevance(b).total_cmp(&relevance(a)))
+            rank_selected(&mut candidates, &pinned, task, |candidate| {
+                assessments
+                    .get(&candidate.file.id)
+                    .map_or(0.5, |value| value.relevance)
             });
             for candidate in &mut candidates {
                 if let Some(value) = assessments.get(&candidate.file.id) {
@@ -981,6 +1006,174 @@ fn candidate_evidence(
     (views, notes)
 }
 
+/// Orders the selector's survivors: public-evidence tiers first in their evidence order
+/// (failure anchors, then direct imports of anchored tests), then task-named paths, then the
+/// rest; within the last two, by descending `relevance`. Scores and reasons are untouched.
+fn rank_selected(
+    candidates: &mut [super::Candidate],
+    pinned: &BTreeMap<PathBuf, u8>,
+    task: &str,
+    relevance: impl Fn(&super::Candidate) -> f64,
+) {
+    let tier = |candidate: &super::Candidate| {
+        pinned.get(&candidate.file.path).copied().unwrap_or(
+            if task.contains(candidate.file.path.to_string_lossy().as_ref()) {
+                2
+            } else {
+                3
+            },
+        )
+    };
+    candidates.sort_by(|a, b| {
+        let (left, right) = (tier(a), tier(b));
+        left.cmp(&right).then_with(|| {
+            if left < 2 {
+                std::cmp::Ordering::Equal
+            } else {
+                relevance(b).total_cmp(&relevance(a))
+            }
+        })
+    });
+}
+
+/// Most direct imports one anchored public test contributes.
+const MAX_IMPORTS_PER_TEST: usize = 8;
+
+/// Most direct imports all anchored public tests contribute together.
+const MAX_IMPORTED_FILES: usize = 16;
+
+/// Candidates for the indexed files the anchored public `tests` import directly (one hop, in
+/// source order), placed after the anchors. Each reference is a syntactic `file-ref/v1` use of
+/// the test's observed source, stated by its language's own name facts, and reaches a file only
+/// through that language's file probe against `records`; nothing is traversed further. Type-only
+/// imports stay: the facts do not prove which imports are erased. A language without name facts
+/// contributes nothing; a faulted extraction and every cap are disclosed in `warnings`.
+///
+/// # Errors
+///
+/// `Interrupted` when `cancel` fires: no further extraction starts.
+async fn anchored_imports(
+    root: &Path,
+    records: &[super::FileRecord],
+    ranked: &[super::Candidate],
+    anchors: &[super::Candidate],
+    tests: &[(PathBuf, String)],
+    warnings: &mut Vec<String>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> io::Result<Vec<super::Candidate>> {
+    use crate::lang::names::{Certainty, Role, ns};
+    let mut imported: Vec<super::Candidate> = Vec::new();
+    for (test, source) in tests {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "context cancelled",
+            ));
+        }
+        let Some(language) = crate::lang::Language::for_path(test) else {
+            continue;
+        };
+        let Some(names) = language.names() else {
+            continue;
+        };
+        let (worktree, file, bytes) = (
+            root.to_path_buf(),
+            test.clone(),
+            source.clone().into_bytes(),
+        );
+        let facts =
+            move || crate::intelligence::names::facts_of(&worktree, language, &file, &bytes);
+        let facts = if crate::intelligence::anchors::routed(language).is_some() {
+            match tokio::task::spawn_blocking(facts).await {
+                Ok(facts) => facts,
+                Err(_) => {
+                    warnings.push(format!(
+                        "{}: direct imports not resolved (extraction task failed)",
+                        test.display()
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            facts()
+        };
+        let mut facts = match facts {
+            Ok(facts) => facts.unwrap_or_default(),
+            Err(fault) => {
+                warnings.push(format!(
+                    "{}: direct imports not resolved ({fault})",
+                    test.display()
+                ));
+                continue;
+            }
+        };
+        // Source order decides which imports the per-test cap keeps.
+        facts.sort_by_key(|fact| (fact.line, fact.column));
+        let mut added = 0;
+        let mut beyond = 0;
+        for fact in facts {
+            if fact.key.namespace != ns::FILE_REF || fact.role != Role::Use {
+                continue;
+            }
+            let Some((target, assumption)) = names.file_probe().reach(&fact.key.name, |path| {
+                records.iter().any(|record| record.path == Path::new(path))
+            }) else {
+                continue;
+            };
+            let target = PathBuf::from(target);
+            if &target == test
+                || anchors.iter().any(|anchor| anchor.file.path == target)
+                || imported
+                    .iter()
+                    .any(|candidate| candidate.file.path == target)
+            {
+                continue;
+            }
+            if added == MAX_IMPORTS_PER_TEST || imported.len() == MAX_IMPORTED_FILES {
+                beyond += 1;
+                continue;
+            }
+            let Some(record) = records.iter().find(|record| record.path == target) else {
+                continue;
+            };
+            let certainty = match (fact.certainty, assumption) {
+                (Certainty::Exact, None) => "exact".to_owned(),
+                (Certainty::Exact, Some(reach)) => reach.to_owned(),
+                (Certainty::Heuristic(read), None) => read.to_owned(),
+                (Certainty::Heuristic(read), Some(reach)) => format!("{read}, {reach}"),
+            };
+            let mut candidate = ranked
+                .iter()
+                .find(|candidate| candidate.file.path == target)
+                .cloned()
+                .unwrap_or_else(|| super::Candidate {
+                    file: record.clone(),
+                    lexical_score: 0,
+                    reasons: Vec::new(),
+                    preferred_spans: Vec::new(),
+                    whole_file: false,
+                });
+            candidate.reasons.insert(
+                0,
+                format!(
+                    "direct import of anchored public test {} (line {}; syntactic reference, {certainty})",
+                    test.display(),
+                    fact.line
+                ),
+            );
+            imported.push(candidate);
+            added += 1;
+        }
+        if beyond > 0 {
+            warnings.push(format!(
+                "{}: {beyond} further direct imports omitted at the import cap",
+                test.display()
+            ));
+        }
+    }
+    Ok(imported)
+}
+
 /// Keeps validated anchors first without spending the ranked retrieval quota on them.
 /// Duplicate files use the anchor's current failure spans; the packet's hard limit stays 256.
 fn merge_anchor_candidates(
@@ -1150,5 +1343,256 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a", "b", "c", "a", "a"]
         );
+    }
+
+    /// Indexes `files` (path, text) lexically under a fresh scratch root.
+    async fn lexical_index(
+        name: &str,
+        files: &[(&str, String)],
+    ) -> (crate::scratch::ScratchDir, ContextIndex, ContextService) {
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new(name);
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let service = ContextService::new(ModelConfig {
+            embedding: None,
+            jev: None,
+            max_new_calls: 0,
+            include_threshold: 0.5,
+        })
+        .unwrap();
+        let mut index = ContextIndex::open(&root).unwrap();
+        let scope = crate::project::structure::StructureOptions {
+            respect_gitignore: false,
+            ..Default::default()
+        };
+        service
+            .index_project(
+                &mut index,
+                &scope,
+                &DocumentOptions::default(),
+                &super::super::indexer::IndexBudget {
+                    max_new_calls: 0,
+                    max_input_bytes: 0,
+                },
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        (root, index, service)
+    }
+
+    /// An anchored public test's direct syntactic imports become candidates after the anchors,
+    /// reached through the language's own probe, in source order, labelled with the test and
+    /// certainty. Unreachable references, the test itself and anchored files add nothing, and
+    /// the per-test cap is disclosed.
+    #[tokio::test]
+    async fn anchored_tests_contribute_their_direct_imports() {
+        let mut refs: Vec<String> = (0..10).map(|n| format!("ref:lib/m{n}")).collect();
+        refs.splice(
+            0..0,
+            [
+                "ref:sub/a".into(),
+                "ref:missing".into(),
+                "ref:test_a.beta".into(),
+                "ref:anchor".into(),
+            ],
+        );
+        let test = format!("{}\nfail here\n", refs.join(" "));
+        let mut files = vec![
+            ("test_a.beta", test.clone()),
+            ("sub/a.alpha", "subject\n".to_owned()),
+            ("anchor.alpha", "anchored\n".to_owned()),
+        ];
+        for n in 0..10 {
+            files.push((
+                Box::leak(format!("lib/m{n}.alpha").into_boxed_str()),
+                "m\n".to_owned(),
+            ));
+        }
+        let (root, index, _) = lexical_index("context-anchored-imports", &files).await;
+        let records = index.records().unwrap();
+        let candidate = |path: &str| super::super::Candidate {
+            file: records
+                .iter()
+                .find(|record| record.path == Path::new(path))
+                .unwrap()
+                .clone(),
+            lexical_score: 0,
+            reasons: Vec::new(),
+            preferred_spans: Vec::new(),
+            whole_file: false,
+        };
+        let anchors = [candidate("test_a.beta"), candidate("anchor.alpha")];
+        let mut warnings = Vec::new();
+        let imported = anchored_imports(
+            &root,
+            &records,
+            &[],
+            &anchors,
+            &[(PathBuf::from("test_a.beta"), test.clone())],
+            &mut warnings,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let paths: Vec<_> = imported
+            .iter()
+            .map(|candidate| candidate.file.path.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "sub/a.alpha",
+                "lib/m0.alpha",
+                "lib/m1.alpha",
+                "lib/m2.alpha",
+                "lib/m3.alpha",
+                "lib/m4.alpha",
+                "lib/m5.alpha",
+                "lib/m6.alpha"
+            ]
+        );
+        assert_eq!(
+            imported[0].reasons,
+            [
+                "direct import of anchored public test test_a.beta (line 1; syntactic reference, extension probe)"
+            ]
+        );
+        assert_eq!(
+            warnings,
+            ["test_a.beta: 3 further direct imports omitted at the import cap"]
+        );
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        let refused = anchored_imports(
+            &root,
+            &records,
+            &[],
+            &anchors,
+            &[(PathBuf::from("test_a.beta"), test)],
+            &mut Vec::new(),
+            &cancelled,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::Interrupted);
+    }
+
+    /// End to end on lexical retrieval: a failure inside a public test delivers the file the
+    /// test imports, which neither the failure nor the task names.
+    #[tokio::test]
+    async fn a_failing_test_delivers_its_imported_subject() {
+        let mut files = vec![
+            ("test_a.beta", "ref:sub/a\nfail here\n".to_owned()),
+            ("sub/a.alpha", "subject\n".to_owned()),
+        ];
+        for n in 0..12 {
+            files.push((
+                Box::leak(format!("needle-{n:02}.alpha").into_boxed_str()),
+                "needle\n".to_owned(),
+            ));
+        }
+        let (_root, index, service) = lexical_index("context-anchored-subject", &files).await;
+        let hash = index
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.path == Path::new("test_a.beta"))
+            .unwrap()
+            .content_hash
+            .unwrap();
+        let evidence = super::super::evidence::PublicEvidence {
+            run_id: "tests-1".into(),
+            failures: vec![super::super::evidence::FailureEvidence {
+                path: "test_a.beta".into(),
+                content_hash: hash,
+                line: Some(2),
+                message: "failed".into(),
+            }],
+        };
+        let options = PacketOptions {
+            candidates: 4,
+            ..Default::default()
+        };
+        let prepared = service
+            .prepare_with_evidence_for_delivery(
+                &index,
+                "needle",
+                &evidence,
+                &options,
+                &DocumentOptions::default(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let paths: Vec<_> = prepared
+            .packet
+            .windows
+            .iter()
+            .map(|window| window.path.to_str().unwrap())
+            .collect();
+        assert_eq!(paths[..2], ["test_a.beta", "sub/a.alpha"], "{paths:?}");
+        assert!(
+            prepared.packet.windows[1].reasons[0]
+                .starts_with("direct import of anchored public test test_a.beta")
+        );
+    }
+
+    /// Public-evidence tiers lead the selector's order whatever their relevance: anchors in
+    /// evidence order, then direct imports, then task-named paths, then the rest by relevance.
+    #[test]
+    fn selector_order_keeps_public_evidence_tiers_first() {
+        let candidate = |path: &str, score: usize| super::super::Candidate {
+            file: super::super::FileRecord {
+                id: path.into(),
+                path: path.into(),
+                content_hash: None,
+                language: None,
+                header: crate::project::structure::Detail::Absent,
+                imports: crate::project::structure::Detail::Absent,
+                symbols: None,
+                truncated: false,
+            },
+            lexical_score: score,
+            reasons: vec![format!("reason {path}")],
+            preferred_spans: Vec::new(),
+            whole_file: false,
+        };
+        let mut candidates = vec![
+            candidate("high.x", 9),
+            candidate("import.x", 1),
+            candidate("named.x", 2),
+            candidate("anchor-b.x", 3),
+            candidate("low.x", 0),
+            candidate("anchor-a.x", 4),
+        ];
+        let pinned = BTreeMap::from([
+            (PathBuf::from("anchor-b.x"), 0),
+            (PathBuf::from("anchor-a.x"), 0),
+            (PathBuf::from("import.x"), 1),
+        ]);
+        rank_selected(&mut candidates, &pinned, "fix named.x", |candidate| {
+            candidate.lexical_score as f64 / 10.0
+        });
+        let order: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.file.path.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "anchor-b.x",
+                "anchor-a.x",
+                "import.x",
+                "named.x",
+                "high.x",
+                "low.x"
+            ]
+        );
+        assert_eq!(candidates[0].reasons, ["reason anchor-b.x"]);
     }
 }

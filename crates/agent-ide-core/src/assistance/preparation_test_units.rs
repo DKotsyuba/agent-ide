@@ -22,8 +22,9 @@ const MAX_CONTEXT_BYTES: usize = 8 * 1024;
 /// Byte spans, in source order and merged, that deliver every failing test named by `anchors`
 /// (1-based lines) as a complete unit, or `None` when that is not provable from the outline.
 ///
-/// Kept: each anchor's innermost enclosing `Test` symbol whole; every enclosing symbol's own lines
-/// (header, closing line, comments, nested declarations and — only when no sibling test is dropped
+/// Kept: each anchor's innermost enclosing `Test` symbol whole; enclosing symbols' own lines
+/// (blank padding outside children is omitted when siblings are dropped; headers, closers,
+/// comments, nested declarations and — only when no sibling test is dropped
 /// from it — its setup statements) with sibling tests that hold no anchor removed; `imports`; every
 /// module-level code line (not a comment) no top-level symbol covers; and top-level non-test
 /// declarations whose name occurs in the kept text, transitively. `None` when an anchor lies outside every test, a needed
@@ -102,6 +103,20 @@ pub(super) fn localize(
                 })
             {
                 return None;
+            }
+            // Drop only blank suite-frame lines outside every declaration. Kept tests and
+            // helpers remain byte-exact, including whitespace inside multiline literals.
+            if drops_sibling {
+                for line in enclosing.range.start + 1..enclosing.range.end {
+                    if text_of(line).trim().is_empty()
+                        && !enclosing
+                            .children
+                            .iter()
+                            .any(|child| child.range.start <= line && line <= child.range.end)
+                    {
+                        kept.remove(&line);
+                    }
+                }
             }
             for child in &enclosing.children {
                 if child.kind == SymbolKind::Test && !on_path(child) && valid(child.range) {
@@ -390,6 +405,24 @@ describe('compose', () => {
 })
 "
         );
+    }
+
+    /// Removing blank suite padding must not alter whitespace inside the selected test.
+    #[test]
+    fn blank_suite_padding_is_omitted_but_test_bytes_stay_exact() {
+        let source = SUITE
+            .replace("  // cases share no state", "  ")
+            .replace("    expect(build(2)).toBe(3)", "    ");
+        let spans = localize(
+            &outline(&source, suite_symbols()),
+            &source,
+            &[17],
+            &[LineRange::new(1, 1)],
+        )
+        .unwrap();
+        let result = text(&source, &spans);
+        assert!(!result.contains("describe('compose', () => {\n  \n"));
+        assert!(result.contains("  it('fails', () => {\n    \n  })"));
     }
 
     /// Two anchors in two sibling tests keep both; neither removes the other. The caller always
