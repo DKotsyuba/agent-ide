@@ -286,6 +286,16 @@ impl LanguageSupport for TypeScript {
         ))
     }
 
+    /// Only explicit whole type-only import/export statements are guaranteed erased.
+    /// Inline type specifiers can retain module side effects and are deliberately unclassified.
+    fn source_type_only_references(
+        &self,
+        file: &Path,
+        source: &str,
+    ) -> Vec<std::ops::Range<usize>> {
+        crate::names::source_type_only_references(file, source)
+    }
+
     /// Top-level declarations recognized from the text alone, for callers the server cannot
     /// answer (a file whose `tsconfig.json` lives below the worktree root). Each column-0
     /// `function`, `class`, `interface`, `type`, `enum`, `namespace` or `const`/`let`/`var`

@@ -978,6 +978,18 @@ pub trait LanguageSupport: Send + Sync {
         ))
     }
 
+    /// Specifier-content byte ranges of imports proven type-only from this exact source.
+    /// Pure syntax only: no file reads or import resolution. The empty default leaves every
+    /// reference runtime-or-unknown; callers must not infer erasure from missing metadata.
+    fn source_type_only_references(
+        &self,
+        file: &Path,
+        source: &str,
+    ) -> Vec<std::ops::Range<usize>> {
+        let _ = (file, source);
+        Vec::new()
+    }
+
     /// Outline computed from the text alone; `None` (the default) keeps outlines server-backed.
     /// When no registered server owns the file's extension, the symbol tools outline, read and
     /// describe the file from this and report usages and callers as unavailable. A language with
@@ -1106,6 +1118,30 @@ pub(crate) mod testing {
     struct Support(&'static str);
 
     impl LanguageSupport for Support {
+        /// Beta fixture lines starting with `!types ` mark their ref tokens as type-only.
+        fn source_type_only_references(
+            &self,
+            _file: &Path,
+            source: &str,
+        ) -> Vec<std::ops::Range<usize>> {
+            let mut ranges = Vec::new();
+            if self.0 != "beta" {
+                return ranges;
+            }
+            let mut offset = 0;
+            for line in source.split_inclusive('\n') {
+                if line.starts_with("!types ") {
+                    for (start, _) in line.match_indices("ref:") {
+                        let end = line[start..]
+                            .find(char::is_whitespace)
+                            .map_or(line.len(), |end| start + end);
+                        ranges.push(offset + start..offset + end);
+                    }
+                }
+                offset += line.len();
+            }
+            ranges
+        }
         /// The stubbed language.
         fn language(&self) -> Language {
             Language::by_id(self.0)

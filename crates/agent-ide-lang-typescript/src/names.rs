@@ -920,9 +920,147 @@ pub(crate) fn source_import_spans(
     agent_ide_core::lang::regions::import_spans_from_code(&code.lines().collect::<Vec<_>>(), rules)
 }
 
+/// Specifier byte ranges for explicit whole-statement type-only imports and re-exports.
+/// Reuses the source lexer and clause boundary finder; inline type specifiers, side effects,
+/// ambiguous bindings and unsupported forms remain unclassified. No resolution or file reads.
+pub(crate) fn source_type_only_references(file: &Path, source: &str) -> Vec<Range<usize>> {
+    if !matches!(
+        file.extension().and_then(|ext| ext.to_str()),
+        Some("ts" | "tsx" | "mts" | "cts")
+    ) {
+        return Vec::new();
+    }
+    let tokens = tokens(source, file.extension().is_some_and(|ext| ext == "tsx"));
+    let word = |at: usize| match tokens.get(at) {
+        Some(Token::Word(range)) => Some(&source[range.clone()]),
+        _ => None,
+    };
+    let mut sink = FactSink::new();
+    let scanner = Facts {
+        file,
+        source,
+        line_starts: vec![0],
+        sink: &mut sink,
+        full: false,
+    };
+    let mut ranges = Vec::new();
+    for at in 0..tokens.len() {
+        let Some(keyword @ ("import" | "export")) = word(at) else {
+            continue;
+        };
+        if word(at + 1) != Some("type")
+            || (at > 0 && matches!(tokens[at - 1], Token::Punct(b'.', _)))
+        {
+            continue;
+        }
+        let Some((from, range)) = scanner.clause(&tokens, at + 2) else {
+            continue;
+        };
+        if type_only_clause(&tokens[at + 2..from], source, keyword == "export") {
+            ranges.push(range);
+        }
+    }
+    ranges
+}
+
+/// Recognizes only complete type-only clause shapes; unknown grammar keeps the edge ordinary.
+fn type_only_clause(clause: &[Token], source: &str, export: bool) -> bool {
+    let word = |token: &Token| match token {
+        Token::Word(range) => Some(&source[range.clone()]),
+        _ => None,
+    };
+    match clause {
+        [Token::Word(name)] if !export => &source[name.clone()] != "from",
+        [Token::Punct(b'*', _)] => export,
+        [Token::Punct(b'*', _), alias, Token::Word(_)] => word(alias) == Some("as"),
+        [Token::Punct(b'{', _), inner @ .., Token::Punct(b'}', _)] => {
+            let mut at = 0;
+            while at < inner.len() {
+                if !matches!(inner[at], Token::Word(_)) {
+                    return false;
+                }
+                at += 1;
+                if inner.get(at).and_then(word) == Some("as") {
+                    if !matches!(inner.get(at + 1), Some(Token::Word(_))) {
+                        return false;
+                    }
+                    at += 2;
+                }
+                if at < inner.len() {
+                    if !matches!(inner[at], Token::Punct(b',', _)) {
+                        return false;
+                    }
+                    at += 1;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whole type modifiers are distinct from inline modifiers, ordinary bindings and literals.
+    #[test]
+    fn type_only_reference_ranges_are_conservative() {
+        let source = r#"
+import type { T, U as V } from './types'; import { value } from './runtime';
+import /* comment */ type
+  * as NS from './namespace';
+import type Default from './default';
+export type { T as U } from './export';
+export type * from './export-star';
+export type * as NS from './export-namespace';
+import type from './binding-named-type';
+import type, { value } from './mixed-default';
+import { type T } from './inline-side-effect';
+import { type T, value } from './mixed';
+import './side-effect';
+const dynamic = import('./dynamic');
+const common = require('./require');
+const literal = "import type { X } from './string'";
+const template = `import type { X } from './template'`;
+// import type { X } from './comment';
+"#;
+        let ranges = source_type_only_references(Path::new("source.ts"), source);
+        let names: Vec<_> = ranges.iter().map(|range| &source[range.clone()]).collect();
+        assert_eq!(
+            names,
+            [
+                "./types",
+                "./namespace",
+                "./default",
+                "./export",
+                "./export-star",
+                "./export-namespace"
+            ]
+        );
+        assert!(source_type_only_references(Path::new("source.js"), source).is_empty());
+    }
+
+    /// Exact byte ranges keep a same-line runtime reference to the same file independent.
+    #[test]
+    fn type_only_ranges_preserve_same_line_runtime_references() {
+        let source = "/* α */ import type { T } from './same'; import { run } from './same';";
+        let ranges = source_type_only_references(Path::new("source.tsx"), source);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, source.find("./same").unwrap());
+        assert!(!ranges[0].contains(&source.rfind("./same").unwrap()));
+        for malformed in [
+            "import type, { T } from './m';",
+            "import type { T = bad } from './m';",
+            "import type { T }",
+            "import type T = require('./m')",
+        ] {
+            assert!(
+                source_type_only_references(Path::new("source.ts"), malformed).is_empty(),
+                "{malformed}"
+            );
+        }
+    }
 
     /// `(namespace id, name, line, column, heuristic reason)` of each fact.
     type Row = (&'static str, String, u32, u32, Option<&'static str>);

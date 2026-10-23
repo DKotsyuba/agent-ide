@@ -1028,7 +1028,8 @@ fn apply_assessments(
 
 /// Orders the selector's survivors: public-evidence tiers first in their evidence order
 /// (failure anchors 0, direct imports of anchored tests 1, of other anchors 2), then
-/// task-named paths (3), then the rest (4); within the last two, by descending `relevance`.
+/// task-named paths (3), proven type-only imports (4), then the rest (5). The first three
+/// tiers keep evidence order; later tiers sort by descending `relevance`.
 /// Scores and reasons are untouched.
 fn rank_selected(
     candidates: &mut [super::Candidate],
@@ -1037,13 +1038,13 @@ fn rank_selected(
     relevance: impl Fn(&super::Candidate) -> f64,
 ) {
     let tier = |candidate: &super::Candidate| {
-        pinned.get(&candidate.file.path).copied().unwrap_or(
-            if task.contains(candidate.file.path.to_string_lossy().as_ref()) {
-                3
-            } else {
-                4
-            },
-        )
+        let named = task.contains(candidate.file.path.to_string_lossy().as_ref());
+        match pinned.get(&candidate.file.path).copied() {
+            Some(tier) if named => tier.min(3),
+            Some(tier) => tier,
+            None if named => 3,
+            None => 5,
+        }
     };
     candidates.sort_by(|a, b| {
         let (left, right) = (tier(a), tier(b));
@@ -1083,11 +1084,11 @@ const MAX_IMPORTED_FILES: usize = 16;
 
 /// Candidates for the indexed files the public anchors import directly (one hop, in source
 /// order), with their tier: 1 for imports of anchored tests, 2 for imports of other failure
-/// locations. Test anchors are read first, so they win the shared cap. `sources` holds each
-/// anchor's observed source and whether it is a test. Each reference is a syntactic `file-ref/v1`
+/// locations; proven type-only imports use tier 4 after both. Ranking precedes the shared cap.
+/// `sources` holds each anchor's observed source and whether it is a test. Each reference is a syntactic `file-ref/v1`
 /// use stated by the anchor language's own name facts, and reaches a file only through that
-/// language's file probe against `records`; nothing is traversed further. Type-only imports stay:
-/// the facts do not prove which imports are erased. A language without name facts contributes
+/// language's file probe against `records`; nothing is traversed further. Proven type-only
+/// references stay as lower-priority candidates; unclassified references keep their usual tier. A language without name facts contributes
 /// nothing; a faulted extraction and every cap are disclosed in `warnings`.
 ///
 /// # Errors
@@ -1103,125 +1104,209 @@ async fn anchored_imports(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> io::Result<Vec<(super::Candidate, u8)>> {
     use crate::lang::names::{Certainty, Role, ns};
-    let mut imported: Vec<(super::Candidate, u8)> = Vec::new();
-    let ordered = sources
-        .iter()
-        .filter(|(_, _, test)| *test)
-        .chain(sources.iter().filter(|(_, _, test)| !*test));
-    for (test, source, is_test) in ordered {
+    /// Lightweight proposal; clone file metadata only after shared admission limits pass.
+    struct Import {
+        record: usize,
+        origin: usize,
+        line: u32,
+        tier: u8,
+        certainty: Certainty,
+        assumption: Option<&'static str>,
+    }
+    let mut proposed = Vec::new();
+    for (origin, (path, source, is_test)) in sources.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "context cancelled",
             ));
         }
-        let Some(language) = crate::lang::Language::for_path(test) else {
+        let Some(language) = crate::lang::Language::for_path(path) else {
             continue;
         };
         let Some(names) = language.names() else {
             continue;
         };
-        let (worktree, file, bytes) = (
-            root.to_path_buf(),
-            test.clone(),
-            source.clone().into_bytes(),
-        );
-        let facts =
-            move || crate::intelligence::names::facts_of(&worktree, language, &file, &bytes);
-        let facts = if crate::intelligence::anchors::routed(language).is_some() {
-            match tokio::task::spawn_blocking(facts).await {
-                Ok(facts) => facts,
+        let (worktree, file, text) = (root.to_path_buf(), path.clone(), source.clone());
+        let extract = move || {
+            let type_only = language.support().source_type_only_references(&file, &text);
+            (
+                crate::intelligence::names::facts_of(&worktree, language, &file, text.as_bytes()),
+                type_only,
+            )
+        };
+        let (facts, ranges) = if crate::intelligence::anchors::routed(language).is_some() {
+            match tokio::task::spawn_blocking(extract).await {
+                Ok(value) => value,
                 Err(_) => {
                     warnings.push(format!(
                         "{}: direct imports not resolved (extraction task failed)",
-                        test.display()
+                        path.display()
                     ));
                     continue;
                 }
             }
         } else {
-            facts()
+            extract()
         };
-        let mut facts = match facts {
+        let facts = match facts {
             Ok(facts) => facts.unwrap_or_default(),
             Err(fault) => {
                 warnings.push(format!(
                     "{}: direct imports not resolved ({fault})",
-                    test.display()
+                    path.display()
                 ));
                 continue;
             }
         };
-        // Source order decides which imports the per-test cap keeps.
-        facts.sort_by_key(|fact| (fact.line, fact.column));
-        let mut added = 0;
-        let mut beyond = 0;
+        let type_only: Vec<_> = ranges
+            .into_iter()
+            .filter(|range| {
+                range.start < range.end
+                    && range.end <= source.len()
+                    && source.is_char_boundary(range.start)
+                    && source.is_char_boundary(range.end)
+            })
+            .collect();
+        let offsets: Vec<_> = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(at, _)| at + 1))
+            .collect();
         for fact in facts {
             if fact.key.namespace != ns::FILE_REF || fact.role != Role::Use {
                 continue;
             }
-            let Some((target, assumption)) = names.file_probe().reach(&fact.key.name, |path| {
-                records.iter().any(|record| record.path == Path::new(path))
+            let Some((target, assumption)) = names.file_probe().reach(&fact.key.name, |name| {
+                records.iter().any(|record| record.path == Path::new(name))
             }) else {
                 continue;
             };
-            let target = PathBuf::from(target);
-            if &target == test
-                || anchors.iter().any(|anchor| anchor.file.path == target)
-                || imported
+            if Path::new(&target) == path
+                || anchors
                     .iter()
-                    .any(|(candidate, _)| candidate.file.path == target)
+                    .any(|anchor| anchor.file.path == Path::new(&target))
             {
                 continue;
             }
-            if added == MAX_IMPORTS_PER_ANCHOR || imported.len() == MAX_IMPORTED_FILES {
-                beyond += 1;
-                continue;
-            }
-            let Some(record) = records.iter().find(|record| record.path == target) else {
-                continue;
-            };
-            let certainty = match (fact.certainty, assumption) {
-                (Certainty::Exact, None) => "exact".to_owned(),
-                (Certainty::Exact, Some(reach)) => reach.to_owned(),
-                (Certainty::Heuristic(read), None) => read.to_owned(),
-                (Certainty::Heuristic(read), Some(reach)) => format!("{read}, {reach}"),
-            };
-            let mut candidate = ranked
+            let Some(record) = records
                 .iter()
-                .find(|candidate| candidate.file.path == target)
-                .cloned()
-                .unwrap_or_else(|| super::Candidate {
-                    file: record.clone(),
-                    lexical_score: 0,
-                    reasons: Vec::new(),
-                    preferred_spans: Vec::new(),
-                    whole_file: false,
-                });
-            let anchor = if *is_test {
-                "anchored public test"
-            } else {
-                "public failure location"
+                .position(|record| record.path == Path::new(&target))
+            else {
+                continue;
             };
-            candidate.reasons.insert(
-                0,
-                format!(
-                    "direct import of {anchor} {} (line {}; syntactic reference, {certainty})",
-                    test.display(),
-                    fact.line
-                ),
-            );
-            imported.push((candidate, if *is_test { 1 } else { 2 }));
-            added += 1;
-        }
-        if beyond > 0 {
-            warnings.push(format!(
-                "{}: {beyond} further direct imports omitted at the import cap",
-                test.display()
-            ));
+            let tier = if reference_is_type_only(&offsets, fact.line, fact.column, &type_only) {
+                4
+            } else if *is_test {
+                1
+            } else {
+                2
+            };
+            proposed.push(Import {
+                record,
+                origin,
+                line: fact.line,
+                tier,
+                certainty: fact.certainty,
+                assumption,
+            });
         }
     }
+    if cancel.is_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "context cancelled",
+        ));
+    }
+    // Rank before applying either cap: an early type-only import must not consume a slot
+    // needed by a later runtime reference, including another reference to the same file.
+    proposed.sort_by_key(|item| item.tier);
+    let mut imported = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut admitted = vec![0; sources.len()];
+    let mut beyond = vec![0; sources.len()];
+    for item in proposed {
+        if seen.contains(&item.record) {
+            continue;
+        }
+        if admitted[item.origin] == MAX_IMPORTS_PER_ANCHOR || imported.len() == MAX_IMPORTED_FILES {
+            beyond[item.origin] += 1;
+            continue;
+        }
+        seen.insert(item.record);
+        admitted[item.origin] += 1;
+        let record = &records[item.record];
+        let (path, _, is_test) = &sources[item.origin];
+        let certainty = match (item.certainty, item.assumption) {
+            (Certainty::Exact, None) => "exact".to_owned(),
+            (Certainty::Exact, Some(reach)) => reach.to_owned(),
+            (Certainty::Heuristic(read), None) => read.to_owned(),
+            (Certainty::Heuristic(read), Some(reach)) => format!("{read}, {reach}"),
+        };
+        let mut candidate = ranked
+            .iter()
+            .find(|candidate| candidate.file.path == record.path)
+            .cloned()
+            .unwrap_or_else(|| super::Candidate {
+                file: record.clone(),
+                lexical_score: 0,
+                reasons: Vec::new(),
+                preferred_spans: Vec::new(),
+                whole_file: false,
+            });
+        let anchor = if *is_test {
+            "anchored public test"
+        } else {
+            "public failure location"
+        };
+        let kind = if item.tier == 4 {
+            "; proven type-only"
+        } else {
+            ""
+        };
+        candidate.reasons.insert(
+            0,
+            format!(
+                "direct import of {anchor} {} (line {}; syntactic reference, {certainty}{kind})",
+                path.display(),
+                item.line
+            ),
+        );
+        imported.push((candidate, item.tier));
+    }
+    for (origin, count) in beyond
+        .into_iter()
+        .enumerate()
+        .filter(|(_, count)| *count > 0)
+    {
+        warnings.push(format!(
+            "{}: {count} further direct imports omitted at the import cap",
+            sources[origin].0.display()
+        ));
+    }
     Ok(imported)
+}
+
+/// Match a fact's one-based byte position to exact specifier ranges, never to its whole line.
+fn reference_is_type_only(
+    offsets: &[usize],
+    line: u32,
+    column: u32,
+    ranges: &[std::ops::Range<usize>],
+) -> bool {
+    let Some(at) = line
+        .checked_sub(1)
+        .and_then(|line| offsets.get(line as usize))
+        .and_then(|start| {
+            column
+                .checked_sub(1)
+                .and_then(|column| start.checked_add(column as usize))
+        })
+    else {
+        return false;
+    };
+    if offsets.get(line as usize).is_some_and(|next| at >= *next) {
+        return false;
+    }
+    ranges.iter().any(|range| range.contains(&at))
 }
 
 /// Keeps validated anchors first without spending the ranked retrieval quota on them.
@@ -1625,6 +1710,86 @@ mod tests {
         assert_eq!(value["line"], 7);
         failure.message = " \n\t".into();
         assert!(public_failure_reason(&failure).is_none());
+    }
+
+    /// Known type-only references cannot consume the shared cap ahead of later runtime imports.
+    #[tokio::test]
+    async fn runtime_imports_precede_type_only_imports_before_caps() {
+        let first = format!(
+            "!types {}\n",
+            (0..8)
+                .map(|n| format!("ref:t{n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let second = format!(
+            "!types {}\n",
+            (8..16)
+                .map(|n| format!("ref:t{n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let runtime = "ref:r0 ref:r1\n".to_owned();
+        let mut files = vec![
+            ("test_a.beta", first.clone()),
+            ("test_b.beta", second.clone()),
+            ("lib.beta", runtime.clone()),
+        ];
+        for name in (0..16)
+            .map(|n| format!("t{n}.alpha"))
+            .chain((0..2).map(|n| format!("r{n}.alpha")))
+        {
+            files.push((Box::leak(name.into_boxed_str()), "code\n".into()));
+        }
+        let (root, index, _) = lexical_index("type-import-cap", &files).await;
+        let sources = vec![
+            ("test_a.beta".into(), first, true),
+            ("test_b.beta".into(), second, true),
+            ("lib.beta".into(), runtime, false),
+        ];
+        let mut warnings = Vec::new();
+        let imported = anchored_imports(
+            &root,
+            &index.records().unwrap(),
+            &[],
+            &[],
+            &sources,
+            &mut warnings,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(imported.len(), MAX_IMPORTED_FILES);
+        assert_eq!(imported[0].0.file.path, Path::new("r0.alpha"));
+        assert_eq!(imported[1].0.file.path, Path::new("r1.alpha"));
+        assert!(imported[..2].iter().all(|(_, tier)| *tier == 2));
+        assert!(imported[2..].iter().all(|(_, tier)| *tier == 4));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("2 further direct imports"))
+        );
+    }
+
+    /// Byte positions distinguish imports on one line and account for preceding Unicode bytes.
+    #[test]
+    fn type_only_reference_positions_are_not_line_wide() {
+        let source = "α 'a' 'b'\nβ 'c' 'd'";
+        let offsets = [0, source.find('\n').unwrap() + 1];
+        let a = source.find('a').unwrap();
+        let c = source.find('c').unwrap();
+        let ranges = [a..a + 1, c..c + 1];
+        assert!(reference_is_type_only(&offsets, 1, 5, &ranges));
+        assert!(!reference_is_type_only(&offsets, 1, 9, &ranges));
+        assert!(reference_is_type_only(&offsets, 2, 5, &ranges));
+        assert!(!reference_is_type_only(&offsets, 0, 5, &ranges));
+        assert!(!reference_is_type_only(&offsets, 2, 0, &ranges));
+        assert!(!reference_is_type_only(
+            &offsets,
+            1,
+            (c + 1) as u32,
+            &ranges
+        ));
     }
 
     /// Public-evidence tiers lead the selector's order whatever their relevance: anchors in
