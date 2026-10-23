@@ -34,9 +34,10 @@ const PROVIDER_TESTS: [&str; 4] = [
     "configured_product_claude_returns_real_pyright_semantic_context_diff_and_stop",
 ];
 /// Non-Rust tooling source is prohibited outside these declared product assets: the embedded
-/// TypeScript checker, syntax outline, shared version predicate and runner prelude ship via
+/// TypeScript checker, syntax outline/context selector, version predicate and runner prelude ship via
 /// `include_str!`; `record.mjs` is the Rust outline-corpus utility (LANG-03 exceptions).
-const ALLOWED_NON_RUST: [&str; 5] = [
+const ALLOWED_NON_RUST: [&str; 6] = [
+    "crates/agent-ide-lang-typescript/src/class_context.js",
     "crates/agent-ide-lang-typescript/src/outline_probe.js",
     "crates/agent-ide-lang-typescript/src/typescript_adapter.js",
     "crates/agent-ide-lang-typescript/src/version_range.js",
@@ -561,6 +562,7 @@ mod tests {
             found,
             vec![
                 "crates/agent-ide-lang-rust/tests/fixtures/lexical/record.mjs".to_owned(),
+                "crates/agent-ide-lang-typescript/src/class_context.js".to_owned(),
                 "crates/agent-ide-lang-typescript/src/outline_probe.js".to_owned(),
                 "crates/agent-ide-lang-typescript/src/runner_guard.js".to_owned(),
                 "crates/agent-ide-lang-typescript/src/typescript_adapter.js".to_owned(),
