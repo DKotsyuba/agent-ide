@@ -494,7 +494,7 @@ impl ContextService {
             // Actual failure locations must reach the selector even if similarity ranks them poorly.
             let records = index.records()?;
             let mut anchors = Vec::new();
-            let mut tests = Vec::new();
+            let mut sources = Vec::new();
             for failure in &evidence.failures {
                 if anchors
                     .iter()
@@ -543,21 +543,19 @@ impl ContextService {
                         candidate.reasons.insert(1, diagnostic);
                     }
                     anchors.push(candidate);
-                    if crate::lang::Language::for_path(&file.path)
-                        .is_some_and(|language| language.support().is_test_file(&file.path))
-                    {
-                        tests.push((file.path.clone(), source));
-                    }
+                    let test = crate::lang::Language::for_path(&file.path)
+                        .is_some_and(|language| language.support().is_test_file(&file.path));
+                    sources.push((file.path.clone(), source, test));
                 }
             }
-            // The code an anchored test exercises is usually what it imports, which a failure
-            // inside the test itself never names.
+            // The code an anchor exercises or depends on is usually what it imports, which a
+            // failure inside the anchor itself never names.
             let imported = anchored_imports(
                 &index.root,
                 &records,
                 &candidates,
                 &anchors,
-                &tests,
+                &sources,
                 &mut result.warnings,
                 cancel,
             )
@@ -568,10 +566,10 @@ impl ContextService {
                 .chain(
                     imported
                         .iter()
-                        .map(|candidate| (candidate.file.path.clone(), 1)),
+                        .map(|(candidate, tier)| (candidate.file.path.clone(), *tier)),
                 )
                 .collect();
-            anchors.extend(imported);
+            anchors.extend(imported.into_iter().map(|(candidate, _)| candidate));
             // Observed failure files supplement the ranked retrieval quota; they must not
             // evict its tail. Both inputs are already bounded, with a final packet safety cap.
             let (combined, omitted) = merge_anchor_candidates(anchors, candidates);
@@ -698,29 +696,13 @@ impl ContextService {
                 }
                 position = end;
             }
-            // Unknown and expansion-needed candidates survive. Public-evidence tiers and
-            // explicitly named paths stay available.
-            candidates.retain(|candidate| {
-                pinned.contains_key(&candidate.file.path)
-                    || task.contains(candidate.file.path.to_string_lossy().as_ref())
-                    || assessments.get(&candidate.file.id).is_none_or(|value| {
-                        value.relevance >= self.config.include_threshold || value.expansion >= 0.5
-                    })
-            });
-            rank_selected(&mut candidates, &pinned, task, |candidate| {
-                assessments
-                    .get(&candidate.file.id)
-                    .map_or(0.5, |value| value.relevance)
-            });
-            for candidate in &mut candidates {
-                if let Some(value) = assessments.get(&candidate.file.id) {
-                    candidate.whole_file = value.expansion >= 0.5;
-                    candidate.reasons.push(format!(
-                        "Jev relevance estimate: {:.2}; additional evidence: {:.2}",
-                        value.relevance, value.expansion
-                    ));
-                }
-            }
+            apply_assessments(
+                &mut candidates,
+                &assessments,
+                &pinned,
+                task,
+                self.config.include_threshold,
+            );
         }
         // Collect under the unchanged byte/read limits, then apply the actual output budget
         // fairly across files. This private ceiling is not a model context allowance.
@@ -1009,9 +991,45 @@ fn candidate_evidence(
     (views, notes)
 }
 
+/// Applies the selector's judgments without changing delivery shape. Unknown candidates, relevant
+/// ones and those whose exclusion needs more evidence (`expansion` ≥ 0.5) survive, as do
+/// public-evidence tiers and task-named paths. An expansion answer is uncertainty about
+/// excluding a candidate, not a request for its whole file: preferred spans and `whole_file`
+/// stay as retrieval set them, and the dependency evidence comes from the anchors' direct
+/// imports. Both estimates are recorded as reasons.
+fn apply_assessments(
+    candidates: &mut Vec<super::Candidate>,
+    assessments: &BTreeMap<String, super::select::Assessment>,
+    pinned: &BTreeMap<PathBuf, u8>,
+    task: &str,
+    include_threshold: f64,
+) {
+    candidates.retain(|candidate| {
+        pinned.contains_key(&candidate.file.path)
+            || task.contains(candidate.file.path.to_string_lossy().as_ref())
+            || assessments
+                .get(&candidate.file.id)
+                .is_none_or(|value| value.relevance >= include_threshold || value.expansion >= 0.5)
+    });
+    rank_selected(candidates, pinned, task, |candidate| {
+        assessments
+            .get(&candidate.file.id)
+            .map_or(0.5, |value| value.relevance)
+    });
+    for candidate in candidates {
+        if let Some(value) = assessments.get(&candidate.file.id) {
+            candidate.reasons.push(format!(
+                "Jev relevance estimate: {:.2}; additional evidence: {:.2}",
+                value.relevance, value.expansion
+            ));
+        }
+    }
+}
+
 /// Orders the selector's survivors: public-evidence tiers first in their evidence order
-/// (failure anchors, then direct imports of anchored tests), then task-named paths, then the
-/// rest; within the last two, by descending `relevance`. Scores and reasons are untouched.
+/// (failure anchors 0, direct imports of anchored tests 1, of other anchors 2), then
+/// task-named paths (3), then the rest (4); within the last two, by descending `relevance`.
+/// Scores and reasons are untouched.
 fn rank_selected(
     candidates: &mut [super::Candidate],
     pinned: &BTreeMap<PathBuf, u8>,
@@ -1021,16 +1039,16 @@ fn rank_selected(
     let tier = |candidate: &super::Candidate| {
         pinned.get(&candidate.file.path).copied().unwrap_or(
             if task.contains(candidate.file.path.to_string_lossy().as_ref()) {
-                2
-            } else {
                 3
+            } else {
+                4
             },
         )
     };
     candidates.sort_by(|a, b| {
         let (left, right) = (tier(a), tier(b));
         left.cmp(&right).then_with(|| {
-            if left < 2 {
+            if left < 3 {
                 std::cmp::Ordering::Equal
             } else {
                 relevance(b).total_cmp(&relevance(a))
@@ -1057,18 +1075,20 @@ fn public_failure_reason(failure: &super::evidence::FailureEvidence) -> Option<S
     ))
 }
 
-/// Most direct imports one anchored public test contributes.
-const MAX_IMPORTS_PER_TEST: usize = 8;
+/// Most direct imports one public anchor contributes.
+const MAX_IMPORTS_PER_ANCHOR: usize = 8;
 
-/// Most direct imports all anchored public tests contribute together.
+/// Most direct imports all public anchors contribute together.
 const MAX_IMPORTED_FILES: usize = 16;
 
-/// Candidates for the indexed files the anchored public `tests` import directly (one hop, in
-/// source order), placed after the anchors. Each reference is a syntactic `file-ref/v1` use of
-/// the test's observed source, stated by its language's own name facts, and reaches a file only
-/// through that language's file probe against `records`; nothing is traversed further. Type-only
-/// imports stay: the facts do not prove which imports are erased. A language without name facts
-/// contributes nothing; a faulted extraction and every cap are disclosed in `warnings`.
+/// Candidates for the indexed files the public anchors import directly (one hop, in source
+/// order), with their tier: 1 for imports of anchored tests, 2 for imports of other failure
+/// locations. Test anchors are read first, so they win the shared cap. `sources` holds each
+/// anchor's observed source and whether it is a test. Each reference is a syntactic `file-ref/v1`
+/// use stated by the anchor language's own name facts, and reaches a file only through that
+/// language's file probe against `records`; nothing is traversed further. Type-only imports stay:
+/// the facts do not prove which imports are erased. A language without name facts contributes
+/// nothing; a faulted extraction and every cap are disclosed in `warnings`.
 ///
 /// # Errors
 ///
@@ -1078,13 +1098,17 @@ async fn anchored_imports(
     records: &[super::FileRecord],
     ranked: &[super::Candidate],
     anchors: &[super::Candidate],
-    tests: &[(PathBuf, String)],
+    sources: &[(PathBuf, String, bool)],
     warnings: &mut Vec<String>,
     cancel: &tokio_util::sync::CancellationToken,
-) -> io::Result<Vec<super::Candidate>> {
+) -> io::Result<Vec<(super::Candidate, u8)>> {
     use crate::lang::names::{Certainty, Role, ns};
-    let mut imported: Vec<super::Candidate> = Vec::new();
-    for (test, source) in tests {
+    let mut imported: Vec<(super::Candidate, u8)> = Vec::new();
+    let ordered = sources
+        .iter()
+        .filter(|(_, _, test)| *test)
+        .chain(sources.iter().filter(|(_, _, test)| !*test));
+    for (test, source, is_test) in ordered {
         if cancel.is_cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -1146,11 +1170,11 @@ async fn anchored_imports(
                 || anchors.iter().any(|anchor| anchor.file.path == target)
                 || imported
                     .iter()
-                    .any(|candidate| candidate.file.path == target)
+                    .any(|(candidate, _)| candidate.file.path == target)
             {
                 continue;
             }
-            if added == MAX_IMPORTS_PER_TEST || imported.len() == MAX_IMPORTED_FILES {
+            if added == MAX_IMPORTS_PER_ANCHOR || imported.len() == MAX_IMPORTED_FILES {
                 beyond += 1;
                 continue;
             }
@@ -1174,15 +1198,20 @@ async fn anchored_imports(
                     preferred_spans: Vec::new(),
                     whole_file: false,
                 });
+            let anchor = if *is_test {
+                "anchored public test"
+            } else {
+                "public failure location"
+            };
             candidate.reasons.insert(
                 0,
                 format!(
-                    "direct import of anchored public test {} (line {}; syntactic reference, {certainty})",
+                    "direct import of {anchor} {} (line {}; syntactic reference, {certainty})",
                     test.display(),
                     fact.line
                 ),
             );
-            imported.push(candidate);
+            imported.push((candidate, if *is_test { 1 } else { 2 }));
             added += 1;
         }
         if beyond > 0 {
@@ -1454,12 +1483,17 @@ mod tests {
             &records,
             &[],
             &anchors,
-            &[(PathBuf::from("test_a.beta"), test.clone())],
+            &[(PathBuf::from("test_a.beta"), test.clone(), true)],
             &mut warnings,
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
+        assert!(imported.iter().all(|(_, tier)| *tier == 1));
+        let imported: Vec<_> = imported
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect();
         let paths: Vec<_> = imported
             .iter()
             .map(|candidate| candidate.file.path.to_str().unwrap())
@@ -1494,7 +1528,7 @@ mod tests {
             &records,
             &[],
             &anchors,
-            &[(PathBuf::from("test_a.beta"), test)],
+            &[(PathBuf::from("test_a.beta"), test, true)],
             &mut Vec::new(),
             &cancelled,
         )
@@ -1645,5 +1679,184 @@ mod tests {
             ]
         );
         assert_eq!(candidates[0].reasons, ["reason anchor-b.x"]);
+    }
+
+    /// A non-test failure location contributes its own direct imports one tier after the
+    /// anchored tests' imports: test anchors are read first and keep priority in the shared cap,
+    /// whatever the evidence order, and the reason names the kind of anchor.
+    #[tokio::test]
+    async fn non_test_anchors_contribute_their_imports_after_test_imports() {
+        let files = [
+            ("lib.beta", "ref:dep\nfail\n".to_owned()),
+            ("test_a.beta", "ref:sub/a\nfail\n".to_owned()),
+            ("dep.alpha", "dependency\n".to_owned()),
+            ("sub/a.alpha", "subject\n".to_owned()),
+        ];
+        let (root, index, _) = lexical_index("context-non-test-anchor", &files).await;
+        let records = index.records().unwrap();
+        let candidate = |path: &str| super::super::Candidate {
+            file: records
+                .iter()
+                .find(|record| record.path == Path::new(path))
+                .unwrap()
+                .clone(),
+            lexical_score: 0,
+            reasons: Vec::new(),
+            preferred_spans: Vec::new(),
+            whole_file: false,
+        };
+        let imported = anchored_imports(
+            &root,
+            &records,
+            &[],
+            &[candidate("lib.beta"), candidate("test_a.beta")],
+            &[
+                (PathBuf::from("lib.beta"), files[0].1.clone(), false),
+                (PathBuf::from("test_a.beta"), files[1].1.clone(), true),
+            ],
+            &mut Vec::new(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let shape: Vec<_> = imported
+            .iter()
+            .map(|(candidate, tier)| (candidate.file.path.to_str().unwrap(), *tier))
+            .collect();
+        assert_eq!(shape, [("sub/a.alpha", 1), ("dep.alpha", 2)]);
+        assert_eq!(
+            imported[1].0.reasons,
+            [
+                "direct import of public failure location lib.beta (line 1; syntactic reference, extension probe)"
+            ]
+        );
+    }
+
+    /// End to end: a failure in a non-test source delivers the file it imports, which neither
+    /// the failure nor the task names.
+    #[tokio::test]
+    async fn a_failing_source_delivers_its_imported_dependency() {
+        let mut files = vec![
+            ("lib.beta", "ref:dep\nfail here\n".to_owned()),
+            ("dep.alpha", "dependency\n".to_owned()),
+        ];
+        for n in 0..12 {
+            files.push((
+                Box::leak(format!("needle-{n:02}.alpha").into_boxed_str()),
+                "needle\n".to_owned(),
+            ));
+        }
+        let (_root, index, service) = lexical_index("context-anchored-dependency", &files).await;
+        let hash = index
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.path == Path::new("lib.beta"))
+            .unwrap()
+            .content_hash
+            .unwrap();
+        let evidence = super::super::evidence::PublicEvidence {
+            run_id: "tests-1".into(),
+            failures: vec![super::super::evidence::FailureEvidence {
+                path: "lib.beta".into(),
+                content_hash: hash,
+                line: Some(2),
+                message: "TypeError: body unusable".into(),
+            }],
+        };
+        let prepared = service
+            .prepare_with_evidence_for_delivery(
+                &index,
+                "needle",
+                &evidence,
+                &PacketOptions {
+                    candidates: 4,
+                    ..Default::default()
+                },
+                &DocumentOptions::default(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let paths: Vec<_> = prepared
+            .packet
+            .windows
+            .iter()
+            .map(|window| window.path.to_str().unwrap())
+            .collect();
+        assert_eq!(paths[..2], ["lib.beta", "dep.alpha"], "{paths:?}");
+        assert!(
+            prepared.packet.windows[1].reasons[0]
+                .starts_with("direct import of public failure location lib.beta")
+        );
+    }
+
+    /// The selector's expansion answer keeps an otherwise irrelevant candidate but never turns it
+    /// into a whole-file delivery: its preferred spans stay, and a large file with spans is still
+    /// delivered localized. Low relevance without expansion drops; public tiers always stay.
+    #[test]
+    fn expansion_retains_without_whole_file_delivery() {
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new("context-expansion-shape");
+        let source = format!("{}\nneedle\n{}", "x".repeat(6000), "y".repeat(6000));
+        std::fs::write(root.join("needle-big.alpha"), &source).unwrap();
+        std::fs::write(root.join("needle-other.alpha"), "needle other\n").unwrap();
+        std::fs::write(root.join("needle-anchor.alpha"), "needle anchor\n").unwrap();
+        let mut index = ContextIndex::open(&root).unwrap();
+        index
+            .refresh(&crate::project::structure::StructureOptions::default())
+            .unwrap();
+        let mut candidates = index.search("needle", 12).unwrap();
+        assert_eq!(candidates.len(), 3);
+        let span = (6001, 6008);
+        for candidate in &mut candidates {
+            if candidate.file.path == Path::new("needle-big.alpha") {
+                candidate.preferred_spans = vec![span];
+            }
+        }
+        let id = |path: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.file.path == Path::new(path))
+                .unwrap()
+                .file
+                .id
+                .clone()
+        };
+        let assessment = |path: &str, relevance: f64, expansion: f64| {
+            (
+                id(path),
+                super::super::select::Assessment {
+                    id: id(path),
+                    relevance,
+                    expansion,
+                },
+            )
+        };
+        let assessments = BTreeMap::from([
+            assessment("needle-big.alpha", 0.1, 0.9),
+            assessment("needle-other.alpha", 0.1, 0.1),
+            assessment("needle-anchor.alpha", 0.1, 0.1),
+        ]);
+        let pinned = BTreeMap::from([(PathBuf::from("needle-anchor.alpha"), 0)]);
+        apply_assessments(&mut candidates, &assessments, &pinned, "needle", 0.5);
+        let kept: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.file.path.to_str().unwrap())
+            .collect();
+        assert_eq!(kept, ["needle-anchor.alpha", "needle-big.alpha"]);
+        let uncertain = &candidates[1];
+        assert!(!uncertain.whole_file);
+        assert_eq!(uncertain.preferred_spans, [span]);
+        assert!(
+            uncertain
+                .reasons
+                .contains(&"Jev relevance estimate: 0.10; additional evidence: 0.90".to_owned())
+        );
+        let packet = index
+            .prepare_candidates("needle", &PacketOptions::default(), vec![uncertain.clone()])
+            .unwrap();
+        assert!(!packet.windows.is_empty());
+        assert!(packet.windows.iter().all(|window| !window.complete_file));
     }
 }

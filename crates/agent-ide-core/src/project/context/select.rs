@@ -30,7 +30,10 @@ pub struct CandidateView {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Assessment {
     pub id: String,
+    /// Relevance of the candidate's implementation, contract or test evidence to the task.
     pub relevance: f64,
+    /// More source or dependency evidence is needed before exclusion. This is retention
+    /// uncertainty, not a request to deliver the whole file or permission to traverse imports.
     pub expansion: f64,
 }
 
