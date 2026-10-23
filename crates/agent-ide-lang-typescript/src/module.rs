@@ -673,7 +673,135 @@ pub const RECIPES: &[EffectRecipe] = &[
             Arg::Param("file"),
         ],
     ),
+    guarded_probe(
+        "ts-probe-guarded",
+        "node_path",
+        &GUARDED_PROBE_ARGS,
+        &GUARDED_PATH_ENV,
+        &[],
+    ),
+    guarded_probe(
+        "ts-outline-guarded",
+        "node_path",
+        &GUARDED_OUTLINE_ARGS,
+        &GUARDED_PATH_ENV,
+        &[],
+    ),
+    guarded_probe(
+        "ts-probe-tool-guarded",
+        "node",
+        &GUARDED_PROBE_ARGS,
+        &GUARDED_SLOT_ENV,
+        RUNNER_NODE_SLOT,
+    ),
+    guarded_probe(
+        "ts-outline-tool-guarded",
+        "node",
+        &GUARDED_OUTLINE_ARGS,
+        &GUARDED_SLOT_ENV,
+        RUNNER_NODE_SLOT,
+    ),
 ];
+
+/// The runner guard's fixed inputs, read by [`crate::environment::RUNNER_PRELUDE`].
+const GUARD_ENV: [EnvRule; 3] = [
+    EnvRule::Param {
+        name: "AGENT_IDE_RUNNER_REQUIREMENTS",
+        param: "requirements",
+        optional: false,
+    },
+    EnvRule::Param {
+        name: "AGENT_IDE_RUNNER_TYPESCRIPT",
+        param: "verifier",
+        optional: false,
+    },
+    EnvRule::Param {
+        name: "AGENT_IDE_RUNNER_NODE_IDENTITY",
+        param: "node_identity",
+        optional: false,
+    },
+];
+
+/// [`PATH_ENV`] plus the guard inputs, for a probe on an explicitly pathed Node.
+const GUARDED_PATH_ENV: [EnvRule; 5] = [
+    PATH_ENV[0],
+    PATH_ENV[1],
+    GUARD_ENV[0],
+    GUARD_ENV[1],
+    GUARD_ENV[2],
+];
+
+/// The guard inputs for a probe on the guarded runner slot, whose directory leads `PATH`.
+const GUARDED_SLOT_ENV: [EnvRule; 5] = [
+    EnvRule::Home { name: "HOME" },
+    EnvRule::SlotDir {
+        name: "PATH",
+        slot: "runner_node",
+        fixed: SYSTEM_PATH,
+    },
+    GUARD_ENV[0],
+    GUARD_ENV[1],
+    GUARD_ENV[2],
+];
+
+/// The syntax probe behind the runner prelude.
+const GUARDED_PROBE_ARGS: [Arg; 6] = [
+    Arg::Literal("--import"),
+    Arg::Literal(crate::environment::RUNNER_PRELUDE),
+    Arg::Literal("-e"),
+    Arg::Literal(crate::support::TS_PROBE),
+    Arg::Param("module"),
+    Arg::Param("file"),
+];
+
+/// The outline probe behind the runner prelude.
+const GUARDED_OUTLINE_ARGS: [Arg; 6] = [
+    Arg::Literal("--import"),
+    Arg::Literal(crate::environment::RUNNER_PRELUDE),
+    Arg::Literal("-e"),
+    Arg::Literal(crate::support::TS_OUTLINE_PROBE),
+    Arg::Param("module"),
+    Arg::Param("file"),
+];
+
+/// The guarded runner Node slot: resolving it prepares the same runner guard as test runs.
+const RUNNER_NODE_SLOT: &[ExecutableSlot] = &[ExecutableSlot {
+    name: "node",
+    source: SlotSource::Launcher("runner_node"),
+}];
+
+/// A stdin probe whose range/alias Node pin the runner prelude proves on the actual Node
+/// before the probe loads: the [`interactive_with`] path policy plus the qualified verifier.
+const fn guarded_probe(
+    id: &'static str,
+    program: &'static str,
+    args: &'static [Arg],
+    env: &'static [EnvRule],
+    executables: &'static [ExecutableSlot],
+) -> EffectRecipe {
+    let mut recipe = interactive_with(id, program, args, env, executables);
+    recipe.paths = &[
+        PathRule {
+            param: "node_path",
+            roles: TOOL_ROLES,
+            existing_only: false,
+            read_root: false,
+        },
+        PathRule {
+            param: "module",
+            roles: TOOL_ROLES,
+            existing_only: false,
+            read_root: false,
+        },
+        PathRule {
+            param: "verifier",
+            roles: TOOL_ROLES,
+            existing_only: false,
+            read_root: false,
+        },
+    ];
+    recipe
+}
 
 /// The recipe request of a test, formatter or probe argument vector the in-process support builds
 /// ([`crate::support`]), under this request's accepted facts: a compiler or Node-pin
@@ -709,22 +837,20 @@ pub fn configured_effect(
             "node_bin".into(),
             Param::Paths(activation.path_prefix.into_iter().collect()),
         );
-        for (name, value) in activation.vars {
-            let (param, value) = match name.to_str() {
-                Some("AGENT_IDE_RUNNER_REQUIREMENTS") => (
-                    "requirements",
-                    Param::Token(value.to_string_lossy().into_owned()),
-                ),
-                Some("AGENT_IDE_RUNNER_TYPESCRIPT") => {
-                    ("verifier", Param::Path(PathBuf::from(value)))
-                }
-                Some("AGENT_IDE_RUNNER_NODE_IDENTITY") => (
-                    "node_identity",
-                    Param::Token(value.to_string_lossy().into_owned()),
-                ),
-                _ => unreachable!("runner activation carries only fixed guard inputs"),
-            };
-            effect.params.insert(param.into(), value);
+        guard_params(effect, activation.vars);
+        return Ok(Some(effect.clone()));
+    }
+    if let Some(effect) = &mut effect
+        && matches!(
+            effect.recipe.as_str(),
+            "ts-probe" | "ts-outline" | "ts-probe-tool" | "ts-outline-tool"
+        )
+    {
+        // A range/alias pin is proven by the runner prelude on the actual Node instead of
+        // refusing the probe; every other obstruction refuses as for raw Node runs.
+        if let Some(vars) = crate::environment::probe_guard(cwd, config, &argv[0])? {
+            effect.recipe = format!("{}-guarded", effect.recipe);
+            guard_params(effect, vars);
         }
         return Ok(Some(effect.clone()));
     }
@@ -735,6 +861,26 @@ pub fn configured_effect(
         crate::environment::admit_effects(cwd, config)?;
     }
     Ok(effect)
+}
+
+/// Adds the runner guard's fixed inputs to `effect` as the recipe parameters its prelude
+/// environment reads: the Node requirements, the qualified verifier and the Node identity.
+fn guard_params(effect: &mut EffectRequest, vars: Vec<(std::ffi::OsString, std::ffi::OsString)>) {
+    for (name, value) in vars {
+        let (param, value) = match name.to_str() {
+            Some("AGENT_IDE_RUNNER_REQUIREMENTS") => (
+                "requirements",
+                Param::Token(value.to_string_lossy().into_owned()),
+            ),
+            Some("AGENT_IDE_RUNNER_TYPESCRIPT") => ("verifier", Param::Path(PathBuf::from(value))),
+            Some("AGENT_IDE_RUNNER_NODE_IDENTITY") => (
+                "node_identity",
+                Param::Token(value.to_string_lossy().into_owned()),
+            ),
+            _ => unreachable!("runner activation carries only fixed guard inputs"),
+        };
+        effect.params.insert(param.into(), value);
+    }
 }
 
 /// The recipe request of a test, formatter or probe argv built by in-process support.
@@ -1719,5 +1865,155 @@ mod tests {
             agent_ide_core::modules::recipe::expand(RECIPES, &outside, &admission),
             Err(Refusal::OutOfRule(name, _)) if name == "node_path"
         ));
+    }
+
+    /// Diagnostic seam: plans both stdin probes under a real launcher's TypeScript provider and
+    /// check section against a real project (`AGENT_IDE_PROBE_LAUNCHER`, `AGENT_IDE_PROBE_ROOT`)
+    /// and prints each planning outcome with its exact refusal text.
+    #[test]
+    #[ignore = "reads a real launcher configuration and project"]
+    fn probe_plans_report_their_exact_cause_for_a_real_launcher() {
+        let launcher: Value = serde_json::from_str(
+            &std::fs::read_to_string(std::env::var("AGENT_IDE_PROBE_LAUNCHER").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let root = PathBuf::from(std::env::var("AGENT_IDE_PROBE_ROOT").unwrap());
+        let provider = launcher["targets"][0]["providers"][0].clone();
+        let config = agent_ide_core::modules::contract::ModuleConfig {
+            read_denies: Vec::new(),
+            test_workers: None,
+            worktree: Some(root.clone()),
+            provider: Some(provider.clone()),
+            checks: Some(launcher["project_checks"]["typescript"].clone()),
+            env: Default::default(),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        };
+        let node = provider["node"]["path"].as_str().unwrap().to_owned();
+        let module = Path::new(provider["typescript"]["tsserver"]["path"].as_str().unwrap())
+            .parent()
+            .unwrap()
+            .join("typescript.js")
+            .display()
+            .to_string();
+        eprintln!(
+            "admit_effects: {:?}",
+            crate::environment::admit_effects(&root, &config)
+        );
+        for (name, script) in [
+            ("outline", crate::support::TS_OUTLINE_PROBE),
+            ("syntax", crate::support::TS_PROBE),
+        ] {
+            let argv: Vec<String> = [
+                node.as_str(),
+                "-e",
+                script,
+                module.as_str(),
+                "context.test.ts",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            // The native route: the activation prefix replaces the argv program.
+            match crate::environment::command_argv(&root, &argv, &config) {
+                Ok(Some(activation)) => {
+                    let mut command = std::process::Command::new(&activation.argv_prefix[0]);
+                    let mut child = command
+                        .args(&activation.argv_prefix[1..])
+                        .args(&argv[1..])
+                        .current_dir(&root)
+                        .env_clear()
+                        .envs(activation.vars.iter().map(|(name, value)| (name, value)))
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    use std::io::Write as _;
+                    child
+                        .stdin
+                        .take()
+                        .unwrap()
+                        .write_all(&std::fs::read(root.join("src/context.test.ts")).unwrap())
+                        .unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    eprintln!(
+                        "{name} native: status {:?}, stdout {} bytes, stderr {:?}",
+                        output.status.code(),
+                        output.stdout.len(),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                }
+                Ok(None) => eprintln!("{name} native: unclaimed"),
+                Err(error) => eprintln!("{name} native: refused: {error}"),
+            }
+            let effect = match configured_effect(&argv, &config, &root) {
+                Ok(Some(effect)) => effect,
+                Ok(None) => {
+                    eprintln!("{name}: unclaimed");
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("{name}: refused: {error}");
+                    continue;
+                }
+            };
+            eprintln!("{name}: planned {}", effect.recipe);
+            // Runs the admitted command on a real test file, then with an unsatisfiable pin.
+            let mut unsatisfiable = effect.clone();
+            unsatisfiable
+                .params
+                .insert("requirements".into(), Param::Token(r#"[">=999"]"#.into()));
+            let home = config.home.clone().unwrap();
+            let roots = vec![
+                Path::new(&node)
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .to_path_buf(),
+            ];
+            let cache = std::env::temp_dir();
+            let admission = agent_ide_core::modules::recipe::Admission {
+                worktree: &root,
+                cache_dir: &cache,
+                read_denies: &[],
+                home: Some(&home),
+                launcher_roots: &roots,
+                developer_dirs: &[],
+                programs: &[],
+                timeout: Duration::from_secs(10),
+            };
+            let source = std::fs::read(root.join("src/context.test.ts")).unwrap();
+            for (case, effect) in [("pin", effect), ("unsatisfiable", unsatisfiable)] {
+                let spec =
+                    match agent_ide_core::modules::recipe::expand(RECIPES, &effect, &admission) {
+                        Ok(spec) => spec,
+                        Err(refusal) => {
+                            eprintln!("{name} {case}: expansion refused: {refusal:?}");
+                            continue;
+                        }
+                    };
+                let mut child = std::process::Command::new(&spec.program)
+                    .args(&spec.args)
+                    .current_dir(&spec.cwd)
+                    .env_clear()
+                    .envs(spec.env.iter().map(|(name, value)| (name, value)))
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                use std::io::Write as _;
+                child.stdin.take().unwrap().write_all(&source).unwrap();
+                let output = child.wait_with_output().unwrap();
+                eprintln!(
+                    "{name} {case}: status {:?}, stdout {} bytes ({}), stderr {:?}",
+                    output.status.code(),
+                    output.stdout.len(),
+                    String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(60)]),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+        }
     }
 }

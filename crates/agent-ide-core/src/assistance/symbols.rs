@@ -3956,15 +3956,15 @@ impl Worker<'_> {
         observed: &SourceObservation,
         source: &str,
         budget: Duration,
-    ) -> (Option<Outline>, &'static str) {
+    ) -> (Option<Outline>, String) {
         if budget.is_zero() {
-            return (None, "probe budget exhausted");
+            return (None, "probe budget exhausted".into());
         }
         let _timing = progress::Progress::enter(&job.progress, "source_probe");
         let deadline = tokio::time::Instant::now() + budget;
         let file = observed.path();
         let Some(language) = Lang::for_path(file) else {
-            return (None, "no source language");
+            return (None, "no source language".into());
         };
         let root = observed.worktree().worktree_path();
         let config = self
@@ -3972,7 +3972,7 @@ impl Worker<'_> {
             .launcher
             .module_config(language, root, &job.target);
         let Ok(Some(project)) = crate::modules::calls::detect(language, root, &config).await else {
-            return (None, "source probe project unavailable");
+            return (None, "source probe project unavailable".into());
         };
         let configured = self.configured_probe_programs(job, language);
         let plan = crate::modules::calls::source_outline_probe_command(
@@ -3987,27 +3987,31 @@ impl Worker<'_> {
         .await;
         let argv = match plan {
             Ok(Ok(Some(argv))) => argv,
-            Ok(Ok(None)) => return (None, "source probe unsupported"),
-            _ => return (None, "source probe plan refused"),
+            Ok(Ok(None)) => return (None, "source probe unsupported".into()),
+            Ok(Err(error)) => return (None, format!("source probe plan refused: {error}")),
+            Err(error) => return (None, format!("source probe routing refused: {error}")),
         };
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return (None, "probe budget exhausted");
+            return (None, "probe budget exhausted".into());
         }
         let Some(output) = run_stdin(&self.admission, &argv, root, source, remaining).await else {
-            return (None, "source probe did not finish");
+            return (None, "source probe did not finish".into());
         };
-        if output.status != Some(0) || output.stdout.len() > 256 * 1024 {
-            return (None, "source probe output rejected");
+        if output.status != Some(0) {
+            return (None, format!("source probe exit status {:?}", output.status));
+        }
+        if output.stdout.len() > 256 * 1024 {
+            return (None, "source probe output exceeds 256 KiB".into());
         }
         let Ok(text) = std::str::from_utf8(&output.stdout) else {
-            return (None, "source probe output is not UTF-8");
+            return (None, "source probe output is not UTF-8".into());
         };
         match crate::modules::calls::source_outline_probe_result(language, root, file, source, text)
             .await
         {
-            Ok(Some(outline)) => (Some(outline), "syntax-only source probe"),
-            _ => (None, "source probe outline not verified"),
+            Ok(Some(outline)) => (Some(outline), "syntax-only source probe".into()),
+            _ => (None, "source probe outline not verified".into()),
         }
     }
 

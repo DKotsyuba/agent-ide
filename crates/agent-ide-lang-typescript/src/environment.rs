@@ -405,6 +405,42 @@ pub fn admit_effects(worktree: &Path, config: &ModuleConfig) -> Result<(), LangE
         .map_err(|(_, cause)| LangError::Environment(cause))
 }
 
+/// Admission of the stdin syntax and outline probes. `Ok(None)` when [`admit_effects`] admits
+/// them as raw Node runs; `Ok(Some(vars))` when its only obstruction is a range/alias Node pin
+/// and the runner guard prepares the runtime proof instead: the fixed prelude tests every pin
+/// with the qualified compiler's VersionRange on the actual Node before the probe loads, and
+/// exits without output when one does not hold. Every other refusal stands, and the guard
+/// binds only a probe on the configured Node (`program` is `node` or its exact path).
+///
+/// # Errors
+///
+/// The [`admit_effects`] refusal when the pin is plain or absent or `program` is another
+/// Node, else the runner guard's.
+pub fn probe_guard(
+    worktree: &Path,
+    config: &ModuleConfig,
+    program: &str,
+) -> Result<Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>, LangError> {
+    let refusal = match admit_effects(worktree, config) {
+        Ok(()) => return Ok(None),
+        Err(refusal) => refusal,
+    };
+    let ranged =
+        node_pin(worktree, &config.read_denies).is_some_and(|pin| plain_version(&pin).is_none());
+    let Some(tools) = configured_tools(config)
+        .filter(|tools| ranged && (program == "node" || Path::new(program) == tools.node))
+    else {
+        return Err(refusal);
+    };
+    let vars = runner_guard(worktree, &tools, config)?;
+    // Only the range path prepares requirements, the verifier and the identity; a guard
+    // without them would run the probe unproven.
+    if vars.len() < 3 {
+        return Err(refusal);
+    }
+    Ok(Some(vars))
+}
+
 /// Activation of `program` under this request's configured tools, resolved before any
 /// admission: `tsc` runs the winning compiler through the configured Node, `node` runs the
 /// configured Node itself. A compiler fact refusal, a known Node-pin mismatch, or an
@@ -470,7 +506,9 @@ pub fn command_env(
 /// `PATH` that a program slot cannot carry. A full argv binds `tsc`/`node` and prepared
 /// project-local Vitest/Jest bins to the configured Node. Unbound `npx` runners refuse;
 /// The private `runner_node` slot resolves only the executable after preparing its mandatory
-/// recipe guard; raw `node`/`tsc` keep their stricter pre-admission pin checks.
+/// recipe guard; raw `node`/`tsc` keep their stricter pre-admission pin checks. A stdin
+/// probe whose only obstruction is a range/alias pin runs behind the runner prelude
+/// ([`probe_guard`]); any other probe obstruction refuses, whichever Node it names.
 pub fn command_argv(
     worktree: &Path,
     argv: &[String],
@@ -495,6 +533,27 @@ pub fn command_argv(
         return Ok(Some(agent_ide_core::lang::environment::CommandEnv {
             argv_prefix: vec![tools.node.clone().into_os_string()],
             ..Default::default()
+        }));
+    }
+    // A stdin probe on a range/alias pin runs behind the same runner prelude as the module's
+    // guarded probe recipes; otherwise it keeps the raw-run admission below.
+    if let [program, flag, script, module, _] = argv
+        && flag == "-e"
+        && (script == crate::support::TS_PROBE || script == crate::support::TS_OUTLINE_PROBE)
+        && module.starts_with('/')
+        && let Some(vars) = probe_guard(worktree, config, program)?
+    {
+        let node = configured_tools(config)
+            .expect("a prepared guard has configured tools")
+            .node;
+        return Ok(Some(agent_ide_core::lang::environment::CommandEnv {
+            argv_prefix: vec![
+                node.clone().into_os_string(),
+                "--import".into(),
+                RUNNER_PRELUDE.into(),
+            ],
+            path_prefix: node.parent().map(Path::to_path_buf),
+            vars,
         }));
     }
     // Bare "tsc" and any other slot name falls through to the full-argv path below.
@@ -1562,6 +1621,317 @@ mod tests {
         );
         assert!(activation.vars.is_empty());
         assert!(activation.path_prefix.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Root's Hono counterexample: a measured 24.4.0 Node with an `engines` `>=16.9.0` pin.
+    /// Both stdin probes leave the range to the runner guard, never to a raw run, in the
+    /// module planner and the native argv route alike: an unqualified verifier, an unmeasured
+    /// Node or another Node still refuses, a plain mismatch keeps its raw-run refusal, and an
+    /// absent pin keeps the unguarded recipes and activations.
+    #[test]
+    fn range_pinned_probes_refuse_without_the_runner_guard() {
+        let root = scratch("probe-range");
+        let (node, tsc) = tools(&root);
+        put(&root, "tsconfig.json", "{}");
+        put(&root, "package.json", r#"{"engines":{"node":">=16.9.0"}}"#);
+        let mut config = config_with(&node, &tsc);
+        config.provider.as_mut().unwrap()["node"]["identity"] = "24.4.0".into();
+        let module = root.join("tools/typescript.js").display().to_string();
+        let argv = |program: &str, script: &str| {
+            [program, "-e", script, module.as_str(), "a.test.ts"].map(str::to_owned)
+        };
+        let scripts = [crate::support::TS_PROBE, crate::support::TS_OUTLINE_PROBE];
+        // Every probe argv on `programs` in both routes, as refusal texts.
+        let refusals = |config: &ModuleConfig, programs: &[&str]| {
+            let mut refusals = Vec::new();
+            for program in programs {
+                for script in scripts {
+                    let argv = argv(program, script);
+                    let module = crate::module::configured_effect(&argv, config, &root);
+                    let native = command_argv(&root, &argv, config);
+                    refusals.push(module.unwrap_err().to_string());
+                    refusals.push(native.unwrap_err().to_string());
+                }
+            }
+            refusals
+        };
+        let node_text = node.display().to_string();
+        let configured = [node_text.as_str(), "node"];
+        // The stub compiler is no qualified verifier: the range stays unproven.
+        assert!(admit_effects(&root, &config).is_err());
+        for refusal in refusals(&config, &configured) {
+            assert!(refusal.contains("project TypeScript compiler"), "{refusal}");
+        }
+        // The guard binds only the configured Node: another one keeps the raw-run refusal.
+        for refusal in refusals(&config, &["/usr/local/bin/node"]) {
+            assert!(refusal.contains("range/alias"), "{refusal}");
+        }
+        let mut unmeasured = config.clone();
+        unmeasured.provider.as_mut().unwrap()["node"]["identity"] = "node".into();
+        for refusal in refusals(&unmeasured, &configured) {
+            assert!(refusal.contains("runner Node requirements"), "{refusal}");
+        }
+        put(&root, ".nvmrc", "22.11.0\n");
+        for refusal in refusals(&config, &configured) {
+            assert!(refusal.contains("does not match"), "{refusal}");
+        }
+        std::fs::remove_file(root.join(".nvmrc")).unwrap();
+        put(&root, "package.json", "{\"dependencies\":{}}");
+        let recipes = scripts.map(|script| {
+            crate::module::configured_effect(&argv(&node_text, script), &config, &root)
+                .unwrap()
+                .unwrap()
+                .recipe
+        });
+        assert_eq!(recipes, ["ts-probe", "ts-outline"]);
+        for script in scripts {
+            assert_eq!(
+                command_argv(&root, &argv(&node_text, script), &config).unwrap(),
+                None,
+                "an explicitly pathed Node stays the caller's tool"
+            );
+            let activation = command_argv(&root, &argv("node", script), &config)
+                .unwrap()
+                .expect("bare node binds the configured Node");
+            assert_eq!(activation.argv_prefix, [node.clone().into_os_string()]);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The guarded probe recipes run the stdin probes behind the fixed runner prelude, with
+    /// the guard's three inputs as their environment, on an explicitly pathed Node or the
+    /// guarded runner slot; a request without the guard inputs does not expand.
+    #[test]
+    fn guarded_probe_recipes_expand_behind_the_runner_prelude() {
+        use agent_ide_core::modules::payload::{EffectRequest, Param};
+        let root = scratch("probe-guarded");
+        let (node, _) = tools(&root);
+        put(&root, "tools/typescript.js", "typescript-stub\n");
+        let module = root.join("tools/typescript.js");
+        let programs = [("runner_node".to_owned(), node.clone())];
+        let admission = agent_ide_core::modules::recipe::Admission {
+            worktree: &root,
+            cache_dir: &root,
+            read_denies: &[],
+            home: Some(&root),
+            launcher_roots: &[],
+            developer_dirs: &[],
+            programs: &programs,
+            timeout: std::time::Duration::from_secs(10),
+        };
+        for (recipe, script) in [
+            ("ts-probe-guarded", crate::support::TS_PROBE),
+            ("ts-outline-guarded", crate::support::TS_OUTLINE_PROBE),
+            ("ts-probe-tool-guarded", crate::support::TS_PROBE),
+            ("ts-outline-tool-guarded", crate::support::TS_OUTLINE_PROBE),
+        ] {
+            let program = if recipe.contains("-tool-") {
+                ("node", Param::Executable("node".into()))
+            } else {
+                ("node_path", Param::Path(node.clone()))
+            };
+            let mut effect = EffectRequest {
+                recipe: recipe.into(),
+                params: [
+                    program,
+                    ("module", Param::Path(module.clone())),
+                    ("file", Param::Token("a.test.ts".into())),
+                    ("verifier", Param::Path(module.clone())),
+                    ("node_identity", Param::Token("24.4.0".into())),
+                ]
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect(),
+            };
+            assert!(
+                agent_ide_core::modules::recipe::expand(
+                    crate::module::RECIPES,
+                    &effect,
+                    &admission
+                )
+                .is_err(),
+                "{recipe} needs the guard requirements"
+            );
+            effect.params.insert(
+                "requirements".into(),
+                Param::Token(r#"[">=16.9.0"]"#.into()),
+            );
+            let spec = agent_ide_core::modules::recipe::expand(
+                crate::module::RECIPES,
+                &effect,
+                &admission,
+            )
+            .unwrap_or_else(|refusal| panic!("{recipe}: {refusal:?}"));
+            assert_eq!(spec.program, node, "{recipe}");
+            let expected: Vec<std::ffi::OsString> = [
+                "--import",
+                RUNNER_PRELUDE,
+                "-e",
+                script,
+                module.to_str().unwrap(),
+                "a.test.ts",
+            ]
+            .map(Into::into)
+            .into();
+            assert_eq!(spec.args, expected, "{recipe}");
+            for (name, value) in [
+                ("AGENT_IDE_RUNNER_REQUIREMENTS", r#"[">=16.9.0"]"#),
+                ("AGENT_IDE_RUNNER_TYPESCRIPT", module.to_str().unwrap()),
+                ("AGENT_IDE_RUNNER_NODE_IDENTITY", "24.4.0"),
+            ] {
+                assert!(
+                    spec.env
+                        .iter()
+                        .any(|(key, actual)| key == name && actual == value),
+                    "{recipe}: {name} in {:?}",
+                    spec.env
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The guarded probes on the real accepted Node and qualified compiler
+    /// (`AGENT_IDE_PROBE_LAUNCHER`: a launcher whose first provider declares the Node;
+    /// `AGENT_IDE_PROBE_COMPILER`: a directory holding the qualified `tsc.js`/`typescript.js`).
+    /// Both routes run the fixed scripts on exactly the configured Node: an `engines` range
+    /// the Node satisfies yields the probe's output, while an unsatisfied range or an alias
+    /// VersionRange cannot parse exits 78 with no output.
+    #[test]
+    #[ignore = "runs the real accepted Node and qualified TypeScript compiler"]
+    fn guarded_probes_prove_the_range_on_the_actual_node() {
+        use agent_ide_core::lang::LanguageSupport;
+        let launcher: Value = serde_json::from_str(
+            &std::fs::read_to_string(std::env::var("AGENT_IDE_PROBE_LAUNCHER").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let compiler = PathBuf::from(std::env::var("AGENT_IDE_PROBE_COMPILER").unwrap());
+        let provider = launcher["targets"][0]["providers"][0].clone();
+        let node = PathBuf::from(provider["node"]["path"].as_str().unwrap());
+        let root = scratch("probe-actual");
+        for name in ["tsc.js", "typescript.js"] {
+            let target = root.join("node_modules/typescript/lib").join(name);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::copy(compiler.join(name), target).unwrap();
+        }
+        let library = root.join("node_modules/typescript/lib/typescript.js");
+        put(&root, "tsconfig.json", "{}");
+        let config = ModuleConfig {
+            worktree: Some(root.clone()),
+            test_workers: None,
+            provider: Some(provider),
+            checks: Some(serde_json::json!({
+                "node": node.display().to_string(),
+                "tsc_cli": root.join("node_modules/typescript/lib/tsc.js").display().to_string(),
+            })),
+            read_denies: Vec::new(),
+            env: Default::default(),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        };
+        let source = "describe('suite', () => {\n  it('case', () => {})\n})\n";
+        let run = |program: &Path, args: &[std::ffi::OsString], env: Vec<(String, String)>| {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new(program)
+                .args(args)
+                .current_dir(&root)
+                .env_clear()
+                .envs(env)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(source.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            (output.status.code(), output.stdout)
+        };
+        let home = config.home.clone().unwrap();
+        let roots = vec![node.parent().unwrap().parent().unwrap().to_path_buf()];
+        let admission = agent_ide_core::modules::recipe::Admission {
+            worktree: &root,
+            cache_dir: &root,
+            read_denies: &[],
+            home: Some(&home),
+            launcher_roots: &roots,
+            developer_dirs: &[],
+            programs: &[],
+            timeout: std::time::Duration::from_secs(10),
+        };
+        for (pin, accepted) in [(">=16.9.0", true), (">=99", false), ("lts/iron", false)] {
+            put(
+                &root,
+                "package.json",
+                &format!(
+                    r#"{{"devDependencies":{{"typescript":"5.9.3"}},"engines":{{"node":"{pin}"}}}}"#
+                ),
+            );
+            for (script, outline) in [
+                (crate::support::TS_PROBE, false),
+                (crate::support::TS_OUTLINE_PROBE, true),
+            ] {
+                let argv = [
+                    node.display().to_string(),
+                    "-e".into(),
+                    script.into(),
+                    library.display().to_string(),
+                    "a.test.ts".into(),
+                ];
+                let effect = crate::module::configured_effect(&argv, &config, &root)
+                    .unwrap()
+                    .unwrap();
+                let spec = agent_ide_core::modules::recipe::expand(
+                    crate::module::RECIPES,
+                    &effect,
+                    &admission,
+                )
+                .unwrap();
+                let activation = command_argv(&root, &argv, &config).unwrap().unwrap();
+                let native: Vec<std::ffi::OsString> = activation.argv_prefix[1..]
+                    .iter()
+                    .cloned()
+                    .chain(argv[1..].iter().map(Into::into))
+                    .collect();
+                // Identical guarded command on exactly the verified configured Node.
+                assert_eq!(spec.program, node, "{pin}");
+                assert_eq!(activation.argv_prefix[0], node.as_os_str(), "{pin}");
+                assert_eq!(spec.args, native, "{pin}");
+                let native_env = activation
+                    .vars
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.to_string_lossy().into_owned(),
+                            value.to_string_lossy().into_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for (route, (status, stdout)) in [
+                    ("module", run(&spec.program, &spec.args, spec.env.clone())),
+                    ("native", run(&node, &native, native_env)),
+                ] {
+                    if !accepted {
+                        assert_eq!((status, stdout.len()), (Some(78), 0), "{pin} {route}");
+                    } else if outline {
+                        assert_eq!(status, Some(0), "{pin} {route}");
+                        let text = String::from_utf8(stdout).unwrap();
+                        let parsed = crate::support::TypeScript.source_outline_probe_result(
+                            Path::new("a.test.ts"),
+                            source,
+                            &text,
+                        );
+                        assert!(parsed.is_some(), "{pin} {route}: {text}");
+                    } else {
+                        assert_eq!((status, stdout.len()), (Some(0), 0), "{pin} {route}");
+                    }
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }
