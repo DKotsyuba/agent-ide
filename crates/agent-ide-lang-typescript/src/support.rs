@@ -48,6 +48,18 @@ const SCRIPT_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "m
 /// no checker was proven.
 pub const TS_PROBE: &str = "let ts;try{ts=require(process.argv[1])}catch(e){process.exit(3)}let cs=[];process.stdin.on('data',c=>cs.push(c)).on('end',()=>{const d=Buffer.concat(cs).toString('utf8');const f=ts.createSourceFile(process.argv[2]||'c.ts',d,ts.ScriptTarget.Latest,true);const p=f.parseDiagnostics[0];if(p){const l=f.getLineAndCharacterOfPosition(p.start).line+1;console.log(l+': '+ts.flattenDiagnosticMessageText(p.messageText,' '));process.exit(1)}});";
 
+/// Source-only outline probe (`outline_probe.js`): TypeScript's own syntactic navigation tree of
+/// the source on stdin, as LSP document symbols converted the way typescript-language-server
+/// converts tsserver's navtree. Same argv shape as [`TS_PROBE`]; a syntactic language service over
+/// one in-memory snapshot, so no program, configuration, type package or `node_modules` is read.
+pub const TS_OUTLINE_PROBE: &str = include_str!("outline_probe.js");
+/// Largest accepted outline probe reply.
+const MAX_OUTLINE_PROBE_BYTES: usize = 256 * 1024;
+/// Most document symbols accepted from one outline probe reply.
+const MAX_OUTLINE_PROBE_SYMBOLS: usize = 4096;
+/// Deepest symbol nesting accepted from one outline probe reply.
+const MAX_OUTLINE_PROBE_DEPTH: usize = 64;
+
 /// Most lines scanned for one declaration's header and signature.
 const SCAN_LINES: usize = 200;
 
@@ -636,32 +648,32 @@ impl LanguageSupport for TypeScript {
         file: &Path,
         configured: Option<&ProbePrograms>,
     ) -> Option<Vec<String>> {
-        match file.extension().and_then(|ext| ext.to_str()) {
-            Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => {}
-            _ => return None,
-        }
-        let module = configured
-            .filter(|tools| tools.module.is_file())
-            .map(|tools| tools.module.clone())
-            .or_else(|| {
-                let local = root.join("node_modules/typescript/lib/typescript.js");
-                local.is_file().then_some(local)
-            })?;
-        let node = configured
-            .map(|tools| tools.program.display().to_string())
-            .unwrap_or_else(|| "node".to_owned());
-        let name = file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("c.ts")
-            .to_owned();
-        Some(vec![
-            node,
-            "-e".to_owned(),
-            TS_PROBE.to_owned(),
-            module.display().to_string(),
-            name,
-        ])
+        probe_argv(TS_PROBE, root, file, configured)
+    }
+
+    /// [`TS_OUTLINE_PROBE`] under the same compiler and Node selection as
+    /// [`Self::syntax_probe_command`]: `[node, "-e", script, <typescript.js>, <file name>]`.
+    fn source_outline_probe_command(
+        &self,
+        _project: &LanguageProject,
+        root: &Path,
+        file: &Path,
+        configured: Option<&ProbePrograms>,
+    ) -> Option<Vec<String>> {
+        probe_argv(TS_OUTLINE_PROBE, root, file, configured)
+    }
+
+    /// The outline probe's reply as this language's outline, through the same position handling
+    /// and [`Self::normalize`] as the server path (describe/it/test callbacks become tests).
+    /// `None` unless the reply is exactly one bounded `{"v":1,"symbols":[…]}` line whose every
+    /// range lies inside `source`.
+    fn source_outline_probe_result(
+        &self,
+        file: &Path,
+        source: &str,
+        output: &str,
+    ) -> Option<Outline> {
+        outline_probe_symbols(source, output).map(|symbols| self.normalize(file, source, symbols))
     }
 
     /// The worktree's environment under this request's configured tools
@@ -1051,6 +1063,104 @@ fn top_level_declaration(line: &str) -> Option<(SymbolKind, String)> {
         (true, true) => Some((kind, "default".to_owned())),
         (true, false) => None,
     }
+}
+
+/// `[node, "-e", script, <typescript.js>, <file name>]` for a stdin probe of a script-language
+/// file: the accepted compiler module from `configured`, else the project's own
+/// `node_modules/typescript`; `None` for another extension or when no compiler module exists.
+fn probe_argv(
+    script: &str,
+    root: &Path,
+    file: &Path,
+    configured: Option<&ProbePrograms>,
+) -> Option<Vec<String>> {
+    match file.extension().and_then(|ext| ext.to_str()) {
+        Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => {}
+        _ => return None,
+    }
+    let module = configured
+        .filter(|tools| tools.module.is_file())
+        .map(|tools| tools.module.clone())
+        .or_else(|| {
+            let local = root.join("node_modules/typescript/lib/typescript.js");
+            local.is_file().then_some(local)
+        })?;
+    let node = configured
+        .map(|tools| tools.program.display().to_string())
+        .unwrap_or_else(|| "node".to_owned());
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("c.ts")
+        .to_owned();
+    Some(vec![
+        node,
+        "-e".to_owned(),
+        script.to_owned(),
+        module.display().to_string(),
+        name,
+    ])
+}
+
+/// Document symbols of one outline probe reply, refused (`None`) when the reply is not exactly one
+/// `{"v":1,"symbols":[…]}` line within [`MAX_OUTLINE_PROBE_BYTES`], holds more than
+/// [`MAX_OUTLINE_PROBE_SYMBOLS`] symbols or nests deeper than [`MAX_OUTLINE_PROBE_DEPTH`], or has a
+/// range or selection range outside `source` (UTF-16 columns) or ending before it starts.
+fn outline_probe_symbols(source: &str, output: &str) -> Option<Vec<lsp::DocumentSymbol>> {
+    if output.len() > MAX_OUTLINE_PROBE_BYTES {
+        return None;
+    }
+    let mut lines = output.lines();
+    let reply: Value = serde_json::from_str(lines.next()?).ok()?;
+    if lines.any(|line| !line.trim().is_empty()) {
+        return None;
+    }
+    let object = reply.as_object()?;
+    if object.len() != 2 || object.get("v") != Some(&Value::from(1)) {
+        return None;
+    }
+    let mut symbols: Vec<lsp::DocumentSymbol> =
+        serde_json::from_value(object.get("symbols")?.clone()).ok()?;
+    let widths: Vec<usize> = source
+        .split('\n')
+        .map(|line| line.encode_utf16().count())
+        .collect();
+    let inside = |position: &lsp::Position| {
+        widths
+            .get(position.line as usize)
+            .is_some_and(|width| position.character as usize <= *width)
+    };
+    let ordered = |range: &lsp::Range| {
+        inside(&range.start)
+            && inside(&range.end)
+            && (range.start.line, range.start.character) <= (range.end.line, range.end.character)
+    };
+    let mut count = 0;
+    let mut pending: Vec<(&lsp::DocumentSymbol, usize)> =
+        symbols.iter().map(|symbol| (symbol, 1)).collect();
+    while let Some((symbol, depth)) = pending.pop() {
+        count += 1;
+        if count > MAX_OUTLINE_PROBE_SYMBOLS
+            || depth > MAX_OUTLINE_PROBE_DEPTH
+            || !ordered(&symbol.range)
+            || !ordered(&symbol.selection_range)
+        {
+            return None;
+        }
+        pending.extend(
+            symbol
+                .children
+                .iter()
+                .flatten()
+                .map(|child| (child, depth + 1)),
+        );
+    }
+    agent_ide_core::intelligence::context::utf16_symbols(
+        source,
+        &mut symbols,
+        &lsp::PositionEncodingKind::UTF16,
+    );
+    Some(symbols)
 }
 
 /// Whether a server symbol name is a test-framework callback: `describe("math") callback`,
@@ -1959,6 +2069,170 @@ export interface Options {
         assert_eq!(suite.children[0].kind, SymbolKind::Test);
         let outline = TypeScript.normalize(Path::new("src/math.ts"), MATH_TEST, symbols);
         assert_eq!(outline.symbols[0].kind, SymbolKind::Function);
+    }
+
+    /// The outline probe reply goes through the same normalization as server symbols; a reply
+    /// that is not exactly one bounded, in-range `{"v":1,"symbols":[…]}` line is refused.
+    #[test]
+    fn source_outline_probe_result_normalizes_bounded_replies_only() {
+        let symbols = vec![symbol(
+            "describe(\"math\") callback",
+            lsp::SymbolKind::FUNCTION,
+            (2, 17, 6, 1),
+            vec![symbol(
+                "it(\"adds\") callback",
+                lsp::SymbolKind::FUNCTION,
+                (3, 13, 5, 3),
+                vec![],
+            )],
+        )];
+        let file = Path::new("src/math.test.ts");
+        let reply = |symbols: &[lsp::DocumentSymbol]| {
+            format!("{}\n", serde_json::json!({"v": 1, "symbols": symbols}))
+        };
+        let good = reply(&symbols);
+        let outline = TypeScript
+            .source_outline_probe_result(file, MATH_TEST, &good)
+            .unwrap();
+        assert_eq!(
+            outline,
+            TypeScript.normalize(file, MATH_TEST, symbols.clone())
+        );
+        assert_eq!(outline.symbols[0].kind, SymbolKind::Test);
+        assert_eq!(outline.symbols[0].children[0].kind, SymbolKind::Test);
+        let refused = |output: &str| {
+            TypeScript
+                .source_outline_probe_result(file, MATH_TEST, output)
+                .is_none()
+        };
+        assert!(refused(""));
+        assert!(refused("not json\n"));
+        assert!(refused(&format!("{good}{good}")));
+        assert!(refused(&format!(
+            "{}\n",
+            serde_json::json!({"v": 2, "symbols": symbols})
+        )));
+        assert!(refused(&format!(
+            "{}\n",
+            serde_json::json!({"v": 1, "symbols": symbols, "extra": true})
+        )));
+        let mut outside = symbols.clone();
+        outside[0].range.end.line = 40;
+        assert!(refused(&reply(&outside)));
+        let mut wide = symbols.clone();
+        wide[0].selection_range.end.character = 500;
+        assert!(refused(&reply(&wide)));
+        let mut backwards = symbols.clone();
+        backwards[0].range = lsp::Range::new(lsp::Position::new(5, 0), lsp::Position::new(2, 0));
+        assert!(refused(&reply(&backwards)));
+        let mut deep = symbol("x", lsp::SymbolKind::VARIABLE, (0, 0, 0, 1), vec![]);
+        for _ in 0..MAX_OUTLINE_PROBE_DEPTH {
+            deep = symbol("x", lsp::SymbolKind::VARIABLE, (0, 0, 0, 1), vec![deep]);
+        }
+        assert!(refused(&reply(&[deep])));
+        let many: Vec<_> = (0..=MAX_OUTLINE_PROBE_SYMBOLS)
+            .map(|_| symbol("x", lsp::SymbolKind::VARIABLE, (0, 0, 0, 1), vec![]))
+            .collect();
+        assert!(refused(&reply(&many)));
+        assert!(refused(&format!(
+            "{}\n",
+            " ".repeat(MAX_OUTLINE_PROBE_BYTES + 1)
+        )));
+    }
+
+    /// The outline probe shares the syntax probe's compiler and Node selection and argv shape;
+    /// its script is the syntactic navigation-tree probe and never builds a program.
+    #[test]
+    fn source_outline_probe_command_shares_the_syntax_probe_selection() {
+        let project = project(&[]);
+        let root =
+            std::env::temp_dir().join(format!("agent-ide-ts-outline-{}", std::process::id()));
+        let local = root.join("node_modules/typescript/lib");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("typescript.js"), "export {};\n").unwrap();
+        let file = Path::new("src/a.test.ts");
+        let outline = TypeScript
+            .source_outline_probe_command(&project, &root, file, None)
+            .unwrap();
+        let syntax = TypeScript
+            .syntax_probe_command(&project, &root, file, None)
+            .unwrap();
+        assert_eq!(outline[2], TS_OUTLINE_PROBE);
+        assert!(outline[2].contains("LanguageServiceMode.Syntactic"));
+        assert!(outline[2].contains("getNavigationTree"));
+        assert!(!outline[2].contains("createProgram"));
+        assert_eq!((&outline[..2], &outline[3..]), (&syntax[..2], &syntax[3..]));
+        assert_eq!(
+            TypeScript.source_outline_probe_command(&project, &root, Path::new("src/a.py"), None),
+            None
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Operator-only: the actual probe on the accepted Node and compiler turns a suite read from
+    /// stdin alone into nested test ranges.
+    #[test]
+    #[ignore = "requires AGENT_IDE_NODE and AGENT_IDE_TSSERVER (typescript.js beside it)"]
+    fn source_outline_probe_runs_on_the_accepted_compiler() {
+        use std::io::Write;
+        let node = std::env::var("AGENT_IDE_NODE").unwrap();
+        let module = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap())
+            .with_file_name("typescript.js");
+        let source = "\
+import { describe, it, expect } from 'vitest'
+
+describe('Body', () => {
+  test('reads', async () => {
+    expect(await read()).toBe('x')
+  })
+  describe('parse', () => {
+    it('parses', () => {
+      expect(1).toBe(1)
+    })
+  })
+})
+";
+        let mut child = std::process::Command::new(node)
+            .args(["-e", TS_OUTLINE_PROBE])
+            .arg(&module)
+            .arg("body.test.ts")
+            .env_clear()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let outline = TypeScript
+            .source_outline_probe_result(
+                Path::new("src/body.test.ts"),
+                source,
+                std::str::from_utf8(&output.stdout).unwrap(),
+            )
+            .unwrap();
+        let suite = outline
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == SymbolKind::Test)
+            .unwrap();
+        assert_eq!((suite.range.start, suite.range.end), (3, 12));
+        let ranges: Vec<_> = suite
+            .children
+            .iter()
+            .map(|child| (child.kind, child.range.start, child.range.end))
+            .collect();
+        assert_eq!(
+            ranges,
+            [(SymbolKind::Test, 4, 6), (SymbolKind::Test, 7, 11)]
+        );
+        assert_eq!(suite.children[1].children[0].kind, SymbolKind::Test);
     }
 
     /// Bodies shrink to their nested declarations; class fields and interface members render

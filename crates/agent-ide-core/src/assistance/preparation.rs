@@ -128,9 +128,31 @@ impl Worker<'_> {
             let mut outline_reason = String::from("outline budget exhausted before request");
             let mut test_symbols = 0;
             let mut attempts = 0;
+            let probe_budget = until.saturating_duration_since(tokio::time::Instant::now());
+            let (syntax_outline, probe_note) = self
+                .source_probe_outline(job, &source.observed, &source.text, probe_budget)
+                .await;
+            if *job.cancel.borrow() {
+                return Err(FailureCode::Cancelled);
+            }
+            let syntax_available = syntax_outline.is_some();
+            if let Some(outline) = syntax_outline {
+                attempts = 1;
+                outline_reason = "syntax-only source probe".into();
+                for symbol in &outline.symbols {
+                    symbol.walk(&mut |symbol| {
+                        test_symbols += usize::from(symbol.kind == crate::lang::SymbolKind::Test);
+                    });
+                }
+                localized =
+                    preparation_test_units::localize(&outline, &source.text, &lines, &imports);
+            }
             // At most two ordinary outline requests: the first can start a cold provider;
             // only an already-owned session is waited on before the second request.
             for attempt in 0..2 {
+                if syntax_available {
+                    break;
+                }
                 if *job.cancel.borrow() {
                     return Err(FailureCode::Cancelled);
                 }
@@ -231,7 +253,7 @@ impl Worker<'_> {
                 ));
             } else {
                 prepared.warnings.push(format!(
-                    "{}: test blocks not localized; {} retained ({outline_reason}; {test_symbols} test symbols; {attempts} requests; {}ms)",
+                    "{}: test blocks not localized; {} retained ({outline_reason}; {probe_note}; {test_symbols} test symbols; {attempts} outline attempts; {}ms)",
                     source.path.display(),
                     if whole {
                         "whole-file candidate"

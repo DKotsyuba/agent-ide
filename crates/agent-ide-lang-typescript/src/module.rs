@@ -581,6 +581,17 @@ pub const RECIPES: &[EffectRecipe] = &[
         ],
         &PATH_ENV,
     ),
+    interactive(
+        "ts-outline",
+        "node_path",
+        &[
+            Arg::Literal("-e"),
+            Arg::Literal(crate::support::TS_OUTLINE_PROBE),
+            Arg::Param("module"),
+            Arg::Param("file"),
+        ],
+        &PATH_ENV,
+    ),
     node_test_run(
         "test-node",
         &[
@@ -649,6 +660,15 @@ pub const RECIPES: &[EffectRecipe] = &[
         &[
             Arg::Literal("-e"),
             Arg::Literal(crate::support::TS_PROBE),
+            Arg::Param("module"),
+            Arg::Param("file"),
+        ],
+    ),
+    interactive_node(
+        "ts-outline-tool",
+        &[
+            Arg::Literal("-e"),
+            Arg::Literal(crate::support::TS_OUTLINE_PROBE),
             Arg::Param("module"),
             Arg::Param("file"),
         ],
@@ -776,11 +796,14 @@ pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
             ],
         ),
         [node, "-e", probe, module, file]
-            if *probe == crate::support::TS_PROBE && module.starts_with('/') =>
+            if (*probe == crate::support::TS_PROBE
+                || *probe == crate::support::TS_OUTLINE_PROBE)
+                && module.starts_with('/') =>
         {
+            let outline = *probe == crate::support::TS_OUTLINE_PROBE;
             if node.starts_with('/') {
                 (
-                    "ts-probe",
+                    if outline { "ts-outline" } else { "ts-probe" },
                     vec![
                         ("node_path", Param::Path(PathBuf::from(node))),
                         ("module", Param::Path(PathBuf::from(module))),
@@ -789,7 +812,11 @@ pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
                 )
             } else if *node == "node" {
                 (
-                    "ts-probe-tool",
+                    if outline {
+                        "ts-outline-tool"
+                    } else {
+                        "ts-probe-tool"
+                    },
                     vec![
                         ("node", Param::Executable("node".to_owned())),
                         ("module", Param::Path(PathBuf::from(module))),
@@ -1624,6 +1651,7 @@ mod tests {
             .join("tools/lib/node_modules/typescript/lib/typescript.js");
         let (node_text, module_text) = (node.display().to_string(), module.display().to_string());
         let probe = crate::support::TS_PROBE;
+        let outline = crate::support::TS_OUTLINE_PROBE;
         for argv in [
             vec!["npx", "prettier", "--stdin-filepath", "src/a.ts"],
             vec![
@@ -1634,6 +1662,14 @@ mod tests {
                 "a.tsx",
             ],
             vec!["node", "-e", probe, module_text.as_str(), "a.mjs"],
+            vec![
+                node_text.as_str(),
+                "-e",
+                outline,
+                module_text.as_str(),
+                "a.test.ts",
+            ],
+            vec!["node", "-e", outline, module_text.as_str(), "a.test.tsx"],
             vec!["node", "--test"],
             vec!["node", "--test", "test/a.test.mjs", "test/b.test.mjs"],
             vec![

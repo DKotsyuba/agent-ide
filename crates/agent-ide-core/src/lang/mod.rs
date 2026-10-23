@@ -791,6 +791,31 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Optional stdin-only source-outline probe using the same admitted programs as syntax checks.
+    /// It must parse the supplied text without loading project configuration or resolving imports.
+    fn source_outline_probe_command(
+        &self,
+        project: &LanguageProject,
+        root: &Path,
+        file: &Path,
+        configured: Option<&ProbePrograms>,
+    ) -> Option<Vec<String>> {
+        let _ = (project, root, file, configured);
+        None
+    }
+
+    /// Validates a source-only probe answer against the exact input text; no semantic claims.
+    /// Invalid, truncated or unsupported answers return `None` and preserve the caller's fallback.
+    fn source_outline_probe_result(
+        &self,
+        file: &Path,
+        source: &str,
+        output: &str,
+    ) -> Option<Outline> {
+        let _ = (file, source, output);
+        None
+    }
+
     /// Runner identifier of the test whose outline path (segments joined with `::`) is
     /// `outline_path` in the project-relative `file`. Defaults to `outline_path` itself; a
     /// language whose runner addresses tests by module path derives it from `file`.

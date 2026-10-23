@@ -312,6 +312,26 @@ impl SupportServer {
                     let text = Self::text(&source, request)?;
                     encode(&support.syntax_verdict(&source.path, &text))
                 }
+                SyntaxQuery::OutlineProbeResult { source, output } => {
+                    let text = Self::text(&source, request)?;
+                    encode(&if output.len() <= 256 * 1024 {
+                        support.source_outline_probe_result(&source.path, &text, &output)
+                    } else {
+                        None
+                    })
+                }
+                SyntaxQuery::OutlineProbePlan {
+                    config,
+                    project,
+                    root,
+                    file,
+                    configured,
+                } => encode(
+                    &support
+                        .source_outline_probe_command(&project, &root, &file, configured.as_ref())
+                        .map(|argv| self.plan(&argv, &config, &root))
+                        .transpose(),
+                ),
                 SyntaxQuery::ProbePlan {
                     config,
                     project,

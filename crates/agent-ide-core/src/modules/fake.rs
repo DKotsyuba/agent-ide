@@ -231,6 +231,12 @@ impl FakeModule {
             }
             Capability::Syntax => match decode::<SyntaxQuery>(payload)? {
                 SyntaxQuery::Verdict { .. } => encode(&SyntaxVerdict::Clean),
+                SyntaxQuery::OutlineProbeResult { .. } => {
+                    encode(&Option::<crate::lang::Outline>::None)
+                }
+                SyntaxQuery::OutlineProbePlan { .. } => {
+                    encode(&Ok::<Option<EffectRequest>, crate::lang::LangError>(None))
+                }
                 SyntaxQuery::ProbePlan { .. } => {
                     encode(&Ok::<_, LangError>(Some(sample_effect("probe"))))
                 }

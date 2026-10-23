@@ -34,9 +34,10 @@ const PROVIDER_TESTS: [&str; 4] = [
     "configured_product_claude_returns_real_pyright_semantic_context_diff_and_stop",
 ];
 /// Non-Rust tooling source is prohibited outside these declared product assets: the embedded
-/// TypeScript checker, shared version predicate and runner prelude ship inside the binary via
+/// TypeScript checker, syntax outline, shared version predicate and runner prelude ship via
 /// `include_str!`; `record.mjs` is the Rust outline-corpus utility (LANG-03 exceptions).
-const ALLOWED_NON_RUST: [&str; 4] = [
+const ALLOWED_NON_RUST: [&str; 5] = [
+    "crates/agent-ide-lang-typescript/src/outline_probe.js",
     "crates/agent-ide-lang-typescript/src/typescript_adapter.js",
     "crates/agent-ide-lang-typescript/src/version_range.js",
     "crates/agent-ide-lang-typescript/src/runner_guard.js",
@@ -549,15 +550,18 @@ mod tests {
         assert_eq!(table_value(text, "s", "missing"), None);
     }
 
+    /// Checks the exact asset set independently of filesystem enumeration order.
     #[test]
     fn non_rust_inventory_flags_only_declared_files() -> Result<()> {
         let root = root()?;
         let mut found = Vec::new();
         collect_non_rust(&root.join("crates"), &mut found)?;
+        found.sort();
         assert_eq!(
             found,
             vec![
                 "crates/agent-ide-lang-rust/tests/fixtures/lexical/record.mjs".to_owned(),
+                "crates/agent-ide-lang-typescript/src/outline_probe.js".to_owned(),
                 "crates/agent-ide-lang-typescript/src/runner_guard.js".to_owned(),
                 "crates/agent-ide-lang-typescript/src/typescript_adapter.js".to_owned(),
                 "crates/agent-ide-lang-typescript/src/version_range.js".to_owned(),

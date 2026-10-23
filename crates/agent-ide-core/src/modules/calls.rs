@@ -1274,6 +1274,99 @@ pub async fn syntax_probe_command(
     }
 }
 
+/// `LanguageSupport::source_outline_probe_command`.
+pub async fn source_outline_probe_command(
+    language: Language,
+    worktree: &Path,
+    project: &LanguageProject,
+    root: &Path,
+    file: &Path,
+    configured: Option<&ProbePrograms>,
+    config: &ModuleConfig,
+) -> Routed<Result<Option<StdinRun>, LangError>> {
+    match module(language) {
+        None => Ok(language
+            .support()
+            .source_outline_probe_command(project, root, file, configured)
+            .map(|argv| {
+                let environment = language
+                    .support()
+                    .configured_command_argv(worktree, root, &argv, config)?;
+                Ok(StdinRun::Argv {
+                    cwd: root.to_path_buf(),
+                    argv,
+                    environment,
+                })
+            })
+            .transpose()),
+        Some(host) => {
+            let effect: super::payload::FormatPlanAnswer = host
+                .request(
+                    language,
+                    worktree,
+                    Capability::Syntax,
+                    encode(&SyntaxQuery::OutlineProbePlan {
+                        config: config.clone(),
+                        project: Box::new(project.clone()),
+                        root: root.to_path_buf(),
+                        file: file.to_path_buf(),
+                        configured: configured.cloned(),
+                    }),
+                    Vec::new(),
+                )
+                .await?;
+            let effect = match effect {
+                Ok(effect) => effect,
+                Err(error) => return Ok(Err(error)),
+            };
+            stdin_run(
+                language,
+                worktree,
+                root,
+                effect,
+                &configured
+                    .iter()
+                    .flat_map(|tools| [tools.program.as_path(), tools.module.as_path()])
+                    .collect::<Vec<_>>(),
+                config,
+            )
+            .map(Ok)
+        }
+    }
+}
+
+/// Validates syntax-probe output without weakening the semantic provider's resolution policy.
+pub async fn source_outline_probe_result(
+    language: Language,
+    worktree: &Path,
+    path: &Path,
+    text: &str,
+    output: &str,
+) -> Routed<Option<Outline>> {
+    if output.len() > 256 * 1024 {
+        return Ok(None);
+    }
+    match module(language) {
+        None => Ok(language
+            .support()
+            .source_outline_probe_result(path, text, output)),
+        Some(host) => {
+            let (source, attachments) = source(path, text);
+            host.request(
+                language,
+                worktree,
+                Capability::Syntax,
+                encode(&SyntaxQuery::OutlineProbeResult {
+                    source,
+                    output: output.into(),
+                }),
+                attachments,
+            )
+            .await
+        }
+    }
+}
+
 /// `LanguageChecks::not_analysed`, as an owned reason.
 pub async fn not_analysed(
     language: Language,

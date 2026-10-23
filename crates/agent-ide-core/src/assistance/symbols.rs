@@ -3947,6 +3947,70 @@ impl Worker<'_> {
         language.server()?.probe_programs(launch)
     }
 
+    /// Obtains per-file syntax from an admitted stdin probe without admitting semantic resolution.
+    /// Only the current source is supplied; invalid output, unavailable tools and timeouts preserve fallback.
+    #[cfg(feature = "jev-pilot")]
+    pub(super) async fn source_probe_outline(
+        &self,
+        job: &Job,
+        observed: &SourceObservation,
+        source: &str,
+        budget: Duration,
+    ) -> (Option<Outline>, &'static str) {
+        if budget.is_zero() {
+            return (None, "probe budget exhausted");
+        }
+        let _timing = progress::Progress::enter(&job.progress, "source_probe");
+        let deadline = tokio::time::Instant::now() + budget;
+        let file = observed.path();
+        let Some(language) = Lang::for_path(file) else {
+            return (None, "no source language");
+        };
+        let root = observed.worktree().worktree_path();
+        let config = self
+            .shared
+            .launcher
+            .module_config(language, root, &job.target);
+        let Ok(Some(project)) = crate::modules::calls::detect(language, root, &config).await else {
+            return (None, "source probe project unavailable");
+        };
+        let configured = self.configured_probe_programs(job, language);
+        let plan = crate::modules::calls::source_outline_probe_command(
+            language,
+            root,
+            &project,
+            root,
+            file,
+            configured.as_ref(),
+            &config,
+        )
+        .await;
+        let argv = match plan {
+            Ok(Ok(Some(argv))) => argv,
+            Ok(Ok(None)) => return (None, "source probe unsupported"),
+            _ => return (None, "source probe plan refused"),
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return (None, "probe budget exhausted");
+        }
+        let Some(output) = run_stdin(&self.admission, &argv, root, source, remaining).await else {
+            return (None, "source probe did not finish");
+        };
+        if output.status != Some(0) || output.stdout.len() > 256 * 1024 {
+            return (None, "source probe output rejected");
+        }
+        let Ok(text) = std::str::from_utf8(&output.stdout) else {
+            return (None, "source probe output is not UTF-8");
+        };
+        match crate::modules::calls::source_outline_probe_result(language, root, file, source, text)
+            .await
+        {
+            Ok(Some(outline)) => (Some(outline), "syntax-only source probe"),
+            _ => (None, "source probe outline not verified"),
+        }
+    }
+
     /// The structural verdict for one text: the in-process check first, else its stdin probe run
     /// from the project root with the daemon's formatter PATH and the launcher-configured probe
     /// programs of the file's language. No registered support, checker or runnable probe yields

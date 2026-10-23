@@ -280,6 +280,27 @@ pub enum SyntaxQuery {
         /// Externally configured probe programs.
         configured: Option<ProbePrograms>,
     },
+    /// Plans a stdin-only syntax outline, using the same closed recipe admission as `ProbePlan`.
+    OutlineProbePlan {
+        /// Current accepted launcher and filesystem facts.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
+        /// Detected project and its admitted toolchain, not permission to resolve its imports.
+        project: Box<LanguageProject>,
+        /// Admitted working directory.
+        root: PathBuf,
+        /// Root-relative source name.
+        file: PathBuf,
+        /// Accepted programs, if configured.
+        configured: Option<ProbePrograms>,
+    },
+    /// Validates bounded probe output against exact supplied source; answers `Option<Outline>`.
+    OutlineProbeResult {
+        /// The original source and its attachment identity.
+        source: SourceRef,
+        /// UTF-8 stdout, capped by the core before transport.
+        output: String,
+    },
 }
 
 // ---- semantic and calls ----
