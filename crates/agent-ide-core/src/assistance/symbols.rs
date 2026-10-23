@@ -528,10 +528,10 @@ impl Worker<'_> {
     /// `read: <n> items in <f> files — <d> delivered, <u> unchanged, <c> not included, <x> failed`.
     /// Unknown symbols, missing files and ranges past the end are reported per item in place
     /// without failing the rest; an exactly duplicated item renders once (duplicates footer); a
-    /// block is never cut mid-body — the longest prefix of blocks that fits the reply envelope is
-    /// delivered and the rest are named with the exact follow-up call in the request's own form.
-    /// Only files whose blocks were all delivered get an edit base retained. When not even the
-    /// first deliverable block fits, it alone is delivered through ordinary byte paging and every
+    /// block is never cut mid-body — whole blocks are fitted in request order, skipping those
+    /// that do not fit and naming them with the exact follow-up call in the request's own form.
+    /// Only delivered blocks receive read memory and their files retain source observations.
+    /// When no whole source block fits, the first source block uses ordinary byte paging and every
     /// other item is named in the footer.
     ///
     /// Item forms: a `{symbol}` item resolves through the file's outline; a `{path}` item renders
@@ -845,14 +845,26 @@ impl Worker<'_> {
             }
             (text, delivered)
         };
-        // Deliver the longest prefix of whole blocks that fits; never split a block.
-        let prefix = |count: usize| (0..count).collect::<Vec<_>>();
-        let included = (0..=items.len())
-            .rev()
-            .find(|&count| fits(&compose(&prefix(count)).0))
-            .unwrap_or(0);
+        // Try the complete response first: removing the omission footer can make it fit.
+        // Otherwise skip oversized blocks without starving smaller later requests. Every
+        // trial includes the exact summary, omissions and serialized reply envelope.
+        let all: Vec<usize> = (0..items.len()).collect();
+        let included = if fits(&compose(&all).0) {
+            all
+        } else {
+            let mut shown = Vec::new();
+            for index in 0..items.len() {
+                shown.push(index);
+                if !fits(&compose(&shown).0) {
+                    shown.pop();
+                }
+            }
+            shown
+        };
         let authority = self.authority(&binding).await.ok();
-        if included == 0
+        // Failure-only replies do not replace source paging: still deliver the first source
+        // page when none of the selected blocks contains source text.
+        if !included.iter().any(|&index| items[index].1.is_some())
             && let Some(index) = items.iter().position(|(_, file, _)| file.is_some())
         {
             // One block larger than the whole budget: deliver it alone through the ordinary
@@ -881,13 +893,13 @@ impl Worker<'_> {
             }
             return Ok((reply, authority, Some(files[file].1.clone())));
         }
-        let (text, delivered) = compose(&prefix(included));
+        let (text, delivered) = compose(&included);
         // Remember the blocks this reply carries in full, so their repeat can answer unchanged.
         if epoch.is_some()
             && let Ok(mut ledger) = self.shared.ledger.lock()
         {
             let memory = ledger.read_memory.entry(binding.clone()).or_default();
-            for index in 0..included {
+            for &index in &included {
                 let (block, file, item) = &items[index];
                 if file.is_some() && !unchanged[index] {
                     memory.remember(epoch, &item.label(), block, &job.reference);
@@ -902,7 +914,7 @@ impl Worker<'_> {
             .collect();
         let job_source = (!sources.is_empty()).then(|| sources.remove(0));
         self.shared.add_edit_sources(&job.reference, sources);
-        let truncated = included < items.len();
+        let truncated = included.len() < items.len();
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Read).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
@@ -922,9 +934,18 @@ impl Worker<'_> {
             other => other,
         };
         // Preserve request order across address and file reads of the same unit. Cut blocks
-        // record nothing; only the blocks delivered whole reach this loop.
+        // record nothing; only whole delivered blocks update read memory.
         let mut unit_reads = unit_reads.into_iter().peekable();
-        for (index, (block, file, item)) in items.iter().take(included).enumerate() {
+        for (index, (block, file, item)) in items.iter().enumerate() {
+            if !included.contains(&index) {
+                if unit_reads
+                    .peek()
+                    .is_some_and(|(unit_index, _)| *unit_index == index)
+                {
+                    unit_reads.next();
+                }
+                continue;
+            }
             if unit_reads
                 .peek()
                 .is_some_and(|(unit_index, _)| *unit_index == index)

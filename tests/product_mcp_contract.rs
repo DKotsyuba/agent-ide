@@ -26505,6 +26505,310 @@ async fn failed_stop_is_retried_by_the_daemon_without_another_call() {
     actor.mcp.close().await;
 }
 
+/// Writes `lines` numbered filler lines of about 45 bytes each, so a read block's serialized size
+/// follows its line count (about 52 bytes per rendered, JSON-escaped line).
+fn read_fill_filler(tag: &str, lines: usize) -> String {
+    (1..=lines)
+        .map(|line| format!("// {tag} filler line {line:04} padding padding padding\n"))
+        .collect()
+}
+
+/// Starts one actor over `fixture` with `files` committed; no semantic provider is needed for
+/// plain path reads.
+async fn read_fill_actor(
+    fixture: &ProductFixture,
+    name: &'static str,
+    files: &[(&str, String)],
+) -> ProductActor {
+    for (path, content) in files {
+        let target = fixture.root.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, content).unwrap();
+        fixture.git(&["add", "--", path]);
+    }
+    fixture.git(&["commit", "--quiet", "-m", "read fill fixture"]);
+    let mut actor = ProductActor::new(fixture, name).await;
+    let started = actor
+        .call(fixture, "ide.start", json!({"activation_id":name}))
+        .await;
+    assert_eq!(actor.settle(fixture, started).await["kind"], "activation");
+    actor
+}
+
+/// One settled `ide.read {items}` reply: structured value and its body text.
+async fn read_fill_call(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    items: Value,
+) -> (Value, String) {
+    let read = batch_call_with_text(actor, fixture, "ide.read", json!({"items":items})).await;
+    let (read, _) = batch_settle_with_text(actor, fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    let body = read["text"].as_str().expect("read body").to_owned();
+    (read, body)
+}
+
+/// Five items of about 3.4, 7.0, 7.8, 0.9 and
+/// 1.5 KB under the 8 KiB source reply. Whole blocks are fitted in request order, skipping the
+/// two that do not fit, instead of stopping after the first; the footer names exactly the skipped
+/// items with their follow-up call, no page is opened, and only delivered blocks are remembered:
+/// a repeat of a delivered item answers unchanged while a skipped item is delivered in full.
+#[tokio::test]
+async fn configured_product_batch_read_fills_later_blocks_after_skipping_oversized_ones() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "read-fill-sol",
+        &[
+            ("src/one.rs", read_fill_filler("one", 240)),
+            ("src/three.rs", read_fill_filler("three", 150)),
+            ("src/four.rs", read_fill_filler("four", 17)),
+            ("src/five.rs", read_fill_filler("five", 28)),
+        ],
+    )
+    .await;
+    let items = json!([
+        {"path":"src/one.rs","lines":"1-65"},
+        {"path":"src/one.rs","lines":"100-234"},
+        {"path":"src/three.rs","lines":"1-150"},
+        {"path":"src/four.rs","lines":"1-17"},
+        {"path":"src/five.rs","lines":"1-28"}
+    ]);
+    let (read, body) = read_fill_call(&mut actor, &fixture, items).await;
+    assert!(
+        body.starts_with(
+            "read: 5 items in 4 files — 3 delivered, 0 unchanged, 2 not included, 0 failed\n"
+        ),
+        "{body}"
+    );
+    let delivered: Vec<usize> = [
+        "src/one.rs  (lines 1–65)\n",
+        "src/four.rs  (lines 1–17)\n",
+        "src/five.rs  (lines 1–28)\n",
+    ]
+    .iter()
+    .map(|header| {
+        body.find(header)
+            .unwrap_or_else(|| panic!("{header}: {body}"))
+    })
+    .collect();
+    assert!(
+        delivered.windows(2).all(|pair| pair[0] < pair[1]),
+        "request order: {body}"
+    );
+    assert!(body.contains("// five filler line 0028"), "{body}");
+    assert!(!body.contains("src/one.rs  (lines 100–234)"), "{body}");
+    assert!(!body.contains("// three filler line"), "{body}");
+    assert!(
+        body.ends_with(
+            "not included (over the reply budget): src/one.rs lines 100-234, src/three.rs \
+             lines 1-150 — call ide.read {\"items\":[{\"lines\":\"100-234\",\"path\":\
+             \"src/one.rs\"},{\"lines\":\"1-150\",\"path\":\"src/three.rs\"}]}\n"
+        ),
+        "{body}"
+    );
+    assert_eq!(read["truncated"], true, "{read}");
+    assert_ne!(read["continuation"], true, "no page is opened: {read}");
+
+    // Only delivered blocks are remembered: the delivered item repeats as unchanged, the skipped
+    // item arrives in full on its first actual delivery.
+    let (_, repeat) = read_fill_call(
+        &mut actor,
+        &fixture,
+        json!([{"path":"src/four.rs","lines":"1-17"}]),
+    )
+    .await;
+    assert!(
+        repeat.starts_with(
+            "read: 1 items in 1 files — 0 delivered, 1 unchanged, 0 not included, 0 failed\n"
+        ),
+        "{repeat}"
+    );
+    let (_, skipped) = read_fill_call(
+        &mut actor,
+        &fixture,
+        json!([{"path":"src/one.rs","lines":"100-234"}]),
+    )
+    .await;
+    assert!(
+        skipped.starts_with(
+            "read: 1 items in 1 files — 1 delivered, 0 unchanged, 0 not included, 0 failed\n"
+        ),
+        "{skipped}"
+    );
+    assert!(skipped.contains("// one filler line 0234"), "{skipped}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Three blocks each larger than the source
+/// reply and one small block. The small block is delivered whole and the three large ones are
+/// named with their exact follow-up call; no page of a large block is opened.
+#[tokio::test]
+async fn configured_product_batch_read_delivers_the_small_block_when_others_are_oversized() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "read-fill-luna",
+        &[
+            ("src/big_a.rs", read_fill_filler("big_a", 400)),
+            ("src/big_b.rs", read_fill_filler("big_b", 350)),
+            ("src/big_c.rs", read_fill_filler("big_c", 450)),
+            ("src/small.rs", read_fill_filler("small", 40)),
+        ],
+    )
+    .await;
+    let (read, body) = read_fill_call(
+        &mut actor,
+        &fixture,
+        json!([
+            {"path":"src/big_a.rs","lines":"1-400"},
+            {"path":"src/big_b.rs","lines":"1-350"},
+            {"path":"src/big_c.rs","lines":"1-450"},
+            {"path":"src/small.rs","lines":"1-40"}
+        ]),
+    )
+    .await;
+    assert!(
+        body.starts_with(
+            "read: 4 items in 4 files — 1 delivered, 0 unchanged, 3 not included, 0 failed\n\
+             src/small.rs  (lines 1–40)\n"
+        ),
+        "{body}"
+    );
+    assert!(body.contains("// small filler line 0040"), "{body}");
+    assert!(!body.contains("big_a filler"), "{body}");
+    assert!(
+        body.ends_with(
+            "not included (over the reply budget): src/big_a.rs lines 1-400, src/big_b.rs \
+             lines 1-350, src/big_c.rs lines 1-450 — call ide.read {\"items\":[{\"lines\":\
+             \"1-400\",\"path\":\"src/big_a.rs\"},{\"lines\":\"1-350\",\"path\":\
+             \"src/big_b.rs\"},{\"lines\":\"1-450\",\"path\":\"src/big_c.rs\"}]}\n"
+        ),
+        "{body}"
+    );
+    assert_ne!(read["continuation"], true, "no page is opened: {read}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// When no whole block fits, the first block still pages as before and the rest is named.
+#[tokio::test]
+async fn configured_product_batch_read_pages_the_first_block_when_none_fits_whole() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "read-fill-paging",
+        &[
+            ("src/big_a.rs", read_fill_filler("big_a", 400)),
+            ("src/big_b.rs", read_fill_filler("big_b", 350)),
+        ],
+    )
+    .await;
+    let (read, body) = read_fill_call(
+        &mut actor,
+        &fixture,
+        json!([
+            {"path":"src/big_a.rs","lines":"1-400"},
+            {"path":"src/big_b.rs","lines":"1-350"}
+        ]),
+    )
+    .await;
+    assert_eq!(read["continuation"], true, "{read}");
+    let (number, last, from, to, total) = page_marker(&body);
+    assert_eq!((number, last, from), (1, false, 0), "{body}");
+    assert!(to > from && total > to, "{body}");
+    assert!(
+        body.split_once('\n').unwrap().1.starts_with(
+            "read: 2 items in 2 files — 1 delivered, 0 unchanged, 1 not included, 0 failed\n\
+             src/big_a.rs  (lines 1–400)\n"
+        ),
+        "{body}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A patch naming more files than one edit may
+/// commit is refused explicitly with its limit and nothing is written, instead of the generic
+/// internal refusal; a patch at the limit still applies every file.
+#[tokio::test]
+async fn configured_product_patch_over_the_file_limit_is_refused_before_any_write() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "patch-file-limit",
+        &[("notes/seed.txt", "seed\n".to_owned())],
+    )
+    .await;
+    let patch = |prefix: &str, count: usize| {
+        let mut text = String::from("*** Begin Patch\n");
+        for index in 1..=count {
+            text.push_str(&format!(
+                "*** Add File: notes/{prefix}_{index:02}.txt\n+{prefix} {index}\n"
+            ));
+        }
+        text.push_str("*** End Patch");
+        text
+    };
+    let over = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"patch-over-limit","patch":patch("over", 17)}),
+    )
+    .await;
+    let (over, over_text) = batch_settle_with_text(&mut actor, &fixture, over).await;
+    assert!(
+        !over_text.contains("The IDE could not complete this request."),
+        "an explicit refusal, not the generic internal one: {over_text}"
+    );
+    assert!(
+        over_text.contains("16"),
+        "the refusal names its limit: {over_text}"
+    );
+    assert_ne!(over["state"], "edit_batch", "{over}");
+    assert!(
+        (1..=17).all(|index| !fixture
+            .root
+            .join(format!("notes/over_{index:02}.txt"))
+            .exists()),
+        "nothing is written"
+    );
+
+    let at_limit = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"patch-at-limit","patch":patch("limit", 16)}),
+    )
+    .await;
+    let (at_limit, at_limit_text) = batch_settle_with_text(&mut actor, &fixture, at_limit).await;
+    assert_eq!(at_limit["state"], "edit_batch", "{at_limit}");
+    assert!(
+        batch_without_status_plate(&at_limit_text).starts_with("edit: applied 16 of 16 files"),
+        "{at_limit_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("notes/limit_16.txt")).unwrap(),
+        "limit 16\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Batch forms (batch-api-v1) against the real daemon, sharing this file's fixtures.
 mod batch_api;
 /// Post-review receipt, fallback and usable-accounting regressions.
