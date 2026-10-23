@@ -3,6 +3,8 @@
 
 mod packet;
 mod storage;
+#[cfg(feature = "jev-pilot")]
+pub(crate) mod trace;
 mod vectors;
 pub use packet::{ContextBundle, DeclarationFact, FileFacts, PacketOptions, SourceWindow};
 pub use storage::ContextIndex;

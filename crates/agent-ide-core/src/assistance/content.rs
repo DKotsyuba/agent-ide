@@ -131,6 +131,15 @@ pub(crate) fn fits_prepare_budget(
         && fits(reply, envelope)
 }
 
+/// Exact text-only MCP serialization size, excluding a later optional status plate.
+/// Used only for private preparation diagnostics, not to change admission or output policy.
+#[cfg(feature = "jev-pilot")]
+pub(crate) fn prepare_carrier_bytes(reply: &PeerReply) -> Option<usize> {
+    project(reply, None, Envelope::TextOnly, None, None)
+        .and_then(|value| serde_json::to_vec(&value).ok())
+        .map(|bytes| bytes.len())
+}
+
 /// Projects one unchanged reply into compact content plus, per `envelope`, the complete typed
 /// structured value.
 ///

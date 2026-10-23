@@ -103,6 +103,11 @@ impl Worker<'_> {
                 if *job.cancel.borrow() {
                     return Err(FailureCode::Cancelled);
                 }
+                if let Some(trace) = &prepared.trace {
+                    trace.record("localization",serde_json::json!({"path":source.path,"kind":"source_context",
+                        "anchors":lines,"selected_lines":spans,"outcome":if spans.is_some(){"localized"}else{"original selection retained; probe unavailable or closure unproven"}}))
+                        .map_err(|_|FailureCode::Internal)?;
+                }
                 if let Some(spans) = spans {
                     let offsets: Vec<_> = std::iter::once(0)
                         .chain(source.text.match_indices('\n').map(|(at, _)| at + 1))
@@ -262,6 +267,12 @@ impl Worker<'_> {
                 if !ready {
                     break;
                 }
+            }
+            if let Some(trace) = &prepared.trace {
+                trace.record("localization",serde_json::json!({"path":source.path,"kind":"test_context",
+                    "anchors":lines,"selected_byte_spans":localized,"outline_reason":outline_reason,"probe_note":probe_note,
+                    "outcome":if localized.is_some(){"localized"}else{"original selection retained; complete test context not proven"}}))
+                    .map_err(|_|FailureCode::Internal)?;
             }
             if let Some(spans) = localized {
                 let resolved: Vec<_> = units
@@ -743,12 +754,32 @@ impl Worker<'_> {
                     .iter()
                     .map(|path| format!("{}: not UTF-8 text", path.display())),
             );
+            if let Some(reason) = prepared
+                .trace
+                .as_ref()
+                .and_then(|trace| trace.degradation())
+            {
+                prepared
+                    .warnings
+                    .push(format!("prepare trace incomplete: {reason}"));
+            }
             if pending.budget > (content::MAX_PREPARE_REPLY_BYTES / 4) as u64 {
                 prepared.warnings.push(format!(
                     "requested context budget {} constrained by {}-byte serialized reply limit",
                     pending.budget,
                     content::MAX_PREPARE_REPLY_BYTES
                 ));
+            }
+            if let Some(trace) = &prepared.trace {
+                trace.record("packing_input", serde_json::json!({"operation_ref":job.reference,
+                    "token_budget":pending.budget,"carrier_limit":content::MAX_PREPARE_REPLY_BYTES,
+                    "prelude_policy":{"manifests":MANIFEST_FILES,"instructions":RULE_FILES},
+                    "units":units.iter().map(|u| serde_json::json!({"path":sources[u.file].path,
+                        "content_hash":sources[u.file].hash,"range":u.range,"rank":u.rank,"required":u.required,
+                        "bundle":u.bundle,"role":u.role,"complete_unit":u.complete})).collect::<Vec<_>>(),
+                    "prelude":prelude.iter().map(|f|serde_json::json!({"path":f.path,"included_bytes":f.head.len(),"total_bytes":f.total})).collect::<Vec<_>>(),
+                    "prior_omissions":omitted
+                })).map_err(|_| FailureCode::Internal)?;
             }
             let reply = fit_packet(
                 &prepared,
@@ -785,6 +816,18 @@ impl Worker<'_> {
             let primary = fences.next();
             self.shared
                 .add_edit_sources(&job.reference, fences.collect());
+            if let Some(trace) = &prepared.trace {
+                trace.finish(serde_json::json!({"operation_ref":job.reference,
+                    "files":files.iter().map(|f|serde_json::json!({"path":sources[f.source].path,
+                        "content_hash":sources[f.source].hash,"lines":f.spans,"whole_file":f.whole})).collect::<Vec<_>>(),
+                    "prelude":prelude.iter().map(|f|serde_json::json!({"path":f.path,"included_bytes":f.head.len(),"total_bytes":f.total})).collect::<Vec<_>>(),
+                    "omissions":omitted,"carrier_bytes_without_status":content::prepare_carrier_bytes(&reply),
+                    "host_visibility":"unverified; worker output is not external client receipt"
+                })).map_err(|_| FailureCode::Internal)?;
+                if let Some(reason) = trace.degradation() {
+                    eprintln!("agent-ide: prepare trace incomplete: {reason}");
+                }
+            }
             Ok((reply, Some(authority), primary))
         }
     }
@@ -1126,6 +1169,9 @@ fn fit_packet(
                     .position(|file| file.path == victim)
                     .ok_or(FailureCode::Internal)?;
                 available.remove(position);
+                if let Some(trace) = &prepared.trace {
+                    trace.record("packing_protected_removed",serde_json::json!({"path":victim,"reason":"protected context prevented a bounded reply"})).map_err(|_|FailureCode::Internal)?;
+                }
                 gaps.push(format!(
                     "{}: protected context omitted to fit the requested budget",
                     victim.display()
@@ -1151,6 +1197,31 @@ fn task_names_path(task: &str, path: &std::path::Path) -> bool {
             !task[..at].chars().next_back().is_some_and(path_char) && end_boundary
         })
     })
+}
+
+/// Explains the measured output bounds without changing packing or guessing a failed projection.
+#[cfg(feature = "jev-pilot")]
+fn packing_bounds(reply: &PeerReply, budget: u64, accepted: bool) -> Vec<&'static str> {
+    if accepted {
+        return Vec::new();
+    }
+    let Some(bytes) = content::prepare_carrier_bytes(reply) else {
+        return vec!["projection_or_serialization_failed"];
+    };
+    let mut reasons = Vec::new();
+    if bytes.div_ceil(4) as u64 > budget {
+        reasons.push("requested_token_budget");
+    }
+    if bytes > content::MAX_PREPARE_REPLY_BYTES {
+        reasons.push("prepare_carrier_bytes");
+    }
+    if bytes > crate::assistance::reply::MAX_REPLY_BYTES - crate::assistance::reply::MCP_RESERVE {
+        reasons.push("common_reply_bytes");
+    }
+    if reasons.is_empty() {
+        reasons.push("other_envelope_constraint");
+    }
+    reasons
 }
 
 /// Builds a bounded reply by admitting ranked units, then optional manifest context.
@@ -1237,7 +1308,18 @@ fn select_packet(
         .map(|unit| (unit.file, unit.range))
         .collect();
     included[..source_count].fill(true);
-    if fits(&assemble(&candidates, prelude, &included).0) {
+    let complete_reply = assemble(&candidates, prelude, &included).0;
+    let complete_fits = fits(&complete_reply);
+    if let Some(trace) = &prepared.trace {
+        trace
+            .record(
+                "packing_all",
+                serde_json::json!({"fits":complete_fits,"failed_bounds":packing_bounds(&complete_reply,budget,complete_fits),
+            "carrier_bytes":content::prepare_carrier_bytes(&complete_reply),"token_budget":budget}),
+            )
+            .map_err(|_| FailureCode::Internal)?;
+    }
+    if complete_fits {
         // Overlapping units can be cheaper together than their separate omission labels.
         *units = candidates;
     } else {
@@ -1248,7 +1330,19 @@ fn select_packet(
                 included[position] = true;
                 units.push(candidates[position].clone());
             }
-            if !fits(&assemble(units, prelude, &included).0) {
+            let trial = assemble(units, prelude, &included).0;
+            let accepted = fits(&trial);
+            if let Some(trace) = &prepared.trace {
+                trace.record("packing_unit", serde_json::json!({"accepted":accepted,"failed_bounds":packing_bounds(&trial,budget,accepted),
+                    "reason":if accepted { "fits" } else { "reply_did_not_fit" },
+                    "carrier_limit_bytes":content::MAX_PREPARE_REPLY_BYTES,
+                    "estimated_tokens":content::prepare_carrier_bytes(&trial).map(|bytes|bytes.div_ceil(4)),
+                    "carrier_bytes":content::prepare_carrier_bytes(&trial),"token_budget":budget,
+                    "units":group.iter().map(|&i|serde_json::json!({"path":sources[candidates[i].file].path,
+                        "range":candidates[i].range,"rank":candidates[i].rank,"bundle":candidates[i].bundle})).collect::<Vec<_>>()
+                })).map_err(|_| FailureCode::Internal)?;
+            }
+            if !accepted {
                 units.truncate(before);
                 for &position in group {
                     included[position] = false;
@@ -1270,8 +1364,23 @@ fn select_packet(
         if already_delivered {
             continue;
         }
+        let path = file.path.clone();
         prelude.push(file);
-        if !fits(&assemble(units, prelude, &included).0) {
+        let trial = assemble(units, prelude, &included).0;
+        let accepted = fits(&trial);
+        if let Some(trace) = &prepared.trace {
+            trace
+                .record(
+                    "packing_prelude",
+                    serde_json::json!({"path":path,"accepted":accepted,"failed_bounds":packing_bounds(&trial,budget,accepted),
+                "reason":if accepted { "fits" } else { "reply_did_not_fit" },
+                    "carrier_limit_bytes":content::MAX_PREPARE_REPLY_BYTES,
+                    "estimated_tokens":content::prepare_carrier_bytes(&trial).map(|bytes|bytes.div_ceil(4)),
+                "carrier_bytes":content::prepare_carrier_bytes(&trial),"token_budget":budget}),
+                )
+                .map_err(|_| FailureCode::Internal)?;
+        }
+        if !accepted {
             prelude.pop();
             included[slot] = false;
         }
@@ -1964,7 +2073,10 @@ mod tests {
                 text,
             });
         }
+        std::fs::create_dir(root.join(".agent-ide")).unwrap();
+        let trace_directory = root.join(".agent-ide/prepare-traces");
         let mut prepared = Preparation {
+            trace: Some(crate::project::context::trace::PrepareTrace::new(&root).unwrap()),
             packet: ContextBundle {
                 task: "Repair observed failures".into(),
                 snapshot: IndexSnapshot {
@@ -2038,6 +2150,35 @@ mod tests {
             "optional manifest displaced code"
         );
         assert!(omitted.iter().any(|line| line.contains("package.json")));
+        let trace_file = std::fs::read_dir(&trace_directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(trace_file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["stage"] == "packing_prelude"
+                    && event["data"]["path"] == "package.json"
+                    && event["data"]["accepted"] == false)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["stage"] == "worker_reply_ready")
+        );
+        assert!(
+            serde_json::to_value(&prepared)
+                .unwrap()
+                .get("trace")
+                .is_none()
+        );
         assert!(
             text.len().div_ceil(4) <= 12000 && content::fits(&reply, content::reply_envelope())
         );

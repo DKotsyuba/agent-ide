@@ -535,6 +535,19 @@ impl ContextIndex {
         if limit == 0 || limit > 256 {
             return Err(io::Error::other("semantic limit must be 1..256"));
         }
+        let (mut hits, _) = self.rank_documents(batch, space, query)?;
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// Every document of `batch` with a vector in `space`, ordered as [`Self::semantic_search`]
+    /// orders them (similarity desc, document id asc), plus the ids of documents without one.
+    fn rank_documents(
+        &self,
+        batch: &DocumentBatch,
+        space: &str,
+        query: &[f32],
+    ) -> io::Result<(Vec<SemanticHit>, Vec<String>)> {
         let snapshot = self
             .snapshot()?
             .ok_or_else(|| io::Error::other("index has not been built"))?;
@@ -543,6 +556,7 @@ impl ContextIndex {
         }
         let query = unit(query, query.len())?;
         let mut hits = Vec::new();
+        let mut missing = Vec::new();
         for document in &batch.documents {
             if let Some(vector) = self.vector(space, &document.id, query.len())? {
                 let similarity = query.iter().zip(vector).map(|(a, b)| a * b).sum::<f32>();
@@ -550,6 +564,8 @@ impl ContextIndex {
                     document: document.clone(),
                     similarity,
                 });
+            } else {
+                missing.push(document.id.clone());
             }
         }
         hits.sort_by(|a, b| {
@@ -557,9 +573,145 @@ impl ContextIndex {
                 .total_cmp(&a.similarity)
                 .then(a.document.id.cmp(&b.document.id))
         });
-        hits.truncate(limit);
-        Ok(hits)
+        Ok((hits, missing))
     }
+}
+
+/// Reciprocal-rank constant of the hybrid fusion: rank `r` (0-based) contributes `1 / (61 + r)`.
+const RRF_OFFSET: usize = 61;
+
+/// One fused file of a hybrid search.
+struct Fused {
+    /// Sum of its reciprocal-rank contributions.
+    score: f64,
+    candidate: super::Candidate,
+    /// Its rank in the lexical shortlist (diagnostic builds only).
+    #[cfg(any(feature = "jev-pilot", test))]
+    lexical_rank: Option<usize>,
+    /// Rank of its first eligible document in the semantic shortlist.
+    first_semantic_rank: Option<usize>,
+}
+
+#[cfg(any(feature = "jev-pilot", test))]
+/// Why a semantic document could or could not stand for its file in the fusion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DocumentEligibility {
+    /// Its file is a current record with the same content hash.
+    Eligible,
+    /// Its file id is not a current record.
+    UnknownFile,
+    /// Its file's current content hash differs from the document's.
+    StaleHash,
+}
+
+#[cfg(any(feature = "jev-pilot", test))]
+/// Where one file ended up in one hybrid search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HybridOutcome {
+    /// Within the final `limit` after fusion.
+    Selected,
+    /// In the lexical top-`limit` or represented by an eligible document of the semantic
+    /// top-`limit`, but ranked beyond `limit` after fusion.
+    CutAtFusion,
+    /// Scored lexically or semantically, but in neither top-`limit`.
+    OutsideBothLimits,
+    /// No matched term and no eligible scored document.
+    Unscored,
+}
+
+#[cfg(any(feature = "jev-pilot", test))]
+/// The fixed parameters one hybrid search ran with.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct HybridTraceConfig {
+    /// Files kept after fusion; also the lexical file and semantic document shortlist sizes.
+    pub limit: usize,
+    /// Reciprocal-rank constant.
+    pub rrf_offset: usize,
+}
+
+#[cfg(any(feature = "jev-pilot", test))]
+/// One file of the complete lexical ranking (matched terms desc, path asc).
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct LexicalRank {
+    pub rank: usize,
+    pub file_id: String,
+    pub path: PathBuf,
+    pub matches: usize,
+}
+
+#[cfg(any(feature = "jev-pilot", test))]
+/// One scored document of the complete semantic ranking (similarity desc, id asc).
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct DocumentRank {
+    pub rank: usize,
+    pub document_id: String,
+    pub file_id: String,
+    pub path: PathBuf,
+    pub content_hash: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub similarity: f32,
+    /// Within the semantic top-`limit` that the fusion consumes.
+    pub within_limit: bool,
+    pub eligibility: DocumentEligibility,
+}
+
+#[cfg(any(feature = "jev-pilot", test))]
+/// One fused file before truncation.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct FusionRank {
+    pub rank: usize,
+    pub file_id: String,
+    pub path: PathBuf,
+    pub score: f64,
+    pub lexical_rank: Option<usize>,
+    /// Rank of the file's first eligible document within the semantic top-`limit`.
+    pub first_semantic_rank: Option<usize>,
+    pub selected: bool,
+}
+
+#[cfg(any(feature = "jev-pilot", test))]
+/// One current record's standing across every stage.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct HybridFileTrace {
+    pub file_id: String,
+    pub path: PathBuf,
+    pub lexical_rank: Option<usize>,
+    pub lexical_matches: usize,
+    /// Best rank and similarity among the file's eligible scored documents.
+    pub semantic_best_rank: Option<usize>,
+    pub semantic_best_similarity: Option<f32>,
+    pub semantic_documents: usize,
+    /// Scored documents of this file that were not eligible; recorded, never an outcome.
+    pub ineligible_documents: usize,
+    pub fusion_rank: Option<usize>,
+    pub fusion_score: f64,
+    pub outcome: HybridOutcome,
+}
+
+#[cfg(any(feature = "jev-pilot", test))]
+/// Every stage of one hybrid search, for diagnostics only: complete rankings before each
+/// truncation, thresholds and per-file outcomes. Paths, ids and scores only; never source text
+/// or vectors. It never feeds selection.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct HybridTrace {
+    pub config: HybridTraceConfig,
+    pub lexical_terms: usize,
+    /// Matched terms of the `limit`-th lexical file, when the ranking is that long.
+    pub lexical_cutoff_matches: Option<usize>,
+    /// Similarity of the `limit`-th scored document, when the ranking is that long.
+    pub semantic_cutoff_similarity: Option<f32>,
+    pub documents_in_batch: usize,
+    pub documents_scored: usize,
+    /// Batch documents without a vector in the space.
+    pub missing_vectors: Vec<String>,
+    pub lexical: Vec<LexicalRank>,
+    pub semantic: Vec<DocumentRank>,
+    pub fusion: Vec<FusionRank>,
+    /// Every current record, in path order.
+    pub files: Vec<HybridFileTrace>,
 }
 
 impl ContextIndex {
@@ -575,6 +727,177 @@ impl ContextIndex {
     ) -> io::Result<Vec<super::Candidate>> {
         let lexical = self.search(task, limit)?;
         let semantic = self.semantic_search(batch, space, query, limit)?;
+        let mut fused = self.fuse(lexical, &semantic)?;
+        fused.truncate(limit);
+        Ok(fused.into_iter().map(|file| file.candidate).collect())
+    }
+
+    #[cfg(any(feature = "jev-pilot", test))]
+    /// [`Self::hybrid_search`]'s exact selection plus a [`HybridTrace`] of every stage. The
+    /// selection consumes the same inputs as `hybrid_search`; the complete rankings are computed
+    /// beside it for the trace only.
+    pub(crate) fn hybrid_search_traced(
+        &self,
+        task: &str,
+        batch: &DocumentBatch,
+        space: &str,
+        query: &[f32],
+        limit: usize,
+    ) -> io::Result<(Vec<super::Candidate>, HybridTrace)> {
+        let lexical = self.search(task, limit)?;
+        let (all_hits, missing_vectors) = self.rank_documents(batch, space, query)?;
+        let semantic: Vec<_> = all_hits.iter().take(limit).cloned().collect();
+        let fused = self.fuse(lexical, &semantic)?;
+        let records = self.records()?;
+        let current: std::collections::BTreeMap<_, _> = records
+            .iter()
+            .map(|record| (record.id.as_str(), record))
+            .collect();
+        // The complete lexical ranking, ordered exactly as `search` orders its shortlist.
+        let terms = super::storage::lexical_terms(task);
+        let mut lexical_all: Vec<_> = records
+            .iter()
+            .map(|record| {
+                (
+                    super::storage::lexical_reasons(record, &terms).len(),
+                    record,
+                )
+            })
+            .filter(|(matches, _)| *matches > 0)
+            .collect();
+        lexical_all.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.path.cmp(&b.1.path)));
+        let lexical_ranks: Vec<_> = lexical_all
+            .iter()
+            .enumerate()
+            .map(|(rank, (matches, record))| LexicalRank {
+                rank,
+                file_id: record.id.clone(),
+                path: record.path.clone(),
+                matches: *matches,
+            })
+            .collect();
+        let semantic_ranks: Vec<_> = all_hits
+            .iter()
+            .enumerate()
+            .map(|(rank, hit)| DocumentRank {
+                rank,
+                document_id: hit.document.id.clone(),
+                file_id: hit.document.file_id.clone(),
+                path: hit.document.path.clone(),
+                content_hash: hit.document.content_hash.clone(),
+                start_byte: hit.document.start_byte,
+                end_byte: hit.document.end_byte,
+                similarity: hit.similarity,
+                within_limit: rank < limit,
+                eligibility: match current.get(hit.document.file_id.as_str()) {
+                    None => DocumentEligibility::UnknownFile,
+                    Some(file)
+                        if file.content_hash.as_deref()
+                            != Some(hit.document.content_hash.as_str()) =>
+                    {
+                        DocumentEligibility::StaleHash
+                    }
+                    Some(_) => DocumentEligibility::Eligible,
+                },
+            })
+            .collect();
+        let fusion_ranks: Vec<_> = fused
+            .iter()
+            .enumerate()
+            .map(|(rank, file)| FusionRank {
+                rank,
+                file_id: file.candidate.file.id.clone(),
+                path: file.candidate.file.path.clone(),
+                score: file.score,
+                lexical_rank: file.lexical_rank,
+                first_semantic_rank: file.first_semantic_rank,
+                selected: rank < limit,
+            })
+            .collect();
+        let lexical_by_file: std::collections::BTreeMap<_, _> = lexical_ranks
+            .iter()
+            .map(|rank| (rank.file_id.as_str(), rank))
+            .collect();
+        let mut documents_by_file: std::collections::BTreeMap<_, Vec<_>> =
+            std::collections::BTreeMap::new();
+        for rank in &semantic_ranks {
+            documents_by_file
+                .entry(rank.file_id.as_str())
+                .or_default()
+                .push(rank);
+        }
+        let fused_by_file: std::collections::BTreeMap<_, _> = fusion_ranks
+            .iter()
+            .map(|rank| (rank.file_id.as_str(), rank))
+            .collect();
+        let files = records
+            .iter()
+            .map(|record| {
+                let lexical = lexical_by_file.get(record.id.as_str()).copied();
+                let documents = documents_by_file
+                    .get(record.id.as_str())
+                    .map_or(&[][..], Vec::as_slice);
+                let eligible: Vec<_> = documents
+                    .iter()
+                    .filter(|rank| rank.eligibility == DocumentEligibility::Eligible)
+                    .collect();
+                let fused = fused_by_file.get(record.id.as_str()).copied();
+                let outcome = match fused {
+                    Some(fused) if fused.selected => HybridOutcome::Selected,
+                    Some(_) => HybridOutcome::CutAtFusion,
+                    None if lexical.is_some() || !eligible.is_empty() => {
+                        HybridOutcome::OutsideBothLimits
+                    }
+                    None => HybridOutcome::Unscored,
+                };
+                HybridFileTrace {
+                    file_id: record.id.clone(),
+                    path: record.path.clone(),
+                    lexical_rank: lexical.map(|rank| rank.rank),
+                    lexical_matches: lexical.map_or(0, |rank| rank.matches),
+                    semantic_best_rank: eligible.first().map(|rank| rank.rank),
+                    semantic_best_similarity: eligible.first().map(|rank| rank.similarity),
+                    semantic_documents: eligible.len(),
+                    ineligible_documents: documents.len() - eligible.len(),
+                    fusion_rank: fused.map(|rank| rank.rank),
+                    fusion_score: fused.map_or(0.0, |rank| rank.score),
+                    outcome,
+                }
+            })
+            .collect();
+        let trace = HybridTrace {
+            config: HybridTraceConfig {
+                limit,
+                rrf_offset: RRF_OFFSET,
+            },
+            lexical_terms: terms.len(),
+            lexical_cutoff_matches: lexical_ranks.get(limit - 1).map(|rank| rank.matches),
+            semantic_cutoff_similarity: semantic_ranks.get(limit - 1).map(|rank| rank.similarity),
+            documents_in_batch: batch.documents.len(),
+            documents_scored: semantic_ranks.len(),
+            missing_vectors,
+            lexical: lexical_ranks,
+            semantic: semantic_ranks,
+            fusion: fusion_ranks,
+            files,
+        };
+        let selected = fused
+            .into_iter()
+            .take(limit)
+            .map(|file| file.candidate)
+            .collect();
+        Ok((selected, trace))
+    }
+
+    /// The hybrid fusion shared by [`Self::hybrid_search`] and [`Self::hybrid_search_traced`]:
+    /// lexical rank and the first eligible document rank of each file add `1 / (61 + rank)`;
+    /// files are ordered by score desc, path asc, untruncated. An unknown or stale document is
+    /// skipped but keeps its rank slot.
+    fn fuse(
+        &self,
+        lexical: Vec<super::Candidate>,
+        semantic: &[SemanticHit],
+    ) -> io::Result<Vec<Fused>> {
         let records: std::collections::BTreeMap<_, _> = self
             .records()?
             .into_iter()
@@ -584,46 +907,241 @@ impl ContextIndex {
         for (rank, candidate) in lexical.into_iter().enumerate() {
             merged.insert(
                 candidate.file.id.clone(),
-                (1.0 / (61 + rank) as f64, candidate),
+                Fused {
+                    score: 1.0 / (RRF_OFFSET + rank) as f64,
+                    candidate,
+                    #[cfg(any(feature = "jev-pilot", test))]
+                    lexical_rank: Some(rank),
+                    first_semantic_rank: None,
+                },
             );
         }
         let mut seen = std::collections::BTreeSet::new();
-        for (rank, hit) in semantic.into_iter().enumerate() {
+        for (rank, hit) in semantic.iter().enumerate() {
             let Some(file) = records.get(&hit.document.file_id) else {
                 continue;
             };
             if file.content_hash.as_deref() != Some(hit.document.content_hash.as_str()) {
                 continue;
             }
-            let entry = merged.entry(file.id.clone()).or_insert_with(|| {
-                (
-                    0.0,
-                    super::Candidate {
-                        file: file.clone(),
-                        lexical_score: 0,
-                        reasons: Vec::new(),
-                        preferred_spans: Vec::new(),
-                        whole_file: false,
-                    },
-                )
+            let entry = merged.entry(file.id.clone()).or_insert_with(|| Fused {
+                score: 0.0,
+                candidate: super::Candidate {
+                    file: file.clone(),
+                    lexical_score: 0,
+                    reasons: Vec::new(),
+                    preferred_spans: Vec::new(),
+                    whole_file: false,
+                },
+                #[cfg(any(feature = "jev-pilot", test))]
+                lexical_rank: None,
+                first_semantic_rank: None,
             });
             if seen.insert(file.id.clone()) {
-                entry.0 += 1.0 / (61 + rank) as f64;
+                entry.score += 1.0 / (RRF_OFFSET + rank) as f64;
+                entry.first_semantic_rank = Some(rank);
             }
             entry
-                .1
+                .candidate
                 .reasons
                 .push(format!("semantic document {}", hit.document.id));
             if hit.document.end_byte > hit.document.start_byte {
                 entry
-                    .1
+                    .candidate
                     .preferred_spans
                     .push((hit.document.start_byte, hit.document.end_byte));
             }
         }
         let mut ranked: Vec<_> = merged.into_values().collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.file.path.cmp(&b.1.file.path)));
-        ranked.truncate(limit);
-        Ok(ranked.into_iter().map(|(_, candidate)| candidate).collect())
+        ranked.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then(a.candidate.file.path.cmp(&b.candidate.file.path))
+        });
+        Ok(ranked)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixture whose lexical and semantic rankings are chosen by hand, limit 3.
+    ///
+    /// Lexical ("needle" in the path, one match each): needle-a, needle-b, needle-c, needle-d.
+    /// Semantic (query [1, 0]) over each file's source document: sem-x 1.0, a stale copy of
+    /// needle-a's document 0.95, needle-a 0.9, sem-y 0.8, the rest 0.0. Path cards and
+    /// novec.alpha's source document have no vector.
+    #[test]
+    fn traced_hybrid_search_keeps_the_selection_and_explains_every_file() {
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new("context-hybrid-trace");
+        for name in [
+            "needle-a.alpha",
+            "needle-b.alpha",
+            "needle-c.alpha",
+            "needle-d.alpha",
+            "sem-x.alpha",
+            "sem-y.alpha",
+            "plain.alpha",
+            "novec.alpha",
+        ] {
+            std::fs::write(root.join(name), format!("{name}\n")).unwrap();
+        }
+        let mut index = ContextIndex::open(&root).unwrap();
+        index
+            .refresh(&crate::project::structure::StructureOptions::default())
+            .unwrap();
+        let mut batch = index.documents(&DocumentOptions::default()).unwrap();
+        let space = "test-space";
+        let vector = |path: &str| -> Option<[f32; 2]> {
+            match path {
+                "sem-x.alpha" => Some([1.0, 0.0]),
+                "needle-a.alpha" => Some([0.9, 0.435_889_9]),
+                "sem-y.alpha" => Some([0.8, 0.6]),
+                "needle-b.alpha" | "needle-c.alpha" | "needle-d.alpha" | "plain.alpha" => {
+                    Some([0.0, 1.0])
+                }
+                // novec.alpha and any file the fixture did not write (e.g. an index ignore
+                // file) stay without vectors.
+                _ => None,
+            }
+        };
+        let source = |document: &&IndexedDocument| document.end_byte > document.start_byte;
+        let mut stored = BTreeSet::new();
+        for document in batch.documents.iter().filter(source) {
+            if let Some(value) = vector(document.path.to_str().unwrap()) {
+                index.store_vector(space, &document.id, &value).unwrap();
+                stored.insert(document.id.clone());
+            }
+        }
+        let expected_missing: BTreeSet<_> = batch
+            .documents
+            .iter()
+            .filter(|document| !stored.contains(&document.id))
+            .map(|document| document.id.clone())
+            .collect();
+        let novec_source = batch
+            .documents
+            .iter()
+            .filter(source)
+            .find(|document| document.path == std::path::Path::new("novec.alpha"))
+            .unwrap()
+            .id
+            .clone();
+        let mut stale = batch
+            .documents
+            .iter()
+            .filter(source)
+            .find(|document| document.path == std::path::Path::new("needle-a.alpha"))
+            .unwrap()
+            .clone();
+        stale.id = "stale-document".into();
+        stale.content_hash = "stale".into();
+        index
+            .store_vector(space, &stale.id, &[0.95, 0.312_249_9])
+            .unwrap();
+        stored.insert(stale.id.clone());
+        batch.documents.push(stale);
+        let query = [1.0, 0.0];
+        let paths = |candidates: &[super::super::Candidate]| -> Vec<String> {
+            candidates
+                .iter()
+                .map(|candidate| candidate.file.path.display().to_string())
+                .collect()
+        };
+        let plain = index
+            .hybrid_search("needle", &batch, space, &query, 3)
+            .unwrap();
+        assert_eq!(
+            paths(&plain),
+            ["needle-a.alpha", "sem-x.alpha", "needle-b.alpha"]
+        );
+        let (traced, trace) = index
+            .hybrid_search_traced("needle", &batch, space, &query, 3)
+            .unwrap();
+        assert_eq!(paths(&traced), paths(&plain));
+        assert_eq!(
+            traced
+                .iter()
+                .map(|candidate| (&candidate.reasons, &candidate.preferred_spans))
+                .collect::<Vec<_>>(),
+            plain
+                .iter()
+                .map(|candidate| (&candidate.reasons, &candidate.preferred_spans))
+                .collect::<Vec<_>>()
+        );
+        let outcome = |path: &str| {
+            trace
+                .files
+                .iter()
+                .find(|file| file.path == std::path::Path::new(path))
+                .unwrap()
+        };
+        assert_eq!(outcome("needle-a.alpha").outcome, HybridOutcome::Selected);
+        assert_eq!(outcome("needle-a.alpha").ineligible_documents, 1);
+        assert_eq!(outcome("sem-x.alpha").outcome, HybridOutcome::Selected);
+        assert_eq!(outcome("needle-b.alpha").outcome, HybridOutcome::Selected);
+        assert_eq!(
+            outcome("needle-c.alpha").outcome,
+            HybridOutcome::CutAtFusion
+        );
+        assert_eq!(outcome("needle-c.alpha").fusion_rank, Some(3));
+        for path in ["needle-d.alpha", "sem-y.alpha", "plain.alpha"] {
+            assert_eq!(
+                outcome(path).outcome,
+                HybridOutcome::OutsideBothLimits,
+                "{path}"
+            );
+        }
+        assert_eq!(outcome("sem-y.alpha").semantic_best_rank, Some(3));
+        assert_eq!(outcome("needle-d.alpha").lexical_rank, Some(3));
+        assert_eq!(outcome("novec.alpha").outcome, HybridOutcome::Unscored);
+        // Exactly the documents this fixture gave no vector: every path card, novec.alpha's
+        // source document and any document of a file the fixture did not write.
+        assert_eq!(
+            trace
+                .missing_vectors
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_missing,
+            "batch paths: {:?}",
+            batch
+                .documents
+                .iter()
+                .map(|document| (&document.path, document.start_byte, document.end_byte))
+                .collect::<Vec<_>>()
+        );
+        assert!(trace.missing_vectors.contains(&novec_source));
+        assert_eq!(trace.lexical.len(), 4);
+        assert_eq!(trace.lexical_cutoff_matches, Some(1));
+        assert_eq!(trace.documents_scored, stored.len());
+        // Seven written files' source documents plus the stale copy.
+        assert_eq!(trace.documents_scored, 8);
+        assert_eq!(
+            trace
+                .semantic
+                .iter()
+                .take(3)
+                .map(|rank| (rank.path.display().to_string(), rank.eligibility))
+                .collect::<Vec<_>>(),
+            [
+                ("sem-x.alpha".to_owned(), DocumentEligibility::Eligible),
+                ("needle-a.alpha".to_owned(), DocumentEligibility::StaleHash),
+                ("needle-a.alpha".to_owned(), DocumentEligibility::Eligible),
+            ]
+        );
+        assert_eq!(
+            trace
+                .fusion
+                .iter()
+                .map(|rank| rank.selected)
+                .collect::<Vec<_>>(),
+            [true, true, true, false]
+        );
+        let json = serde_json::to_string(&trace).unwrap();
+        assert!(json.contains("\"outcome\":\"cut_at_fusion\""));
+        assert!(!json.contains("needle-a.alpha\\n"), "no source text");
     }
 }

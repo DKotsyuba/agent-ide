@@ -37,6 +37,9 @@ pub struct CallRecord {
 /// Source packet plus honest backend coverage and accounting, not an assertion of task completeness.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Preparation {
+    /// Private per-invocation evidence, never serialized into model context.
+    #[serde(skip)]
+    pub(crate) trace: Option<super::trace::PrepareTrace>,
     pub packet: ContextBundle,
     pub embedding_used: bool,
     pub embedding_complete: bool,
@@ -417,11 +420,24 @@ impl ContextService {
             .map(|c| c.space_id().map_err(io::Error::other))
             .transpose()?
             .unwrap_or_else(|| "lexical".into());
+        let trace = super::trace::PrepareTrace::new(&index.root)?;
+        trace.record("started", json!({"task":task,"space":ready_space,"rank_base":0,"byte_spans":"UTF-8 start-inclusive end-exclusive","line_spans":"1-based inclusive",
+            "candidate_limit":packet_options.candidates,"include_threshold":self.config.include_threshold,
+            "embedding_model":self.config.embedding.as_ref().map(|c| &c.model),
+            "jev_model":self.config.jev.as_ref().map(|c| &c.model)}))?;
+        let outcome: io::Result<Preparation> = async {
         let ready = index.published_documents(&ready_space)?;
+        trace.record("index_inventory", json!({"snapshot":index.snapshot()?, "published_generation":ready.generation, "atomic_snapshot":false, "gaps":ready.gaps,
+            "files":index.records()?.iter().map(|file| json!({"path":file.path,"file_id":file.id,
+                "content_hash":file.content_hash,"language":file.language,"details_truncated":file.truncated,
+                "published_documents":ready.documents.iter().filter(|doc| doc.file_id == file.id).map(|doc|
+                    json!({"id":doc.id,"content_hash":doc.content_hash,"start_byte":doc.start_byte,"end_byte":doc.end_byte})).collect::<Vec<_>>()
+            })).collect::<Vec<_>>() }))?;
         let journal = (self.embedding.is_some() || self.jev.is_some())
             .then(|| Journal::new(&index.root))
             .transpose()?;
         let mut result = Preparation {
+            trace: Some(trace.clone()),
             packet: ContextBundle {
                 task: task.into(),
                 snapshot: index.snapshot()?.ok_or_else(|| {
@@ -440,7 +456,25 @@ impl ContextService {
             warnings: Vec::new(),
             elapsed_ms: 0.0,
         };
+        let terms = super::storage::lexical_terms(task);
+        let mut lexical = index
+            .records()?
+            .into_iter()
+            .map(|file| {
+                let reasons = super::storage::lexical_reasons(&file, &terms);
+                (file.path, file.content_hash, reasons)
+            })
+            .collect::<Vec<_>>();
+        lexical.sort_by(|a, b| b.2.len().cmp(&a.2.len()).then(a.0.cmp(&b.0)));
+        trace.record("lexical_ranking", json!({"generation":index.snapshot()?.map(|s|s.generation),"limit":packet_options.candidates,
+            "files":lexical.iter().enumerate().map(|(rank,(path,hash,reasons))|json!({"path":path,"content_hash":hash,
+                "rank":if reasons.is_empty(){None}else{Some(rank)},"matches":reasons.len(),"reasons":reasons,
+                "selected":!reasons.is_empty() && rank<packet_options.candidates})).collect::<Vec<_>>() }))?;
         let mut candidates = index.search(task, packet_options.candidates)?;
+        trace.record(
+            "lexical_candidates",
+            json!({"candidates":candidate_trace(&candidates)}),
+        )?;
         let mut remaining = self.config.max_new_calls;
         if let (Some(client), Some(config)) = (&self.embedding, &self.config.embedding) {
             let journal = journal.as_ref().expect("model journal constructed");
@@ -467,13 +501,19 @@ impl ContextService {
                         .await
                     {
                         Ok(response) => {
-                            candidates = index.hybrid_search(
+                            trace.record("embedding_query", json!({"journal":journal.path(&space,&request),"model":config.model,"space":space,"generation":documents.generation}))?;
+                            let (found, ranking) = index.hybrid_search_traced(
                                 task,
                                 &documents,
                                 &space,
                                 &response.vectors[0],
                                 packet_options.candidates,
                             )?;
+                            trace.record(
+                                "hybrid_ranking",
+                                serde_json::to_value(ranking).map_err(io::Error::other)?,
+                            )?;
+                            candidates = found;
                             result.embedding_used = true;
                         }
                         Err(error) => result.warnings.push(error.to_string()),
@@ -486,6 +526,9 @@ impl ContextService {
                     "semantic index coverage is partial; lexical candidates were retained".into(),
                 );
             }
+        }
+        if !result.embedding_used {
+            trace.record("embedding_skipped", json!({"reason":if self.embedding.is_none(){"disabled"}else if ready.documents.is_empty(){"no published vectors"}else{"query unavailable"},"warnings":result.warnings}))?;
         }
         // Deterministic public-evidence tiers by path: failure anchors (0), then the direct
         // imports of anchored tests (1). The selector never drops them and ranks them first.
@@ -559,6 +602,7 @@ impl ContextService {
                 &mut result.warnings,
                 cancel,
                 task,
+                Some(&trace),
             )
             .await?;
             pinned = anchors
@@ -573,7 +617,9 @@ impl ContextService {
             anchors.extend(imported.into_iter().map(|(candidate, _)| candidate));
             // Observed failure files supplement the ranked retrieval quota; they must not
             // evict its tail. Both inputs are already bounded, with a final packet safety cap.
+            let before_merge: BTreeSet<_> = anchors.iter().chain(&candidates).map(|c|c.file.path.clone()).collect();
             let (combined, omitted) = merge_anchor_candidates(anchors, candidates);
+            trace.record("candidate_merge", json!({"dropped":before_merge.iter().filter(|path| !combined.iter().any(|c|c.file.path==**path)).map(|path|json!({"path":path,"reason":"candidate safety cap"})).collect::<Vec<_>>()}))?;
             if omitted > 0 {
                 result.warnings.push(format!(
                     "{omitted} ranked candidates omitted at the 256-file safety limit"
@@ -581,7 +627,12 @@ impl ContextService {
             }
             candidates = combined;
         }
+        trace.record(
+            "anchor_and_dependency_candidates",
+            json!({"candidates":candidate_trace(&candidates),"pinned":pinned}),
+        )?;
         let ready_files: BTreeSet<_> = ready.documents.iter().map(|d| &d.path).collect();
+        trace.record("readiness_exclusions", json!({"files":candidates.iter().filter(|c| !ready_files.contains(&c.file.path)).map(|c| json!({"path":c.file.path,"reason":"no published document"})).collect::<Vec<_>>()}))?;
         candidates.retain(|c| ready_files.contains(&c.file.path));
         if self.jev.is_none() {
             rank_without_selector(&mut candidates, &pinned);
@@ -590,6 +641,8 @@ impl ContextService {
             let journal = journal.as_ref().expect("model journal constructed");
             // The main agent's output budget must not hide candidates from the selector.
             let (views, notes) = candidate_evidence(index, &candidates, packet_options);
+            trace.record("jev_view_exclusions", json!({"files":candidates.iter().filter(|c|!views.iter().any(|v|v.id==c.file.id)).map(|c|json!({"path":c.file.path,"id":c.file.id,"reason":"candidate view unavailable","notes":notes})).collect::<Vec<_>>()}))?;
+            trace.record("jev_views", json!({"notes":notes,"candidates":views.iter().map(|v| json!({"id":v.id,"path":v.path,"partial":v.partial,"content_hash":v.content_hash,"source_bytes":v.source.len(),"source_hash":blake3::hash(v.source.as_bytes()).to_hex().to_string()})).collect::<Vec<_>>()}))?;
             result.warnings.extend(notes);
             let scope = format!(
                 "jev:{}",
@@ -614,6 +667,7 @@ impl ContextService {
                     end -= 1;
                 }
                 if end == position {
+                    trace.record("jev_skip", json!({"path":views[position].path,"id":views[position].id,"reason":"evidence exceeds Jev request limit"}))?;
                     result.warnings.push(format!(
                         "{}: evidence exceeds Jev request limit",
                         views[position].path.display()
@@ -623,6 +677,7 @@ impl ContextService {
                 }
                 let batch = &views[position..end];
                 let request = client.request(task, batch);
+                trace.record("jev_request", json!({"journal":journal.path(&scope,&request),"ids":batch.iter().map(|v| &v.id).collect::<Vec<_>>()}))?;
                 let selection = match journal.cached(&scope, &request) {
                     Ok(Some(response)) => serde_json::from_value::<Selection>(response)
                         .map(|value| (value, true))
@@ -691,6 +746,10 @@ impl ContextService {
                             usage: selection.usage,
                             error: None,
                         });
+                        trace.record(
+                            "jev_decisions",
+                            json!({"replayed":replayed,"assessments":selection.assessments}),
+                        )?;
                         for assessment in selection.assessments {
                             assessments.insert(assessment.id.clone(), assessment);
                         }
@@ -700,6 +759,7 @@ impl ContextService {
                 }
                 position = end;
             }
+            let before_selection = candidates.clone();
             apply_assessments(
                 &mut candidates,
                 &assessments,
@@ -707,7 +767,18 @@ impl ContextService {
                 task,
                 self.config.include_threshold,
             );
+            trace.record("jev_selection", json!({"threshold":self.config.include_threshold,
+                "files":before_selection.iter().map(|c|json!({"id":c.file.id,"path":c.file.path,
+                    "retained":candidates.iter().any(|kept|kept.file.id==c.file.id),
+                    "pinned_tier":pinned.get(&c.file.path),"assessment":assessments.get(&c.file.id),
+                    "task_names_path":task.contains(c.file.path.to_string_lossy().as_ref())})).collect::<Vec<_>>() }))?;
         }
+        trace.record("retrieval_status",json!({"generation":index.snapshot()?.map(|s|s.generation),"embedding_used":result.embedding_used,"embedding_complete":result.embedding_complete,"jev_used":result.jev_used,"calls":result.calls,"warnings":result.warnings}))?;
+        if !result.jev_used { trace.record("jev_skipped",json!({"reason":if self.jev.is_none(){"disabled"}else{"no successful assessments"},"warnings":result.warnings}))?; }
+        trace.record(
+            "selected_candidates",
+            json!({"candidates":candidate_trace(&candidates),"warnings":result.warnings}),
+        )?;
         // Collect under the unchanged byte/read limits, then apply the actual output budget
         // fairly across files. This private ceiling is not a model context allowance.
         let mut collection = packet_options.clone();
@@ -715,14 +786,32 @@ impl ContextService {
             .saturating_mul(8)
             .saturating_add(262144);
         collection.reserved_tokens = 0;
+        let selected_paths: Vec<_> = candidates.iter().map(|c|c.file.path.clone()).collect();
+        let generation_before = index.snapshot()?.map(|s|s.generation);
         result.packet = index.prepare_candidates(task, &collection, candidates)?;
+        trace.record("source_selection_outcomes",json!({"generation_before":generation_before,"generation_after":index.snapshot()?.map(|s|s.generation),
+            "files":selected_paths.iter().map(|path|json!({"path":path,"has_selected_window":result.packet.windows.iter().any(|w|w.path==*path),
+                "reasons":result.packet.gaps.iter().filter(|gap|gap.starts_with(&format!("{}:",path.display()))).collect::<Vec<_>>() })).collect::<Vec<_>>() }))?;
+        trace.record("source_windows", json!({"windows":result.packet.windows.iter().map(|w|json!({"path":w.path,"content_hash":w.content_hash,"start_byte":w.start_byte,"end_byte":w.end_byte,"rank":w.rank,"required":w.required,"whole_file":w.complete_file})).collect::<Vec<_>>(),"gaps":result.packet.gaps}))?;
         result.packet.gaps.extend(ready.gaps);
         interleave(&mut result.packet.windows);
         result.elapsed_ms = began.elapsed().as_secs_f64() * 1000.0;
         if fit_json {
             result.fit(packet_options)?;
         }
+        if let Some(reason) = trace.degradation() {
+            result.warnings.push(format!("prepare trace incomplete: {reason}"));
+        }
+        trace.record("retrieval_ready", json!({"generation":index.snapshot()?.map(|s|s.generation),"elapsed_ms":result.elapsed_ms,"warnings":result.warnings}))?;
         Ok(result)
+        }.await;
+        if let Err(error) = &outcome {
+            trace.record(
+                "failed",
+                json!({"kind":format!("{:?}",error.kind()),"message":error.to_string()}),
+            )?;
+        }
+        outcome
     }
 
     /// Replays only completed validated batches; pending/failed outcomes never trigger automatic retries.
@@ -819,6 +908,19 @@ impl ContextService {
         });
         Ok(batch)
     }
+}
+
+/// Source identities and selection facts only; no duplicated source text or provider credentials.
+fn candidate_trace(candidates: &[super::Candidate]) -> Vec<Value> {
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(rank, c)| {
+            json!({"rank":rank,"id":c.file.id,"path":c.file.path,
+        "content_hash":c.file.content_hash,"lexical_score":c.lexical_score,"reasons":c.reasons,
+        "preferred_spans":c.preferred_spans,"whole_file":c.whole_file})
+        })
+        .collect()
 }
 
 impl Preparation {
@@ -1137,6 +1239,7 @@ async fn anchored_imports(
     warnings: &mut Vec<String>,
     cancel: &tokio_util::sync::CancellationToken,
     task: &str,
+    trace: Option<&super::trace::PrepareTrace>,
 ) -> io::Result<Vec<(super::Candidate, u8)>> {
     use crate::lang::names::{Certainty, Role, ns};
     /// Lightweight proposal; clone file metadata only after shared admission limits pass.
@@ -1152,6 +1255,7 @@ async fn anchored_imports(
     let terms = super::storage::lexical_terms(task);
     let mut scores = BTreeMap::new();
     let mut proposed = Vec::new();
+    let mut outcomes = Vec::new();
     for (origin, (path, source, is_test)) in sources.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(io::Error::new(
@@ -1160,9 +1264,11 @@ async fn anchored_imports(
             ));
         }
         let Some(language) = crate::lang::Language::for_path(path) else {
+            outcomes.push(json!({"origin":path,"reason":"unsupported language"}));
             continue;
         };
         let Some(names) = language.names() else {
+            outcomes.push(json!({"origin":path,"reason":"no name extractor"}));
             continue;
         };
         let (worktree, file, text) = (root.to_path_buf(), path.clone(), source.clone());
@@ -1177,6 +1283,7 @@ async fn anchored_imports(
             match tokio::task::spawn_blocking(extract).await {
                 Ok(value) => value,
                 Err(_) => {
+                    outcomes.push(json!({"origin":path,"reason":"extraction task failed"}));
                     warnings.push(format!(
                         "{}: direct imports not resolved (extraction task failed)",
                         path.display()
@@ -1190,6 +1297,9 @@ async fn anchored_imports(
         let facts = match facts {
             Ok(facts) => facts.unwrap_or_default(),
             Err(fault) => {
+                outcomes.push(
+                    json!({"origin":path,"reason":"extraction fault","fault":fault.to_string()}),
+                );
                 warnings.push(format!(
                     "{}: direct imports not resolved ({fault})",
                     path.display()
@@ -1216,6 +1326,7 @@ async fn anchored_imports(
             let Some((target, assumption)) = names.file_probe().reach(&fact.key.name, |name| {
                 records.iter().any(|record| record.path == Path::new(name))
             }) else {
+                outcomes.push(json!({"origin":path,"reference":fact.key.name,"line":fact.line,"reason":"reference did not resolve to an indexed file"}));
                 continue;
             };
             if Path::new(&target) == path
@@ -1223,6 +1334,7 @@ async fn anchored_imports(
                     .iter()
                     .any(|anchor| anchor.file.path == Path::new(&target))
             {
+                outcomes.push(json!({"origin":path,"target":target,"line":fact.line,"reason":"already an anchor or self"}));
                 continue;
             }
             let Some(record) = records
@@ -1272,12 +1384,15 @@ async fn anchored_imports(
     let mut beyond = vec![0; sources.len()];
     for item in proposed {
         if seen.contains(&item.record) {
+            outcomes.push(json!({"origin":sources[item.origin].0,"target":records[item.record].path,"line":item.line,"tier":item.tier,"score":item.score,"reason":"duplicate target"}));
             continue;
         }
         if admitted[item.origin] == MAX_IMPORTS_PER_ANCHOR || imported.len() == MAX_IMPORTED_FILES {
+            outcomes.push(json!({"origin":sources[item.origin].0,"target":records[item.record].path,"line":item.line,"tier":item.tier,"score":item.score,"reason":if admitted[item.origin] == MAX_IMPORTS_PER_ANCHOR {"per-anchor import cap"} else {"total import cap"}}));
             beyond[item.origin] += 1;
             continue;
         }
+        outcomes.push(json!({"origin":sources[item.origin].0,"target":records[item.record].path,"line":item.line,"tier":item.tier,"score":item.score,"reason":"admitted"}));
         seen.insert(item.record);
         admitted[item.origin] += 1;
         let record = &records[item.record];
@@ -1329,6 +1444,9 @@ async fn anchored_imports(
             "{}: {count} further direct imports omitted at the import cap",
             sources[origin].0.display()
         ));
+    }
+    if let Some(trace) = trace {
+        trace.record("dependency_expansion", json!({"per_anchor_limit":MAX_IMPORTS_PER_ANCHOR,"total_limit":MAX_IMPORTED_FILES,"decisions":outcomes}))?;
     }
     Ok(imported)
 }
@@ -1620,6 +1738,7 @@ mod tests {
             &mut warnings,
             &tokio_util::sync::CancellationToken::new(),
             "",
+            None,
         )
         .await
         .unwrap();
@@ -1666,6 +1785,7 @@ mod tests {
             &mut Vec::new(),
             &cancelled,
             "",
+            None,
         )
         .await
         .unwrap_err();
@@ -1814,6 +1934,7 @@ mod tests {
             &mut warnings,
             &tokio_util::sync::CancellationToken::new(),
             "",
+            None,
         )
         .await
         .unwrap();
@@ -1961,6 +2082,7 @@ mod tests {
             &mut Vec::new(),
             &tokio_util::sync::CancellationToken::new(),
             "",
+            None,
         )
         .await
         .unwrap();
