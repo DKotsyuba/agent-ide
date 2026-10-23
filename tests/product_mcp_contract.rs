@@ -26505,6 +26505,636 @@ async fn failed_stop_is_retried_by_the_daemon_without_another_call() {
     actor.mcp.close().await;
 }
 
+/// Public test file of the localized-prepare scenarios: one passing and one failing test, a
+/// helper the failing test needs and an import; the failure panics at line 14.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+const LOCALIZED_TESTS: &str = "\
+use product_fixture::value;
+
+fn expected() -> i32 {
+    8
+}
+
+#[test]
+fn passes() {
+    assert_eq!(value() + 0, 7);
+}
+
+#[test]
+fn fails() {
+    assert_eq!(value(), expected());
+}
+";
+
+/// Public test file whose failure panics inside a helper (line 4), outside every test.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+const HELPER_FAILURE_TESTS: &str = "\
+use product_fixture::value;
+
+fn expected() -> i32 {
+    assert_eq!(value(), 8);
+    8
+}
+
+#[test]
+fn passes() {
+    assert_eq!(value() + 0, 7);
+}
+
+#[test]
+fn fails() {
+    assert_eq!(expected(), 8);
+}
+";
+
+/// Writes and commits `tests/check.rs` with `source` and enables the local index and a public
+/// check of that file through the prepared Cargo toolchain. `providers` replaces the launcher's
+/// language servers. Call before the daemon starts.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+fn localized_prepare_fixture(fixture: &ProductFixture, providers: Value, source: &str) {
+    std::fs::create_dir_all(fixture.root.join("tests")).unwrap();
+    std::fs::write(fixture.root.join("tests/check.rs"), source).unwrap();
+    fixture.git(&["add", "--", "tests/check.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "localized prepare fixture"]);
+    fixture.write_config(providers);
+    configure_prepared_rust_checks(fixture);
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["task_context"] = json!({"enabled":true,
+        "models":{"embedding":null,"jev":null,"max_new_calls":0,"include_threshold":0.5},
+        "indexing":{"enabled":true,"max_new_calls":0,"max_input_bytes":0,"debounce_ms":50},
+        "evidence":{"enabled":true,"target":{"files":["tests/check.rs"]},"budget_ms":30000}});
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+}
+
+/// Starts one activated actor once the background index is published.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+async fn localized_prepare_actor(fixture: &ProductFixture, name: &'static str) -> ProductActor {
+    let mut actor = ProductActor::new(fixture, name).await;
+    let started = actor.call(fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(fixture, started).await["kind"], "activation");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !agent_ide::project::context::ContextIndex::open_existing(&fixture.root)
+        .ok()
+        .flatten()
+        .is_some_and(|index| index.index_report("lexical").ok().flatten().is_some())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background index did not publish"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    actor
+}
+
+/// One prepare call answered directly (never pending), its packet text.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+async fn localized_prepare(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
+    let before = actor.next;
+    let raw = actor
+        .call_raw(
+            fixture,
+            "ide.prepare",
+            json!({"task":"Restore reliable behavior.","token_budget":12000}),
+        )
+        .await;
+    assert_eq!(actor.next, before + 1, "one call");
+    let reply = &raw["result"]["structuredContent"];
+    assert_eq!(reply["state"], "complete", "{raw}");
+    assert_ne!(reply["continuation"], true, "{raw}");
+    let text = reply["text"].as_str().unwrap().to_owned();
+    // Explicit diagnostic output for reviewers; ordinary runs print nothing.
+    if std::env::var_os("AGENT_IDE_TEST_PRINT_PACKETS").is_some() {
+        eprintln!("--- prepare packet ---\n{text}");
+    }
+    text
+}
+
+/// Runtime proof of public test localization (worker path, real public check, the language's
+/// exact source outline): one prepare delivers the failing test with its import and the helper
+/// it names as one bundle, never delivers the passing sibling's numbered body (an outline line
+/// may still name it), writes nothing, and remembers nothing for the left-out sibling — a later
+/// read of it is a full delivery.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn prepare_localizes_the_failing_public_test_with_its_context() {
+    let fixture = ProductFixture::new(json!([]));
+    localized_prepare_fixture(&fixture, json!([]), LOCALIZED_TESTS);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = localized_prepare_actor(&fixture, "localized-prepare").await;
+    let library = std::fs::read(fixture.root.join("src/lib.rs")).unwrap();
+    let text = localized_prepare(&mut actor, &fixture).await;
+    assert!(
+        text.contains("public check") && text.contains("failed 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tests/check.rs: public test context localized"),
+        "{text}"
+    );
+    for kept in [
+        "use product_fixture::value;",
+        "fn expected() -> i32 {",
+        "fn fails() {",
+        "assert_eq!(value(), expected());",
+    ] {
+        assert!(text.contains(kept), "{kept}: {text}");
+    }
+    assert!(
+        text.contains("14\t    assert_eq!(value(), expected());"),
+        "the failing line is delivered as numbered source: {text}"
+    );
+    assert!(
+        !text.contains("assert_eq!(value() + 0, 7);"),
+        "the passing sibling's body is not delivered: {text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/lib.rs")).unwrap(),
+        library,
+        "prepare writes no source"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("tests/check.rs")).unwrap(),
+        LOCALIZED_TESTS
+    );
+    let read = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"items":[{"path":"tests/check.rs","lines":"7-10"}]}),
+    )
+    .await;
+    let (_, read_text) = batch_settle_with_text(&mut actor, &fixture, read).await;
+    let read_text = batch_without_status_plate(&read_text);
+    assert!(
+        read_text.starts_with(
+            "read: 1 items in 1 files — 1 delivered, 0 unchanged, 0 not included, 0 failed\n"
+        ) && read_text.contains("fn passes()"),
+        "the left-out sibling was never read: {read_text}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A configured server that cannot start (held behind a gate the test never opens during the
+/// call) is not waited for: the one call localizes from the language's exact source outline,
+/// answers promptly, and the same session keeps answering ordinary reads.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn prepare_with_a_cold_server_localizes_from_the_exact_source_outline() {
+    use std::os::unix::fs::PermissionsExt;
+    let toolchain_dir = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+        .expect("prepared Rust tests require AGENT_IDE_RUST_TOOLCHAIN_DIR");
+    let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER")
+        .unwrap_or_else(|_| format!("{toolchain_dir}/bin/rust-analyzer"));
+    let toolchain = Path::new(&toolchain_dir)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let fixture = ProductFixture::new(json!([]));
+    let gate = fixture.base.join("release-analyzer");
+    let wrapper = fixture.base.join("gated-rust-analyzer");
+    fixture.guard_gate(&gate);
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nwhile [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.02; done\nexec '{}' \"$@\"\n",
+            gate.display(),
+            fixture.base.display(),
+            analyzer.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let providers = json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-cold-prepare-cache"
+    }]);
+    localized_prepare_fixture(&fixture, providers, LOCALIZED_TESTS);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = localized_prepare_actor(&fixture, "cold-prepare").await;
+    let began = std::time::Instant::now();
+    let text = localized_prepare(&mut actor, &fixture).await;
+    assert!(
+        began.elapsed() < Duration::from_secs(15),
+        "the held server is not waited for"
+    );
+    assert!(
+        text.contains("tests/check.rs: public test context localized")
+            && text.contains("14\t    assert_eq!(value(), expected());")
+            && !text.contains("assert_eq!(value() + 0, 7);"),
+        "{text}"
+    );
+    let read = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"items":[{"path":"src/lib.rs","lines":"1-1"}]}),
+    )
+    .await;
+    let (read, _) = batch_settle_with_text(&mut actor, &fixture, read).await;
+    assert_eq!(read["kind"], "read", "the session is not poisoned: {read}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// The public test file is larger than one whole-file window (trailing comments past 8 KiB), so
+/// retrieval selects only an anchored part of it; one bounded prepare still delivers the import,
+/// the helper and the whole failing test as one bundle, without the sibling body or the padding.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn prepare_localizes_a_partially_selected_failing_test() {
+    let padding: String = (0..200)
+        .map(|index| format!("// padding comment {index:03} padding padding padding padding\n"))
+        .collect();
+    let source = format!("{LOCALIZED_TESTS}{padding}");
+    assert!(source.len() > 8 * 1024);
+    let fixture = ProductFixture::new(json!([]));
+    localized_prepare_fixture(&fixture, json!([]), &source);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = localized_prepare_actor(&fixture, "partial-prepare").await;
+    let began = std::time::Instant::now();
+    let text = localized_prepare(&mut actor, &fixture).await;
+    assert!(
+        began.elapsed() < Duration::from_secs(45),
+        "one bounded call"
+    );
+    assert!(
+        text.contains("tests/check.rs: public test context localized"),
+        "{text}"
+    );
+    for kept in [
+        "use product_fixture::value;",
+        "fn expected() -> i32 {",
+        "14\t    assert_eq!(value(), expected());",
+    ] {
+        assert!(text.contains(kept), "{kept}: {text}");
+    }
+    assert!(!text.contains("assert_eq!(value() + 0, 7);"), "{text}");
+    assert!(!text.contains("padding comment"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("tests/check.rs")).unwrap(),
+        source
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A failure outside every test (inside a helper) has no complete test unit to deliver: the one
+/// call keeps the whole public test file, says so, and writes nothing.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn prepare_keeps_the_whole_test_file_when_the_failure_is_outside_tests() {
+    let fixture = ProductFixture::new(json!([]));
+    localized_prepare_fixture(&fixture, json!([]), HELPER_FAILURE_TESTS);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = localized_prepare_actor(&fixture, "unlocalized-prepare").await;
+    let text = localized_prepare(&mut actor, &fixture).await;
+    assert!(
+        text.contains("public check") && text.contains("failed 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tests/check.rs: test blocks not localized; whole-file candidate retained"),
+        "{text}"
+    );
+    assert!(
+        text.contains("assert_eq!(value() + 0, 7);") && text.contains("assert_eq!(expected(), 8);"),
+        "the whole file is delivered: {text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("tests/check.rs")).unwrap(),
+        HELPER_FAILURE_TESTS
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Writes `lines` numbered filler lines of about 45 bytes each, so a read block's serialized size
+/// follows its line count (about 52 bytes per rendered, JSON-escaped line).
+fn read_fill_filler(tag: &str, lines: usize) -> String {
+    (1..=lines)
+        .map(|line| format!("// {tag} filler line {line:04} padding padding padding\n"))
+        .collect()
+}
+
+/// Starts one actor over `fixture` with `files` committed; no semantic provider is needed for
+/// plain path reads.
+async fn read_fill_actor(
+    fixture: &ProductFixture,
+    name: &'static str,
+    files: &[(&str, String)],
+) -> ProductActor {
+    for (path, content) in files {
+        let target = fixture.root.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, content).unwrap();
+        fixture.git(&["add", "--", path]);
+    }
+    fixture.git(&["commit", "--quiet", "-m", "read fill fixture"]);
+    let mut actor = ProductActor::new(fixture, name).await;
+    let started = actor
+        .call(fixture, "ide.start", json!({"activation_id":name}))
+        .await;
+    assert_eq!(actor.settle(fixture, started).await["kind"], "activation");
+    actor
+}
+
+/// One settled `ide.read {items}` reply: structured value and its body text.
+async fn read_fill_call(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    items: Value,
+) -> (Value, String) {
+    let read = batch_call_with_text(actor, fixture, "ide.read", json!({"items":items})).await;
+    let (read, _) = batch_settle_with_text(actor, fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    let body = read["text"].as_str().expect("read body").to_owned();
+    (read, body)
+}
+
+/// Five items of about 3.4, 7.0, 7.8, 0.9 and
+/// 1.5 KB under the 8 KiB source reply. Whole blocks are fitted in request order, skipping the
+/// two that do not fit, instead of stopping after the first; the footer names exactly the skipped
+/// items with their follow-up call, no page is opened, and only delivered blocks are remembered:
+/// a repeat of a delivered item answers unchanged while a skipped item is delivered in full.
+#[tokio::test]
+async fn configured_product_batch_read_fills_later_blocks_after_skipping_oversized_ones() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "read-fill-sol",
+        &[
+            ("src/one.rs", read_fill_filler("one", 240)),
+            ("src/three.rs", read_fill_filler("three", 150)),
+            ("src/four.rs", read_fill_filler("four", 17)),
+            ("src/five.rs", read_fill_filler("five", 28)),
+        ],
+    )
+    .await;
+    let items = json!([
+        {"path":"src/one.rs","lines":"1-65"},
+        {"path":"src/one.rs","lines":"100-234"},
+        {"path":"src/three.rs","lines":"1-150"},
+        {"path":"src/four.rs","lines":"1-17"},
+        {"path":"src/five.rs","lines":"1-28"}
+    ]);
+    let (read, body) = read_fill_call(&mut actor, &fixture, items).await;
+    assert!(
+        body.starts_with(
+            "read: 5 items in 4 files — 3 delivered, 0 unchanged, 2 not included, 0 failed\n"
+        ),
+        "{body}"
+    );
+    let delivered: Vec<usize> = [
+        "src/one.rs  (lines 1–65)\n",
+        "src/four.rs  (lines 1–17)\n",
+        "src/five.rs  (lines 1–28)\n",
+    ]
+    .iter()
+    .map(|header| {
+        body.find(header)
+            .unwrap_or_else(|| panic!("{header}: {body}"))
+    })
+    .collect();
+    assert!(
+        delivered.windows(2).all(|pair| pair[0] < pair[1]),
+        "request order: {body}"
+    );
+    assert!(body.contains("// five filler line 0028"), "{body}");
+    assert!(!body.contains("src/one.rs  (lines 100–234)"), "{body}");
+    assert!(!body.contains("// three filler line"), "{body}");
+    assert!(
+        body.ends_with(
+            "not included (over the reply budget): src/one.rs lines 100-234, src/three.rs \
+             lines 1-150 — call ide.read {\"items\":[{\"lines\":\"100-234\",\"path\":\
+             \"src/one.rs\"},{\"lines\":\"1-150\",\"path\":\"src/three.rs\"}]}\n"
+        ),
+        "{body}"
+    );
+    assert_eq!(read["truncated"], true, "{read}");
+    assert_ne!(read["continuation"], true, "no page is opened: {read}");
+
+    // Only delivered blocks are remembered: the delivered item repeats as unchanged, the skipped
+    // item arrives in full on its first actual delivery.
+    let (_, repeat) = read_fill_call(
+        &mut actor,
+        &fixture,
+        json!([{"path":"src/four.rs","lines":"1-17"}]),
+    )
+    .await;
+    assert!(
+        repeat.starts_with(
+            "read: 1 items in 1 files — 0 delivered, 1 unchanged, 0 not included, 0 failed\n"
+        ),
+        "{repeat}"
+    );
+    let (_, skipped) = read_fill_call(
+        &mut actor,
+        &fixture,
+        json!([{"path":"src/one.rs","lines":"100-234"}]),
+    )
+    .await;
+    assert!(
+        skipped.starts_with(
+            "read: 1 items in 1 files — 1 delivered, 0 unchanged, 0 not included, 0 failed\n"
+        ),
+        "{skipped}"
+    );
+    assert!(skipped.contains("// one filler line 0234"), "{skipped}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Three blocks each larger than the source
+/// reply and one small block. The small block is delivered whole and the three large ones are
+/// named with their exact follow-up call; no page of a large block is opened.
+#[tokio::test]
+async fn configured_product_batch_read_delivers_the_small_block_when_others_are_oversized() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "read-fill-luna",
+        &[
+            ("src/big_a.rs", read_fill_filler("big_a", 400)),
+            ("src/big_b.rs", read_fill_filler("big_b", 350)),
+            ("src/big_c.rs", read_fill_filler("big_c", 450)),
+            ("src/small.rs", read_fill_filler("small", 40)),
+        ],
+    )
+    .await;
+    let (read, body) = read_fill_call(
+        &mut actor,
+        &fixture,
+        json!([
+            {"path":"src/big_a.rs","lines":"1-400"},
+            {"path":"src/big_b.rs","lines":"1-350"},
+            {"path":"src/big_c.rs","lines":"1-450"},
+            {"path":"src/small.rs","lines":"1-40"}
+        ]),
+    )
+    .await;
+    assert!(
+        body.starts_with(
+            "read: 4 items in 4 files — 1 delivered, 0 unchanged, 3 not included, 0 failed\n\
+             src/small.rs  (lines 1–40)\n"
+        ),
+        "{body}"
+    );
+    assert!(body.contains("// small filler line 0040"), "{body}");
+    assert!(!body.contains("big_a filler"), "{body}");
+    assert!(
+        body.ends_with(
+            "not included (over the reply budget): src/big_a.rs lines 1-400, src/big_b.rs \
+             lines 1-350, src/big_c.rs lines 1-450 — call ide.read {\"items\":[{\"lines\":\
+             \"1-400\",\"path\":\"src/big_a.rs\"},{\"lines\":\"1-350\",\"path\":\
+             \"src/big_b.rs\"},{\"lines\":\"1-450\",\"path\":\"src/big_c.rs\"}]}\n"
+        ),
+        "{body}"
+    );
+    assert_ne!(read["continuation"], true, "no page is opened: {read}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// When no whole block fits, the first block still pages as before and the rest is named.
+#[tokio::test]
+async fn configured_product_batch_read_pages_the_first_block_when_none_fits_whole() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "read-fill-paging",
+        &[
+            ("src/big_a.rs", read_fill_filler("big_a", 400)),
+            ("src/big_b.rs", read_fill_filler("big_b", 350)),
+        ],
+    )
+    .await;
+    let (read, body) = read_fill_call(
+        &mut actor,
+        &fixture,
+        json!([
+            {"path":"src/big_a.rs","lines":"1-400"},
+            {"path":"src/big_b.rs","lines":"1-350"}
+        ]),
+    )
+    .await;
+    assert_eq!(read["continuation"], true, "{read}");
+    let (number, last, from, to, total) = page_marker(&body);
+    assert_eq!((number, last, from), (1, false, 0), "{body}");
+    assert!(to > from && total > to, "{body}");
+    assert!(
+        body.split_once('\n').unwrap().1.starts_with(
+            "read: 2 items in 2 files — 1 delivered, 0 unchanged, 1 not included, 0 failed\n\
+             src/big_a.rs  (lines 1–400)\n"
+        ),
+        "{body}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A patch naming more files than one edit may
+/// commit is refused explicitly with its limit and nothing is written, instead of the generic
+/// internal refusal; a patch at the limit still applies every file.
+#[tokio::test]
+async fn configured_product_patch_over_the_file_limit_is_refused_before_any_write() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "patch-file-limit",
+        &[("notes/seed.txt", "seed\n".to_owned())],
+    )
+    .await;
+    let patch = |prefix: &str, count: usize| {
+        let mut text = String::from("*** Begin Patch\n");
+        for index in 1..=count {
+            text.push_str(&format!(
+                "*** Add File: notes/{prefix}_{index:02}.txt\n+{prefix} {index}\n"
+            ));
+        }
+        text.push_str("*** End Patch");
+        text
+    };
+    let over = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"patch-over-limit","patch":patch("over", 17)}),
+    )
+    .await;
+    let (over, over_text) = batch_settle_with_text(&mut actor, &fixture, over).await;
+    assert!(
+        !over_text.contains("The IDE could not complete this request."),
+        "an explicit refusal, not the generic internal one: {over_text}"
+    );
+    assert!(
+        over_text.contains("16"),
+        "the refusal names its limit: {over_text}"
+    );
+    assert_ne!(over["state"], "edit_batch", "{over}");
+    assert!(
+        (1..=17).all(|index| !fixture
+            .root
+            .join(format!("notes/over_{index:02}.txt"))
+            .exists()),
+        "nothing is written"
+    );
+
+    let at_limit = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"patch-at-limit","patch":patch("limit", 16)}),
+    )
+    .await;
+    let (at_limit, at_limit_text) = batch_settle_with_text(&mut actor, &fixture, at_limit).await;
+    assert_eq!(at_limit["state"], "edit_batch", "{at_limit}");
+    assert!(
+        batch_without_status_plate(&at_limit_text).starts_with("edit: applied 16 of 16 files"),
+        "{at_limit_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("notes/limit_16.txt")).unwrap(),
+        "limit 16\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Batch forms (batch-api-v1) against the real daemon, sharing this file's fixtures.
 mod batch_api;
 /// Post-review receipt, fallback and usable-accounting regressions.

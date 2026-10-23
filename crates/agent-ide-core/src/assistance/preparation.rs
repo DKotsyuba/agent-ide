@@ -20,7 +20,7 @@ pub(super) struct Pending {
     /// Background indexing state of this worktree, for the not-ready answer.
     index_note: String,
     cancel: tokio_util::sync::CancellationToken,
-    pub(super) handle: Option<tokio::task::JoinHandle<std::io::Result<Preparation>>>,
+    pub(super) handle: Option<tokio::task::JoinHandle<std::io::Result<Computed>>>,
 }
 #[cfg(feature = "jev-pilot")]
 impl Drop for Pending {
@@ -28,6 +28,21 @@ impl Drop for Pending {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
+}
+
+/// Private computation handoff; public failure anchors never change the serialized model packet.
+#[cfg(feature = "jev-pilot")]
+pub(super) struct Computed {
+    prepared: Preparation,
+    anchors: Vec<TestAnchor>,
+}
+
+/// A validated public-check line tied to the exact bytes observed by that check.
+#[cfg(feature = "jev-pilot")]
+struct TestAnchor {
+    path: std::path::PathBuf,
+    hash: String,
+    line: u32,
 }
 
 /// Trusted opt-in only; model parameters cannot choose root, provider or credentials.
@@ -46,6 +61,161 @@ struct Config {
 }
 
 impl Worker<'_> {
+    /// Uses complete source-backed test units when available; otherwise preserves the original selection.
+    /// Provider startup is awaited normally, never cancelled while its backend is out of its slot.
+    #[cfg(feature = "jev-pilot")]
+    async fn localize_public_tests(
+        &mut self,
+        job: &mut Job,
+        sources: &[SourceFile],
+        units: &mut Vec<Unit>,
+        anchors: &[TestAnchor],
+        deadline: tokio::time::Instant,
+        prepared: &mut Preparation,
+    ) -> Result<(), FailureCode> {
+        let until = deadline.min(tokio::time::Instant::now() + Duration::from_secs(2));
+        for (file, source) in sources.iter().enumerate() {
+            let Some(language) = crate::lang::Language::for_path(&source.path) else {
+                continue;
+            };
+            if !language.support().is_test_file(&source.path) {
+                continue;
+            }
+            let lines: Vec<u32> = anchors
+                .iter()
+                .filter(|anchor| anchor.path == source.path && anchor.hash == source.hash)
+                .map(|anchor| anchor.line)
+                .collect();
+            let Some(mut original) = units
+                .iter()
+                .filter(|unit| unit.file == file)
+                .min_by_key(|unit| unit.rank)
+                .cloned()
+            else {
+                continue;
+            };
+            if lines.is_empty() {
+                continue;
+            }
+            let whole = units
+                .iter()
+                .any(|unit| unit.file == file && unit.range == (0, source.text.len()));
+            original.required = units.iter().any(|unit| unit.file == file && unit.required);
+            original.reasons = dedup(
+                units
+                    .iter()
+                    .filter(|unit| unit.file == file)
+                    .flat_map(|unit| unit.reasons.iter().cloned())
+                    .collect(),
+            );
+            if !whole {
+                for unit in units.iter_mut().filter(|unit| unit.file == file) {
+                    unit.complete = false;
+                }
+            }
+            let Some(imports) = language
+                .support()
+                .source_import_spans(&source.path, &source.text)
+            else {
+                prepared.warnings.push(format!(
+                    "{}: imports unavailable; original test context retained",
+                    source.path.display()
+                ));
+                continue;
+            };
+            let mut localized = None;
+            // At most two ordinary outline requests: the first can start a cold provider;
+            // only an already-owned session is waited on before the second request.
+            for attempt in 0..2 {
+                if *job.cancel.borrow() {
+                    return Err(FailureCode::Cancelled);
+                }
+                if tokio::time::Instant::now() >= until {
+                    break;
+                }
+                let failure = job.failure_detail.take();
+                let parked = job.park_until.take();
+                let owner = job.session_binding.clone();
+                let answer = self
+                    .outline_of(job, &source.observed, source.text.as_bytes())
+                    .await;
+                job.failure_detail = failure;
+                job.park_until = parked;
+                job.session_binding = owner;
+                if *job.cancel.borrow() || matches!(&answer, Err(FailureCode::Cancelled)) {
+                    return Err(FailureCode::Cancelled);
+                }
+                let Ok((outline, _, lexical)) = &answer else {
+                    break;
+                };
+                // Source-backed parsers can prove complete test units without a live server.
+                // The localizer refuses outlines that do not contain the enclosing tests.
+                localized =
+                    preparation_test_units::localize(outline, &source.text, &lines, &imports);
+                if localized.is_some() || !matches!(lexical, Some(symbols::Lexical::Loading)) {
+                    break;
+                }
+                if attempt != 0 {
+                    break;
+                }
+                let budget = until.saturating_duration_since(tokio::time::Instant::now());
+                if budget.is_zero() {
+                    break;
+                }
+                let binding = job.invocation.binding_ref().clone();
+                let ready = tokio::select! {
+                    ready = self.providers.wait_existing_session(&binding, &source.path, budget) => ready,
+                    _ = job.cancel.changed() => return Err(FailureCode::Cancelled),
+                };
+                if !ready {
+                    break;
+                }
+            }
+            if let Some(spans) = localized {
+                let resolved: Vec<_> = units
+                    .iter()
+                    .filter(|unit| unit.file == file)
+                    .map(|unit| {
+                        format!(
+                            "{}: bytes {}..{} are not a complete declaration",
+                            source.path.display(),
+                            unit.range.0,
+                            unit.range.1
+                        )
+                    })
+                    .collect();
+                prepared.packet.gaps.retain(|gap| !resolved.contains(gap));
+                units.retain(|unit| unit.file != file);
+                for range in spans {
+                    let mut unit = original.clone();
+                    unit.range = range;
+                    unit.complete = true; // Complete source-backed context only as one bundle.
+                    unit.bundle = Some(file);
+                    unit.role = "test".into();
+                    unit.symbol = None;
+                    unit.reasons
+                        .push("public test block with surrounding setup".into());
+                    units.push(unit);
+                }
+                prepared.warnings.push(format!(
+                    "{}: public test context localized",
+                    source.path.display()
+                ));
+            } else {
+                prepared.warnings.push(format!(
+                    "{}: test blocks not localized; {} retained",
+                    source.path.display(),
+                    if whole {
+                        "whole-file candidate"
+                    } else {
+                        "incomplete selected fragments"
+                    }
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Cancels and joins owned computations before stop/shutdown releases their authority.
     pub(super) async fn cancel_preparations(&mut self, binding: Option<&BindingRef>) {
         #[cfg(feature = "jev-pilot")]
@@ -277,6 +447,19 @@ impl Worker<'_> {
                         })
                         .await
                         .map_err(std::io::Error::other)??;
+                        let anchors = evidence
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|evidence| {
+                                evidence.failures.iter().filter_map(|failure| {
+                                    failure.line.map(|line| TestAnchor {
+                                        path: failure.path.clone(),
+                                        hash: failure.content_hash.clone(),
+                                        line,
+                                    })
+                                })
+                            })
+                            .collect();
                         prepared.warnings.extend(check_notes);
                         if let Some(report) = public_report {
                             prepared.warnings.push(format!(
@@ -289,7 +472,7 @@ impl Worker<'_> {
                             ));
                             prepared.warnings.extend(report.errors);
                         }
-                        Ok(prepared)
+                        Ok(Computed { prepared, anchors })
                     })
                 });
                 self.preparations.insert(
@@ -346,7 +529,10 @@ impl Worker<'_> {
             {
                 return Ok((not_ready_reply(&pending.index_note), None, None));
             }
-            let mut prepared = computed.map_err(|_| {
+            let Computed {
+                mut prepared,
+                anchors,
+            } = computed.map_err(|_| {
                 if tokio::time::Instant::now() >= pending.deadline {
                     job.failure_detail = Some(DEADLINE_DETAIL.into());
                     FailureCode::Deadline
@@ -399,10 +585,20 @@ impl Worker<'_> {
                     rank: window.rank,
                     required: window.required,
                     complete: window.unit_complete || window.complete_file,
+                    bundle: None,
                     symbol: window.symbol.clone(),
                     reasons: window.reasons.clone(),
                 });
             }
+            self.localize_public_tests(
+                job,
+                &sources,
+                &mut units,
+                &anchors,
+                pending.deadline,
+                &mut prepared,
+            )
+            .await?;
             let root = authority.worktree().worktree_path().to_path_buf();
             let mut prelude = Vec::new();
             let (read, over_limit) = split_prelude(prelude_paths(
@@ -748,6 +944,8 @@ struct Unit {
     rank: u32,
     required: bool,
     complete: bool,
+    /// Disjoint ranges of one complete test context must be admitted together.
+    bundle: Option<usize>,
     symbol: Option<String>,
     reasons: Vec<String>,
 }
@@ -922,6 +1120,18 @@ fn select_packet(
         matches!(reply, PeerReply::Complete {text,..} if text.len().div_ceil(4) as u64 <= budget)
             && content::fits(reply, content::reply_envelope())
     };
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (index, unit) in candidates.iter().enumerate() {
+        if let Some(bundle) = unit.bundle
+            && let Some(group) = groups
+                .iter_mut()
+                .find(|group| candidates[group[0]].bundle == Some(bundle))
+        {
+            group.push(index);
+        } else {
+            groups.push(vec![index]);
+        }
+    }
     let source_count = candidates.len();
     let requested: Vec<_> = candidates
         .iter()
@@ -933,12 +1143,17 @@ fn select_packet(
         *units = candidates;
     } else {
         included[..source_count].fill(false);
-        for (position, unit) in candidates.into_iter().enumerate() {
-            included[position] = true;
-            units.push(unit);
+        for group in &groups {
+            let before = units.len();
+            for &position in group {
+                included[position] = true;
+                units.push(candidates[position].clone());
+            }
             if !fits(&assemble(units, prelude, &included).0) {
-                units.pop();
-                included[position] = false;
+                units.truncate(before);
+                for &position in group {
+                    included[position] = false;
+                }
             }
         }
     }
@@ -964,16 +1179,22 @@ fn select_packet(
     }
     // A skipped unit may still be delivered by later overlapping selections.
     let delivered = delivered_files(sources, units);
-    for (slot, (file, range)) in requested.into_iter().enumerate() {
-        let (first, last) = line_span(&sources[file].text, range.0, range.1);
-        if delivered.iter().any(|item| {
-            item.source == file
-                && item
-                    .spans
-                    .iter()
-                    .any(|&(start, end)| start <= first && end >= last)
-        }) {
-            included[slot] = true;
+    for group in &groups {
+        let covered = group.iter().all(|&slot| {
+            let (file, range) = requested[slot];
+            let (first, last) = line_span(&sources[file].text, range.0, range.1);
+            delivered.iter().any(|item| {
+                item.source == file
+                    && item
+                        .spans
+                        .iter()
+                        .any(|&(start, end)| start <= first && end >= last)
+            })
+        });
+        if covered {
+            for &slot in group {
+                included[slot] = true;
+            }
         }
     }
     let (reply, gaps) = assemble(units, prelude, &included);
@@ -1492,6 +1713,7 @@ mod tests {
                 rank: file as u32,
                 required: file < 2,
                 complete: true,
+                bundle: None,
                 symbol: None,
                 reasons: vec![],
             })
@@ -1551,6 +1773,72 @@ mod tests {
         };
         assert!(text.contains("## implementation.alpha") && !text.contains("## large-test.alpha"));
         assert!(text.starts_with("prepare: partial"));
+
+        // Test, setup and import context are one unit: a small budget must not split it.
+        let bundle: Vec<_> = [(0, 3200), (6400, 9600), (12800, 16000)]
+            .into_iter()
+            .map(|range| {
+                let mut unit = original_units[0].clone();
+                unit.range = range;
+                unit.bundle = Some(0);
+                unit
+            })
+            .collect();
+        let mut bundled = bundle.clone();
+        bundled.push(original_units[2].clone());
+        let mut bundle_omitted = Vec::new();
+        fit_packet(
+            &prepared,
+            &sources,
+            &mut bundled,
+            &mut Vec::new(),
+            &mut bundle_omitted,
+            2000,
+        )
+        .unwrap();
+        assert!(bundled.iter().all(|unit| unit.file != 0));
+        assert!(bundled.iter().any(|unit| unit.file == 2));
+        assert_eq!(
+            bundle_omitted
+                .iter()
+                .filter(|note| note.contains("large-test.alpha"))
+                .count(),
+            3
+        );
+        let mut fitting = bundle.clone();
+        fit_packet(
+            &prepared,
+            &sources,
+            &mut fitting,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            5000,
+        )
+        .unwrap();
+        assert_eq!(fitting.len(), 3);
+        // An independent delivered overlap cannot hide omissions of the rest of the bundle.
+        let mut overlap = bundle[0].clone();
+        overlap.bundle = None;
+        let mut partial = vec![overlap];
+        partial.extend(bundle);
+        let mut missing = Vec::new();
+        fit_packet(
+            &prepared,
+            &sources,
+            &mut partial,
+            &mut Vec::new(),
+            &mut missing,
+            2000,
+        )
+        .unwrap();
+        assert_eq!(partial.len(), 1);
+        assert_eq!(
+            missing
+                .iter()
+                .filter(|note| note.contains("large-test.alpha"))
+                .count(),
+            3
+        );
 
         // Naming a manifest explicitly keeps it even when it only exists in the prelude.
         prepared.packet.task = "Update the test script in package.json".into();

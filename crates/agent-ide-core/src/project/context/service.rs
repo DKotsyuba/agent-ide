@@ -534,19 +534,19 @@ impl ContextService {
                     if !spans.is_empty() {
                         candidate.preferred_spans = spans;
                     }
-                    candidate.reasons.push(format!("public check {} failure location; investigation anchor, not a proven defect", evidence.run_id));
+                    candidate.reasons.insert(0, format!("public check {} failure location; investigation anchor, not a proven defect", evidence.run_id));
                     anchors.push(candidate);
                 }
             }
-            candidates.retain(|c| !anchors.iter().any(|a| a.file.path == c.file.path));
-            anchors.extend(candidates);
-            if evidence.failures.len() > packet_options.candidates {
-                result
-                    .warnings
-                    .push("public failure locations exceed candidate budget".into());
+            // Observed failure files supplement the ranked retrieval quota; they must not
+            // evict its tail. Both inputs are already bounded, with a final packet safety cap.
+            let (combined, omitted) = merge_anchor_candidates(anchors, candidates);
+            if omitted > 0 {
+                result.warnings.push(format!(
+                    "{omitted} ranked candidates omitted at the 256-file safety limit"
+                ));
             }
-            anchors.truncate(packet_options.candidates);
-            candidates = anchors;
+            candidates = combined;
         }
         let ready_files: BTreeSet<_> = ready.documents.iter().map(|d| &d.path).collect();
         candidates.retain(|c| ready_files.contains(&c.file.path));
@@ -981,6 +981,25 @@ fn candidate_evidence(
     (views, notes)
 }
 
+/// Keeps validated anchors first without spending the ranked retrieval quota on them.
+/// Duplicate files use the anchor's current failure spans; the packet's hard limit stays 256.
+fn merge_anchor_candidates(
+    mut anchors: Vec<super::Candidate>,
+    ranked: Vec<super::Candidate>,
+) -> (Vec<super::Candidate>, usize) {
+    for candidate in ranked {
+        if !anchors
+            .iter()
+            .any(|anchor| anchor.file.path == candidate.file.path)
+        {
+            anchors.push(candidate);
+        }
+    }
+    let omitted = anchors.len().saturating_sub(256);
+    anchors.truncate(256);
+    (anchors, omitted)
+}
+
 /// Returns a byte-bounded UTF-8 excerpt; its enclosing card always declares incompleteness.
 fn prefix(text: &str, mut limit: usize) -> &str {
     limit = limit.min(text.len());
@@ -1054,6 +1073,30 @@ mod tests {
                 .iter()
                 .all(|view| view.source == source && !view.partial)
         );
+    }
+
+    /// Four observed failures do not evict the tail of twelve independently ranked files.
+    #[test]
+    fn public_anchors_supplement_the_ranked_quota() {
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new("context-anchor-quota");
+        for number in 0..16 {
+            std::fs::write(root.join(format!("needle-{number:02}.alpha")), "x").unwrap();
+        }
+        let mut index = ContextIndex::open(&root).unwrap();
+        index
+            .refresh(&crate::project::structure::StructureOptions::default())
+            .unwrap();
+        let all = index.search("needle", 16).unwrap();
+        let mut anchors = all[..4].to_vec();
+        anchors[0].preferred_spans = vec![(0, 1)];
+        let (combined, omitted) = merge_anchor_candidates(anchors.clone(), all[4..].to_vec());
+        assert_eq!(omitted, 0);
+        assert_eq!(combined.len(), 16);
+        assert_eq!(combined.last().unwrap().file.path, all[15].file.path);
+        let (deduplicated, _) = merge_anchor_candidates(anchors, all);
+        assert_eq!(deduplicated.len(), 16);
+        assert_eq!(deduplicated[0].preferred_spans, vec![(0, 1)]);
     }
 
     /// Expansion closes a large selected file, including facts outside the initial semantic span.

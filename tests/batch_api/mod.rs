@@ -15,7 +15,7 @@ fn assert_no_source_ref(text: &str) {
 /// reply: the summary line first, blocks in request order, failed items in place without failing
 /// the rest, a duplicate once, and one `source_ref` that a following multi-change `ide.edit` of a
 /// delivered file accepts without a re-read. A second read whose middle item does not fit the
-/// reply envelope delivers the prefix, names the rest with an exact `{"items":[…]}` call, and its
+/// reply envelope skips it while answering later items, names it with an exact follow-up call, and its
 /// `source_ref` does not cover the cut file.
 #[tokio::test]
 async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
@@ -120,7 +120,7 @@ async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
     assert_eq!(cut["kind"], "read", "{cut} {text}");
     assert!(
         text.starts_with(
-            "read: 3 items in 3 files — 1 delivered, 0 unchanged, 2 not included, 0 failed\n"
+            "read: 3 items in 3 files — 1 delivered, 1 unchanged, 1 not included, 0 failed\n"
         ),
         "{text}"
     );
@@ -129,20 +129,17 @@ async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
         .find(|line| line.starts_with("not included (over the reply budget): "))
         .unwrap_or_else(|| panic!("no footer: {text}"));
     let call: Value = serde_json::from_str(footer.split_once("call ide.read ").unwrap().1).unwrap();
-    assert_eq!(
-        call,
-        json!({"items":[{"path":"big.md"},{"path":"notes.md"}]}),
-        "{footer}"
-    );
+    assert_eq!(call, json!({"items":[{"path":"big.md"}]}), "{footer}");
     assert_no_source_ref(&text);
     let cut_ref = cut["detail_ref"].as_str().unwrap().to_owned();
+    let big_before = std::fs::read(fixture.root.join("big.md")).unwrap();
     let refused = actor
         .call(
             &fixture,
             "ide.edit",
             json!({
                 "operation_id":"read-items-cut-edit",
-                "path":"notes.md",
+                "path":"big.md",
                 "source_ref":cut_ref,
                 "changes":[{"lines":"2-2","content":"changed"}]
             }),
@@ -154,8 +151,8 @@ async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
         "a cut file is not an edit base: {refused}"
     );
     assert_eq!(
-        std::fs::read_to_string(fixture.root.join("notes.md")).unwrap(),
-        "# title\nbody\n"
+        std::fs::read(fixture.root.join("big.md")).unwrap(),
+        big_before
     );
 
     actor.call(&fixture, "ide.stop", json!({})).await;

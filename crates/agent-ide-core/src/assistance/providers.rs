@@ -134,6 +134,30 @@ pub(super) fn cache_root(runtime: &std::path::Path) -> std::path::PathBuf {
 }
 
 impl Providers {
+    /// Waits only for an already-owned session; never starts, removes or replaces a backend.
+    #[cfg(feature = "jev-pilot")]
+    pub(super) async fn wait_existing_session(
+        &mut self,
+        binding: &BindingRef,
+        path: &Path,
+        budget: Duration,
+    ) -> bool {
+        let Some(server) = self.session_server(path) else {
+            return false;
+        };
+        let Ok(index) = self.slot_of(server) else {
+            return false;
+        };
+        let Some(live) = self.slots[index]
+            .backend
+            .as_mut()
+            .and_then(|backend| backend.live_session(binding))
+        else {
+            return false;
+        };
+        live.wait_ready(budget).await.is_ok()
+    }
+
     /// Creates fixed finite provider bookkeeping and one idle backend per server without launching
     /// processes.
     pub(super) fn new(cache_root: std::path::PathBuf) -> Self {

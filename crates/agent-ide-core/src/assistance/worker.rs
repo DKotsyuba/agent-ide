@@ -69,6 +69,9 @@ mod preparation_checks;
 #[cfg(feature = "jev-pilot")]
 #[path = "preparation_evidence.rs"]
 mod preparation_evidence;
+#[cfg(feature = "jev-pilot")]
+#[path = "preparation_test_units.rs"]
+mod preparation_test_units;
 #[path = "progress.rs"]
 mod progress;
 #[path = "providers.rs"]

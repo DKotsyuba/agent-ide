@@ -19,7 +19,8 @@ impl Worker<'_> {
     /// Applies one `ide.edit {operation_id, patch}` call.
     ///
     /// Parse errors answer as invalid parameters with the parser's own sentence (including the
-    /// delete/move refusal). Absolute file headers are normalized beneath the active worktree
+    /// delete/move refusal). More than the batch file limit refuses before source observation
+    /// or writes, with a split hint. Absolute file headers are normalized beneath the active worktree
     /// before an `Update File` is observed; an outside path refuses with a worktree-relative
     /// repair hint. A missing file or unmatched hunk is refused as `edit_refused` with
     /// `patch refused, nothing written: …` plus the nearest text and one repair line. Normalized
@@ -53,6 +54,15 @@ impl Worker<'_> {
                 return Ok((PeerReply::InvalidParameters { message }, authority, None));
             }
         };
+        if parsed.len() > crate::changes::batch::MAX_BATCH_FILES {
+            return Err(refuse(
+                job,
+                format!(
+                    "at most {} files per edit; split this patch into smaller edits",
+                    crate::changes::batch::MAX_BATCH_FILES
+                ),
+            ));
+        }
         let existing = self.batch_receipt(job, &operation_id).await?;
         if existing.as_ref().is_some_and(|receipt| {
             receipt.request_digest != crate::assistance::batch::edit_request_digest(&job.parameters)

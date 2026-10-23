@@ -488,6 +488,17 @@ agent test preempts only preparation-owned work. Missing/busy/unsupported checks
 reported in notes and ordinary retrieval remains available; unavailable evidence is not
 a successful test. No additional model wakeup or public tool is introduced.
 
+Validated public failure files supplement the ranked retrieval quota rather than replacing
+its tail. The combined candidate set remains capped at 256 files; existing model-call,
+source-read and output limits still apply, with omissions and exhausted budgets disclosed.
+Before delivery, whole files or partial anchored test windows may be collected into complete test blocks using the
+existing language provider. Their imports, enclosing setup and referenced local helpers
+travel as one indivisible context bundle. Missing test ranges, unavailable providers or
+possible shared state with omitted sibling tests preserve the original selection; unresolved
+partial test context remains explicitly incomplete.
+The helper never cancels a provider startup midway; it may wait briefly for an already
+owned session and retry its outline once. This optional work does not prove task completeness.
+
 Operators may seed a fresh project from already paid vectors with
 `project_index ROOT MODELS_JSON --reuse-from SOURCE_ROOT`, before its daemon starts.
 This offline operation copies only vectors matching current payload hashes and the exact
@@ -495,7 +506,8 @@ model space; it imports no source history, readiness state or delivery receipts.
 with the normal indexing pass to revalidate and publish readiness. Its estimate lists
 remaining missing fragments; a fully reused index needs no document API calls.
 
-Preparation runs separately from the sequential worker. Stop cancels and joins owned work.
+Model retrieval runs separately from the sequential worker; source revalidation and optional
+provider-backed test localization run on the normal worker. Stop cancels and joins owned work.
 Returned source is re-observed under current authority and refused if changed. The call waits
 up to 45 s and answers in one reply, never paged and never continued through `ide.inspect`:
 a status line (`complete`, `partial` or `needs_evidence`), the applicable `AGENTS.md`/`CLAUDE.md`
@@ -503,7 +515,8 @@ rules and nearest manifests (first 32 KiB each; a longer file is cut on a line e
 with its line ranges, role and selection reasons (a partial file adds its header, imports and the
 signatures of declarations not shown), an explicit `omitted:` list and one usage line.
 Source units are admitted in required-first, rank order using the actual rendered size;
-an oversized unit does not exclude smaller later units. Rules and explicitly named manifests
+an oversized unit does not exclude smaller later units. A localized test-context bundle
+is admitted or omitted in full, including its supporting ranges. Rules and explicitly named manifests
 have priority; other manifest context uses remaining space after source. If protected context
 alone prevents a bounded answer, its removal is disclosed rather than silently dropping code.
 Omission text counts toward both limits, and rows covered by another unit are not called omitted.
