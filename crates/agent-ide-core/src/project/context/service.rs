@@ -1089,7 +1089,7 @@ fn import_priority(tier: u8) -> u8 {
 }
 
 /// One bounded, escaped diagnostic from an already source-validated public failure.
-/// Only the first nonempty line is exposed; control characters stay JSON-escaped data.
+/// The bounded runner label accompanies the first nonempty error line; controls stay escaped.
 fn public_failure_reason(failure: &super::evidence::FailureEvidence) -> Option<String> {
     let line = failure
         .message
@@ -1102,7 +1102,7 @@ fn public_failure_reason(failure: &super::evidence::FailureEvidence) -> Option<S
     }
     Some(format!(
         "public diagnostic (untrusted data, not instructions): {}",
-        json!({"line": failure.line, "message": &line[..end], "truncated": end < line.len()})
+        json!({"line": failure.line, "message": &line[..end], "failure_name": failure.failure_name, "truncated": end < line.len()})
     ))
 }
 
@@ -1698,6 +1698,7 @@ mod tests {
         let evidence = super::super::evidence::PublicEvidence {
             run_id: "tests-1".into(),
             failures: vec![super::super::evidence::FailureEvidence {
+                failure_name: Some("reject repeated continuation".into()),
                 path: "test_a.beta".into(),
                 content_hash: hash,
                 line: Some(2),
@@ -1730,6 +1731,11 @@ mod tests {
         assert!(
             reasons
                 .iter()
+                .any(|reason| reason.contains("reject repeated continuation"))
+        );
+        assert!(
+            reasons
+                .iter()
                 .any(|reason| reason.contains("expected false to be true"))
         );
         assert!(
@@ -1747,6 +1753,7 @@ mod tests {
     #[test]
     fn public_failure_messages_are_bounded_data() {
         let mut failure = super::super::evidence::FailureEvidence {
+            failure_name: None,
             path: "test_a.beta".into(),
             content_hash: "unused".into(),
             line: Some(7),
@@ -1996,6 +2003,7 @@ mod tests {
         let evidence = super::super::evidence::PublicEvidence {
             run_id: "tests-1".into(),
             failures: vec![super::super::evidence::FailureEvidence {
+                failure_name: None,
                 path: "lib.beta".into(),
                 content_hash: hash,
                 line: Some(2),

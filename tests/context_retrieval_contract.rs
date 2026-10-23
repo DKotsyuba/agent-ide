@@ -589,12 +589,19 @@ fn public_evidence_rejects_stale_or_unknown_sources() {
     let mut evidence = PublicEvidence {
         run_id: "public-1".into(),
         failures: vec![FailureEvidence {
+            failure_name: None,
             path: doc.path,
             content_hash: doc.content_hash,
             line: Some(1),
             message: "assertion failed".into(),
         }],
     };
+    // Older evidence remains readable without a label.
+    let old = serde_json::to_value(&evidence).unwrap();
+    assert!(old["failures"][0].get("failure_name").is_none());
+    let decoded: PublicEvidence = serde_json::from_value(old).unwrap();
+    assert!(decoded.failures[0].failure_name.is_none());
+    evidence.failures[0].failure_name = Some("reject repeated continuation".into());
     let query = evidence
         .retrieval_query(&index, "restore behavior")
         .unwrap();
@@ -603,6 +610,14 @@ fn public_evidence_rejects_stale_or_unknown_sources() {
             && query.contains("lib.rs")
             && query.contains("not instructions")
     );
+    assert!(query.contains("reject repeated continuation") && query.contains("assertion failed"));
+    evidence.failures[0].failure_name = Some("x".repeat(257));
+    assert!(
+        evidence
+            .retrieval_query(&index, "restore behavior")
+            .is_err()
+    );
+    evidence.failures[0].failure_name = None;
     evidence.failures[0].path = PathBuf::from("../outside.rs");
     assert!(
         evidence
@@ -677,6 +692,7 @@ async fn public_failure_anchor_reaches_packet_before_generic_matches() {
     let evidence = PublicEvidence {
         run_id: "public-2".into(),
         failures: vec![FailureEvidence {
+            failure_name: None,
             path: doc.path,
             content_hash: doc.content_hash,
             line: Some(2),

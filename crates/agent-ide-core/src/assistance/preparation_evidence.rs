@@ -450,8 +450,9 @@ impl PublicCheckReport {
     }
 
     /// Converts to the context-retrieval evidence: failure locations then frames, each bound to
-    /// its observed hash and carrying its failure's bounded error line (the failure name when
-    /// none was printed), at most 32 entries inside the 12 KiB budget. `None` without anchors.
+    /// its observed hash and carrying both its bounded runner label and error line (the label
+    /// also stands in for the error when none was printed). At most 32 entries fit inside
+    /// the 12 KiB serialized budget. Returns `None` without anchors.
     pub(super) fn retrieval_evidence(
         &self,
     ) -> Option<crate::project::context::evidence::PublicEvidence> {
@@ -471,36 +472,36 @@ impl PublicCheckReport {
         let candidates = self
             .failures
             .iter()
-            .filter_map(|failure| {
-                failure
-                    .location
-                    .as_ref()
-                    .map(|frame| (frame, observed(failure)))
-            })
+            .filter_map(|failure| failure.location.as_ref().map(|frame| (frame, failure)))
             .chain(
                 self.frames
                     .iter()
-                    .map(|frame| (frame, observed(&self.failures[frame.failure]))),
+                    .map(|frame| (frame, &self.failures[frame.failure])),
             );
-        for (frame, message) in candidates {
+        for (frame, failure) in candidates {
             if failures.len() == MAX_ANCHORS {
                 break;
             }
             if !seen.insert((frame.path.clone(), frame.line)) {
                 continue;
             }
-            let message = bounded(message, ANCHOR_MESSAGE);
-            let cost = frame.path.as_os_str().len() + frame.source_hash.len() + message.len() + 96;
-            if used + cost > ANCHOR_BUDGET {
-                break;
-            }
-            used += cost;
-            failures.push(FailureEvidence {
+            let message = bounded(observed(failure), ANCHOR_MESSAGE);
+            let failure_name =
+                (!failure.name.trim().is_empty()).then(|| bounded(&failure.name, 256));
+            let anchor = FailureEvidence {
                 path: frame.path.clone(),
                 content_hash: frame.source_hash.clone(),
                 line: Some(frame.line),
                 message,
-            });
+                failure_name,
+            };
+            // Count escaped JSON bytes, including labels containing control characters.
+            let cost = serde_json::to_vec(&anchor).ok()?.len() + 1;
+            if used + cost > ANCHOR_BUDGET {
+                break;
+            }
+            used += cost;
+            failures.push(anchor);
         }
         (!failures.is_empty()).then(|| PublicEvidence {
             run_id: format!("tests-{}", self.run_id),

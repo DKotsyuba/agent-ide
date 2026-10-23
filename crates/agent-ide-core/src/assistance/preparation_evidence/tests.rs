@@ -626,6 +626,15 @@ fn retrieval_handoff_is_bounded_and_hash_bound() {
     );
     let evidence = report.retrieval_evidence().unwrap();
     assert_eq!(evidence.run_id, "tests-7");
+    // The typed location and stack anchors retain the same public behavior label.
+    assert_eq!(
+        evidence.failures[0].failure_name.as_deref(),
+        Some("Request > parses")
+    );
+    assert_eq!(
+        evidence.failures[2].failure_name,
+        evidence.failures[0].failure_name
+    );
     let anchors: Vec<(&Path, Option<u32>, &str)> = evidence
         .failures
         .iter()
@@ -658,6 +667,40 @@ fn retrieval_handoff_is_bounded_and_hash_bound() {
         );
     }
     assert!(serde_json::to_string(&evidence).unwrap().len() <= 12 * 1024);
+}
+
+/// Escape expansion in many public labels must not exceed the serialized evidence allowance.
+#[test]
+fn retrieval_handoff_counts_escaped_labels() {
+    let (_scratch, root) = project();
+    let mut report = extract(
+        &root,
+        7,
+        &settled(&mixed_output(&root), failed_report(), Some(1), false, false),
+        after_writes(),
+    );
+    for failure in &mut report.failures {
+        failure.name = "\"".repeat(256);
+        failure.message = "\n".repeat(300);
+        failure.location = None;
+    }
+    let frame = report.frames[0].clone();
+    report.frames = (1..=32)
+        .map(|line| {
+            let mut frame = frame.clone();
+            frame.line = line;
+            frame
+        })
+        .collect();
+    let evidence = report.retrieval_evidence().unwrap();
+    assert!(evidence.failures.len() < 32);
+    assert!(serde_json::to_vec(&evidence).unwrap().len() <= 12 * 1024);
+    assert!(
+        evidence
+            .failures
+            .iter()
+            .all(|f| f.failure_name.as_ref().unwrap().len() == 256)
+    );
 }
 
 pub(super) fn origin(owner: &BindingRef, task: &str) -> SupportOrigin {

@@ -10,6 +10,9 @@ pub struct FailureEvidence {
     pub content_hash: String,
     pub line: Option<u32>,
     pub message: String,
+    /// Public runner label, kept separately from the diagnostic; absent in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_name: Option<String>,
 }
 
 /// A bounded check result supplied by the authorized caller, excluding hidden evaluator data.
@@ -33,7 +36,13 @@ impl PublicEvidence {
         let records = index.records()?;
         let mut read = 0;
         for failure in &self.failures {
-            if failure.message.len() > 1024 || failure.line == Some(0) {
+            if failure.message.len() > 1024
+                || failure
+                    .failure_name
+                    .as_ref()
+                    .is_some_and(|name| name.len() > 256)
+                || failure.line == Some(0)
+            {
                 return Err(io::Error::other("invalid public failure location"));
             }
             let record = records

@@ -1695,6 +1695,17 @@ mod tests {
     /// it was outside the initial shortlist and an earlier test imported a less relevant file.
     #[tokio::test]
     async fn relevant_source_dependency_survives_the_final_carrier() {
+        dependency_carrier("needle", None).await;
+    }
+
+    /// A behavior named only by the public runner label must still rank its implementation.
+    #[tokio::test]
+    async fn failure_label_selects_dependency_in_final_carrier() {
+        dependency_carrier("restore behavior", Some("needle")).await;
+    }
+
+    /// Runs the same competing-import carrier with either task or public-label relevance.
+    async fn dependency_carrier(task: &str, failure_name: Option<&str>) {
         use crate::project::context::evidence::{FailureEvidence, PublicEvidence};
         use crate::project::context::service::{ContextService, ModelConfig};
         use crate::project::context::{ContextIndex, DocumentOptions, PacketOptions};
@@ -1762,6 +1773,7 @@ mod tests {
             failures: ["test_a.beta", "test_b.beta", "lib.beta"]
                 .into_iter()
                 .map(|path| FailureEvidence {
+                    failure_name: failure_name.map(str::to_owned),
                     path: path.into(),
                     content_hash: blake3::hash(&std::fs::read(root.join(path)).unwrap())
                         .to_hex()
@@ -1774,7 +1786,7 @@ mod tests {
         let prepared = service
             .prepare_with_evidence_for_delivery(
                 &index,
-                "needle",
+                task,
                 &evidence,
                 &PacketOptions {
                     candidates: 1,
