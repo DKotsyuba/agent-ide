@@ -233,8 +233,38 @@ fn valid_channel(channel: &str) -> Result<String, &'static str> {
     Ok(channel.to_owned())
 }
 
-/// Parses a plain legacy channel or one toolchain table with a channel and optional known
-/// profile. Components/targets/path/complex TOML need native qualification and are refused.
+/// Components a pin may list: optional rustup tools that never change how a package builds or
+/// tests. Every tool the IDE itself runs (`rustfmt`, `cargo clippy`) is resolved and checked
+/// where it is used, so listing one here adds no unverified requirement.
+const KNOWN_COMPONENTS: [&str; 8] = [
+    "rustfmt",
+    "clippy",
+    "rust-src",
+    "rust-analyzer",
+    "rust-docs",
+    "llvm-tools",
+    "llvm-tools-preview",
+    "rustc-dev",
+];
+
+/// Whether `value` is a one-line array of quoted [`KNOWN_COMPONENTS`] (`["rustfmt", "clippy"]`).
+fn known_components(value: &str) -> bool {
+    let Some(inner) = value
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    inner
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .all(|item| quoted(item).is_some_and(|name| KNOWN_COMPONENTS.contains(&name)))
+}
+
+/// Parses a plain legacy channel or one toolchain table with a channel, an optional known
+/// profile and an optional list of known components. Targets/path/unknown components and
+/// complex TOML need native qualification and are refused.
 fn parse_pin(text: &str, toml: bool) -> Result<String, &'static str> {
     let lines: Vec<_> = text
         .lines()
@@ -275,6 +305,7 @@ fn parse_pin(text: &str, toml: bool) -> Result<String, &'static str> {
                     quoted(value.trim()),
                     Some("minimal" | "default" | "complete")
                 ) => {}
+            "components" if known_components(value.trim()) => {}
             _ => return Err("unsupported toolchain pin requirements"),
         }
     }
@@ -1163,6 +1194,37 @@ mod tests {
             Some(EnvSource::Pin("rust-toolchain.toml".into()))
         );
         assert_eq!(resolved.chosen.unwrap().version.as_deref(), Some("1.98.1"));
+    }
+
+    /// A pin listing known optional components is qualified like a bare channel pin; an unknown
+    /// component, a target list or a multi-line array still needs native qualification.
+    #[test]
+    fn known_components_do_not_block_an_exact_pin() {
+        let root = ScratchDir::new("rust-pin-components");
+        put(&root, "Cargo.toml", "[package]\nname=\"x\"\n");
+        let dir = root.join("tools");
+        fs::create_dir_all(&dir).unwrap();
+        put(
+            &root,
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = \"1.98.1\"\ncomponents = [\"rustfmt\", \"clippy\"]\n",
+        );
+        assert!(pin_conflict(&root, &dir, Some("rustc 1.98.1"), &[]).is_none());
+        for extra in [
+            "components = [\"rustfmt\", \"custom-tool\"]",
+            "targets = [\"wasm32-unknown-unknown\"]",
+            "components = [",
+        ] {
+            put(
+                &root,
+                "rust-toolchain.toml",
+                format!("[toolchain]\nchannel = \"1.98.1\"\n{extra}\n"),
+            );
+            assert!(
+                pin_conflict(&root, &dir, Some("rustc 1.98.1"), &[]).is_some(),
+                "{extra}"
+            );
+        }
     }
 
     /// Denied, invalid, oversized and unknown TOML never fall through to valid legacy pins.
