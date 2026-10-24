@@ -115,11 +115,14 @@ pub const INLINE_REPLY_WAIT: Duration = Duration::from_secs(8);
 /// Stays below the hosts' MCP tool-call timeouts; the job's own operation deadline still applies.
 pub const PREPARE_INLINE_WAIT: Duration = Duration::from_secs(45);
 
-/// The inline wait of one submitted `tool`: [`PREPARE_INLINE_WAIT`] for `ide.prepare`,
-/// [`INLINE_REPLY_WAIT`] for every other tool.
+/// The inline wait of one submitted `tool`: [`PREPARE_INLINE_WAIT`] for `ide.prepare` (a
+/// test-seam build may shorten it to reach the pending path), [`INLINE_REPLY_WAIT`] for every
+/// other tool.
 pub(crate) fn inline_wait(tool: AssistanceTool) -> Duration {
     if tool == AssistanceTool::Prepare {
-        PREPARE_INLINE_WAIT
+        crate::test_seams::var("AGENT_IDE_TEST_PREPARE_INLINE_WAIT_MS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(PREPARE_INLINE_WAIT, Duration::from_millis)
     } else {
         INLINE_REPLY_WAIT
     }
@@ -875,6 +878,9 @@ struct Shared {
     ledger: Mutex<Ledger>,
     /// Wakes the worker for jobs, stops or native-change hints.
     notify: Notify,
+    /// Wakes callers waiting for a job to leave `pending` (an `ide.inspect` of a still-computing
+    /// preparation); signalled whenever any detail settles.
+    settled: Notify,
     /// Immutable trusted restart configuration.
     launcher: LauncherConfig,
     /// Additional Claude targets admitted by live managed MCP leases for this repository.
@@ -1277,6 +1283,7 @@ impl Shared {
         }
         if let Some((owner, final_reply, deferred)) = settled {
             self.job_settled(reference, &owner, &final_reply, deferred);
+            self.settled.notify_waiters();
         }
     }
     /// Answers one settled run's terminal text and, for the owning binding, hands the run's
@@ -1780,6 +1787,7 @@ impl WorkerHandle {
                 bindings,
                 ledger: Mutex::new(Ledger::default()),
                 notify: Notify::new(),
+                settled: Notify::new(),
                 launcher,
                 claude_targets: Mutex::new(BTreeMap::new()),
                 retired_initial_claude_target: std::sync::atomic::AtomicBool::new(false),
@@ -2532,6 +2540,7 @@ impl WorkerHandle {
                 detail: None,
             };
         }
+        self.await_pending_prepare(&binding, &reference).await;
         let permit = match reserve_inspection(&self.inspect) {
             Ok(permit) => permit,
             Err(code) => {
@@ -2544,6 +2553,29 @@ impl WorkerHandle {
         };
         self.inspect_reserved(binding, reference, expected, permit, recover_test_output)
             .await
+    }
+
+    /// Waits, at most [`PREPARE_INLINE_WAIT`], while `reference` is `binding`'s still-pending
+    /// preparation, so the second call of an asynchronous `ide.prepare` answers the packet itself
+    /// instead of another `pending` the agent would poll. Any other reference returns at once.
+    async fn await_pending_prepare(&self, binding: &BindingRef, reference: &str) {
+        let deadline = tokio::time::Instant::now() + PREPARE_INLINE_WAIT;
+        loop {
+            let settled = self.shared.settled.notified();
+            tokio::pin!(settled);
+            // Registered before the check, so a settlement between the two is not missed.
+            settled.as_mut().enable();
+            let pending = self.shared.ledger.lock().is_ok_and(|ledger| {
+                ledger.details.get(reference).is_some_and(|detail| {
+                    detail.binding == *binding
+                        && detail.selection.0 == AssistanceTool::Prepare
+                        && matches!(detail.reply, PeerReply::Pending { .. })
+                })
+            });
+            if !pending || tokio::time::timeout_at(deadline, settled).await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Publishes one fully built inspection through a permit that already owns channel capacity.
@@ -12047,6 +12079,7 @@ mod stop_retry_tests {
                 bindings: Arc::new(Mutex::new(HostBindingGuard::default())),
                 ledger: Mutex::new(Ledger::default()),
                 notify: Notify::new(),
+                settled: Notify::new(),
                 launcher,
                 claude_targets: Mutex::new(BTreeMap::new()),
                 retired_initial_claude_target: std::sync::atomic::AtomicBool::new(false),

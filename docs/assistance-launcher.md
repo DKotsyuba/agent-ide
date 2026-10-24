@@ -480,10 +480,12 @@ An optional operator-selected public check can ground preparation before retriev
 The setting belongs inside `task_context`; it is off when absent. A target is either
 `files` (1–64 worktree-relative paths) or `pattern` (a runner filter). The existing
 language test planner must support it. Only writer authority starts a check. Its result
-is collected within the same `ide.prepare` call; failed test locations and failure-block
+is collected within the same preparation; failed test locations and failure-block
 stack frames are source-validated investigation anchors, not instructions or proven defects.
 Unchanged-at-run and current source checks reject stale observations. The check has a
-maximum 30 s budget and leaves 10 s of the preparation deadline for retrieval. An explicit
+maximum 280 s budget and leaves 10 s of the preparation deadline for retrieval; a preparation
+outliving the call's wait answers `pending` and settles through one `ide.inspect`, so set
+`limits.operation_ms` (at most 300 000) above the check budget for slow suites. An explicit
 agent test preempts only preparation-owned work. Missing/busy/unsupported checks are
 reported in notes and ordinary retrieval remains available; unavailable evidence is not
 a successful test. No additional model wakeup or public tool is introduced.

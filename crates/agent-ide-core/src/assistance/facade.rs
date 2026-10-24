@@ -5340,7 +5340,7 @@ impl StdioFacade {
 
 #[tool_router]
 impl StdioFacade {
-    /// Task source packet in one call, selected source whole; operator-configured models. Check gaps.
+    /// Task source packet in one call, selected source whole; operator-configured models. If pending, one ide.inspect of its detail_ref waits for it. Check gaps.
     #[tool(name = "ide.prepare", input_schema = tool_schemas()[11].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true))]
     async fn prepare(

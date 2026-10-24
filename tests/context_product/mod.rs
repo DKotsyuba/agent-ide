@@ -14,6 +14,10 @@ const FIXTURE_RULE: &str = "- Keep tokenizer changes covered by a unit test in t
 /// pointer to `ide.inspect`, every numbered source row equal to the fixture file's line, the
 /// project rule and manifest delivered verbatim, and a delivered file edited with no read in
 /// between. Returns a summary: status, delivered paths, usage line and the packet text.
+///
+/// With `AGENT_IDE_TEST_PREPARE_INLINE_WAIT_MS` in `env` the preparation outlives its call
+/// instead: that call answers `pending`, and exactly one `ide.inspect` of its reference waits
+/// for and returns the same whole packet.
 async fn roundtrip(
     models: Value,
     evidence: Option<&Path>,
@@ -69,9 +73,15 @@ async fn roundtrip_with(
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let task = "Correct handling of braces inside quoted strings in the stylesheet tokenizer while preserving comments, URLs and interpolation. Identify the implementation and relevant tests before editing.";
     let request = json!({"task":task,"token_budget":budget});
+    let asynchronous = env
+        .iter()
+        .any(|(name, _)| *name == "AGENT_IDE_TEST_PREPARE_INLINE_WAIT_MS");
     // `ide.prepare` never builds the index: wait until the background indexer published it.
+    // A not-ready answer is immediate; the first other answer is the measured call itself.
     let ready_by = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
+    let (calls_before, began, raw) = loop {
+        let calls_before = actor.next;
+        let began = std::time::Instant::now();
         let probe = actor
             .call_raw(&fixture, "ide.prepare", request.clone())
             .await;
@@ -80,29 +90,39 @@ async fn roundtrip_with(
             .unwrap_or_default()
             .to_owned();
         if !text.starts_with("prepare: not_ready") {
-            break;
+            break (calls_before, began, probe);
         }
         assert!(
             std::time::Instant::now() < ready_by,
             "index not ready: {text}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    // Exactly one ordinary call: no settle, no inspect.
-    let calls_before = actor.next;
-    let began = std::time::Instant::now();
-    let raw = actor
-        .call_raw(&fixture, "ide.prepare", request.clone())
-        .await;
-    assert_eq!(actor.next, calls_before + 1, "exactly one MCP request");
+    };
+    let raw = if asynchronous {
+        // The preparation outlives its call: a reference, then one inspect that waits.
+        let pending = raw["result"]["structuredContent"].clone();
+        assert_eq!(pending["state"], "pending", "{raw}");
+        let reference = pending["detail_ref"].as_str().unwrap().to_owned();
+        let settled = actor
+            .call_raw(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+            .await;
+        assert_eq!(actor.next, calls_before + 2, "prepare plus one inspect");
+        settled
+    } else {
+        // Exactly one ordinary call: no settle, no inspect.
+        assert_eq!(actor.next, calls_before + 1, "exactly one MCP request");
+        raw
+    };
     let reply = raw["result"]["structuredContent"].clone();
-    assert_eq!(reply["state"], "complete", "one call must answer: {raw}");
+    assert_eq!(reply["state"], "complete", "the packet must answer: {raw}");
     assert_ne!(reply["continuation"], true, "{reply}");
     assert_ne!(reply["truncated"], true, "{reply}");
-    assert!(
-        reply["detail_ref"].is_null(),
-        "no continuation reference: {reply}"
-    );
+    if !asynchronous {
+        assert!(
+            reply["detail_ref"].is_null(),
+            "no continuation reference: {reply}"
+        );
+    }
     let text = reply["text"].as_str().unwrap().to_owned();
     assert!(
         !text.contains("ide.inspect") && !text.starts_with("page "),
@@ -255,6 +275,25 @@ async fn task_context_mcp_slow_preparation_answers_in_one_call() {
     )
     .await;
     assert!(packet["prepare_ms"].as_u64().unwrap() >= 12_000, "{packet}");
+    assert_ne!(packet["status"], "needs_evidence", "{packet}");
+}
+
+/// A preparation outliving its call's inline wait answers `pending`; one `ide.inspect` of its
+/// reference waits for the settlement and returns the whole packet: two calls, no polling.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn task_context_mcp_pending_preparation_settles_through_one_inspect() {
+    let packet = roundtrip(
+        json!({"embedding":null,"jev":null,"max_new_calls":0,"include_threshold":0.5}),
+        None,
+        &[
+            ("AGENT_IDE_TEST_PREPARE_DELAY_MS", "6000"),
+            ("AGENT_IDE_TEST_PREPARE_INLINE_WAIT_MS", "1000"),
+        ],
+        12000,
+    )
+    .await;
+    assert!(packet["prepare_ms"].as_u64().unwrap() >= 6_000, "{packet}");
     assert_ne!(packet["status"], "needs_evidence", "{packet}");
 }
 

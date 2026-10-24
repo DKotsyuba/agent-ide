@@ -153,8 +153,9 @@ and the gate fail on drift.
 
 `ide.prepare {"task":"…"}` is the opt-in task reconnaissance call after
 `ide.start`. It returns one text reply carrying every selected unit whole, without
-pagination, size cuts or a required follow-up read (`token_budget` is accepted only for
-compatibility and ignored). `partial` and `needs_evidence` are not successful
+pagination or size cuts (`token_budget` is accepted only for compatibility and ignored); a
+preparation outliving the call's 45 s wait answers `pending`, and one `ide.inspect` of its
+`detail_ref` waits for and returns that packet. `partial` and `needs_evidence` are not successful
 reconnaissance. `complete` describes delivered selected evidence, not a proof that
 every edit location for an arbitrary task was discovered. Provider/key/root settings
 remain in the trusted launcher; the caller supplies only the task.

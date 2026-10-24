@@ -10,8 +10,9 @@ use crate::lang::{TestFailure, TestReport, TestTarget};
 use std::os::unix::fs::MetadataExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Longest public check a prepare may start; the configured budget never exceeds it.
-pub(super) const MAX_CHECK_BUDGET: Duration = Duration::from_secs(30);
+/// Longest public check a prepare may start; the configured budget never exceeds it. A whole
+/// compiled test suite (including a cold build) fits; the prepare answers `pending` meanwhile.
+pub(super) const MAX_CHECK_BUDGET: Duration = Duration::from_secs(280);
 /// Largest source file hashed for one location.
 const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 /// Report bounds: typed failures, distinct frames, explicit errors, message bytes, block lines.

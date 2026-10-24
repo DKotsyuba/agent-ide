@@ -282,7 +282,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Task source packet in one call, selected source whole; operator-configured models. Check gaps.",
+    "description": "Task source packet in one call, selected source whole; operator-configured models. If pending, one ide.inspect of its detail_ref waits for it. Check gaps.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

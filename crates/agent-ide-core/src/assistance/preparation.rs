@@ -12,8 +12,8 @@ pub(super) struct Pending {
     binding: BindingRef,
     authority: AuthorityStamp,
     epoch: u64,
-    /// When this computation must have finished; past it the call answers a final deadline
-    /// refusal instead of a pending state the agent would have to poll.
+    /// When this computation must have finished; past it the job settles as a final deadline
+    /// refusal. Before it, a call whose inline wait ends answers `pending`.
     deadline: tokio::time::Instant,
     /// Legacy `token_budget` argument when the caller sent one. Recorded in the trace and
     /// answered with a warning; it never limits the packet.
@@ -406,8 +406,8 @@ impl Worker<'_> {
                     .ok_or(FailureCode::Internal)?
                     .to_owned();
                 let budget = job.parameters.get("token_budget").and_then(Value::as_u64);
-                // Test-only stall before any work, to prove a slow preparation still answers in
-                // one call; default builds never read it.
+                // Test-only stall once the index is ready, to prove a slow preparation still
+                // answers (inline or through one waiting inspect); default builds never read it.
                 let stall = crate::test_seams::var("AGENT_IDE_TEST_PREPARE_DELAY_MS")
                     .and_then(|value| value.parse::<u64>().ok())
                     .map(Duration::from_millis);
@@ -437,14 +437,6 @@ impl Worker<'_> {
                         if cancelled.is_cancelled() || tokio::time::Instant::now() >= deadline {
                             return Err(std::io::Error::other("context cancelled"));
                         }
-                        if let Some(stall) = stall {
-                            tokio::select! {
-                                () = cancelled.cancelled() => {
-                                    return Err(std::io::Error::other("context cancelled"));
-                                }
-                                () = tokio::time::sleep(stall) => {}
-                            }
-                        }
                         // Only an index the background indexer already published is read: no
                         // creation, no refresh and no document embedding inside this call.
                         let index = ContextIndex::open_existing(&root)?.ok_or_else(|| {
@@ -462,6 +454,15 @@ impl Worker<'_> {
                                 std::io::ErrorKind::NotFound,
                                 "context_index_not_ready",
                             ));
+                        }
+                        // The test stall slows only a preparation that would otherwise proceed.
+                        if let Some(stall) = stall {
+                            tokio::select! {
+                                () = cancelled.cancelled() => {
+                                    return Err(std::io::Error::other("context cancelled"));
+                                }
+                                () = tokio::time::sleep(stall) => {}
+                            }
                         }
                         let mut check_notes = Vec::new();
                         let public_report = if let Some(mut check_config) = check_config {
@@ -559,6 +560,20 @@ impl Worker<'_> {
                             })
                             .collect();
                         prepared.warnings.extend(check_notes);
+                        if let Some(report) = &public_report
+                            && evidence.is_none()
+                            && matches!(
+                                report.outcome,
+                                preparation_evidence::CheckOutcome::BudgetExhausted
+                                    | preparation_evidence::CheckOutcome::Cancelled
+                                    | preparation_evidence::CheckOutcome::Incomplete
+                            )
+                        {
+                            prepared.warnings.push(format!(
+                                "no failure anchors: public check {} ended {:?} before reporting failures; files were selected from the task text alone",
+                                report.run_id, report.outcome
+                            ));
+                        }
                         if let Some(report) = public_report {
                             prepared.warnings.push(format!(
                                 "public check {}: {:?}; passed {}; failed {}; elapsed {}ms",
@@ -804,10 +819,11 @@ const RULE_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 /// Manifests that name a module's build, dependencies, features and test targets.
 #[cfg(feature = "jev-pilot")]
 const MANIFEST_FILES: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"];
-/// Longest a preparation computes; kept below the call's inline wait so a slow preparation ends
-/// in a final deadline refusal, never in a pending state.
+/// Longest a preparation computes, further bounded by the launcher's operation deadline. A
+/// preparation outliving its call's inline wait ([`PREPARE_INLINE_WAIT`]) answers `pending`; the
+/// whole packet then settles as the job's result, which `ide.inspect` of its reference waits for.
 #[cfg(feature = "jev-pilot")]
-const PREPARE_COMPUTE_BUDGET: Duration = PREPARE_INLINE_WAIT.saturating_sub(Duration::from_secs(5));
+const PREPARE_COMPUTE_BUDGET: Duration = Duration::from_secs(300);
 /// Closed error message of an index that was never published (shared with the context index).
 #[cfg(feature = "jev-pilot")]
 const NOT_READY: &str = "context_index_not_ready";
@@ -1022,8 +1038,7 @@ fn failed_run(
 
 /// Failure detail of a preparation that missed its compute budget.
 #[cfg(feature = "jev-pilot")]
-const DEADLINE_DETAIL: &str =
-    "prepare:deadline: the packet was not ready within the one-call wait; nothing was delivered";
+const DEADLINE_DETAIL: &str = "prepare:deadline: the packet was not ready within the operation deadline; nothing was delivered";
 
 /// One re-observed source file of the packet.
 #[cfg(feature = "jev-pilot")]

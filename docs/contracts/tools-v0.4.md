@@ -681,8 +681,11 @@ No caller-selected filesystem root or model route. Requires an active binding (a
 enabled trusted `task_context` configuration; otherwise returns an explicit refusal.
 Creates/updates local index state and may call operator-enabled model backends.
 
-One call delivers the whole packet: the call waits up to 45 s for indexing and model work,
-and the reply is never paged and names no continuation. Text form:
+The call waits up to 45 s for indexing, the public check and model work; a packet ready by then
+arrives in that one reply. A preparation still computing answers `pending` with its
+`detail_ref`; exactly one `ide.inspect {"detail_ref":…}` then waits (up to another 45 s per call)
+for the job to settle and returns the whole packet. The packet itself is never paged and names
+no continuation. Text form:
 
 ```text
 prepare: complete|partial|needs_evidence|not_ready; <n> files; ~<t> tokens (estimated)
@@ -703,8 +706,10 @@ usage: embeddings used|off, jev used|off; model calls N (replayed R, failed F); 
 ```
 
 Rules are `AGENTS.md`/`CLAUDE.md` at the worktree root and in every directory above a delivered
-file; manifests are the root one and the nearest one of each delivered file (regular files
-only, each delivered whole). A partially delivered file also shows its module header and imports
+file; manifests are the root one and the nearest one of each delivered file; for a delivered test
+file, the nearest member of each test toolchain configuration family its language declares
+(TypeScript: `vitest.config.*`, else `vite.config.*`, else `jest.config.*`; and `tsconfig.json`)
+follows them (regular files only, each delivered whole). A partially delivered file also shows its module header and imports
 (when not among the delivered rows) and `other declarations:` — every declaration whose rows are
 not delivered, with line range and one-line signature (160 characters at most). Every selected unit
 and every prelude file is delivered whole; nothing is omitted, cut or paged for reply size
@@ -718,6 +723,6 @@ background indexing state named); `ide.prepare` never builds or refreshes the in
 checked again before delivery; a file that is not UTF-8 text is listed under `omitted:`
 instead of shown. The delivered rows are remembered exactly as a read of them
 would be, so unit and window edits work without another read; every delivered file, fragments
-included, keeps its observation as a freshness fence. A preparation not ready within its compute budget (below the call's wait)
-ends in a final `deadline` refusal — never a pending state to poll — and its work is cancelled
-and joined by the worker's cleanup.
+included, keeps its observation as a freshness fence. A preparation not ready within its compute budget (300 s, further bounded by the launcher's
+operation deadline) settles as a final `deadline` refusal, and its work is cancelled and joined by
+the worker's cleanup. An edit before the preparation settles cancels it.

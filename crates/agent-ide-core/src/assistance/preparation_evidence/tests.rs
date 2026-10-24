@@ -364,7 +364,7 @@ fn config_is_operator_only_and_bounded() {
             budget: Duration::from_millis(500),
         }))
     );
-    for budget in [0, 30_001] {
+    for budget in [0, 280_001] {
         assert_eq!(
             parse(json!({"enabled":true,"target":{"pattern":"src"},"budget_ms":budget})),
             Err("evidence_budget_invalid")
