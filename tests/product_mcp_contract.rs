@@ -850,7 +850,9 @@ fn assert_compact_envelope(reply: &Value) {
                     || header.contains(": file has ")
                     || header.starts_with("not a readable text file")
                     || header.contains(" has no code symbols; ")
-                    || header.ends_with("  (empty file)"))
+                    || header.ends_with("  (empty file)")
+                    // A multi-reference inspection that carries a whole retained read.
+                    || header.starts_with("== "))
             {
                 // `<title>  (lines A–B)` for a range, `<address>  (<n> lines; file lines A-B)` for
                 // a unit and `<address>:A-B  (lines A-B of <n>; file lines C-D)` for a window.
@@ -5668,15 +5670,49 @@ async fn managed_claude_hook_distinguishes_input_timeout_and_oversize() {
     assert_managed_hook_silent(&output);
     drop(open_input);
 
+    // Only metadata the daemon needs that alone exceeds the 64 KiB transport bound is oversize.
     let mut oversized = launch();
     let mut input = oversized.stdin.take().unwrap();
     input
-        .write_all(&vec![b'x'; 8 * 1024 * 1024 + 1])
+        .write_all(
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "s".repeat(80 * 1024),
+                "tool_use_id": "call",
+                "cwd": project,
+            })
+            .to_string()
+            .as_bytes(),
+        )
         .await
         .unwrap();
     input.shutdown().await.unwrap();
     drop(input);
     let output = oversized.wait_with_output().await.unwrap();
+    assert_managed_hook_silent(&output);
+
+    // A post over the former 8 MiB input cap streams its tool bodies away: never oversize. A
+    // debug build may hit the 250 ms hook deadline mid-stream and close its stdin first, so the
+    // write may end in a broken pipe; either way the event is not classified as oversize.
+    let mut streamed = launch();
+    let mut input = streamed.stdin.take().unwrap();
+    let _ = input
+        .write_all(
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session",
+                "tool_use_id": "call",
+                "tool_name": "mcp__agent-ide__ide_read",
+                "cwd": project,
+                "tool_response": [{"type": "text", "text": "x".repeat(9 * 1024 * 1024)}],
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .await;
+    let _ = input.shutdown().await;
+    drop(input);
+    let output = streamed.wait_with_output().await.unwrap();
     assert_managed_hook_silent(&output);
 
     // A payload merely over the old 64 KiB bound now projects its tool body away instead of
@@ -5725,7 +5761,7 @@ async fn managed_claude_hook_distinguishes_input_timeout_and_oversize() {
         .count();
     assert_eq!(
         oversize_events, 1,
-        "only the beyond-8-MiB payload names oversize: {events:?}"
+        "only metadata beyond the transport bound names oversize: {events:?}"
     );
     std::fs::remove_dir_all(home).unwrap();
 }
@@ -6528,11 +6564,18 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
     assert_eq!(started["kind"], "activation", "{started}");
 
     // One call before the restart, keeping its reference for the stale-reference check.
-    // A source too large for one reply is cut, and the cut names the `detail_ref` that continues
-    // it; a complete reply names no reference.
+    // A diff too large for one reply is cut, and the cut names the `detail_ref` that continues it
+    // (Read is never cut, so it names no reference).
     std::fs::write(
         fixture.root.join("restart-pages.txt"),
-        "padding padding padding\n".repeat(20_000),
+        "padding padding padding\n".repeat(5_000),
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "restart-pages.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "paged diff fixture"]);
+    std::fs::write(
+        fixture.root.join("restart-pages.txt"),
+        "changed changed changed\n".repeat(5_000),
     )
     .unwrap();
     next += 1;
@@ -6542,14 +6585,14 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
         next,
         "restart-session",
         None,
-        "ide.read",
-        json!({"path":"restart-pages.txt"}),
+        "ide.diff",
+        json!({}),
     )
     .await;
     let stale_ref = before["detail_ref"]
         .as_str()
         .map(str::to_owned)
-        .expect("a cut context reply names its detail_ref");
+        .expect("a cut diff reply names its detail_ref");
 
     // The shared daemon generation ends; the watcher must heal it before the next pre-hook.
     let stale_attachment = managed_claude_candidate_attachment(&fixture.root);
@@ -6771,19 +6814,18 @@ async fn a_pre_hook_on_a_dead_generations_attachment_fails_open_until_the_cache_
     mcp.close().await;
 }
 
-/// A paged Read survives native tool activity between its pages: a non-inert post (Bash) no
-/// longer discards a page whose bytes are unchanged, while a real edit between pages still
-/// refuses with the explicit changed-source recovery.
+/// A Claude Read of about 150 KB arrives whole in one reply with no page, and native tool
+/// activity (a non-inert Bash post) does not invalidate it: the read stays an edit base for its
+/// unchanged bytes.
 #[tokio::test]
-async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
+async fn claude_large_read_is_whole_and_survives_native_posts() {
     let fixture = ProductFixture::new(json!([]));
-    // ~150 KB of short lines, comfortably multi-page.
     let content: String = (0..3300)
         .map(|line| format!("value_{line:05} = \"padding padding padding {line:05}\"\n"))
         .collect();
     std::fs::write(fixture.root.join("claude-pages.py"), &content).unwrap();
     fixture.git(&["add", "--", "claude-pages.py"]);
-    fixture.git(&["commit", "--quiet", "-m", "claude paged source"]);
+    fixture.git(&["commit", "--quiet", "-m", "claude large source"]);
 
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "claude-paged-context").await;
@@ -6796,54 +6838,28 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     let first_call = actor
         .call_claude(&fixture, "ide.read", json!({"path":"claude-pages.py"}))
         .await;
-    let (page1, _) = actor.settle_claude(&fixture, first_call).await;
-    assert_eq!(page1["kind"], "read", "{page1}");
-    assert_eq!(page1["continuation"], true, "{page1}");
-    let reference = page1["detail_ref"].as_str().unwrap().to_owned();
-    let (_, _, _, end, total) = page_marker(page1["text"].as_str().unwrap());
+    let (read, _) = actor.settle_claude(&fixture, first_call).await;
+    assert_eq!(read["kind"], "read", "{}", read["kind"]);
+    assert_eq!(read["continuation"], false, "{}", read["continuation"]);
+    assert_eq!(
+        read["text"].as_str().unwrap(),
+        numbered_source("claude-pages.py", &content)
+    );
 
-    // A non-inert native post (Bash) between pages bumps the native epoch without touching the
-    // file: page two must still be served byte-exactly.
+    // A non-inert native post (Bash) bumps the native epoch without touching the file.
     actor
         .claude_lifecycle(&fixture, "PostToolUse", "paged-bash")
         .await;
-    let next = actor
-        .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
-        .await;
-    assert_eq!(next["kind"], "read", "{next}");
-    let text = next["text"].as_str().unwrap();
-    let (number, _, from, to, _) = page_marker(text);
-    assert_eq!(number, 2, "page two is served after a Bash post: {text}");
-    assert_eq!(from, end, "page two continues byte-exactly: {text}");
-    assert!(
-        to > from && to <= total,
-        "page two covers real bytes: {text}"
-    );
-
-    // A real edit between pages changes the bytes: the next page refuses with the explicit
-    // changed-source recovery instead of a bare source_unavailable.
-    let edited = content.replace("value_00002", "value_EDITED");
-    std::fs::write(fixture.root.join("claude-pages.py"), &edited).unwrap();
-    actor.next += 1;
-    let call = format!("call-{}", actor.next);
-    actor.claude_lifecycle(&fixture, "PreToolUse", &call).await;
-    let refused = actor
-        .mcp
-        .exchange(
-            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
-                "name":"ide.inspect","arguments":{"detail_ref":&reference},
-                "_meta":{"claudecode/toolUseId":call}
-            }}),
+    let edit = actor
+        .call_claude(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"after-bash","path":"claude-pages.py",
+                   "changes":[{"lines":"3-3","content":"value_EDITED = 1"}]}),
         )
         .await;
-    let refused_text = assert_claude_envelope(&refused);
-    let _ = total;
-    assert!(
-        refused_text.starts_with("The source changed since this result was captured.")
-            && refused_text.contains("  \"claude-pages.py\"")
-            && refused_text.contains("Repair: Read the requested unit again with ide.read."),
-        "{refused_text}"
-    );
+    let (edit, _) = actor.settle_claude(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     daemon.kill().await.unwrap();
@@ -9335,11 +9351,19 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
             .is_some_and(|text| text.contains("src/lib.rs")),
         "{outline}"
     );
-    // A complete source read retains a result; inspection keeps its completed outcome, names
-    // the originating call and is typed as delivered. This source requires continuation pages.
+    // A paged diff retains a result (Read is never paged, so it names no continuation);
+    // inspection keeps its completed outcome, names the originating call and is typed as
+    // delivered.
     std::fs::write(
         fixture.root.join("context-pages.txt"),
-        "padding padding padding\n".repeat(20_000),
+        "padding padding padding\n".repeat(5_000),
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "context-pages.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "paged diff fixture"]);
+    std::fs::write(
+        fixture.root.join("context-pages.txt"),
+        "changed changed changed\n".repeat(5_000),
     )
     .unwrap();
     next += 1;
@@ -9350,8 +9374,8 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
         next,
         "context-session",
         None,
-        "ide.read",
-        json!({"path":"context-pages.txt"}),
+        "ide.diff",
+        json!({}),
     )
     .await;
     let detail_ref = lexical["detail_ref"]
@@ -9419,7 +9443,7 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     let lexical_context = events
         .iter()
         .find(|event| {
-            event.method == "read" && event.correlation.as_deref() == Some(detail_ref.as_str())
+            event.method == "diff" && event.correlation.as_deref() == Some(detail_ref.as_str())
         })
         .unwrap_or_else(|| panic!("the lexical context line: {raw}"));
     assert_eq!(lexical_context.outcome, "completed", "{lexical_context:?}");
@@ -14093,10 +14117,11 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     daemon.wait().await.unwrap();
 }
 
-/// Case 10: an oversized first block is delivered through bounded pages before the footer names
-/// the cut items; fetching those items separately reports the unknown symbol and full source.
+/// Case 10: two large blocks, an unknown symbol and a duplicate are answered in ONE reply: every
+/// block whole in request order, the failure in place, the duplicate once, with no cut item, no
+/// page and no continuation.
 #[tokio::test]
-async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbol() {
+async fn configured_product_batch_read_delivers_large_blocks_whole() {
     let huge_body: String = (0..380)
         .map(|index| {
             format!(
@@ -14137,208 +14162,32 @@ async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbo
     .await;
     let (read, read_text) = batch_settle_with_text(&mut actor, &fixture, read).await;
     assert_eq!(read["kind"], "read", "{read}");
-    assert_eq!(read["truncated"], true, "{read}");
-    assert_eq!(read["continuation"], true, "{read}");
-    // The delivered block renders the unit with the same numbered gutter as every read.
-    let huge_a_end = 383usize;
-    let width = huge_a_end.to_string().len();
-    let mut expected = format!(
-        "read: 3 items in 1 files — 1 delivered, 0 unchanged, 2 not included, 0 failed\n\
-         src/big.rs#huge_a  ({huge_a_end} lines; file lines 1-{huge_a_end})\n"
-    );
-    for number in 1..=huge_a_end {
-        expected.push_str(&format!("{number:>width$}\t{}\n", lines[number - 1]));
-    }
-    expected.push_str(
-        "duplicates shown once: src/big.rs#huge_a\n\
-         not included (over the reply budget): src/big.rs#missing, src/big.rs#huge_b — \
-         call ide.read {\"symbols\":[\"src/big.rs#missing\",\"src/big.rs#huge_b\"]}\n",
-    );
-    let reference = read["detail_ref"].as_str().expect("paged read reference");
-    assert!(
-        read_text.ends_with(&format!(
-            "\nCut; ide.read {{\"detail_ref\":\"{reference}\"}} continues"
-        )),
-        "the rendered continuation points to the owner's read: {read_text}"
-    );
-    let first_body = read["text"].as_str().unwrap();
-    let mut collected = first_body
-        .split_once('\n')
-        .expect("page marker precedes the read body")
-        .1
-        .to_owned();
-    let (number, last, from, mut end, total) = page_marker(first_body);
-    assert_eq!((number, last, from, total), (1, false, 0, expected.len()));
-    assert!(end > from, "the first page advances bytes: {read_text}");
-    let mut continuation = read["continuation"].as_bool().unwrap();
-    let mut expected_page = 1;
-    let max_pages = expected.len().div_ceil(4 * 1024) + 1;
-    while continuation {
-        expected_page += 1;
-        assert!(
-            expected_page <= max_pages,
-            "pagination exceeded {max_pages} pages"
-        );
-        let (next, rendered) = batch_call_with_text(
-            &mut actor,
-            &fixture,
-            "ide.inspect",
-            json!({"detail_ref":reference}),
-        )
-        .await;
-        assert_eq!(next["kind"], "read", "{next}");
-        let body = next["text"].as_str().unwrap();
-        let (number, last, from, to, total) = page_marker(body);
-        assert_eq!(number, expected_page, "continuation order: {body}");
-        assert_eq!((from, total), (end, expected.len()), "{body}");
-        assert!(to > from, "each page advances source bytes: {body}");
-        end = to;
-        continuation = next["continuation"].as_bool().unwrap();
-        assert_eq!(last, !continuation, "{body}");
-        assert_eq!(next["truncated"], json!(continuation), "{next}");
-        if continuation {
-            assert!(
-                rendered.ends_with(&format!(
-                    "\nCut; ide.read {{\"detail_ref\":\"{reference}\"}} continues"
-                )),
-                "{rendered}"
-            );
-        } else {
-            assert!(
-                !rendered.contains("Cut;"),
-                "template carrier is not body data: {rendered}"
-            );
+    assert_eq!(read["truncated"], false, "{read}");
+    assert_eq!(read["continuation"], false, "{read}");
+    let block = |name: &str, start: usize, end: usize| {
+        let count = end - start + 1;
+        let width = count.to_string().len();
+        let mut text = format!("src/big.rs#{name}  ({count} lines; file lines {start}-{end})\n");
+        for local in 1..=count {
+            text.push_str(&format!("{local:>width$}\t{}\n", lines[start + local - 2]));
         }
-        collected.push_str(body.split_once('\n').unwrap().1);
-    }
-    assert_eq!(end, expected.len(), "the last page reaches the full read");
-    assert_eq!(
-        collected, expected,
-        "all numbered bytes and footer pages join"
-    );
-    assert!(!collected.contains("let other_159"), "{collected}");
-
-    // The large block deferred the missing symbol, so only its explicit follow-up is a failure.
-    let (missing, missing_text) = batch_call_with_text(
-        &mut actor,
-        &fixture,
-        "ide.read",
-        json!({"symbols":["src/big.rs#missing"]}),
-    )
-    .await;
-    let (missing, missing_text) =
-        batch_settle_with_text(&mut actor, &fixture, (missing, missing_text)).await;
-    assert_eq!(missing["kind"], "read", "{missing}");
-    assert!(
-        missing_text.contains("0 delivered, 0 unchanged, 0 not included, 1 failed"),
-        "{missing_text}"
-    );
-    assert!(
-        missing_text.contains("no such symbol: src/big.rs#missing"),
-        "{missing_text}"
-    );
-
-    // The footer's exact call fetches the other cut symbol; if it is paged too, assemble all bytes.
-    let (follow, follow_text) = batch_call_with_text(
-        &mut actor,
-        &fixture,
-        "ide.read",
-        json!({"symbols":["src/big.rs#huge_b"]}),
-    )
-    .await;
-    let (follow, follow_rendered) =
-        batch_settle_with_text(&mut actor, &fixture, (follow, follow_text)).await;
-    assert_eq!(follow["kind"], "read", "{follow}");
+        text
+    };
     let huge_b_start = lines
         .iter()
         .position(|line| *line == "pub fn huge_b() -> i32 {")
         .expect("fixture declares huge_b")
         + 1;
-    let huge_b_end = lines.len();
-    let huge_b_count = huge_b_end - huge_b_start + 1;
-    let huge_b_width = huge_b_count.to_string().len();
-    let mut expected_huge_b = format!(
-        "read: 1 items in 1 files — 1 delivered, 0 unchanged, 0 not included, 0 failed\n\
-         src/big.rs#huge_b  ({huge_b_count} lines; file lines {huge_b_start}-{huge_b_end})\n"
+    let expected = format!(
+        "read: 3 items in 1 files — 2 delivered, 0 unchanged, 0 not included, 1 failed\n\
+         {}no such symbol: src/big.rs#missing — check ide.outline {{\"path\":\"src/big.rs\"}}\n\
+         {}duplicates shown once: src/big.rs#huge_a\n",
+        block("huge_a", 1, 383),
+        block("huge_b", huge_b_start, lines.len()),
     );
-    for local_line in 1..=huge_b_count {
-        expected_huge_b.push_str(&format!(
-            "{local_line:>huge_b_width$}\t{}\n",
-            lines[huge_b_start + local_line - 2]
-        ));
-    }
-    let mut follow_continuation = follow["continuation"].as_bool().unwrap_or(false);
-    assert_eq!(follow["truncated"], json!(follow_continuation), "{follow}");
-    let first_follow_body = follow["text"].as_str().unwrap();
-    let mut follow_all = if follow_continuation {
-        first_follow_body.split_once('\n').unwrap().1.to_owned()
-    } else {
-        first_follow_body.to_owned()
-    };
-    if follow_continuation {
-        let follow_ref = follow["detail_ref"]
-            .as_str()
-            .expect("paged huge_b reference");
-        assert!(
-            follow_rendered.ends_with(&format!(
-                "\nCut; ide.read {{\"detail_ref\":\"{follow_ref}\"}} continues"
-            )),
-            "{follow_rendered}"
-        );
-        let (number, last, from, mut end, follow_total) = page_marker(first_follow_body);
-        assert_eq!((number, last, from), (1, false, 0), "{first_follow_body}");
-        assert!(
-            end > from,
-            "the first huge_b page advances bytes: {first_follow_body}"
-        );
-        let follow_max_pages = follow_total.div_ceil(4 * 1024) + 1;
-        let mut follow_page = 1;
-        while follow_continuation {
-            follow_page += 1;
-            assert!(
-                follow_page <= follow_max_pages,
-                "huge_b pagination exceeded {follow_max_pages}"
-            );
-            let (next, rendered) = batch_call_with_text(
-                &mut actor,
-                &fixture,
-                "ide.inspect",
-                json!({"detail_ref":follow_ref}),
-            )
-            .await;
-            assert_eq!(next["kind"], "read", "{next}");
-            let body = next["text"].as_str().unwrap();
-            let (number, last, from, to, total) = page_marker(body);
-            assert_eq!(number, follow_page, "{body}");
-            assert_eq!((from, total), (end, follow_total), "{body}");
-            assert!(to > from, "each huge_b page advances bytes: {body}");
-            end = to;
-            follow_continuation = next["continuation"].as_bool().unwrap();
-            assert_eq!(last, !follow_continuation, "{body}");
-            assert_eq!(next["truncated"], json!(follow_continuation), "{next}");
-            if follow_continuation {
-                assert!(
-                    rendered.ends_with(&format!(
-                        "\nCut; ide.read {{\"detail_ref\":\"{follow_ref}\"}} continues"
-                    )),
-                    "{rendered}"
-                );
-            } else {
-                assert!(!rendered.contains("Cut;"), "{rendered}");
-            }
-            follow_all.push_str(body.split_once('\n').unwrap().1);
-        }
-        assert_eq!(
-            end, follow_total,
-            "the last huge_b page reaches the full block"
-        );
-    } else {
-        assert!(!follow_rendered.contains("Cut;"), "{follow_rendered}");
-    }
-    assert_eq!(
-        follow_all, expected_huge_b,
-        "all huge_b source pages join exactly"
-    );
+    assert_eq!(read["text"].as_str().unwrap(), expected);
+    assert!(read_text.contains(&expected) && !read_text.contains("Cut;"));
+    assert!(read_text.contains("let other_159"), "huge_b arrives whole");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -22028,17 +21877,13 @@ fn page_marker(text: &str) -> (usize, bool, usize, usize, usize) {
     )
 }
 
-/// A Claude Read reads a source file far over the former 64 KiB render cap in one daemon
-/// capture, and the daemon pages the whole composed text across repeated `ide.inspect` calls:
-/// the first continuation call serves page two (not page one again), every page starts with a
-/// contiguous position marker, the pages join to the exact file bytes, the last page states
-/// completion, re-inspecting after it re-serves that last page, and `ide.edit` is refused on the
-/// source reference until every page was delivered (T13B, T16B).
+/// A Claude Read of a source file far over the former 8 KiB source, 64 KiB reply and 144 KiB
+/// IPC caps arrives in ONE reply: no page, no continuation, every numbered byte exact including
+/// UTF-8, and the reference is a whole-file edit base at once (T13B, T16B superseded).
 #[tokio::test]
-async fn claude_context_pagination_delivers_the_whole_source_across_repeated_inspect() {
+async fn claude_large_read_delivers_the_whole_source_in_one_reply() {
     let fixture = ProductFixture::new(json!([]));
-    // ~150 KB of short lines with a multibyte character: over the former 64 KiB cap, over the
-    // 114000-byte live report, and well under the 1 MiB read ceiling.
+    // ~150 KB of short lines with a multibyte character, well under the 1 MiB read ceiling.
     let content: String = (0..3300)
         .map(|line| format!("value_{line:05} = \"caf\u{e9} {line:05} padding padding padding\"\n"))
         .collect();
@@ -22058,97 +21903,17 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
     let first_call = actor
         .call_claude(&fixture, "ide.read", json!({"path":"claude-large.py"}))
         .await;
-    let (page1, _) = actor.settle_claude(&fixture, first_call).await;
-    assert_eq!(page1["kind"], "read", "{page1}");
-    assert_eq!(page1["truncated"], true, "{page1}");
-    assert_eq!(page1["continuation"], true, "{page1}");
-    let reference = page1["detail_ref"]
-        .as_str()
-        .expect("a multi-page Context result must carry a detail_ref")
-        .to_owned();
-    let page1_text = page1["text"].as_str().unwrap().to_owned();
-    let expected = numbered_source("claude-large.py", &content);
-    assert!(
-        page1_text.contains("claude-large.py  (lines 1–3300)"),
-        "{page1_text}"
-    );
-    let (number, last, from, mut end, total) = page_marker(&page1_text);
-    assert_eq!((number, last, from, total), (1, false, 0, expected.len()));
-    assert!(
-        end > from,
-        "the first page advances source bytes: {page1_text}"
-    );
-    let mut collected = page1_text
-        .split_once('\n')
-        .expect("page marker precedes body")
-        .1
-        .to_owned();
-
-    let mut continuation = true;
-    let mut expected_page = 1;
-    let mut last_page = String::new();
-    // The 8 KiB serialized source-page budget includes framing; reserve 512 bytes for it and
-    // halve the remainder for worst-case JSON escaping of this fixture's quoted/newline text.
-    let max_pages = expected.len().div_ceil((8 * 1024 - 512) / 2) + 1;
-    while continuation {
-        expected_page += 1;
-        assert!(
-            expected_page <= max_pages,
-            "pagination exceeded the fixture-derived bound of {max_pages} pages"
-        );
-        let next = actor
-            .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
-            .await;
-        assert_eq!(next["kind"], "read", "{next}");
-        let text = next["text"].as_str().unwrap();
-        let (number, last, from, to, total) = page_marker(text);
-        assert_eq!(
-            number, expected_page,
-            "the first continuation call must serve page two, never page one again: {text}"
-        );
-        assert_eq!((from, total), (end, expected.len()), "{text}");
-        assert!(to > from, "each page advances source bytes: {text}");
-        end = to;
-        continuation = next["continuation"].as_bool().unwrap();
-        assert_eq!(last, !continuation, "{text}");
-        assert_eq!(next["truncated"], json!(continuation), "{next}");
-        collected.push_str(text.split_once('\n').unwrap().1);
-        if expected_page == 2 {
-            // Two pages of a longer file are a partial view: an edit built on its source
-            // reference could truncate the file, so it is refused before the last page.
-            let edit = actor
-                .call_claude(
-                    &fixture,
-                    "ide.edit",
-                    json!({"operation_id":"partial-view","path":"claude-large.py",
-                           "source_ref":&reference,"content":"x = 1\n"}),
-                )
-                .await;
-            let (edit, _) = actor.settle_claude(&fixture, edit).await;
-            assert_eq!(edit["result"]["outcome"], "stale_source", "{edit}");
-            assert_eq!(edit["result"]["source_ref"], Value::Null, "{edit}");
-        }
-        if !continuation {
-            assert!(
-                text.lines().next().unwrap().ends_with("; complete"),
-                "{text}"
-            );
-            last_page = text.to_owned();
-        }
-    }
-    assert!(expected_page >= 3, "the fixture must force several pages");
-    assert_eq!(end, expected.len(), "the last page must reach the end");
+    let (read, _) = actor.settle_claude(&fixture, first_call).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    assert_eq!(read["truncated"], false, "{read}");
+    assert_eq!(read["continuation"], false, "{read}");
     assert_eq!(
-        collected, expected,
-        "pages must join to every numbered source byte, including UTF-8"
+        read["text"].as_str().unwrap(),
+        numbered_source("claude-large.py", &content),
+        "one reply carries every numbered source byte, including UTF-8"
     );
-
-    // Terminal behaviour: a further inspect re-serves the same last page, byte-identical.
-    let again = actor
-        .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
-        .await;
-    assert_eq!(again["text"].as_str().unwrap(), last_page, "{again}");
-    assert_eq!(again["continuation"], false, "{again}");
+    // A one-page read names no continuation reference: the current text is the edit base.
+    assert!(read["detail_ref"].is_null(), "{}", read["detail_ref"]);
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -26874,13 +26639,11 @@ async fn read_fill_call(
     (read, body)
 }
 
-/// Five items of about 3.4, 7.0, 7.8, 0.9 and
-/// 1.5 KB under the 8 KiB source reply. Whole blocks are fitted in request order, skipping the
-/// two that do not fit, instead of stopping after the first; the footer names exactly the skipped
-/// items with their follow-up call, no page is opened, and only delivered blocks are remembered:
-/// a repeat of a delivered item answers unchanged while a skipped item is delivered in full.
+/// Five items of about 3.4, 7.0, 7.8, 0.9 and 1.5 KB, past the former 8 KiB source reply: every
+/// block is delivered whole in request order with no footer and no page, and every delivered
+/// block is remembered, so a repeat of any of them answers unchanged.
 #[tokio::test]
-async fn configured_product_batch_read_fills_later_blocks_after_skipping_oversized_ones() {
+async fn configured_product_batch_read_delivers_every_block_whole_in_request_order() {
     let fixture = ProductFixture::new(json!([]));
     let mut daemon = fixture.daemon().await;
     let mut actor = read_fill_actor(
@@ -26904,12 +26667,14 @@ async fn configured_product_batch_read_fills_later_blocks_after_skipping_oversiz
     let (read, body) = read_fill_call(&mut actor, &fixture, items).await;
     assert!(
         body.starts_with(
-            "read: 5 items in 4 files — 3 delivered, 0 unchanged, 2 not included, 0 failed\n"
+            "read: 5 items in 4 files — 5 delivered, 0 unchanged, 0 not included, 0 failed\n"
         ),
         "{body}"
     );
     let delivered: Vec<usize> = [
         "src/one.rs  (lines 1–65)\n",
+        "src/one.rs  (lines 100–234)\n",
+        "src/three.rs  (lines 1–150)\n",
         "src/four.rs  (lines 1–17)\n",
         "src/five.rs  (lines 1–28)\n",
     ]
@@ -26923,26 +26688,25 @@ async fn configured_product_batch_read_fills_later_blocks_after_skipping_oversiz
         delivered.windows(2).all(|pair| pair[0] < pair[1]),
         "request order: {body}"
     );
-    assert!(body.contains("// five filler line 0028"), "{body}");
-    assert!(!body.contains("src/one.rs  (lines 100–234)"), "{body}");
-    assert!(!body.contains("// three filler line"), "{body}");
+    for line in [
+        "// one filler line 0234",
+        "// three filler line 0150",
+        "// five filler line 0028",
+    ] {
+        assert!(body.contains(line), "{line}: {body}");
+    }
     assert!(
-        body.ends_with(
-            "not included (over the reply budget): src/one.rs lines 100-234, src/three.rs \
-             lines 1-150 — call ide.read {\"items\":[{\"lines\":\"100-234\",\"path\":\
-             \"src/one.rs\"},{\"lines\":\"1-150\",\"path\":\"src/three.rs\"}]}\n"
-        ),
+        !body.contains("not included (over the reply budget)"),
         "{body}"
     );
-    assert_eq!(read["truncated"], true, "{read}");
+    assert_eq!(read["truncated"], false, "{read}");
     assert_ne!(read["continuation"], true, "no page is opened: {read}");
 
-    // Only delivered blocks are remembered: the delivered item repeats as unchanged, the skipped
-    // item arrives in full on its first actual delivery.
+    // Every delivered block is remembered: a repeat answers unchanged.
     let (_, repeat) = read_fill_call(
         &mut actor,
         &fixture,
-        json!([{"path":"src/four.rs","lines":"1-17"}]),
+        json!([{"path":"src/one.rs","lines":"100-234"}]),
     )
     .await;
     assert!(
@@ -26951,30 +26715,16 @@ async fn configured_product_batch_read_fills_later_blocks_after_skipping_oversiz
         ),
         "{repeat}"
     );
-    let (_, skipped) = read_fill_call(
-        &mut actor,
-        &fixture,
-        json!([{"path":"src/one.rs","lines":"100-234"}]),
-    )
-    .await;
-    assert!(
-        skipped.starts_with(
-            "read: 1 items in 1 files — 1 delivered, 0 unchanged, 0 not included, 0 failed\n"
-        ),
-        "{skipped}"
-    );
-    assert!(skipped.contains("// one filler line 0234"), "{skipped}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
 
-/// Three blocks each larger than the source
-/// reply and one small block. The small block is delivered whole and the three large ones are
-/// named with their exact follow-up call; no page of a large block is opened.
+/// Three blocks each far larger than the former source reply and one small block, about 75 KB in
+/// all: every block arrives whole in request order in one reply, with no footer and no page.
 #[tokio::test]
-async fn configured_product_batch_read_delivers_the_small_block_when_others_are_oversized() {
+async fn configured_product_batch_read_delivers_large_and_small_blocks_together() {
     let fixture = ProductFixture::new(json!([]));
     let mut daemon = fixture.daemon().await;
     let mut actor = read_fill_actor(
@@ -27001,63 +26751,22 @@ async fn configured_product_batch_read_delivers_the_small_block_when_others_are_
     .await;
     assert!(
         body.starts_with(
-            "read: 4 items in 4 files — 1 delivered, 0 unchanged, 3 not included, 0 failed\n\
-             src/small.rs  (lines 1–40)\n"
-        ),
-        "{body}"
-    );
-    assert!(body.contains("// small filler line 0040"), "{body}");
-    assert!(!body.contains("big_a filler"), "{body}");
-    assert!(
-        body.ends_with(
-            "not included (over the reply budget): src/big_a.rs lines 1-400, src/big_b.rs \
-             lines 1-350, src/big_c.rs lines 1-450 — call ide.read {\"items\":[{\"lines\":\
-             \"1-400\",\"path\":\"src/big_a.rs\"},{\"lines\":\"1-350\",\"path\":\
-             \"src/big_b.rs\"},{\"lines\":\"1-450\",\"path\":\"src/big_c.rs\"}]}\n"
-        ),
-        "{body}"
-    );
-    assert_ne!(read["continuation"], true, "no page is opened: {read}");
-    actor.call(&fixture, "ide.stop", json!({})).await;
-    actor.mcp.close().await;
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
-}
-
-/// When no whole block fits, the first block still pages as before and the rest is named.
-#[tokio::test]
-async fn configured_product_batch_read_pages_the_first_block_when_none_fits_whole() {
-    let fixture = ProductFixture::new(json!([]));
-    let mut daemon = fixture.daemon().await;
-    let mut actor = read_fill_actor(
-        &fixture,
-        "read-fill-paging",
-        &[
-            ("src/big_a.rs", read_fill_filler("big_a", 400)),
-            ("src/big_b.rs", read_fill_filler("big_b", 350)),
-        ],
-    )
-    .await;
-    let (read, body) = read_fill_call(
-        &mut actor,
-        &fixture,
-        json!([
-            {"path":"src/big_a.rs","lines":"1-400"},
-            {"path":"src/big_b.rs","lines":"1-350"}
-        ]),
-    )
-    .await;
-    assert_eq!(read["continuation"], true, "{read}");
-    let (number, last, from, to, total) = page_marker(&body);
-    assert_eq!((number, last, from), (1, false, 0), "{body}");
-    assert!(to > from && total > to, "{body}");
-    assert!(
-        body.split_once('\n').unwrap().1.starts_with(
-            "read: 2 items in 2 files — 1 delivered, 0 unchanged, 1 not included, 0 failed\n\
+            "read: 4 items in 4 files — 4 delivered, 0 unchanged, 0 not included, 0 failed\n\
              src/big_a.rs  (lines 1–400)\n"
         ),
         "{body}"
     );
+    for line in [
+        "// big_a filler line 0400",
+        "// big_b filler line 0350",
+        "// big_c filler line 0450",
+        "// small filler line 0040",
+    ] {
+        assert_eq!(body.matches(line).count(), 1, "{line}");
+    }
+    assert!(!body.contains("not included (over the reply budget)"));
+    assert_eq!(read["truncated"], false, "{read}");
+    assert_ne!(read["continuation"], true, "no page is opened: {read}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

@@ -2178,11 +2178,13 @@ async fn run_managed_claude_hook() {
     if std::thread::Builder::new()
         .name("claude-hook-input".into())
         .spawn(move || {
-            let mut payload = Vec::new();
-            let result = std::io::stdin()
-                .take(agent_ide::assistance::codex_hook::MAX_HOOK_INPUT_BYTES + 1)
-                .read_to_end(&mut payload);
-            let _ = sender.send(result.ok().map(|_| payload));
+            // Bodies of any size stream through; only the routing `cwd` and the projected
+            // identity fields are kept for a payload over the transport bound.
+            let _ = sender.send(agent_ide::assistance::codex_hook::read_hook_payload(
+                std::io::stdin().lock(),
+                HostKind::Claude,
+                true,
+            ));
         })
         .is_err()
     {
@@ -2190,9 +2192,17 @@ async fn run_managed_claude_hook() {
         return;
     }
     let payload = match tokio::time::timeout_at(deadline, receiver).await {
-        Ok(Ok(Some(payload))) => payload,
+        Ok(Ok(Ok(payload))) => payload,
         Err(_) => {
             log("hook_input_timeout");
+            return;
+        }
+        Ok(Ok(Err(agent_ide::assistance::codex_hook::HookInputError::Oversize))) => {
+            log("hook_input_oversize");
+            return;
+        }
+        Ok(Ok(Err(agent_ide::assistance::codex_hook::HookInputError::Malformed))) => {
+            log("hook_no_cwd");
             return;
         }
         _ => {
@@ -2200,10 +2210,6 @@ async fn run_managed_claude_hook() {
             return;
         }
     };
-    if payload.len() > agent_ide::assistance::codex_hook::MAX_HOOK_INPUT_BYTES as usize {
-        log("hook_input_oversize");
-        return;
-    }
     let Some(cwd) = serde_json::from_slice::<serde_json::Value>(&payload)
         .ok()
         .and_then(|value| value.get("cwd")?.as_str().map(PathBuf::from))

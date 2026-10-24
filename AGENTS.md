@@ -151,9 +151,10 @@ the managed launcher form. After any change to the tool surface in
 update`, review the diff, and commit it together with the source change; CI
 and the gate fail on drift.
 
-`ide.prepare {"task":"…","token_budget":12000}` is the opt-in task reconnaissance
-call after `ide.start`. It returns one bounded text reply, without pagination or
-a required follow-up read. `partial` and `needs_evidence` are not successful
+`ide.prepare {"task":"…"}` is the opt-in task reconnaissance call after
+`ide.start`. It returns one text reply carrying every selected unit whole, without
+pagination, size cuts or a required follow-up read (`token_budget` is accepted only for
+compatibility and ignored). `partial` and `needs_evidence` are not successful
 reconnaissance. `complete` describes delivered selected evidence, not a proof that
 every edit location for an arbitrary task was discovered. Provider/key/root settings
-remain in the trusted launcher; the caller supplies only task and output budget.
+remain in the trusted launcher; the caller supplies only the task.

@@ -159,6 +159,7 @@ The unadvertised wait_ms compatibility parameter, valid only beside a reference,
 ### Ceilings and pages
 
 - A response is at most 64 KiB (the serialized reply is held to 63 KiB, leaving a 1 KiB reserve for the MCP envelope). Lists are capped at 30 usage lines, 20 caller lines, 8 diagnostic lines in an edit reply, and 20 problems per problems page. Any remainder is reported as “N more” with a `detail_ref`.
+- Exception: `ide.read` and `ide.prepare` deliver every requested or selected source block whole. Their replies have no byte ceiling of their own and are never paged or shrunk; only the private IPC frame's four-byte length prefix (4 GiB) bounds them. The 1 MiB source read bound per file, input argument caps and every other tool's ceilings are unchanged. A host that clips long tool output does so outside the IDE. This is the tool reply; deferred asynchronous notification is separate: a Read or Prepare result that settles after the inline wait is announced to Bridge as a `job-ready` fact without any source snippet (a Read fact says `ready`, a Prepare fact carries its status line; both name the `detail_ref` and the retrieval call), and `ide.read`/`ide.inspect {detail_ref}` returns the retained result whole in one call.
 - This ceiling bounds the *reply*, not the model-facing *argument*: `ide.edit`'s `content` accepts up to 128 KiB (v0.6.1), enough for a whole module in one call.
 - `ide.inspect {detail_ref}` retrieves pages; `ide.inspect {detail_ref, page}` retrieves a specific page.
 - A symbol card with more than 30 usages, or an ambiguity list with more than 20 candidates, keeps the cut rows in its detail. The first page is the card or list as before, ending with `… N more (ide.inspect <detail_ref>)`; each later `ide.inspect` returns the next page of the remaining rows (`usages 31–N of N:` or `candidates 21–N of N:`, same row format). Cards and lists within the ceilings are unchanged. The first `ide.inspect` after an inline reply always returns page two, never page one again, for every paged tool.
@@ -404,9 +405,9 @@ ide.read {"symbols": ["src/a.rs#Foo/bar", "src/b.rs#qux"]}   // up to 16, any fi
 ide.read {"path": "src/x.rs", "ranges": ["10-20", "44-60"]}  // up to 16 ranges
 ```
 
-An `items` entry is exactly one of `{symbol}`, `{path}` (the whole text of any readable text file) or `{path, lines}`; `items` excludes every other read key, and the batch forms accept arguments up to 16 KiB. The reply opens with one summary line, `read: <n> items in <f> files — <d> delivered, <u> unchanged, <c> not included, <x> failed`, then one block per item in request order, headed by its address and line range, with the same numbered gutter as every read. Unknown symbols, missing files and ranges past the end are reported per item in place (`no such symbol: … — check ide.outline {"path":"…"}`) without failing the rest. One `source_ref` is minted per call and is valid as a version fence for every file with at least one delivered block (read memory still covers only delivered rows): a batch `ide.edit` on any of them needs no re-read, and its line numbers are that version's. Blocks are never cut mid-body: whole blocks are considered in request order; a non-fitting block is skipped so smaller later blocks can still be delivered, and every skipped item is listed explicitly with the exact call in the request's own form (`not included (over the reply budget): src/c.rs#C — call ide.read {"items":[{"symbol":"src/c.rs#C"}]}`); when no whole source block fits, the first source block pages by bytes like any read, with the summary and the footer naming every other item. An exactly duplicated item renders once; a nested symbol (a method inside a requested type) renders inside its parent and as its own block. In the `items` form, an item whose block this session already received with identical bytes answers `unchanged since your read <ref>: <item> (<n> lines); "force":true returns the text` instead, and the reply's `source_ref` still covers its file; this answer is given only while the session's context-compaction epoch is known (session outbox §9.1) and resets when it rises, on any byte change and on `ide.stop`; `"force":true` always returns the text.
+An `items` entry is exactly one of `{symbol}`, `{path}` (the whole text of any readable text file) or `{path, lines}`; `items` excludes every other read key, and the batch forms accept arguments up to 16 KiB. The reply opens with one summary line, `read: <n> items in <f> files — <d> delivered, <u> unchanged, <c> not included, <x> failed`, then one block per item in request order, headed by its address and line range, with the same numbered gutter as every read. Unknown symbols, missing files and ranges past the end are reported per item in place (`no such symbol: … — check ide.outline {"path":"…"}`) without failing the rest. One `source_ref` is minted per call and is valid as a version fence for every file with at least one delivered block (read memory still covers only delivered rows): a batch `ide.edit` on any of them needs no re-read, and its line numbers are that version's. Every block is delivered whole in request order: no block is cut, skipped or paged for size, so the summary's `not included` count stays 0. An exactly duplicated item renders once; a nested symbol (a method inside a requested type) renders inside its parent and as its own block. In the `items` form, an item whose block this session already received with identical bytes answers `unchanged since your read <ref>: <item> (<n> lines); "force":true returns the text` instead, and the reply's `source_ref` still covers its file; this answer is given only while the session's context-compaction epoch is known (session outbox §9.1) and resets when it rises, on any byte change and on `ide.stop`; `"force":true` always returns the text.
 
-A file no IDE language analyzes (a log, `README.md`, YAML, a script, `Cargo.toml`) reads as text in every form that needs no outline — `{path}` alone (the whole file, `(empty file)` when it has no lines, paged by bytes like any read), `{path, lines}`, `{path, ranges}` and a bare file path as an item of `{symbols}` — and the reply carries one line before `source_ref`: `note: no code analysis for this format; showing its text only (ide.outline and ide.symbol do not read it)`. A symbol address into such a file (`ide.read {symbol}`, an item of `{symbols}`) has no outline to resolve: the single form answers `unsupported_file`, a batch item says `<file> has no code symbols; read it with ide.read {path, lines|ranges}` — in either order with a bare-path item of the same file, and without failing the rest. A binary file (not UTF-8, or holding a NUL byte), a directory or a file whose bytes could not be read is refused softly, never as `internal`: the single forms answer `source_unavailable` (`read:not_text` or `read:source_unavailable`) naming the path and a native tool, a batch reports a binary item as `not a readable text file (binary, not UTF-8 or unreadable; inspect it with a native tool such as `file` or `xxd`): <path>` and still answers the rest.
+A file no IDE language analyzes (a log, `README.md`, YAML, a script, `Cargo.toml`) reads as text in every form that needs no outline — `{path}` alone (the whole file, `(empty file)` when it has no lines), `{path, lines}`, `{path, ranges}` and a bare file path as an item of `{symbols}` — and the reply carries one line before `source_ref`: `note: no code analysis for this format; showing its text only (ide.outline and ide.symbol do not read it)`. A symbol address into such a file (`ide.read {symbol}`, an item of `{symbols}`) has no outline to resolve: the single form answers `unsupported_file`, a batch item says `<file> has no code symbols; read it with ide.read {path, lines|ranges}` — in either order with a bare-path item of the same file, and without failing the rest. A binary file (not UTF-8, or holding a NUL byte), a directory or a file whose bytes could not be read is refused softly, never as `internal`: the single forms answer `source_unavailable` (`read:not_text` or `read:source_unavailable`) naming the path and a native tool, a batch reports a binary item as `not a readable text file (binary, not UTF-8 or unreadable; inspect it with a native tool such as `file` or `xxd`): <path>` and still answers the rest.
 
 Errors: `no_such_file` (the requested path does not exist in the worktree; fix the path or use `ide.symbol` with a bare name), `unknown_symbol`, `unsupported_file` (symbol address into a file no IDE language reads), `source_unavailable` (binary or unreadable file, or a line range past the end).
 
@@ -673,8 +674,9 @@ Total: about two weeks; Rust is fully implemented by the end of the first week.
 
 ## ide.prepare
 
-Arguments: required nonempty `task` (up to 16384 UTF-8 bytes), optional `token_budget`
-(integer 1024..32000, default 12000).
+Arguments: required nonempty `task` (up to 16384 UTF-8 bytes). `token_budget` (a nonnegative
+integer) is accepted for compatibility only: it is ignored, never limits the packet, and the
+packet says so in a warning.
 No caller-selected filesystem root or model route. Requires an active binding (a reader may prepare; only writers start background indexing) and
 enabled trusted `task_context` configuration; otherwise returns an explicit refusal.
 Creates/updates local index state and may call operator-enabled model backends.
@@ -687,7 +689,7 @@ prepare: complete|partial|needs_evidence|not_ready; <n> files; ~<t> tokens (esti
 
 rules and manifests:
 --- AGENTS.md
-<verbatim, first 32 KiB; a longer file adds "(AGENTS.md: first X of Y bytes)" and is listed under omitted:>
+<verbatim, whole>
 --- crates/x/Cargo.toml
 <verbatim>
 
@@ -702,11 +704,11 @@ usage: embeddings used|off, jev used|off; model calls N (replayed R, failed F); 
 
 Rules are `AGENTS.md`/`CLAUDE.md` at the worktree root and in every directory above a delivered
 file; manifests are the root one and the nearest one of each delivered file (regular files
-only, at most eight prelude files). A partially delivered file also shows its module header and imports
+only, each delivered whole). A partially delivered file also shows its module header and imports
 (when not among the delivered rows) and `other declarations:` — every declaration whose rows are
-not delivered, with line range and one-line signature (160 characters at most). When the reply
-would not fit, whole selected units leave one at a time — optional before required, latest
-rank first — then prelude files, each listed under `omitted:`; nothing is cut silently. A
+not delivered, with line range and one-line signature (160 characters at most). Every selected unit
+and every prelude file is delivered whole; nothing is omitted, cut or paged for reply size
+(`omitted:` lists only selection gaps). A
 required unit that is not a complete declaration also makes the packet `partial`.
 `complete` means the retriever reported no gap, no unanswered request for more evidence
 (those are listed under `omitted:`), no incomplete declaration list, and nothing was omitted

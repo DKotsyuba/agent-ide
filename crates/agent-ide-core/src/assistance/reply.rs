@@ -5,7 +5,8 @@ use std::path::Path;
 use crate::app::transport::OpaqueJson;
 use serde::{Deserialize, Serialize};
 
-/// Maximum complete Assistance JSON envelope including escaped text and all keys.
+/// Maximum complete Assistance JSON envelope including escaped text and all keys. Read and
+/// Prepare source (`PeerReply::delivers_source`) is exempt and bounded only by the IPC prefix.
 pub const MAX_REPLY_BYTES: usize = 64 * 1024;
 /// Maximum model-visible feedback text returned to a native host hook.
 pub const MAX_FEEDBACK_BYTES: usize = 4 * 1024;
@@ -700,16 +701,39 @@ struct DeliveredReply {
     reply: PeerReply,
 }
 impl PeerReply {
-    /// Fits the complete serialized budget by trimming only owner text at UTF-8 boundaries.
-    /// Invalid references fail closed. Trimming sets truncated and never changes the evidence kind.
+    /// Whether this reply carries requested source that reaches the caller whole: a completed
+    /// Read or Prepare result. Such a reply is bounded only by the IPC length prefix
+    /// ([`crate::app::MAX_PREFIXED_FRAME_BYTES`]) and its text is never shrunk.
+    pub(crate) fn delivers_source(&self) -> bool {
+        matches!(
+            self,
+            Self::Complete {
+                kind: ResultKind::Read | ResultKind::Prepare,
+                ..
+            }
+        )
+    }
+    /// Serialized byte bound of this reply: the IPC length prefix for source
+    /// ([`Self::delivers_source`]), `MAX_REPLY_BYTES - MCP_RESERVE` for every other reply.
+    fn max_serialized_bytes(&self) -> usize {
+        if self.delivers_source() {
+            crate::app::MAX_PREFIXED_FRAME_BYTES
+        } else {
+            MAX_REPLY_BYTES - MCP_RESERVE
+        }
+    }
+    /// Fits the reply's serialized bound by trimming only owner text at UTF-8 boundaries.
+    /// Source replies ([`Self::delivers_source`]) are never trimmed. Invalid references fail
+    /// closed. Trimming sets truncated and never changes the evidence kind.
     pub(crate) fn encode(mut self) -> Option<OpaqueJson> {
         if !self.valid_reference() {
             return None;
         }
         loop {
             let serialized = serde_json::to_string(&self).ok()?;
-            if serialized.len() <= MAX_REPLY_BYTES - MCP_RESERVE {
-                return OpaqueJson::new(serialized, MAX_REPLY_BYTES);
+            let bound = self.max_serialized_bytes();
+            if serialized.len() <= bound {
+                return OpaqueJson::new(serialized, bound);
             }
             if !self.shrink_text() {
                 return None;
@@ -717,18 +741,12 @@ impl PeerReply {
         }
     }
     /// Reduces only owner text while preserving UTF-8 and explicitly marking omitted content.
-    /// Returns false for fitted Prepare source packets, non-text results or empty text;
+    /// Returns false for Read and Prepare source, non-text results or empty text;
     /// callers retain a due status plate or fail closed without falsifying source delivery.
     pub(crate) fn shrink_text(&mut self) -> bool {
-        // Prepare has already fitted source units and recorded their delivery. Cutting it here
-        // would invalidate those receipts; a status plate must remain due instead.
-        if matches!(
-            self,
-            Self::Complete {
-                kind: ResultKind::Prepare,
-                ..
-            }
-        ) {
+        // Read and Prepare have already recorded the delivery of every source block they carry.
+        // Cutting them here would invalidate those receipts.
+        if self.delivers_source() {
             return false;
         }
         let (Self::Complete {
@@ -751,19 +769,29 @@ impl PeerReply {
         *truncated = true;
         true
     }
-    /// Decodes a closed envelope only when serialized bytes and reference syntax are bounded.
+    /// Decodes a closed envelope only when serialized bytes and reference syntax are bounded;
+    /// the byte bound is the decoded reply's own ([`Self::delivers_source`]).
     pub(crate) fn decode(value: &str) -> Option<Self> {
-        if value.len() > MAX_REPLY_BYTES - MCP_RESERVE {
+        if value.len() > crate::app::MAX_PREFIXED_FRAME_BYTES {
             return None;
         }
         let reply: Self = serde_json::from_str(value).ok()?;
-        reply.valid_reference().then_some(reply)
+        (reply.valid_reference() && value.len() <= reply.max_serialized_bytes()).then_some(reply)
+    }
+    /// Byte bound of the private delivery wrapper around `reply`: the IPC length prefix for
+    /// source, [`MAX_REPLY_BYTES`] for every other reply.
+    fn max_delivered_bytes(reply: &Self) -> usize {
+        if reply.delivers_source() {
+            crate::app::MAX_PREFIXED_FRAME_BYTES
+        } else {
+            MAX_REPLY_BYTES
+        }
     }
     /// Decodes one daemon method reply with its optional carried status plate and restart-loss
     /// handoff result.
     ///
     /// Accepts the bare closed reply (`status` absent, the historical wire form) and the
-    /// [`DeliveredReply`] wrapper. Both forms enforce the same byte bound; a carried plate
+    /// [`DeliveredReply`] wrapper. Both forms enforce the reply's own byte bound; a carried plate
     /// must be a nonempty block within [`MAX_FEEDBACK_BYTES`] — the ceiling a hook-delivered
     /// plate has too, since due git and environment notices join the feed's
     /// [`crate::feed::MAX_BLOCK_BYTES`] block — and its reply must pass the same
@@ -771,7 +799,7 @@ impl PeerReply {
     /// daemon evaluated a restart-loss handoff.
     pub(crate) fn decode_delivered(value: &str) -> Option<(Self, Option<String>, Option<bool>)> {
         if let Ok(carried) = serde_json::from_str::<DeliveredReply>(value) {
-            if value.len() > MAX_REPLY_BYTES {
+            if value.len() > Self::max_delivered_bytes(&carried.reply) {
                 return None;
             }
             let valid = carried.reply.valid_reference()
@@ -788,7 +816,7 @@ impl PeerReply {
     ///
     /// At least one metadata field must be present. A status plate is supplied only after the
     /// complete final MCP carrier was proven to fit (`content::fits_with_status`), so this wrapper
-    /// stays inside the transport bound. `lost_handoff` follows Bridge's existing boolean custody
+    /// stays inside the reply's transport bound; a source reply is bounded only by the IPC prefix. `lost_handoff` follows Bridge's existing boolean custody
     /// contract and never claims model observation.
     pub(crate) fn encode_delivered(
         reply: &Self,
@@ -805,7 +833,10 @@ impl PeerReply {
         if let Some(lost_handoff) = lost_handoff {
             wrapped["lost_handoff"] = serde_json::json!(lost_handoff);
         }
-        OpaqueJson::new(serde_json::to_string(&wrapped).ok()?, MAX_REPLY_BYTES)
+        OpaqueJson::new(
+            serde_json::to_string(&wrapped).ok()?,
+            Self::max_delivered_bytes(reply),
+        )
     }
     /// Checks reference syntax; ownership and current liveness remain worker admission gates.
     fn valid_reference(&self) -> bool {

@@ -23,11 +23,23 @@ use std::{
     time::Duration,
 };
 
-/// Caps raw host input before parsing; a host payload may carry megabytes of tool bodies that the
-/// daemon never consumes ([`project_hook_payload`] drops them before submission).
-pub const MAX_HOOK_INPUT_BYTES: u64 = 8 * 1024 * 1024;
-/// Bounds the projected identity payload handed to the parser and the daemon transport.
+/// Bounds the projected identity payload handed to the parser and the daemon transport. A larger
+/// raw payload (megabytes of `tool_input`/`tool_response` the daemon never consumes) is streamed
+/// through [`read_hook_payload`], which keeps only the projected fields and buffers nothing else.
 const MAX_INPUT_BYTES: u64 = 64 * 1024;
+/// Top-level hook fields the daemon's observation consumes, copied by every projection.
+const PROJECTED_FIELDS: [&str; 6] = [
+    "hook_event_name",
+    "session_id",
+    "agent_id",
+    "tool_use_id",
+    "tool_name",
+    "source",
+];
+/// Claude writer-tool path fields kept from `tool_input` (`NotebookEdit` carries `notebook_path`).
+const TOOL_INPUT_PATHS: [&str; 2] = ["file_path", "notebook_path"];
+/// Error text a kept value over the transport bound raises inside the streaming visitor.
+const OVERSIZE_FIELD: &str = "projected hook field over the transport bound";
 /// Bounds stdin, parsing, connect and reply together, including a silent or stuck host pipe.
 const TOTAL_DEADLINE: Duration = Duration::from_millis(250);
 /// Private authenticated-datagram endpoint owned by the daemon inside its runtime directory.
@@ -216,34 +228,313 @@ fn report_native_fallback(runtime_dir: &Path, attachment: &str) -> bool {
             .is_ok()
 }
 
-/// Reads one raw host payload from stdin and projects it when a large tool body would otherwise
-/// drop the event; a payload beyond [`MAX_HOOK_INPUT_BYTES`] names the closed oversize fact.
+/// Reads one raw host payload from stdin through [`read_hook_payload`]; a projection that still
+/// exceeds the transport bound names the closed oversize fact.
 async fn read_projected_stdin(host_kind: HostKind) -> Option<Vec<u8>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("codex-hook-input".into())
         .spawn(move || {
-            let mut payload = Vec::new();
-            let result = std::io::stdin()
-                .take(MAX_HOOK_INPUT_BYTES + 1)
-                .read_to_end(&mut payload);
-            let _ = sender.send(result.ok().map(|_| payload));
+            let _ = sender.send(read_hook_payload(std::io::stdin().lock(), host_kind, false));
         })
         .ok()?;
-    let payload = receiver.await.ok()??;
-    if payload.len() > MAX_HOOK_INPUT_BYTES as usize {
-        log_oversize();
-        return None;
+    match receiver.await.ok()? {
+        Ok(payload) => Some(payload),
+        Err(HookInputError::Oversize) => {
+            log_oversize();
+            None
+        }
+        Err(_) => None,
     }
-    if payload.len() <= MAX_INPUT_BYTES as usize {
-        return Some(payload);
+}
+
+/// Why one host hook payload could not be read or projected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookInputError {
+    /// Reading the host pipe failed.
+    Read,
+    /// The payload is not one JSON object, or repeats a projected field.
+    Malformed,
+    /// Even the projected fields exceed the 64 KiB transport bound.
+    Oversize,
+}
+
+/// Reads one host hook payload of any size without buffering the bodies the daemon never uses.
+///
+/// A payload within the 64 KiB transport bound keeps its exact bytes (so the parser still rejects
+/// duplicate keys). A larger one is streamed: only the projected top-level fields (plus `cwd` when
+/// `keep_cwd`, which the Claude router needs to route the event, and Claude's `agent_type` and
+/// writer-tool path) are kept, a repeated projected field is malformed, and every other value —
+/// multi-megabyte `tool_input`/`tool_response` bodies included — is skipped as it is read.
+///
+/// Memory: skipped values are never buffered, objects and arrays in kept fields are drained, but
+/// `serde_json` decodes one whole string token (a kept value or any object key) before the
+/// visitor can bound it, so peak memory is the size of the longest such single token, not of
+/// the payload. The input comes from the local host's hook pipe within the hook deadline.
+pub fn read_hook_payload(
+    mut reader: impl Read,
+    host_kind: HostKind,
+    keep_cwd: bool,
+) -> Result<Vec<u8>, HookInputError> {
+    let mut head = Vec::new();
+    (&mut reader)
+        .take(MAX_INPUT_BYTES + 1)
+        .read_to_end(&mut head)
+        .map_err(|_| HookInputError::Read)?;
+    if head.len() <= MAX_INPUT_BYTES as usize {
+        return Ok(head);
     }
-    // A large tool body is projected away; only a projection that still cannot fit drops the
-    // event as oversize.
-    project_hook_payload(host_kind, &payload).or_else(|| {
-        log_oversize();
-        None
-    })
+    project_reader(
+        std::io::BufReader::with_capacity(256 * 1024, std::io::Cursor::new(head).chain(reader)),
+        host_kind,
+        keep_cwd,
+    )
+}
+
+/// Streams one hook object from `reader` into its bounded projection.
+fn project_reader(
+    reader: impl Read,
+    host_kind: HostKind,
+    keep_cwd: bool,
+) -> Result<Vec<u8>, HookInputError> {
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let error = |error: serde_json::Error| {
+        if error.is_io() {
+            HookInputError::Read
+        } else if error.to_string().starts_with(OVERSIZE_FIELD) {
+            HookInputError::Oversize
+        } else {
+            HookInputError::Malformed
+        }
+    };
+    let projected = serde::Deserializer::deserialize_map(
+        &mut deserializer,
+        Projection {
+            host_kind,
+            keep_cwd,
+        },
+    )
+    .map_err(error)?;
+    deserializer.end().map_err(error)?;
+    let bytes = serde_json::to_vec(&serde_json::Value::Object(projected))
+        .map_err(|_| HookInputError::Malformed)?;
+    if bytes.len() > MAX_INPUT_BYTES as usize {
+        return Err(HookInputError::Oversize);
+    }
+    Ok(bytes)
+}
+
+/// Visits one top-level hook object, keeping only the projected fields.
+struct Projection {
+    host_kind: HostKind,
+    keep_cwd: bool,
+}
+
+impl<'de> serde::de::Visitor<'de> for Projection {
+    type Value = serde_json::Map<String, serde_json::Value>;
+
+    /// Names the only accepted shape: one JSON object.
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("one hook payload object")
+    }
+
+    /// Copies projected fields, refuses a repeated one, and skips every other value unbuffered.
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let claude = self.host_kind == HostKind::Claude;
+        let mut out = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let kept = PROJECTED_FIELDS.contains(&key.as_str())
+                || (claude && key == "agent_type")
+                || (self.keep_cwd && key == "cwd");
+            let tool_input = claude && key == "tool_input";
+            if (kept || tool_input) && out.contains_key(&key) {
+                return Err(serde::de::Error::custom("repeated hook field"));
+            }
+            if kept {
+                let value = map.next_value_seed(KeptValue {
+                    drop_oversize: false,
+                })?;
+                out.insert(key, value);
+            } else if tool_input {
+                let paths = map.next_value_seed(ToolInputPaths)?;
+                out.insert(key, serde_json::Value::Object(paths));
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        // A `tool_input` without a kept path projects to nothing, as an absent one does.
+        if out
+            .get("tool_input")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            out.remove("tool_input");
+        }
+        Ok(out)
+    }
+}
+
+/// Reads one kept value without materializing structure: a string over the transport bound is
+/// oversize, a scalar is kept, and an object or array (never a valid identity or path) is drained
+/// unbuffered and kept as an empty one of the same type, so the parser refuses it exactly as it
+/// would refuse the original. With `drop_oversize` (a `tool_input` path, which the parser drops
+/// rather than refusing the event when invalid) an over-bound string is kept as `null` instead.
+struct KeptValue {
+    drop_oversize: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for KeptValue {
+    type Value = serde_json::Value;
+
+    /// Accepts any JSON value.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for KeptValue {
+    type Value = serde_json::Value;
+
+    /// Names the accepted shape: any JSON value.
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a hook field value")
+    }
+
+    /// Keeps a string within the transport bound; a longer one is oversize (or `null` when
+    /// `drop_oversize`).
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        if value.len() <= MAX_INPUT_BYTES as usize {
+            Ok(serde_json::Value::String(value.to_owned()))
+        } else if self.drop_oversize {
+            Ok(serde_json::Value::Null)
+        } else {
+            Err(E::custom(OVERSIZE_FIELD))
+        }
+    }
+
+    /// Keeps a boolean.
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(value))
+    }
+
+    /// Keeps a signed number.
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    /// Keeps an unsigned number.
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    /// Keeps a finite float; any other float projects to `null`, as `serde_json` would.
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+        Ok(serde_json::Number::from_f64(value).map_or(serde_json::Value::Null, Into::into))
+    }
+
+    /// Keeps `null`.
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    /// Drains an array unbuffered; an empty array stands in for it.
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(serde_json::Value::Array(Vec::new()))
+    }
+
+    /// Drains an object unbuffered; an empty object stands in for it.
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(serde_json::Value::Object(serde_json::Map::new()))
+    }
+}
+
+/// Reads Claude's `tool_input`, keeping only its writer-tool path fields exactly as the parser
+/// sees them: each present key with its last value (a non-string value is kept as `null`, which
+/// the parser treats like the original: present, but no path), every other field skipped.
+struct ToolInputPaths;
+
+impl<'de> serde::de::DeserializeSeed<'de> for ToolInputPaths {
+    type Value = serde_json::Map<String, serde_json::Value>;
+
+    /// Accepts any JSON value: only an object can carry a kept path.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ToolInputPaths {
+    type Value = serde_json::Map<String, serde_json::Value>;
+
+    /// Names the accepted shape: any JSON value.
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a tool_input value")
+    }
+
+    /// Keeps the last value of each path key (a string, or `null` for anything else); skips the rest.
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut paths = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if TOOL_INPUT_PATHS.contains(&key.as_str()) {
+                let value = match map.next_value_seed(KeptValue {
+                    drop_oversize: true,
+                })? {
+                    path @ serde_json::Value::String(_) => path,
+                    _ => serde_json::Value::Null,
+                };
+                paths.insert(key, value);
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Drains an array value without keeping it.
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(serde_json::Map::new())
+    }
+
+    /// A scalar carries no path.
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Map::new())
+    }
+
+    /// A scalar carries no path.
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Map::new())
+    }
+
+    /// A scalar carries no path.
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Map::new())
+    }
+
+    /// A scalar carries no path.
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Map::new())
+    }
+
+    /// A scalar carries no path.
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(serde_json::Map::new())
+    }
+
+    /// `null` carries no path.
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Map::new())
+    }
 }
 
 /// Records that even a projected payload could not fit the transport bound; warn, not skipped.
@@ -261,48 +552,13 @@ fn log_oversize() {
 /// Projects one raw host payload down to the bounded identity fields the daemon consumes.
 ///
 /// The daemon's observation uses only the host, phase, actor, session, and optional call/tool-name
-/// fields, so a multi-megabyte `tool_input`/`tool_response` body is dropped rather than the whole
-/// event — except Claude's bounded `tool_input.file_path`, which a projected writer post keeps so
-/// its check trigger can still name the changed file's language. Payloads already inside the
-/// 64 KiB transport bound keep their exact bytes (preserving the parser's duplicate-key
-/// rejection); only larger ones are projected, where duplicate keys collapse last-wins. Returns
-/// `None` when the payload is not a JSON object or even the projection exceeds the transport
-/// bound (oversized identifiers).
+/// fields, so multi-megabyte `tool_input`/`tool_response` bodies are dropped rather than the whole
+/// event — except Claude's bounded `tool_input.file_path`/`notebook_path`, which a projected
+/// writer post keeps so its check trigger can still name the changed file's language. A repeated
+/// projected field is refused. Returns `None` when the payload is not a JSON object or even the
+/// projection exceeds the transport bound (oversized identifiers).
 pub fn project_hook_payload(host_kind: HostKind, payload: &[u8]) -> Option<Vec<u8>> {
-    let mut projected = serde_json::Map::new();
-    {
-        let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
-        let object = value.as_object()?;
-        for field in [
-            "hook_event_name",
-            "session_id",
-            "agent_id",
-            "tool_use_id",
-            "tool_name",
-            "source",
-        ]
-        .into_iter()
-        .chain((host_kind == HostKind::Claude).then_some("agent_type"))
-        {
-            if let Some(item) = object.get(field) {
-                projected.insert(field.to_owned(), item.clone());
-            }
-        }
-        if host_kind == HostKind::Claude
-            && let Some(file) = object
-                .get("tool_input")
-                .and_then(|input| input.get("file_path"))
-                .and_then(|value| value.as_str())
-                .filter(|path| !path.is_empty() && path.len() <= 1024)
-        {
-            projected.insert(
-                "tool_input".to_owned(),
-                serde_json::json!({ "file_path": file }),
-            );
-        }
-    }
-    let bytes = serde_json::to_vec(&serde_json::Value::Object(projected)).ok()?;
-    (bytes.len() <= MAX_INPUT_BYTES as usize).then_some(bytes)
+    project_reader(payload, host_kind, false).ok()
 }
 
 /// Reads one bounded native payload and submits only selected identity fields, without output.
@@ -528,6 +784,155 @@ mod tests {
         })
         .to_string();
         assert!(project_hook_payload(HostKind::Claude, oversized.as_bytes()).is_none());
+    }
+
+    /// A Post of any size (here about 20 MiB of `tool_response` and `tool_input` body) streams
+    /// through: its projection equals that of the same event with small bodies, keeps the routing
+    /// `cwd` only when asked, and parses to the same event; a repeated identity field is
+    /// malformed and an identity that alone exceeds the transport bound is oversize.
+    #[test]
+    fn huge_hook_payloads_stream_to_the_same_projection() {
+        let event = |body: &str| {
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session",
+                "tool_use_id": "call",
+                "tool_name": "NotebookEdit",
+                "agent_type": "general-purpose",
+                "cwd": "/private/tmp/project",
+                "transcript_path": "/private/tmp/t.jsonl",
+                "tool_input": {"notebook_path": "/private/tmp/project/n.ipynb", "new_source": body, "cells": [1, {"x": body}]},
+                "tool_response": {"content": [{"type": "text", "text": body}], "isError": false},
+            })
+            .to_string()
+        };
+        let huge = event(&"é\"x".repeat(3 * 1024 * 1024));
+        assert!(huge.len() > 16 * 1024 * 1024, "{}", huge.len());
+        let started = std::time::Instant::now();
+        let projected = read_hook_payload(huge.as_bytes(), HostKind::Claude, true).unwrap();
+        eprintln!("streamed {} bytes in {:?}", huge.len(), started.elapsed());
+        let small = event("ab");
+        let mut small_projection: serde_json::Value = serde_json::from_slice(
+            &project_reader(small.as_bytes(), HostKind::Claude, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&projected).unwrap(),
+            small_projection
+        );
+        assert_eq!(small_projection["cwd"], "/private/tmp/project");
+        assert_eq!(
+            small_projection["tool_input"],
+            serde_json::json!({"notebook_path": "/private/tmp/project/n.ipynb"})
+        );
+        assert!(small_projection.get("tool_response").is_none());
+        // The parsed event equals that of the exact small payload.
+        let parsed = parse_claude_hook_event(&projected).unwrap();
+        let exact = parse_claude_hook_event(small.as_bytes()).unwrap();
+        assert_eq!(parsed.session_id(), exact.session_id());
+        assert_eq!(parsed.optional_call_id(), exact.optional_call_id());
+        assert_eq!(parsed.tool_name(), exact.tool_name());
+        assert_eq!(parsed.tool_file(), exact.tool_file());
+        assert_eq!(parsed.agent_type(), exact.agent_type());
+        // Without `keep_cwd` the routing field is not forwarded.
+        small_projection.as_object_mut().unwrap().remove("cwd");
+        let no_cwd = read_hook_payload(huge.as_bytes(), HostKind::Claude, false).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&no_cwd).unwrap(),
+            small_projection
+        );
+        // A small payload keeps its exact bytes.
+        assert_eq!(
+            read_hook_payload(small.as_bytes(), HostKind::Claude, true).unwrap(),
+            small.as_bytes()
+        );
+        let padding = "x".repeat(MAX_INPUT_BYTES as usize);
+        let repeated =
+            format!(r#"{{"session_id":"a","tool_response":"{padding}","session_id":"b"}}"#);
+        assert_eq!(
+            read_hook_payload(repeated.as_bytes(), HostKind::Claude, false),
+            Err(HookInputError::Malformed)
+        );
+        let oversized = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "s".repeat(MAX_INPUT_BYTES as usize),
+        })
+        .to_string();
+        assert_eq!(
+            read_hook_payload(oversized.as_bytes(), HostKind::Claude, false),
+            Err(HookInputError::Oversize)
+        );
+        let not_object = "x".repeat(MAX_INPUT_BYTES as usize + 1);
+        assert_eq!(
+            read_hook_payload(not_object.as_bytes(), HostKind::Claude, false),
+            Err(HookInputError::Malformed)
+        );
+    }
+
+    /// A projected large payload parses to exactly what the parser makes of the same payload with
+    /// small bodies: path precedence (`file_path` present but not a string blocks
+    /// `notebook_path`), last-value duplicates, non-string and over-long paths, and a non-object
+    /// `tool_input` all agree; an object-valued identity is refused either way.
+    #[test]
+    fn projection_matches_the_parser_for_every_tool_input_shape() {
+        let long = "p".repeat(2000);
+        let cases = [
+            r#"{"file_path":"/w/a.rs"}"#.to_owned(),
+            r#"{"notebook_path":"/w/n.ipynb"}"#.to_owned(),
+            r#"{"file_path":null,"notebook_path":"/w/a.py"}"#.to_owned(),
+            r#"{"file_path":"/w/a.rs","file_path":5}"#.to_owned(),
+            r#"{"file_path":5,"file_path":"/w/b.rs"}"#.to_owned(),
+            r#"{"file_path":{"x":1},"notebook_path":"/w/b.ipynb"}"#.to_owned(),
+            r#""just text""#.to_owned(),
+            format!(r#"{{"file_path":"{long}"}}"#),
+        ];
+        let event = |tool_input: &str, padding: &str| {
+            format!(
+                r#"{{"hook_event_name":"PostToolUse","session_id":"s","tool_use_id":"c","tool_name":"Write","agent_type":"t","tool_input":{tool_input},"tool_response":"{padding}"}}"#
+            )
+        };
+        let padding = "x".repeat(MAX_INPUT_BYTES as usize + 1);
+        for case in &cases {
+            let small = event(case, "");
+            let large = event(case, &padding);
+            let exact = parse_claude_hook_event(small.as_bytes()).unwrap();
+            let projected = read_hook_payload(large.as_bytes(), HostKind::Claude, false).unwrap();
+            let parsed = parse_claude_hook_event(&projected).unwrap();
+            assert_eq!(parsed.tool_file(), exact.tool_file(), "{case}");
+            assert_eq!(parsed.session_id(), exact.session_id(), "{case}");
+            assert_eq!(
+                parsed.optional_call_id(),
+                exact.optional_call_id(),
+                "{case}"
+            );
+            assert_eq!(parsed.tool_name(), exact.tool_name(), "{case}");
+            assert_eq!(parsed.agent_type(), exact.agent_type(), "{case}");
+        }
+        // A path over the transport bound is dropped like an invalid one, not the event.
+        let huge_path = event(
+            &format!(
+                r#"{{"file_path":"{}"}}"#,
+                "p".repeat(MAX_INPUT_BYTES as usize + 1)
+            ),
+            "",
+        );
+        let projected = read_hook_payload(huge_path.as_bytes(), HostKind::Claude, false).unwrap();
+        assert_eq!(
+            parse_claude_hook_event(&projected).unwrap().tool_file(),
+            None
+        );
+        // An object-valued identity is refused by the parser for both shapes.
+        let object_session = |padding: &str| {
+            format!(
+                r#"{{"hook_event_name":"PreToolUse","session_id":{{"a":"{}"}},"tool_use_id":"c","tool_response":"{padding}"}}"#,
+                "b".repeat(16)
+            )
+        };
+        assert!(parse_claude_hook_event(object_session("").as_bytes()).is_err());
+        let projected =
+            read_hook_payload(object_session(&padding).as_bytes(), HostKind::Claude, false)
+                .unwrap();
+        assert!(parse_claude_hook_event(&projected).is_err());
     }
 
     /// Distinguishes short Unix-socket test paths within this process.

@@ -172,12 +172,12 @@ async fn the_related_links_block_is_identical_in_every_mixed_setting() {
     }
 }
 
-/// Every usage row stays in the block, past the card's ceiling of 30: the rows that do not fit the
-/// first reply page follow on the reply's own `detail_ref` pages. Read keeps its exact numbered
-/// source before the links, and the fully delivered reference still authorizes the same bytes.
+/// Every usage row stays in the block, past the card's ceiling of 30, and the Read reply carries
+/// them all in one reply with no page: Read output has no size ceiling. Read keeps its exact
+/// numbered source before the links, and the delivered reference still authorizes the same bytes.
 /// Warm the advisory index explicitly: lexical source delivery no longer waits for it.
 #[tokio::test]
-async fn long_usage_lists_continue_on_the_replys_own_pages() {
+async fn long_usage_lists_arrive_whole_in_one_read_reply() {
     const FILES: usize = 1200;
     let mut files: Vec<(String, String)> = (0..FILES)
         .map(|n| {
@@ -212,26 +212,14 @@ async fn long_usage_lists_continue_on_the_replys_own_pages() {
             break reply;
         }
     };
-    let mut text = first["text"].as_str().unwrap().to_owned();
+    let text = first["text"].as_str().unwrap().to_owned();
     assert!(
         text.contains(&format!("usages: {FILES} indexed in {FILES} files")),
         "{text}"
     );
     assert!(!text.contains("… "), "no cut row: {text}");
-    // The rows exceed one page: the reply says so and `ide.inspect` serves the rest.
-    assert_eq!(first["continuation"], true, "{first}");
-    let mut reply = first.clone();
-    let mut pages = 1;
-    while reply["continuation"] == true {
-        let reference = reply["detail_ref"].as_str().unwrap().to_owned();
-        reply = session
-            .call(&fixture, "ide.inspect", json!({"detail_ref": reference}))
-            .await;
-        text.push_str(reply["text"].as_str().unwrap());
-        pages += 1;
-        assert!(pages < 20, "{reply}");
-    }
-    assert!(pages > 1);
+    // The rows far exceed the former reply page, yet arrive in this one reply.
+    assert_ne!(first["continuation"], true, "{first}");
     for n in [0, 29, 30, FILES - 1] {
         assert!(text.contains(&format!("pages/p{n:04}.html:1")), "p{n}");
     }
@@ -245,7 +233,7 @@ async fn long_usage_lists_continue_on_the_replys_own_pages() {
     let source_at = text.find(&numbered).expect("complete numbered source");
     let links_at = text.find("related_links:").expect("retained link rows");
     assert!(source_at < links_at, "{text}");
-    // The actual delivered read reference still binds the file after all link pages are fetched.
+    // The actual delivered read reference still binds the file.
     let reference = first["detail_ref"].as_str().unwrap();
     let edited = ".wide { margin: 1px; }\n";
     let edit = session

@@ -29,7 +29,7 @@ The kind set is closed. Adding a kind is a contract revision.
 |---|---|---|---|---|
 | `test-finished` | test run settlement; shared `terminal_fact` | `tests #N` | no | `summary` (<= 256 bytes) + `detail`, together <= 3584 bytes: counts, <= 8 `FAIL` entries, target exits, `rerun:` (<= 300 bytes), explicit `<ref>/output/1` route |
 | `edit-checked` | edit project check; single- and multi-file | `edit <operation_id>` | no | §3.3 |
-| `job-ready` | a job registered with `defer` (§3.2): a reply that went `pending`, a pending batch job, a precise answer after an approximate one, an accepted graph job | `<tool> <target>` or `batch <detail_ref>: items i,j` | yes for context/outline/read/symbol/graph/diff answers; no for edit, start, test | the job's final reply or final failure |
+| `job-ready` | a job registered with `defer` (§3.2): a reply that went `pending`, a pending batch job, a precise answer after an approximate one, an accepted graph job | `<tool> <target>` or `batch <detail_ref>: items i,j` | yes for context/outline/read/symbol/graph/diff answers; no for edit, start, test, prepare | the job's final reply or final failure; for read only `ready`, the `detail_ref` and the call that returns the retained result whole; for prepare only its status line and that call (no source snippet in either) |
 | `lost-after-restart` | session re-activation after a daemon replacement | `restart` | no | §10 |
 
 ## 3. Interface, envelope and size budget

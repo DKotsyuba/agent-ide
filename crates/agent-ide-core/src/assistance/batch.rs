@@ -29,9 +29,6 @@ pub(crate) const MAX_READ_ITEMS: usize = 32;
 /// multi-file edit's file cap so one read's `source_ref` can cover every file of one edit.
 pub(crate) const MAX_READ_FILES: usize = 16;
 
-/// Footer entries named inline before `+N more`, matching the worker's other bounded lists.
-const MAX_FOOTER_NAMES: usize = 8;
-
 /// The closed item shape an `items` entry must have, quoted in its refusal.
 const ITEM_SHAPE: &str = "an array of 1 to 32 items, each exactly one of {\"symbol\":\"src/x.rs#Owner/name\"}, \
 {\"path\":\"docs/x.md\"} or {\"path\":\"src/x.rs\",\"lines\":\"10-40\"}";
@@ -270,8 +267,8 @@ pub(crate) fn validate_read_items(object: &Map<String, Value>) -> Result<(), Par
     Ok(())
 }
 
-/// Which request form produced a batch read; it decides how the follow-up footer spells the call
-/// that fetches cut items, so that call is always a valid request of the same form.
+/// Which request form produced a batch read; only `{items}` reads answer a repeated block with
+/// the one-line unchanged acknowledgement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadForm {
     /// `ide.read {items: […]}`.
@@ -305,22 +302,12 @@ impl ReadItem {
         }
     }
 
-    /// The item's one-line name in summary-adjacent lines (duplicates, footers, the unchanged
-    /// answer): the symbol address, the path, or `<path> lines <start-end>`.
+    /// The item's one-line name in summary-adjacent lines (duplicates, the unchanged answer): the symbol address, the path, or `<path> lines <start-end>`.
     pub(crate) fn label(&self) -> String {
         match self {
             Self::Symbol(address) => address.clone(),
             Self::Path(path) => path.clone(),
             Self::Lines(path, lines) => format!("{path} lines {lines}"),
-        }
-    }
-
-    /// The item as one `items` entry of a valid `ide.read {items}` request.
-    fn call_entry(&self) -> Value {
-        match self {
-            Self::Symbol(address) => json!({"symbol": address}),
-            Self::Path(path) => json!({"path": path}),
-            Self::Lines(path, lines) => json!({"path": path, "lines": lines}),
         }
     }
 }
@@ -397,66 +384,6 @@ pub(crate) fn read_summary(counts: &ReadCounts) -> String {
         "read: {} items in {} files — {} delivered, {} unchanged, {} not included, {} failed\n",
         counts.items, counts.files, counts.delivered, counts.unchanged, counts.cut, counts.failed
     )
-}
-
-/// The footer naming the items a batch read left out, with the exact call that fetches them.
-///
-/// `cut` holds the left-out items in request order and must not be empty. At most eight are named
-/// and put into the call; more end the line with `; +N more`. The call keeps the request's own
-/// form: `{"items":[…]}`, `{"symbols":[…]}`, or `{"path":…,"ranges":[…]}` with the path of the
-/// cut ranges. The line ends with a newline.
-pub(crate) fn read_follow_up(form: ReadForm, cut: &[&ReadItem]) -> String {
-    let shown = &cut[..cut.len().min(MAX_FOOTER_NAMES)];
-    let names = shown
-        .iter()
-        .map(|item| match (form, item) {
-            (ReadForm::Ranges, ReadItem::Lines(_, lines)) => lines.clone(),
-            _ => item.label(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let quoted = |values: Vec<String>| {
-        values
-            .iter()
-            .map(|value| Value::String(value.clone()).to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let call = match form {
-        ReadForm::Items => format!(
-            "{{\"items\":[{}]}}",
-            shown
-                .iter()
-                .map(|item| item.call_entry().to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        ReadForm::Symbols => format!(
-            "{{\"symbols\":[{}]}}",
-            quoted(shown.iter().map(|item| item.label()).collect())
-        ),
-        ReadForm::Ranges => format!(
-            "{{\"path\":{},\"ranges\":[{}]}}",
-            Value::String(shown[0].file().to_owned()),
-            quoted(
-                shown
-                    .iter()
-                    .map(|item| match item {
-                        ReadItem::Lines(_, lines) => lines.clone(),
-                        other => other.label(),
-                    })
-                    .collect()
-            )
-        ),
-    };
-    let mut footer =
-        format!("not included (over the reply budget): {names} — call ide.read {call}");
-    let hidden = cut.len() - shown.len();
-    if hidden > 0 {
-        footer.push_str(&format!("; +{hidden} more"));
-    }
-    footer.push('\n');
-    footer
 }
 
 /// Most delivered blocks one session's [`ReadMemory`] keeps; past it all read history resets.
@@ -1865,55 +1792,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn follow_up_calls_keep_the_request_form_and_parse() {
-        let items = [
-            ReadItem::Symbol("a.rs#A".into()),
-            ReadItem::Path("b \"q\".md".into()),
-            ReadItem::Lines("c.rs".into(), "3-4".into()),
-        ];
-        let cut = items.iter().collect::<Vec<_>>();
-        let footer = read_follow_up(ReadForm::Items, &cut);
-        let call = footer.trim_end().split_once("call ide.read ").unwrap().1;
-        let parsed: Value = serde_json::from_str(call).unwrap();
-        assert_eq!(
-            parsed,
-            json!({"items":[{"symbol":"a.rs#A"},{"path":"b \"q\".md"},{"path":"c.rs","lines":"3-4"}]})
-        );
-        assert!(footer.starts_with(
-            "not included (over the reply budget): a.rs#A, b \"q\".md, c.rs lines 3-4 — call"
-        ));
-
-        let ranges = [
-            ReadItem::Lines("x.rs".into(), "1-2".into()),
-            ReadItem::Lines("x.rs".into(), "9-9".into()),
-        ];
-        let footer = read_follow_up(ReadForm::Ranges, &ranges.iter().collect::<Vec<_>>());
-        assert_eq!(
-            footer,
-            "not included (over the reply budget): 1-2, 9-9 — call ide.read \
-             {\"path\":\"x.rs\",\"ranges\":[\"1-2\",\"9-9\"]}\n"
-        );
-        let symbols = [ReadItem::Symbol("x.rs#A".into())];
-        assert_eq!(
-            read_follow_up(ReadForm::Symbols, &symbols.iter().collect::<Vec<_>>()),
-            "not included (over the reply budget): x.rs#A — call ide.read {\"symbols\":[\"x.rs#A\"]}\n"
-        );
-    }
-
-    #[test]
-    fn follow_up_names_eight_and_counts_the_rest() {
-        let items = (0..11)
-            .map(|index| ReadItem::Path(format!("f{index}.md")))
-            .collect::<Vec<_>>();
-        let footer = read_follow_up(ReadForm::Items, &items.iter().collect::<Vec<_>>());
-        assert!(footer.ends_with("; +3 more\n"), "{footer}");
-        assert!(
-            footer.contains("f7.md") && !footer.contains("f8.md"),
-            "{footer}"
-        );
-    }
-
     /// Unknown/new context cannot use guards, and an existing unit at the quota must not evict
     /// other entries. Crossing the distinct-unit or block quota explicitly resets read history.
     #[test]
@@ -2468,8 +2346,6 @@ mod tests {
             failed: 0,
         }));
         assert_no_polling(&unchanged_line("ref-1", "src/a.rs", "1  a\n2  b\n"));
-        let cut = ReadItem::Symbol("src/c.rs#C".to_owned());
-        assert_no_polling(&read_follow_up(ReadForm::Items, &[&cut]));
         let pending = vec![(
             "src/a.rs".to_owned(),
             EditDiagnostics::Pending {

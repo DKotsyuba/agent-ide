@@ -234,8 +234,11 @@ fn compact_text(reply: &PeerReply) -> Option<String> {
 ///
 /// A failure (an error, unavailable or invalid-parameters reply) carries its compact first line
 /// and `failed = true`. A successful source-bearing answer carries only `ready` and its
-/// reference, so the body is read (and re-proved) through `ide.inspect`; any other successful
-/// answer carries its compact text, which holds no source.
+/// reference, so the body is read (and re-proved) through `ide.inspect`. A Prepare packet
+/// ([`PeerReply::delivers_source`] from a tool that is not source-bearing) carries only its status
+/// line and the call that returns it whole, never a source snippet, so it needs no source re-proof
+/// and a `not_ready` answer stays honest. Any other successful answer carries its compact text,
+/// which holds no source.
 fn job_fact(reference: &str, reply: &PeerReply, spec: &DeferSpec) -> FactDraft {
     let failed = matches!(
         reply,
@@ -246,6 +249,18 @@ fn job_fact(reference: &str, reply: &PeerReply, spec: &DeferSpec) -> FactDraft {
     let bearing = source_bearing(spec.tool);
     let (summary, detail) = if bearing && !failed {
         ("ready".to_owned(), None)
+    } else if !failed && reply.delivers_source() {
+        let text = compact_text(reply).unwrap_or_else(|| "settled".to_owned());
+        let summary = bounded(
+            text.lines().next().unwrap_or("settled"),
+            MAX_SUMMARY_BYTES,
+            false,
+        );
+        let retrieval = format!(
+            "whole result: ide.inspect {}",
+            serde_json::json!({"detail_ref":reference})
+        );
+        (summary, Some(retrieval))
     } else {
         let text = compact_text(reply).unwrap_or_else(|| "settled".to_owned());
         let mut lines = text.lines();
@@ -272,7 +287,9 @@ fn job_fact(reference: &str, reply: &PeerReply, spec: &DeferSpec) -> FactDraft {
 }
 
 /// Builds the useful deferred body for Bridge after local job authorization. A changed observed
-/// source epoch yields an explicit terminal superseded result with no obsolete source body.
+/// source epoch yields an explicit terminal superseded result with no obsolete source body. A fact
+/// whose reply is Read or Prepare source ([`PeerReply::delivers_source`]) is metadata only (ready,
+/// reference, retrieval call); other source-bearing facts carry a bounded preview.
 /// The public graph page is already bounded by the normal renderer; large continuations remain
 /// explicit. This is domain result composition, not a transport queue or freshness grant.
 fn bridge_job_fact(
@@ -290,6 +307,23 @@ fn bridge_job_fact(
         ));
         fact.failed = true;
         fact.source_bearing = false;
+        return fact;
+    }
+    if fact.source_bearing && reply.delivers_source() {
+        // Read and Prepare source, whichever tool's job settled with it, is never snipped into a
+        // notification: this deferred async fact only says the result is ready and names the one
+        // call that returns it whole. It is not the tool reply, which has no output ceiling.
+        let retrieval = if spec.tool == AssistanceTool::Read {
+            "ide.read"
+        } else {
+            "ide.inspect"
+        };
+        fact.detail = Some(format!(
+            "whole result: {retrieval} {}\nresult_ref: {reference}; source epoch {}/{}",
+            serde_json::json!({"detail_ref":reference}),
+            captured.native_epoch,
+            captured.edit_seq
+        ));
         return fact;
     }
     if fact.source_bearing {
@@ -1807,6 +1841,104 @@ mod worker_tests {
         assert!(stale.summary.starts_with("superseded"));
         assert!(!stale.detail.as_deref().unwrap().contains("caller: g"));
         assert!(stale.validate().is_ok());
+    }
+
+    /// A deferred completion whose reply is Read source (also through Inspect) is metadata only:
+    /// the Bridge fact says the result is ready and names the one call that returns it whole,
+    /// carries no snipped source, keeps its source epoch, and a changed epoch still supersedes it.
+    #[test]
+    fn source_completion_facts_are_metadata_only() {
+        let rows: String = (1..=4000)
+            .map(|row| format!("{row}\tlet value = {row};\n"))
+            .collect();
+        let epoch = JobEpoch {
+            native_epoch: 1,
+            edit_seq: 1,
+        };
+        for (tool, retrieval) in [
+            (AssistanceTool::Read, "ide.read"),
+            (AssistanceTool::Inspect, "ide.inspect"),
+        ] {
+            assert!(source_bearing(tool));
+            let spec = DeferSpec {
+                tool,
+                target: "src/big.rs".into(),
+                fence_paths: Vec::new(),
+            };
+            let reply = PeerReply::Complete {
+                kind: ResultKind::Read,
+                text: format!("header line\n{rows}"),
+                detail_ref: Some("source-ref".into()),
+                truncated: false,
+                continuation: false,
+            };
+            let fact = bridge_job_fact("source-ref", &reply, &spec, epoch, epoch);
+            let detail = fact.detail.as_deref().unwrap();
+            assert!(fact.source_bearing && !fact.failed && fact.summary == "ready");
+            assert_eq!(
+                detail,
+                format!(
+                    "whole result: {retrieval} {{\"detail_ref\":\"source-ref\"}}\n\
+                     result_ref: source-ref; source epoch 1/1"
+                )
+            );
+            assert!(!detail.contains("let value"), "no snipped source");
+            assert!(fact.validate().is_ok());
+            let stale = bridge_job_fact(
+                "source-ref",
+                &reply,
+                &spec,
+                epoch,
+                JobEpoch {
+                    edit_seq: 2,
+                    ..epoch
+                },
+            );
+            assert!(stale.failed && stale.summary.starts_with("superseded"));
+        }
+    }
+
+    /// A deferred Prepare packet is announced by its status line and the call that returns it
+    /// whole, never with a source snippet: it is not source-bearing, so a `not_ready` answer
+    /// (which has no authority to re-prove) is reported as itself, not as superseded.
+    #[test]
+    fn prepare_completion_facts_carry_the_status_line_only() {
+        assert!(!source_bearing(AssistanceTool::Prepare));
+        let spec = DeferSpec {
+            tool: AssistanceTool::Prepare,
+            target: "task".into(),
+            fence_paths: Vec::new(),
+        };
+        let epoch = JobEpoch {
+            native_epoch: 1,
+            edit_seq: 1,
+        };
+        for (text, status) in [
+            (
+                "prepare: complete; 2 files; ~9 tokens (estimated)\n\n## src/a.rs — whole file\n1\tlet secret = 1;\n",
+                "prepare: complete; 2 files; ~9 tokens (estimated)",
+            ),
+            (
+                "prepare: not_ready; 0 files\n\nThe task-context index is not ready.\n",
+                "prepare: not_ready; 0 files",
+            ),
+        ] {
+            let reply = PeerReply::Complete {
+                kind: ResultKind::Prepare,
+                text: text.into(),
+                detail_ref: None,
+                truncated: false,
+                continuation: false,
+            };
+            let fact = bridge_job_fact("prepare-ref", &reply, &spec, epoch, epoch);
+            assert!(!fact.source_bearing && !fact.failed);
+            assert_eq!(fact.summary, status);
+            assert_eq!(
+                fact.detail.as_deref(),
+                Some("whole result: ide.inspect {\"detail_ref\":\"prepare-ref\"}")
+            );
+            assert!(fact.validate().is_ok());
+        }
     }
 
     /// A run whose caller left with a started line hands its work over exactly once when it

@@ -119,6 +119,12 @@ impl OpaqueJson {
     }
 }
 
+/// Private host-metadata key with which a front announces it decodes Read, Prepare and Inspect
+/// replies of any size (`AssistanceMethod::delivers_source`). A daemon refuses such a call from
+/// a front without it before executing anything; older daemons ignore the key, as they ignore
+/// every host-metadata key they do not read.
+pub const WHOLE_SOURCE_META: &str = "agent-ide/whole-source";
+
 /// Names the closed Assistance operations Application may route through wire v2 through v5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistanceMethod {
@@ -159,6 +165,17 @@ impl AssistanceMethod {
             Self::Graph | Self::Prepare => 5,
             _ => 2,
         }
+    }
+
+    /// Whether this method's reply may carry requested source text that must reach the caller
+    /// whole (a front announces it can receive such replies with [`WHOLE_SOURCE_META`]): Read and Prepare, and Inspect, which hands over a retained Read result that did not
+    /// finish within the inline wait.
+    ///
+    /// These replies are bounded only by the length-prefixed frame format; every other method keeps
+    /// the fixed Assistance payload and frame caps. A non-source reply inside them is still held to
+    /// its own serialized bound when it is encoded and decoded.
+    pub(crate) fn delivers_source(self) -> bool {
+        matches!(self, Self::Read | Self::Prepare | Self::Inspect)
     }
 
     /// Parses only the method tag paired with its assigned wire version.

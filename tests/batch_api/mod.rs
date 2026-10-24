@@ -14,9 +14,9 @@ fn assert_no_source_ref(text: &str) {
 /// `ide.read {items}` answers a symbol, a range and a whole file across three files in ONE
 /// reply: the summary line first, blocks in request order, failed items in place without failing
 /// the rest, a duplicate once, and one `source_ref` that a following multi-change `ide.edit` of a
-/// delivered file accepts without a re-read. A second read whose middle item does not fit the
-/// reply envelope skips it while answering later items, names it with an exact follow-up call, and its
-/// `source_ref` does not cover the cut file.
+/// delivered file accepts without a re-read. A second read whose middle item is a file of about
+/// 240 KB, past every former reply and IPC ceiling, delivers all items whole through the real
+/// daemon and MCP front, and its `source_ref` is an edit base of the large file.
 #[tokio::test]
 async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
     let fixture = symbol_test_fixture();
@@ -31,14 +31,13 @@ async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
     )
     .unwrap();
     std::fs::write(fixture.root.join("notes.md"), "# title\nbody\n").unwrap();
-    let wide = "x".repeat(100);
-    std::fs::write(
-        fixture.root.join("big.md"),
-        (1..=700)
-            .map(|line| format!("{line} {wide}\n"))
-            .collect::<String>(),
-    )
-    .unwrap();
+    // About 240 KB: past every former Read, Prepare, reply and IPC ceiling, with multibyte
+    // characters, quotes and backslashes that JSON escaping grows further.
+    let wide = "é🦀\"\\".repeat(20);
+    let big = (1..=1500)
+        .map(|line| format!("{line} {wide}\n"))
+        .collect::<String>();
+    std::fs::write(fixture.root.join("big.md"), &big).unwrap();
     std::fs::write(fixture.root.join("tail.md"), "tail\n").unwrap();
     fixture.git(&[
         "add",
@@ -111,48 +110,85 @@ async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
     let edit = actor.settle(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
 
-    let (cut, text) = read_text(
+    let (whole, text) = read_text(
         &mut actor,
         &fixture,
         json!({"items":[{"path":"tail.md"},{"path":"big.md"},{"path":"notes.md"}]}),
     )
     .await;
-    assert_eq!(cut["kind"], "read", "{cut} {text}");
+    assert_eq!(whole["kind"], "read", "{whole} {text}");
     assert!(
         text.starts_with(
-            "read: 3 items in 3 files — 1 delivered, 1 unchanged, 1 not included, 0 failed\n"
+            "read: 3 items in 3 files — 2 delivered, 1 unchanged, 0 not included, 0 failed\n"
         ),
-        "{text}"
+        "{}",
+        &text[..text.len().min(400)]
     );
-    let footer = text
+    // Every row of the large file arrives exactly once, numbered, with no paging marker.
+    let width = big.lines().count().to_string().len();
+    let rows = big
         .lines()
-        .find(|line| line.starts_with("not included (over the reply budget): "))
-        .unwrap_or_else(|| panic!("no footer: {text}"));
-    let call: Value = serde_json::from_str(footer.split_once("call ide.read ").unwrap().1).unwrap();
-    assert_eq!(call, json!({"items":[{"path":"big.md"}]}), "{footer}");
+        .enumerate()
+        .map(|(index, line)| format!("{:>width$}\t{line}\n", index + 1))
+        .collect::<String>();
+    assert!(
+        text.contains(&rows),
+        "the large file is not delivered whole"
+    );
+    assert_eq!(text.matches(&rows).count(), 1);
+    assert!(!text.contains("over the reply budget") && !text.contains("page 1"));
     assert_no_source_ref(&text);
-    let cut_ref = cut["detail_ref"].as_str().unwrap().to_owned();
-    let big_before = std::fs::read(fixture.root.join("big.md")).unwrap();
-    let refused = actor
+    // The retained result replays whole through its reference, by ide.inspect and by ide.read.
+    let whole_ref = whole["detail_ref"].as_str().unwrap().to_owned();
+    for tool in ["ide.inspect", "ide.read"] {
+        let reply = call_text(
+            &mut actor,
+            &fixture,
+            tool,
+            json!({"detail_ref": whole_ref.clone()}),
+        )
+        .await;
+        let (replayed, replayed_text) = settle_text(&mut actor, &fixture, reply).await;
+        assert_eq!(replayed["kind"], "read", "{tool}: {replayed}");
+        assert_eq!(
+            replayed["text"], whole["text"],
+            "{tool} replays the same bytes"
+        );
+        assert_eq!(replayed_text.matches(&rows).count(), 1, "{tool}");
+    }
+    // A multi-reference inspection carries the retained large read whole beside another result.
+    let reply = call_text(
+        &mut actor,
+        &fixture,
+        "ide.inspect",
+        json!({"detail_refs": [whole_ref.clone(), source_ref.clone()]}),
+    )
+    .await;
+    let (many, many_text) = settle_text(&mut actor, &fixture, reply).await;
+    assert_eq!(many["kind"], "read", "{many}");
+    assert!(many_text.contains(&format!("== {whole_ref} ==")), "{many}");
+    assert_eq!(many_text.matches(&rows).count(), 1);
+    // The whole large file is an edit base.
+    let edit = actor
         .call(
             &fixture,
             "ide.edit",
             json!({
-                "operation_id":"read-items-cut-edit",
+                "operation_id":"read-items-whole-edit",
                 "path":"big.md",
-                "source_ref":cut_ref,
+                "source_ref":whole_ref,
                 "changes":[{"lines":"2-2","content":"changed"}]
             }),
         )
         .await;
-    let refused = actor.settle(&fixture, refused).await;
+    let edit = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     assert_eq!(
-        refused["result"]["outcome"], "stale_source",
-        "a cut file is not an edit base: {refused}"
-    );
-    assert_eq!(
-        std::fs::read(fixture.root.join("big.md")).unwrap(),
-        big_before
+        std::fs::read_to_string(fixture.root.join("big.md"))
+            .unwrap()
+            .lines()
+            .nth(1),
+        Some("changed")
     );
 
     actor.call(&fixture, "ide.stop", json!({})).await;

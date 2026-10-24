@@ -224,9 +224,9 @@ impl Worker<'_> {
     /// reports its own refusal); otherwise the numbered unit reply (see [`read_unit`]).
     ///
     /// A file no IDE language reads has no map, so its locations and addresses answer the
-    /// outline's own refusal. The unit lines the reply's first page delivered (all of them when
-    /// the reply is complete, see [`delivered_last`]) are remembered for the window-edit guard;
-    /// lines on later pages count as read only once they are delivered and read again.
+    /// outline's own refusal. A Read reply is never paged, so every unit line it carries is
+    /// remembered for the window-edit guard ([`delivered_last`] returns the last line of a
+    /// complete reply).
     pub(super) async fn read_by_address(
         &mut self,
         job: &mut Job,
@@ -284,7 +284,7 @@ impl Worker<'_> {
         }
         let authority = self.finish_symbol_job(job, binding, &observed).await?;
         let reply = self.unit_reply(job, body, authority, observed)?;
-        // Only the lines the reply's first page actually delivered are remembered as read.
+        // The reply is whole, so every unit line it delivered is remembered as read.
         let delivered = delivered_last(&reply.0, read.last);
         self.remember_unit_read(binding, read, delivered);
         Ok(Some(reply))
@@ -447,7 +447,7 @@ impl Worker<'_> {
             .latest_unit_text(epoch, address)
     }
 
-    /// Wraps a rendered unit read as the paged `read` reply of the job.
+    /// Wraps a rendered unit read as the job's `read` reply, whole in one reply.
     fn unit_reply(
         &mut self,
         job: &Job,

@@ -43,6 +43,25 @@ const MAX_V1_FRAME_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_V2_FRAME_BYTES: usize = 160 * 1024;
 /// Cap for one Assistance JSON payload inside a frame.
 pub(crate) const MAX_ASSISTANCE_JSON_BYTES: usize = 144 * 1024;
+/// Largest frame the four-byte big-endian length prefix can describe. A Read, Prepare or Inspect
+/// reply ([`AssistanceMethod::delivers_source`]) is bounded by this wire format alone, never by
+/// [`MAX_V2_FRAME_BYTES`] or [`MAX_ASSISTANCE_JSON_BYTES`].
+pub(crate) const MAX_PREFIXED_FRAME_BYTES: usize = u32::MAX as usize;
+
+/// Returns the `(frame, payload)` bounds of one method reply.
+///
+/// Requested source of Read, Prepare and Inspect travels whole up to the wire format's own limit;
+/// every other method keeps `max_frame_bytes` and [`MAX_ASSISTANCE_JSON_BYTES`].
+pub(crate) fn method_reply_bounds(
+    method: AssistanceMethod,
+    max_frame_bytes: usize,
+) -> (usize, usize) {
+    if method.delivers_source() {
+        (MAX_PREFIXED_FRAME_BYTES, MAX_PREFIXED_FRAME_BYTES)
+    } else {
+        (max_frame_bytes, MAX_ASSISTANCE_JSON_BYTES)
+    }
+}
 /// Maximum time to wait for an Assistance method reply after its request is written.
 const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
 
@@ -831,8 +850,9 @@ pub async fn dispatch_method_if_running(
     else {
         return MethodDispatchTransportResult::OutcomeUnknown;
     };
+    let (reply_frame_bytes, _) = method_reply_bounds(request.method(), limits.max_frame_bytes);
     let result = async {
-        let reply: Value = read_frame(&mut stream, limits.max_frame_bytes).await?;
+        let reply: Value = read_frame(&mut stream, reply_frame_bytes).await?;
         parse_method_dispatch_reply(&reply, &request)
     };
     tokio::pin!(result);
@@ -1723,9 +1743,11 @@ async fn serve_assistance_request(
             if drop_reply_for_test(dispatch.method()) {
                 return Ok(());
             }
+            let (reply_frame_bytes, reply_json_bytes) =
+                method_reply_bounds(dispatch.method(), limits.max_frame_bytes);
             let value = match reply {
                 Ok(Ok(AssistanceDispatchReply::MethodDispatch(payload)))
-                    if payload.as_str().len() <= MAX_ASSISTANCE_JSON_BYTES =>
+                    if payload.as_str().len() <= reply_json_bytes =>
                 {
                     json!({
                         "version": version,
@@ -1742,7 +1764,7 @@ async fn serve_assistance_request(
                     })
                 }
             };
-            write_frame(stream, &value, limits.max_frame_bytes).await
+            write_frame(stream, &value, reply_frame_bytes).await
         }
         _ => Err(invalid_transport("unsupported v2 transport method")),
     }
@@ -1775,6 +1797,9 @@ fn parse_hook_submit_reply(
 }
 
 /// Parses one closed method reply and maps transport unavailable or overflow states without semantics.
+///
+/// The payload bound is the method's own ([`method_reply_bounds`]): unbounded source for Read,
+/// Prepare and Inspect, [`MAX_ASSISTANCE_JSON_BYTES`] for every other method.
 fn parse_method_dispatch_reply(
     reply: &Value,
     request: &MethodDispatch,
@@ -1802,7 +1827,8 @@ fn parse_method_dispatch_reply(
     let Some(payload) = object.get("opaque_result_json") else {
         return Ok(MethodDispatchTransportResult::OutcomeUnknown);
     };
-    let payload = OpaqueJson::from_value(payload, MAX_ASSISTANCE_JSON_BYTES)
+    let (_, max_json_bytes) = method_reply_bounds(request.method(), MAX_V2_FRAME_BYTES);
+    let payload = OpaqueJson::from_value(payload, max_json_bytes)
         .ok_or_else(|| invalid_transport("invalid method reply payload"))?;
     Ok(MethodDispatchTransportResult::Dispatched {
         opaque_result_json: payload,
@@ -1867,6 +1893,9 @@ where
 }
 
 /// Serializes one JSON value as the fixed bounded length-prefixed IPC frame.
+///
+/// A value over `max_frame_bytes` or over the four-byte length prefix is refused before any byte
+/// is written, so an oversized frame never wraps its length.
 async fn write_frame<T>(
     stream: &mut UnixStream,
     value: &T,
@@ -1877,15 +1906,11 @@ where
 {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if bytes.len() > max_frame_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "oversized IPC frame",
-        ));
-    }
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await?;
+    let length = u32::try_from(bytes.len())
+        .ok()
+        .filter(|_| bytes.len() <= max_frame_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "oversized IPC frame"))?;
+    stream.write_all(&length.to_be_bytes()).await?;
     stream.write_all(&bytes).await?;
     stream.flush().await
 }
@@ -2769,6 +2794,98 @@ mod tests {
             .unwrap();
         let events = crate::errorlog::capture_take();
         assert_eq!(connection_panic_lines(&events), 1, "{events:?}");
+    }
+
+    /// Dispatcher answering every method with one fixed JSON payload.
+    struct FixedReplyDispatcher(String);
+
+    impl AssistanceDispatcher for FixedReplyDispatcher {
+        /// Returns the fixed payload for every dispatch, bounded only by the frame prefix.
+        fn dispatch(
+            &self,
+            _request: AssistanceDispatch,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<AssistanceDispatchReply, AssistanceDispatchUnavailable>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let payload = OpaqueJson::new(self.0.clone(), MAX_PREFIXED_FRAME_BYTES);
+            Box::pin(async move {
+                payload
+                    .map(AssistanceDispatchReply::MethodDispatch)
+                    .ok_or(AssistanceDispatchUnavailable)
+            })
+        }
+    }
+
+    /// Read and Prepare replies cross the real daemon socket byte for byte past the former
+    /// 144 KiB payload and 160 KiB frame caps, Unicode and JSON escapes included; every other
+    /// method keeps its cap, so the same payload answers an explicit unavailable that the caller
+    /// maps to an unknown outcome, never to a cut reply.
+    #[tokio::test]
+    async fn source_replies_cross_the_daemon_socket_whole() {
+        let text = "é🦀\"\\\n".repeat(400_000);
+        let payload = serde_json::to_string(&json!({ "text": text })).unwrap();
+        assert!(payload.len() > 16 * MAX_V2_FRAME_BYTES);
+        let scratch = ScratchRuntime(
+            std::env::temp_dir().join(format!("agent-ide-source-whole-{}", std::process::id())),
+        );
+        let runtime = RuntimeDir::prepare_for_daemon(&scratch.0).unwrap();
+        let daemon = tokio::spawn(run_daemon_with_assistance(
+            runtime,
+            Arc::new(FixedReplyDispatcher(payload.clone())),
+            config::EffectiveConfig::defaults(),
+            Duration::from_millis(1500),
+        ));
+        for _ in 0..200 {
+            if UnixStream::connect(scratch.0.join(SOCKET_NAME))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let limits = HookTransportLimits::new(
+            MAX_V2_FRAME_BYTES,
+            MAX_ASSISTANCE_JSON_BYTES,
+            Duration::from_secs(5),
+        )
+        .expect("fixed limits are valid");
+        for method in [
+            AssistanceMethod::Read,
+            AssistanceMethod::Prepare,
+            AssistanceMethod::Context,
+        ] {
+            let request = MethodDispatch::new(
+                "whole",
+                "whole",
+                "attachment",
+                method,
+                OpaqueJson::new("{}", 64).unwrap(),
+            )
+            .unwrap();
+            match dispatch_method_if_running(&scratch.0, request, limits).await {
+                MethodDispatchTransportResult::Dispatched { opaque_result_json }
+                    if method.delivers_source() =>
+                {
+                    assert_eq!(opaque_result_json.as_str().len(), payload.len());
+                    assert_eq!(
+                        blake3::hash(opaque_result_json.as_str().as_bytes()),
+                        blake3::hash(payload.as_bytes())
+                    );
+                }
+                MethodDispatchTransportResult::OutcomeUnknown if !method.delivers_source() => {}
+                other => panic!("{method:?}: {other:?}"),
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("the idle daemon exits")
+            .unwrap()
+            .unwrap();
     }
 
     /// A connection task that panicked before shutdown's abort-and-join is journaled by the drain

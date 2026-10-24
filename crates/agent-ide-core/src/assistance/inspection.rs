@@ -18,7 +18,8 @@ use super::WorkerHandle;
 
 /// Pause between re-reads of references that are still pending during a wait.
 const REREAD_PAUSE: Duration = Duration::from_millis(250);
-/// Byte budget of the whole consolidated reply text, below the 64 KiB reply envelope.
+/// Byte budget of the consolidated reply's non-source sections, below the 64 KiB reply envelope.
+/// A retained Read or Prepare result is never cut to it.
 const REPLY_TEXT_BUDGET: usize = 48 * 1024;
 
 /// Cuts `text` to at most `limit` bytes on a character boundary.
@@ -43,10 +44,15 @@ fn compact(reply: &PeerReply) -> String {
         .unwrap_or_else(|| "result could not be rendered".to_owned())
 }
 
-/// Wraps consolidated text as one complete `inspect` reply.
-fn inspect_reply(text: String) -> PeerReply {
+/// Wraps consolidated text as one complete reply: `inspect`, or `read` when it carries a whole
+/// Read or Prepare result, so that source is held to no output ceiling ([`PeerReply::delivers_source`]).
+fn inspect_reply(text: String, carries_source: bool) -> PeerReply {
     PeerReply::Complete {
-        kind: ResultKind::Inspect,
+        kind: if carries_source {
+            ResultKind::Read
+        } else {
+            ResultKind::Inspect
+        },
         text,
         detail_ref: None,
         truncated: false,
@@ -185,8 +191,9 @@ impl WorkerHandle {
         }
     }
 
-    /// Answers several references in order within the reply budget; with a wait, re-reads until
-    /// at least one of them settles or the deadline passes.
+    /// Answers several references in order: retained Read and Prepare results whole, the other
+    /// sections within an even share of the reply budget; with a wait, re-reads until at least one
+    /// of them settles or the deadline passes.
     async fn inspect_many(
         &self,
         binding: &BindingRef,
@@ -222,16 +229,32 @@ impl WorkerHandle {
                 .await;
             }
             if settled || tokio::time::Instant::now() >= deadline {
-                let share = REPLY_TEXT_BUDGET / references.len().max(1);
+                let replies: Vec<PeerReply> = references
+                    .iter()
+                    .zip(&replies)
+                    .map(|(reference, reply)| {
+                        self.progress_reply(binding, reference, reply.clone())
+                    })
+                    .collect();
+                let sources = replies
+                    .iter()
+                    .filter(|reply| reply.delivers_source())
+                    .count();
+                let share = REPLY_TEXT_BUDGET / (replies.len() - sources).max(1);
                 let sections = references
                     .iter()
                     .zip(&replies)
                     .map(|(reference, reply)| {
-                        let reply = self.progress_reply(binding, reference, reply.clone());
-                        format!("== {reference} ==\n{}", cut(&compact(&reply), share))
+                        let text = compact(reply);
+                        let text = if reply.delivers_source() {
+                            text.as_str()
+                        } else {
+                            cut(&text, share)
+                        };
+                        format!("== {reference} ==\n{text}")
                     })
                     .collect::<Vec<_>>();
-                return inspect_reply(sections.join("\n"));
+                return inspect_reply(sections.join("\n"), sources > 0);
             }
         }
     }

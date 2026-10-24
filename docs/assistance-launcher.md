@@ -431,7 +431,7 @@ project context and are not sent to the main agent or ordinary logs.
 
 ## Task context (experimental)
 
-`ide.prepare {"task":"exact user task","token_budget":12000}` prepares current source
+`ide.prepare {"task":"exact user task"}` prepares current source
 inside the active writer workspace. It does not execute tests or edit source, and it never
 builds or refreshes the index: it reads only the index the background indexer published.
 Without one it answers `prepare: not_ready` in the same call and names the cause. Index
@@ -511,16 +511,15 @@ provider-backed test localization run on the normal worker. Stop cancels and joi
 Returned source is re-observed under current authority and refused if changed. The call waits
 up to 45 s and answers in one reply, never paged and never continued through `ide.inspect`:
 a status line (`complete`, `partial` or `needs_evidence`), the applicable `AGENTS.md`/`CLAUDE.md`
-rules and nearest manifests (first 32 KiB each; a longer file is cut on a line end and listed as omitted), numbered source per file
+rules and nearest manifests (each whole), numbered source per file
 with its line ranges, role and selection reasons (a partial file adds its header, imports and the
 signatures of declarations not shown), an explicit `omitted:` list and one usage line.
-Source units are admitted in required-first, rank order using the actual rendered size;
-an oversized unit does not exclude smaller later units. A localized test-context bundle
-is admitted or omitted in full, including its supporting ranges. Rules and explicitly named manifests
-have priority; other manifest context uses remaining space after source. If protected context
-alone prevents a bounded answer, its removal is disclosed rather than silently dropping code.
-Omission text counts toward both limits, and rows covered by another unit are not called omitted.
-The requested budget is kept; whatever leaves to fit the reply is named under `omitted:`.
+Every selected source unit is delivered whole, required units first, then by rank; a
+localized test-context bundle arrives with all its supporting ranges. Rules, task-named files
+and manifests are delivered whole; a manifest already delivered whole as ranked source is not
+repeated. Nothing is omitted, cut or paged for reply size: the packet has no output ceiling,
+`token_budget` is ignored (with a note), and `omitted:` lists only selection gaps. A host that
+clips long tool output does so outside the IDE (Codex: raise `tool_output_token_limit`).
 `complete` means
 the retriever reported no gap, every required unit is complete and nothing was left out or
 cut. Delivered rows are remembered like a read of them; every delivered file keeps its

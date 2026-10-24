@@ -258,22 +258,26 @@ async fn task_context_mcp_slow_preparation_answers_in_one_call() {
     assert_ne!(packet["status"], "needs_evidence", "{packet}");
 }
 
-/// A small requested budget is honoured by the rendered text itself, and what did not fit is
-/// named: the packet is never `complete` then, and never larger than the budget's estimate.
+/// A legacy `token_budget` no longer limits the packet: even 100, which the old validator
+/// refused (1024..32000), is accepted, answered with an explicit warning, and the packet is
+/// several times larger than that budget with nothing omitted for size.
 #[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
 #[tokio::test]
-async fn task_context_mcp_small_budget_is_partial_and_bounded() {
+async fn task_context_mcp_legacy_budget_never_cuts_the_packet() {
     let packet = roundtrip(
         json!({"embedding":null,"jev":null,"max_new_calls":0,"include_threshold":0.5}),
         None,
         &[],
-        1024,
+        100,
     )
     .await;
     let text = packet["text"].as_str().unwrap();
-    assert!(text.len() <= 4 * 1024, "{} bytes: {text}", text.len());
-    assert_ne!(packet["status"], "complete", "{packet}");
-    assert!(text.contains("\nomitted:\n"), "{text}");
+    assert!(text.len() > 4 * 1024, "{} bytes: {text}", text.len());
+    assert!(
+        text.contains("token_budget is ignored: the packet carries every selected unit whole"),
+        "{text}"
+    );
+    assert!(!text.contains("omitted to fit"), "{text}");
 }
 
 /// With background indexing disabled no index is ever built and `ide.prepare` answers a final

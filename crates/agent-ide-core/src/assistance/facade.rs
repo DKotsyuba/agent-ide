@@ -418,11 +418,21 @@ pub fn tool_schemas() -> [ToolSchema; 12] {
             AssistanceTool::Prepare,
             json!({"type":"object","additionalProperties":false,"required":["task"],"properties":{
                 "task":{"type":"string","minLength":1,"maxLength":16384},
-                "token_budget":{"type":"integer","minimum":1024,"maximum":32000,"default":12000}
+                "token_budget":{"type":"integer","minimum":0,"description":"Deprecated; ignored."}
             }}),
         ),
     ]
 }
+
+/// Tool `_meta` key with which an MCP server declares how many characters of one result its
+/// host may show inline. Claude Code (2.1.296) skips its MCP output-token limit for a tool that
+/// declares it and persists a result to a file only above the declared size, capped at
+/// [`WHOLE_SOURCE_RESULT_CHARS`]; without it a result over 100 000 characters (or the
+/// 25 000-token MCP limit) reaches the model only as a saved-file notice.
+pub(crate) const WHOLE_SOURCE_RESULT_META: &str = "anthropic/maxResultSizeChars";
+/// Inline result size declared for Read, Prepare and Inspect: Claude Code's own ceiling for a
+/// declared result size, so a whole packet up to it is shown to the model unchanged.
+pub(crate) const WHOLE_SOURCE_RESULT_CHARS: u64 = 500_000;
 
 /// Maximum bytes of a symbol path argument.
 pub const MAX_SYMBOL_PATH_BYTES: usize = 1024;
@@ -1022,14 +1032,14 @@ pub(crate) fn validate_normalized_call(
             if task.trim().is_empty() {
                 return Err(invalid_field("task", FieldRule::OneOf("nonempty task")));
             }
-            if object.get("token_budget").is_some_and(|value| {
-                value
-                    .as_u64()
-                    .is_none_or(|budget| !(1024..=32000).contains(&budget))
-            }) {
+            // Accepted for compatibility only; the packet is never cut to a budget.
+            if object
+                .get("token_budget")
+                .is_some_and(|value| value.as_u64().is_none())
+            {
                 return Err(invalid_field(
                     "token_budget",
-                    FieldRule::OneOf("integer 1024..32000"),
+                    FieldRule::OneOf("nonnegative integer"),
                 ));
             }
         }
@@ -2227,7 +2237,7 @@ impl AssistanceFacade {
         // The method envelope has the daemon's own method-payload bound, so the front's private
         // host metadata never takes room from bounded model arguments.
         let Some(parameters) = OpaqueJson::from_value(
-            &json!({"parameters":call.parameters(),"host_meta":host.host_meta}),
+            &method_envelope(tool, call.parameters(), host.host_meta.as_ref()),
             crate::app::MAX_ASSISTANCE_JSON_BYTES,
         ) else {
             return (FacadeOutcome::InvalidParameters, None, None);
@@ -2320,6 +2330,55 @@ impl AssistanceFacade {
         };
         (outcome, tag, lost_handoff)
     }
+}
+
+/// Builds one method envelope: the validated model `parameters` and the trusted `host_meta`, to
+/// which a call whose reply may carry whole source adds
+/// [`crate::app::transport::WHOLE_SOURCE_META`], so the daemon knows this front decodes it.
+/// Absent host metadata stays absent; the envelope keeps exactly its two historical keys.
+fn method_envelope(tool: AssistanceTool, parameters: &Value, host_meta: Option<&Value>) -> Value {
+    let mut host_meta = host_meta.cloned();
+    if tool.transport_method().delivers_source()
+        && let Some(Value::Object(meta)) = host_meta.as_mut()
+    {
+        meta.insert(
+            crate::app::transport::WHOLE_SOURCE_META.into(),
+            Value::Bool(true),
+        );
+    }
+    json!({"parameters":parameters,"host_meta":host_meta})
+}
+
+/// Read, Prepare and Inspect envelopes announce whole-source decoding; other tools' envelopes and
+/// absent host metadata are unchanged, and every envelope keeps exactly its two keys.
+#[test]
+fn whole_source_tools_announce_the_front_capability() {
+    let meta = json!({"claudecode/toolUseId":"call"});
+    for tool in [
+        AssistanceTool::Read,
+        AssistanceTool::Prepare,
+        AssistanceTool::Inspect,
+    ] {
+        let envelope = method_envelope(tool, &json!({}), Some(&meta));
+        assert_eq!(envelope.as_object().unwrap().len(), 2);
+        assert_eq!(
+            envelope["host_meta"][crate::app::transport::WHOLE_SOURCE_META],
+            json!(true)
+        );
+        assert_eq!(envelope["host_meta"]["claudecode/toolUseId"], "call");
+    }
+    for tool in [
+        AssistanceTool::Context,
+        AssistanceTool::Edit,
+        AssistanceTool::Start,
+    ] {
+        let envelope = method_envelope(tool, &json!({}), Some(&meta));
+        assert_eq!(envelope["host_meta"], meta);
+    }
+    assert_eq!(
+        method_envelope(AssistanceTool::Read, &json!({}), None),
+        json!({"parameters":{},"host_meta":null})
+    );
 }
 
 /// Reports whether a delivered call's outcome is the kind a wedged daemon produces: a transport
@@ -5257,12 +5316,22 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
 
 impl StdioFacade {
     /// Builds the eleven-tool public router with the language-derived description phrases filled in
-    /// from the registered languages (see [`describe_languages`]).
+    /// from the registered languages (see [`describe_languages`]), and the whole-source result
+    /// annotation on the tools whose replies carry source of any size
+    /// ([`WHOLE_SOURCE_RESULT_META`]).
     pub(super) fn described_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         let mut router = Self::tool_router();
         for route in router.map.values_mut() {
             if let Some(description) = route.attr.description.as_mut() {
                 *description = std::borrow::Cow::Owned(describe_languages(description));
+            }
+            if ["ide.read", "ide.prepare", "ide.inspect"].contains(&route.attr.name.as_ref()) {
+                let mut meta = serde_json::Map::new();
+                meta.insert(
+                    WHOLE_SOURCE_RESULT_META.into(),
+                    json!(WHOLE_SOURCE_RESULT_CHARS),
+                );
+                route.attr.meta = Some(rmcp::model::MetaObject(meta));
             }
         }
         router
@@ -5271,7 +5340,7 @@ impl StdioFacade {
 
 #[tool_router]
 impl StdioFacade {
-    /// Task source packet in one call; operator-configured models. Check gaps; tokens are estimated.
+    /// Task source packet in one call, selected source whole; operator-configured models. Check gaps.
     #[tool(name = "ide.prepare", input_schema = tool_schemas()[11].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true))]
     async fn prepare(
@@ -5317,7 +5386,7 @@ impl StdioFacade {
             .await
     }
 
-    /// Batch items: {symbol} or {path, offset, limit}. Addresses: file#Type/f, #@imports, path:line, …:3-5. Current source; unchanged acknowledged, force:true resends.
+    /// Batch items: {symbol} or {path, offset, limit}. Addresses: file#Type/f, #@imports, path:line, …:3-5. Current source, every item whole; unchanged acknowledged, force:true resends.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn read(
@@ -5458,6 +5527,11 @@ impl CatalogHost {
             .into_iter()
             .filter(|tool| &*tool.name != "ide.context")
             .map(|mut tool| {
+                // The whole-source result annotation is Claude Code's own contract; Codex ignores
+                // it, so its catalog does not carry the bytes.
+                if self == Self::Codex {
+                    tool.meta = None;
+                }
                 let mut schema = (*tool.input_schema).clone();
                 if let Some(Value::Object(properties)) = schema.get_mut("properties") {
                     for legacy in ["file_path", "old_string", "new_string", "source_ref"] {
@@ -5798,13 +5872,15 @@ fn advertised_text_never_teaches_waiting() {
 
 /// The advertised catalog stays inside its byte budgets: the server paragraph under 700 bytes,
 /// every tool description under 600 bytes, every property description under 160 bytes
-/// (harness-reply-v1 section 3), and the per-host catalog totals of E-005 M-038. These are
+/// (harness-reply-v1 section 3), and the per-host catalog totals of E-005 M-038 — the Claude total
+/// raised by 200 B for the whole-source result annotation on Read, Prepare and Inspect, without
+/// which Claude Code shows a result over 100 000 characters only as a saved-file notice. These are
 /// export-byte regression limits only. Token/context acceptance requires actual assembled-host
 /// catalog plus skill measurements; the historical 9,069-token prompt delta is not a byte scale.
 #[test]
 fn catalog_stays_within_the_budgets() {
     for (host, paragraph, total_limit) in [
-        (CatalogHost::Claude, SERVER_INSTRUCTIONS, 8_000),
+        (CatalogHost::Claude, SERVER_INSTRUCTIONS, 8_200),
         (CatalogHost::Codex, SERVER_INSTRUCTIONS_CODEX, 7_500),
     ] {
         assert!(

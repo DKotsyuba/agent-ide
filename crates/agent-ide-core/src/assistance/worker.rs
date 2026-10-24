@@ -14242,12 +14242,13 @@ mod stop_retry_tests {
         // next inspection of the same reference starts from its own clean flag — here a refusal
         // (another binding's view of the reference) must not inherit a stale true.
         let (_, _) = inspect("ok-ref", false).await;
-        // Timeout/caller cancellation must preserve both the first and an expanded source page.
+        // Timeout/caller cancellation must preserve both the first and an expanded page. Context
+        // still pages; Read and Prepare source is never paged.
         let (first, page) = ContextPageState::new(
             "a retained row\n".repeat(20_000),
             0,
             false,
-            ResultKind::Read,
+            ResultKind::Context,
         )
         .next("paged-ref")
         .unwrap();

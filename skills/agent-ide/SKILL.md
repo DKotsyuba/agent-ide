@@ -7,7 +7,7 @@ description: Task-based Agent IDE workflow, compatible batches, native fallback 
 
 The tool descriptions define each call; this skill holds the rules. Call `ide.start` first.
 
-For an unfamiliar task, an enabled `ide.prepare {"task":"exact task","token_budget":12000}`
+For an unfamiliar task, an enabled `ide.prepare {"task":"exact task"}`
 returns a source shortlist from the active project. Read its gaps and source ranges before
 planning edits; omitted files are not proven irrelevant. The operator controls indexing and
 model services. If disabled, use the normal outline/read/search workflow. Indexing and private

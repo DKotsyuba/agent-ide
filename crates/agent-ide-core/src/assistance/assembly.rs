@@ -101,6 +101,21 @@ fn binding_cause(reason: super::host_binding::BindingUnavailable) -> HostBinding
     HostBindingCause::from_binding(reason).unwrap_or(HostBindingCause::InvalidMetadata)
 }
 
+/// Detail of [`outdated_front_refusal`]: a `read:source_unavailable:` detail, whose message every
+/// front's template prints after its fixed sentence.
+pub(crate) const OUTDATED_FRONT_DETAIL: &str = "read:source_unavailable:This IDE front is older than its daemon and cannot receive whole source replies; restart this agent session so the current IDE front loads, then repeat the call.";
+
+/// The refusal a Read, Prepare or Inspect call gets from a front that did not announce
+/// [`crate::app::transport::WHOLE_SOURCE_META`]: `source_unavailable` with
+/// [`OUTDATED_FRONT_DETAIL`], which older fronts decode and render as an actionable error, never
+/// as an executed call with an unknown outcome.
+fn outdated_front_refusal() -> PeerReply {
+    PeerReply::Error {
+        code: super::reply::FailureCode::SourceUnavailable,
+        detail: Some(OUTDATED_FRONT_DETAIL.to_owned()),
+    }
+}
+
 /// Most actor tags one `claudecode/recover` announcement may carry.
 const MAX_RECOVER_TAGS: usize = 32;
 
@@ -907,6 +922,16 @@ impl ProductDispatcher {
                         .clone(),
                 )
                 .or_cause(HostBindingCause::InvalidParameters)?;
+                // A front that cannot decode whole-source replies (one older than this daemon) is
+                // refused before anything executes, so no read memory or edit base records a reply
+                // it could not receive. The refusal is a code and detail older fronts already
+                // render, naming the restart that fixes it rather than inviting a repeat.
+                if method.method().delivers_source()
+                    && meta.get(crate::app::transport::WHOLE_SOURCE_META)
+                        != Some(&Value::Bool(true))
+                {
+                    return Ok(outdated_front_refusal());
+                }
                 if self
                     .worker
                     .as_ref()
@@ -1628,10 +1653,18 @@ impl AssistanceDispatcher for ProductDispatcher {
             // decoding byte-identical replies.
             // An empty tag (an identity query whose call no actor owns) is sent as `null`: the
             // wrapper itself tells the front that this daemon answers identity queries.
+            // The wrapper keeps the method's own reply bound, so Read and Prepare source stays whole.
+            let wrapper_bytes = match &request {
+                AssistanceDispatch::MethodDispatch(method) => {
+                    crate::app::method_reply_bounds(method.method(), crate::app::MAX_V2_FRAME_BYTES)
+                        .1
+                }
+                AssistanceDispatch::HookSubmit(_) => crate::app::MAX_ASSISTANCE_JSON_BYTES,
+            };
             let reply = match tag {
                 Some(tag) => OpaqueJson::from_value(
                     &json!({"actor": (!tag.is_empty()).then_some(tag), "reply": serde_json::from_str::<Value>(reply.as_str()).ok()}),
-                    crate::app::MAX_ASSISTANCE_JSON_BYTES,
+                    wrapper_bytes,
                 )
                 .ok_or(AssistanceDispatchUnavailable)?,
                 None => reply,
@@ -1846,6 +1879,82 @@ async fn ingress_exits_name_a_typed_cause() {
         ))
         .await,
         HostBindingCause::InvalidParameters
+    );
+}
+
+/// A front that did not announce `agent-ide/whole-source` (one older than this daemon) gets an
+/// actionable `source_unavailable` refusal for Read, Prepare and Inspect before anything executes;
+/// with the announcement the call proceeds to ordinary binding. The key is ignored, like every
+/// unread host-metadata key, by methods without whole-source replies, which is also why an older
+/// daemon accepts a current front's envelopes unchanged.
+#[tokio::test]
+async fn whole_source_calls_need_the_front_announcement() {
+    use crate::app::transport::{MethodDispatch, OpaqueJson, WHOLE_SOURCE_META};
+
+    let dispatcher = ProductDispatcher::default();
+    let reply_of = |name: AssistanceMethod, parameters: Value, announced: bool| {
+        let dispatcher = &dispatcher;
+        async move {
+            let mut meta = json!({"claudecode/toolUseId":"call"});
+            if announced {
+                meta[WHOLE_SOURCE_META] = json!(true);
+            }
+            let request = AssistanceDispatch::MethodDispatch(
+                MethodDispatch::new(
+                    "request",
+                    "call",
+                    "attachment",
+                    name,
+                    OpaqueJson::from_value(
+                        &json!({"parameters":parameters,"host_meta":meta}),
+                        64 * 1024,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            let reply = match dispatcher.dispatch(request).await.unwrap() {
+                AssistanceDispatchReply::HookSubmit(reply)
+                | AssistanceDispatchReply::MethodDispatch(reply) => reply,
+            };
+            PeerReply::decode(reply.as_str()).unwrap()
+        }
+    };
+    let refused = PeerReply::Error {
+        code: super::reply::FailureCode::SourceUnavailable,
+        detail: Some(OUTDATED_FRONT_DETAIL.to_owned()),
+    };
+    for (name, parameters) in [
+        (AssistanceMethod::Read, json!({"path":"a.rs"})),
+        (AssistanceMethod::Prepare, json!({"task":"fix it"})),
+        (AssistanceMethod::Inspect, json!({"detail_ref":"ref-1"})),
+    ] {
+        assert_eq!(
+            reply_of(name, parameters.clone(), false).await,
+            refused,
+            "{name:?}"
+        );
+        assert_ne!(reply_of(name, parameters, true).await, refused, "{name:?}");
+    }
+    // Methods without whole-source replies ignore the key: the same answer with or without it.
+    let plain = reply_of(AssistanceMethod::Context, json!({}), false).await;
+    assert_ne!(plain, refused);
+    assert_eq!(
+        reply_of(AssistanceMethod::Context, json!({}), true).await,
+        plain
+    );
+    // The refusal is rendered by the shared template every front version carries: an error that
+    // names the restart, never a repeat of an executed call.
+    let rendered =
+        super::content::render_with_status(refused, None, super::content::Envelope::TextOnly)
+            .unwrap();
+    assert_eq!(rendered.is_error, Some(true));
+    let text = rendered.content[0].as_text().unwrap().text.clone();
+    assert!(
+        text.contains("Read it with a native tool.")
+            && text.contains("This IDE front is older than its daemon")
+            && text.contains("restart this agent session"),
+        "{text}"
     );
 }
 

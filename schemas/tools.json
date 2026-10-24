@@ -186,6 +186,9 @@
     "name": "ide.graph"
   },
   {
+    "_meta": {
+      "anthropic/maxResultSizeChars": 500000
+    },
     "annotations": {
       "openWorldHint": false,
       "readOnlyHint": true
@@ -271,12 +274,15 @@
     "name": "ide.outline"
   },
   {
+    "_meta": {
+      "anthropic/maxResultSizeChars": 500000
+    },
     "annotations": {
       "destructiveHint": false,
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Task source packet in one call; operator-configured models. Check gaps; tokens are estimated.",
+    "description": "Task source packet in one call, selected source whole; operator-configured models. Check gaps.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -284,7 +290,7 @@
           "type": "string"
         },
         "token_budget": {
-          "default": 12000,
+          "description": "Deprecated; ignored.",
           "type": "integer"
         }
       },
@@ -296,11 +302,14 @@
     "name": "ide.prepare"
   },
   {
+    "_meta": {
+      "anthropic/maxResultSizeChars": 500000
+    },
     "annotations": {
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Batch items: {symbol} or {path, offset, limit}. Addresses: file#Type/f, #@imports, path:line, …:3-5. Current source; unchanged acknowledged, force:true resends.",
+    "description": "Batch items: {symbol} or {path, offset, limit}. Addresses: file#Type/f, #@imports, path:line, …:3-5. Current source, every item whole; unchanged acknowledged, force:true resends.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

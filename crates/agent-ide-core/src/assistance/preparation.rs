@@ -15,8 +15,9 @@ pub(super) struct Pending {
     /// When this computation must have finished; past it the call answers a final deadline
     /// refusal instead of a pending state the agent would have to poll.
     deadline: tokio::time::Instant,
-    /// Requested `token_budget`; the rendered packet's estimate must stay within it.
-    budget: u64,
+    /// Legacy `token_budget` argument when the caller sent one. Recorded in the trace and
+    /// answered with a warning; it never limits the packet.
+    budget: Option<u64>,
     /// Background indexing state of this worktree, for the not-ready answer.
     index_note: String,
     cancel: tokio_util::sync::CancellationToken,
@@ -404,11 +405,7 @@ impl Worker<'_> {
                     .as_str()
                     .ok_or(FailureCode::Internal)?
                     .to_owned();
-                let budget = job
-                    .parameters
-                    .get("token_budget")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(12000);
+                let budget = job.parameters.get("token_budget").and_then(Value::as_u64);
                 // Test-only stall before any work, to prove a slow preparation still answers in
                 // one call; default builds never read it.
                 let stall = crate::test_seams::var("AGENT_IDE_TEST_PREPARE_DELAY_MS")
@@ -517,11 +514,8 @@ impl Worker<'_> {
                             return Err(std::io::Error::other("context cancelled"));
                         }
                         let service = ContextService::new(config.models)?;
-                        let options = PacketOptions {
-                            context_tokens: budget,
-                            reserved_tokens: 512,
-                            ..Default::default()
-                        };
+                        // Delivery collects whole selected units; no output budget reaches selection.
+                        let options = PacketOptions::default();
                         let docs = DocumentOptions::default();
                         let evidence = public_report
                             .as_ref()
@@ -705,11 +699,7 @@ impl Worker<'_> {
             .await?;
             let root = authority.worktree().worktree_path().to_path_buf();
             let mut prelude = Vec::new();
-            let (read, over_limit) = split_prelude(prelude_paths(
-                &root,
-                sources.iter().map(|file| file.path.as_path()),
-            ));
-            for path in read {
+            for path in prelude_paths(&root, sources.iter().map(|file| file.path.as_path())) {
                 let (observed, bytes) = self.observe_as(&binding, path.clone(), false).await?;
                 if std::str::from_utf8(&bytes).is_err() {
                     unreadable.push(path);
@@ -719,18 +709,6 @@ impl Worker<'_> {
                 file.observed = Some(observed);
                 prelude.push(file);
             }
-            let cut_prelude: Vec<String> = prelude
-                .iter()
-                .filter(|file| file.head.len() < file.total)
-                .map(|file| {
-                    format!(
-                        "{}: only the first {} of {} bytes delivered",
-                        file.path.display(),
-                        file.head.len(),
-                        file.total
-                    )
-                })
-                .collect();
             let active = self.shared.active(&binding)?;
             self.workspace
                 .authorize(&authority, &active)
@@ -743,12 +721,6 @@ impl Worker<'_> {
                     .warnings
                     .push("embeddings: not every indexed unit was embedded".to_owned());
             }
-            omitted.extend(cut_prelude);
-            omitted.extend(
-                over_limit
-                    .iter()
-                    .map(|path| format!("{}: prelude file limit reached", path.display())),
-            );
             omitted.extend(
                 unreadable
                     .iter()
@@ -763,32 +735,24 @@ impl Worker<'_> {
                     .warnings
                     .push(format!("prepare trace incomplete: {reason}"));
             }
-            if pending.budget > (content::MAX_PREPARE_REPLY_BYTES / 4) as u64 {
-                prepared.warnings.push(format!(
-                    "requested context budget {} constrained by {}-byte serialized reply limit",
-                    pending.budget,
-                    content::MAX_PREPARE_REPLY_BYTES
-                ));
+            if pending.budget.is_some() {
+                prepared.warnings.push(
+                    "token_budget is ignored: the packet carries every selected unit whole"
+                        .to_owned(),
+                );
             }
             if let Some(trace) = &prepared.trace {
                 trace.record("packing_input", serde_json::json!({"operation_ref":job.reference,
-                    "token_budget":pending.budget,"carrier_limit":content::MAX_PREPARE_REPLY_BYTES,
+                    "requested_token_budget":pending.budget,
                     "prelude_policy":{"manifests":MANIFEST_FILES,"instructions":RULE_FILES},
                     "units":units.iter().map(|u| serde_json::json!({"path":sources[u.file].path,
                         "content_hash":sources[u.file].hash,"range":u.range,"rank":u.rank,"required":u.required,
                         "bundle":u.bundle,"role":u.role,"complete_unit":u.complete})).collect::<Vec<_>>(),
-                    "prelude":prelude.iter().map(|f|serde_json::json!({"path":f.path,"included_bytes":f.head.len(),"total_bytes":f.total})).collect::<Vec<_>>(),
+                    "prelude":prelude.iter().map(|f|serde_json::json!({"path":f.path,"bytes":f.text.len(),"included_bytes":f.text.len(),"total_bytes":f.text.len()})).collect::<Vec<_>>(),
                     "prior_omissions":omitted
                 })).map_err(|_| FailureCode::Internal)?;
             }
-            let reply = fit_packet(
-                &prepared,
-                &sources,
-                &mut units,
-                &mut prelude,
-                &mut omitted,
-                pending.budget,
-            )?;
+            let reply = select_packet(&prepared, &sources, &mut units, &mut prelude, &omitted)?;
             // Read memory gets exactly the delivered rows, so unit and window edits see what the
             // agent saw.
             let files = delivered_files(&sources, &units);
@@ -820,7 +784,7 @@ impl Worker<'_> {
                 trace.finish(serde_json::json!({"operation_ref":job.reference,
                     "files":files.iter().map(|f|serde_json::json!({"path":sources[f.source].path,
                         "content_hash":sources[f.source].hash,"lines":f.spans,"whole_file":f.whole})).collect::<Vec<_>>(),
-                    "prelude":prelude.iter().map(|f|serde_json::json!({"path":f.path,"included_bytes":f.head.len(),"total_bytes":f.total})).collect::<Vec<_>>(),
+                    "prelude":prelude.iter().map(|f|serde_json::json!({"path":f.path,"bytes":f.text.len(),"included_bytes":f.text.len(),"total_bytes":f.text.len()})).collect::<Vec<_>>(),
                     "omissions":omitted,"carrier_bytes_without_status":content::prepare_carrier_bytes(&reply),
                     "host_visibility":"unverified; worker output is not external client receipt"
                 })).map_err(|_| FailureCode::Internal)?;
@@ -840,10 +804,6 @@ const RULE_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 /// Manifests that name a module's build, dependencies, features and test targets.
 #[cfg(feature = "jev-pilot")]
 const MANIFEST_FILES: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"];
-/// Bytes of one prelude file delivered verbatim; a longer file is cut on a line end, named under
-/// `omitted:` and so makes the packet `partial`.
-#[cfg(feature = "jev-pilot")]
-const PRELUDE_FILE_BYTES: usize = 32 * 1024;
 /// Longest a preparation computes; kept below the call's inline wait so a slow preparation ends
 /// in a final deadline refusal, never in a pending state.
 #[cfg(feature = "jev-pilot")]
@@ -1064,9 +1024,6 @@ fn failed_run(
 #[cfg(feature = "jev-pilot")]
 const DEADLINE_DETAIL: &str =
     "prepare:deadline: the packet was not ready within the one-call wait; nothing was delivered";
-/// Prelude files one packet carries at most.
-#[cfg(feature = "jev-pilot")]
-const MAX_PRELUDE_FILES: usize = 8;
 
 /// One re-observed source file of the packet.
 #[cfg(feature = "jev-pilot")]
@@ -1143,45 +1100,6 @@ fn delivered_files(sources: &[SourceFile], units: &[Unit]) -> Vec<DeliveredFile>
         .collect()
 }
 
-/// Keeps rules first; if protected context alone prevents a bounded answer, disclose its removal.
-#[cfg(feature = "jev-pilot")]
-fn fit_packet(
-    prepared: &Preparation,
-    sources: &[SourceFile],
-    units: &mut Vec<Unit>,
-    prelude: &mut Vec<PreludeFile>,
-    omitted: &mut Vec<String>,
-    budget: u64,
-) -> Result<PeerReply, FailureCode> {
-    let candidates = std::mem::take(units);
-    let mut available = std::mem::take(prelude);
-    let mut gaps = std::mem::take(omitted);
-    loop {
-        *units = candidates.clone();
-        *prelude = available.clone();
-        *omitted = gaps.clone();
-        match select_packet(prepared, sources, units, prelude, omitted, budget) {
-            Ok(reply) => return Ok(reply),
-            Err(FailureCode::Capacity) => {
-                let victim = prelude.last().ok_or(FailureCode::Capacity)?.path.clone();
-                let position = available
-                    .iter()
-                    .position(|file| file.path == victim)
-                    .ok_or(FailureCode::Internal)?;
-                available.remove(position);
-                if let Some(trace) = &prepared.trace {
-                    trace.record("packing_protected_removed",serde_json::json!({"path":victim,"reason":"protected context prevented a bounded reply"})).map_err(|_|FailureCode::Internal)?;
-                }
-                gaps.push(format!(
-                    "{}: protected context omitted to fit the requested budget",
-                    victim.display()
-                ));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 /// Recognizes an explicit relative path token, not a suffix inside an unrelated nested path.
 #[cfg(feature = "jev-pilot")]
 fn task_names_path(task: &str, path: &std::path::Path) -> bool {
@@ -1199,45 +1117,20 @@ fn task_names_path(task: &str, path: &std::path::Path) -> bool {
     })
 }
 
-/// Explains the measured output bounds without changing packing or guessing a failed projection.
-#[cfg(feature = "jev-pilot")]
-fn packing_bounds(reply: &PeerReply, budget: u64, accepted: bool) -> Vec<&'static str> {
-    if accepted {
-        return Vec::new();
-    }
-    let Some(bytes) = content::prepare_carrier_bytes(reply) else {
-        return vec!["projection_or_serialization_failed"];
-    };
-    let mut reasons = Vec::new();
-    if bytes.div_ceil(4) as u64 > budget {
-        reasons.push("requested_token_budget");
-    }
-    if bytes > content::MAX_PREPARE_REPLY_BYTES {
-        reasons.push("prepare_carrier_bytes");
-    }
-    if bytes > crate::assistance::reply::MAX_REPLY_BYTES - crate::assistance::reply::MCP_RESERVE {
-        reasons.push("common_reply_bytes");
-    }
-    if reasons.is_empty() {
-        reasons.push("other_envelope_constraint");
-    }
-    reasons
-}
-
-/// Builds a bounded reply by admitting ranked units, then optional manifest context.
-/// All possible omissions are budgeted from the start; only retained bytes receive receipts.
+/// Assembles the whole selected packet: every ranked unit (required first, then by rank), the
+/// rules and task-named files, then each manifest not already delivered whole as ranked source.
+/// Nothing is omitted for size; `omitted` carries only selection gaps. The serialized size is
+/// measured for the trace and never limits delivery.
 #[cfg(feature = "jev-pilot")]
 fn select_packet(
     prepared: &Preparation,
     sources: &[SourceFile],
-    units: &mut Vec<Unit>,
+    units: &mut [Unit],
     prelude: &mut Vec<PreludeFile>,
-    omitted: &mut Vec<String>,
-    budget: u64,
+    omitted: &[String],
 ) -> Result<PeerReply, FailureCode> {
-    let mut candidates = std::mem::take(units);
-    candidates.sort_by_key(|unit| (!unit.required, unit.rank));
-    let (rules, manifests): (Vec<_>, Vec<_>) =
+    units.sort_by_key(|unit| (!unit.required, unit.rank));
+    let (mut kept, manifests): (Vec<_>, Vec<_>) =
         std::mem::take(prelude).into_iter().partition(|file| {
             file.path
                 .file_name()
@@ -1245,171 +1138,37 @@ fn select_packet(
                 .is_some_and(|name| RULE_FILES.contains(&name))
                 || task_names_path(&prepared.packet.task, &file.path)
         });
-    *prelude = rules;
-    let base_omitted = std::mem::take(omitted);
-    let notes: Vec<_> = candidates
-        .iter()
-        .map(|unit| {
-            format!(
-                "{}: omitted to fit one reply",
-                unit_label(&sources[unit.file], unit)
-            )
-        })
-        .chain(
-            manifests
-                .iter()
-                .map(|file| format!("{}: omitted to fit one reply", file.path.display())),
-        )
-        .collect();
-    let mut included = vec![false; notes.len()];
-    let assemble = |units: &[Unit], prelude: &[PreludeFile], included: &[bool]| {
-        let gaps: Vec<_> = base_omitted
-            .iter()
-            .cloned()
-            .chain(
-                notes
-                    .iter()
-                    .zip(included)
-                    .filter(|(_, kept)| !**kept)
-                    .map(|(note, _)| note.clone()),
-            )
-            .collect();
-        let files = delivered_files(sources, units);
-        let text = render_packet(prepared, sources, &files, prelude, units, &gaps);
-        (
-            PeerReply::Complete {
-                kind: ResultKind::Prepare,
-                text,
-                detail_ref: None,
-                truncated: false,
-                continuation: false,
-            },
-            gaps,
-        )
-    };
-    // Fit the escaped production carrier, not only its unescaped source text.
-    let fits =
-        |reply: &PeerReply| content::fits_prepare_budget(reply, content::reply_envelope(), budget);
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for (index, unit) in candidates.iter().enumerate() {
-        if let Some(bundle) = unit.bundle
-            && let Some(group) = groups
-                .iter_mut()
-                .find(|group| candidates[group[0]].bundle == Some(bundle))
-        {
-            group.push(index);
-        } else {
-            groups.push(vec![index]);
+    let files = delivered_files(sources, units);
+    for file in manifests {
+        // A manifest already delivered whole as ranked source needs no duplicate prelude.
+        let already_delivered = files.iter().any(|delivered| {
+            let source = &sources[delivered.source];
+            delivered.whole && source.path == file.path && source.text == file.text
+        });
+        if !already_delivered {
+            kept.push(file);
         }
     }
-    let source_count = candidates.len();
-    let requested: Vec<_> = candidates
-        .iter()
-        .map(|unit| (unit.file, unit.range))
-        .collect();
-    included[..source_count].fill(true);
-    let complete_reply = assemble(&candidates, prelude, &included).0;
-    let complete_fits = fits(&complete_reply);
+    *prelude = kept;
+    let text = render_packet(prepared, sources, &files, prelude, units, omitted);
+    let reply = PeerReply::Complete {
+        kind: ResultKind::Prepare,
+        text,
+        detail_ref: None,
+        truncated: false,
+        continuation: false,
+    };
     if let Some(trace) = &prepared.trace {
+        let bytes = content::prepare_carrier_bytes(&reply);
         trace
             .record(
                 "packing_all",
-                serde_json::json!({"fits":complete_fits,"failed_bounds":packing_bounds(&complete_reply,budget,complete_fits),
-            "carrier_bytes":content::prepare_carrier_bytes(&complete_reply),"token_budget":budget}),
+                serde_json::json!({"carrier_bytes":bytes,
+                    "estimated_tokens":bytes.map(|bytes| bytes.div_ceil(4)),
+                    "units":units.len(),"prelude_files":prelude.len()}),
             )
             .map_err(|_| FailureCode::Internal)?;
     }
-    if complete_fits {
-        // Overlapping units can be cheaper together than their separate omission labels.
-        *units = candidates;
-    } else {
-        included[..source_count].fill(false);
-        for group in &groups {
-            let before = units.len();
-            for &position in group {
-                included[position] = true;
-                units.push(candidates[position].clone());
-            }
-            let trial = assemble(units, prelude, &included).0;
-            let accepted = fits(&trial);
-            if let Some(trace) = &prepared.trace {
-                trace.record("packing_unit", serde_json::json!({"accepted":accepted,"failed_bounds":packing_bounds(&trial,budget,accepted),
-                    "reason":if accepted { "fits" } else { "reply_did_not_fit" },
-                    "carrier_limit_bytes":content::MAX_PREPARE_REPLY_BYTES,
-                    "estimated_tokens":content::prepare_carrier_bytes(&trial).map(|bytes|bytes.div_ceil(4)),
-                    "carrier_bytes":content::prepare_carrier_bytes(&trial),"token_budget":budget,
-                    "units":group.iter().map(|&i|serde_json::json!({"path":sources[candidates[i].file].path,
-                        "range":candidates[i].range,"rank":candidates[i].rank,"bundle":candidates[i].bundle})).collect::<Vec<_>>()
-                })).map_err(|_| FailureCode::Internal)?;
-            }
-            if !accepted {
-                units.truncate(before);
-                for &position in group {
-                    included[position] = false;
-                }
-            }
-        }
-    }
-    for (position, file) in manifests.into_iter().enumerate() {
-        let slot = source_count + position;
-        included[slot] = true;
-        // A manifest already delivered whole as ranked source needs no duplicate prelude.
-        let already_delivered = delivered_files(sources, units).iter().any(|delivered| {
-            let source = &sources[delivered.source];
-            delivered.whole
-                && source.path == file.path
-                && source.text.len() == file.total
-                && source.text.starts_with(&file.head)
-        });
-        if already_delivered {
-            continue;
-        }
-        let path = file.path.clone();
-        prelude.push(file);
-        let trial = assemble(units, prelude, &included).0;
-        let accepted = fits(&trial);
-        if let Some(trace) = &prepared.trace {
-            trace
-                .record(
-                    "packing_prelude",
-                    serde_json::json!({"path":path,"accepted":accepted,"failed_bounds":packing_bounds(&trial,budget,accepted),
-                "reason":if accepted { "fits" } else { "reply_did_not_fit" },
-                    "carrier_limit_bytes":content::MAX_PREPARE_REPLY_BYTES,
-                    "estimated_tokens":content::prepare_carrier_bytes(&trial).map(|bytes|bytes.div_ceil(4)),
-                "carrier_bytes":content::prepare_carrier_bytes(&trial),"token_budget":budget}),
-                )
-                .map_err(|_| FailureCode::Internal)?;
-        }
-        if !accepted {
-            prelude.pop();
-            included[slot] = false;
-        }
-    }
-    // A skipped unit may still be delivered by later overlapping selections.
-    let delivered = delivered_files(sources, units);
-    for group in &groups {
-        let covered = group.iter().all(|&slot| {
-            let (file, range) = requested[slot];
-            let (first, last) = line_span(&sources[file].text, range.0, range.1);
-            delivered.iter().any(|item| {
-                item.source == file
-                    && item
-                        .spans
-                        .iter()
-                        .any(|&(start, end)| start <= first && end >= last)
-            })
-        });
-        if covered {
-            for &slot in group {
-                included[slot] = true;
-            }
-        }
-    }
-    let (reply, gaps) = assemble(units, prelude, &included);
-    if !fits(&reply) {
-        return Err(FailureCode::Capacity);
-    }
-    *omitted = gaps;
     Ok(reply)
 }
 
@@ -1425,36 +1184,23 @@ fn unit_label(source: &SourceFile, unit: &Unit) -> String {
     }
 }
 
-/// One rule or manifest file and the verbatim head the packet carries.
+/// One rule or manifest file, carried whole and verbatim.
 #[cfg(feature = "jev-pilot")]
 #[derive(Clone)]
 struct PreludeFile {
     path: std::path::PathBuf,
-    head: String,
-    total: usize,
+    text: String,
     /// Observation of the delivered bytes, kept as a freshness fence.
     observed: Option<SourceObservation>,
 }
 
 #[cfg(feature = "jev-pilot")]
 impl PreludeFile {
-    /// Keeps at most [`PRELUDE_FILE_BYTES`], cut back to a line end, and the full size.
+    /// Keeps the whole file; the caller has already checked it is UTF-8.
     fn new(path: std::path::PathBuf, bytes: &[u8]) -> Self {
-        let text = String::from_utf8_lossy(bytes);
-        let head = if text.len() <= PRELUDE_FILE_BYTES {
-            text.to_string()
-        } else {
-            let mut cut = PRELUDE_FILE_BYTES;
-            while !text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            let cut = text[..cut].rfind('\n').map_or(cut, |index| index + 1);
-            text[..cut].to_owned()
-        };
         Self {
             path,
-            head,
-            total: bytes.len(),
+            text: String::from_utf8_lossy(bytes).into_owned(),
             observed: None,
         }
     }
@@ -1462,7 +1208,7 @@ impl PreludeFile {
 
 /// Worktree-relative rule files (root first, then nearer directories) and the nearest manifest
 /// of every delivered file plus the root manifest, each a regular file and listed once. The
-/// list is bounded by the delivered files' ancestors; [`split_prelude`] applies the read limit.
+/// list is bounded by the delivered files' ancestors.
 ///
 /// Only the ancestors of `files` are probed with `symlink_metadata`: no walk, no Git call and no
 /// path outside `root`. A symlink or non-regular file declares nothing.
@@ -1507,16 +1253,6 @@ fn prelude_paths<'a>(
     }
     rules.extend(manifests);
     rules
-}
-
-/// Splits prelude paths into the first [`MAX_PRELUDE_FILES`] to read and the rest, which the
-/// packet names under `omitted:` (making it `partial`) instead of dropping them silently.
-#[cfg(feature = "jev-pilot")]
-fn split_prelude(
-    mut paths: Vec<std::path::PathBuf>,
-) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
-    let rest = paths.split_off(paths.len().min(MAX_PRELUDE_FILES));
-    (paths, rest)
 }
 
 /// Whether rows for `ranges` cover every line of `text` (rows are whole lines, so a window cut
@@ -1670,18 +1406,9 @@ fn render_packet(
         body.push_str("rules and manifests:\n");
         for file in prelude {
             let _ = writeln!(body, "--- {}", file.path.display());
-            body.push_str(&file.head);
-            if !file.head.ends_with('\n') {
+            body.push_str(&file.text);
+            if !file.text.ends_with('\n') {
                 body.push('\n');
-            }
-            if file.head.len() < file.total {
-                let _ = writeln!(
-                    body,
-                    "({}: first {} of {} bytes)",
-                    file.path.display(),
-                    file.head.len(),
-                    file.total
-                );
             }
         }
         body.push('\n');
@@ -1995,21 +1722,9 @@ mod tests {
                 reasons: window.reasons.clone(),
             });
         }
-        let mut gaps = prepared.packet.gaps.clone();
-        let reply = fit_packet(
-            &prepared,
-            &sources,
-            &mut units,
-            &mut Vec::new(),
-            &mut gaps,
-            2400,
-        )
-        .unwrap();
-        assert!(content::fits_prepare_budget(
-            &reply,
-            content::reply_envelope(),
-            2400
-        ));
+        let gaps = prepared.packet.gaps.clone();
+        let reply = select_packet(&prepared, &sources, &mut units, &mut Vec::new(), &gaps).unwrap();
+        assert!(content::fits(&reply, content::reply_envelope()));
         let PeerReply::Complete { text, .. } = reply else {
             panic!("expected packet")
         };
@@ -2022,15 +1737,16 @@ mod tests {
             !gaps.iter().any(|gap| gap.contains("needle-worker.alpha")),
             "{gaps:?}"
         );
-        assert!(
-            gaps.iter().any(|gap| gap.contains("noise-")),
-            "competing import must actually exceed the carrier"
-        );
+        // The competing import is delivered too: nothing is omitted to fit one reply.
+        assert!(text.contains("noise-"), "{text}");
+        assert!(!text.contains("omitted to fit"), "{text}");
     }
 
-    /// A large optional manifest must not displace useful code and leave most of the budget idle.
+    /// Every selected unit, every rule and every manifest reaches the packet whole, past the
+    /// former 38 000-byte carrier, the former 32 KiB prelude head and any `token_budget`; bundles
+    /// and overlapping selections are all kept, and the trace measures the size it never limits.
     #[test]
-    fn packing_keeps_code_instead_of_a_large_manifest() {
+    fn packing_delivers_every_selected_unit_and_manifest_whole() {
         use crate::project::context::{ContextBundle, IndexSnapshot};
         use crate::workspace::observation::{
             ObservationRef, ObservedState, SourceBytes, SourceCoverage, SourceRevision,
@@ -2046,8 +1762,6 @@ mod tests {
         .unwrap();
         let mut sources = Vec::new();
         for (name, width, lines) in [
-            // Together the required source units fit the production carrier; the optional
-            // 23 KiB manifest below does not. Keep >16 KiB for the bundle cases below.
             ("large-test.alpha", 63, 260),
             ("implementation.alpha", 31, 400),
             ("small.alpha", 27, 70),
@@ -2075,7 +1789,7 @@ mod tests {
         }
         std::fs::create_dir(root.join(".agent-ide")).unwrap();
         let trace_directory = root.join(".agent-ide/prepare-traces");
-        let mut prepared = Preparation {
+        let prepared = Preparation {
             trace: Some(crate::project::context::trace::PrepareTrace::new(&root).unwrap()),
             packet: ContextBundle {
                 task: "Repair observed failures".into(),
@@ -2102,7 +1816,7 @@ mod tests {
             warnings: vec![],
             elapsed_ms: 0.0,
         };
-        let mut units: Vec<_> = sources
+        let units: Vec<_> = sources
             .iter()
             .enumerate()
             .map(|(file, source)| Unit {
@@ -2117,39 +1831,34 @@ mod tests {
                 reasons: vec![],
             })
             .collect();
+        // Longer than the former 32 KiB prelude head.
+        let manifest = "m".repeat(40_000) + "\n";
         let mut prelude = vec![
             PreludeFile::new("AGENTS.md".into(), b"Keep the public behavior.\n"),
-            PreludeFile::new("package.json".into(), ("m".repeat(23102) + "\n").as_bytes()),
+            PreludeFile::new("package.json".into(), manifest.as_bytes()),
         ];
-        let original_units = units.clone();
-        let original_prelude = prelude.clone();
-        let mut omitted = Vec::new();
-        let reply = fit_packet(
-            &prepared,
-            &sources,
-            &mut units,
-            &mut prelude,
-            &mut omitted,
-            12000,
-        )
-        .unwrap();
+        let mut all = units.clone();
+        let reply = select_packet(&prepared, &sources, &mut all, &mut prelude, &[]).unwrap();
         let PeerReply::Complete { text, .. } = &reply else {
             panic!("expected packet")
         };
-        assert!(
-            text.contains("## implementation.alpha"),
-            "useful implementation was dropped"
-        );
-        assert!(
-            text.contains("## small.alpha"),
-            "smaller lower-ranked unit should use remaining capacity"
-        );
-        assert!(text.contains("--- AGENTS.md"), "rules must remain");
-        assert!(
-            !text.contains("--- package.json"),
-            "optional manifest displaced code"
-        );
-        assert!(omitted.iter().any(|line| line.contains("package.json")));
+        assert!(text.starts_with("prepare: complete"), "{text}");
+        for source in &sources {
+            assert!(text.contains(&format!("## {}", source.path.display())));
+        }
+        assert!(text.contains("--- AGENTS.md") && text.contains(&manifest));
+        assert!(!text.contains("omitted"), "nothing is omitted for size");
+        // Each whole file arrives through its last numbered row.
+        for source in &sources {
+            let rows = source.text.lines().count();
+            assert!(
+                text.contains(&format!("\n{rows}\t")),
+                "{}",
+                source.path.display()
+            );
+        }
+        let carrier = content::prepare_carrier_bytes(&reply).unwrap();
+        assert!(carrier > 64 * 1024, "{carrier}");
         let trace_file = std::fs::read_dir(&trace_directory)
             .unwrap()
             .next()
@@ -2161,197 +1870,69 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert!(
-            events
-                .iter()
-                .any(|event| event["stage"] == "packing_prelude"
-                    && event["data"]["path"] == "package.json"
-                    && event["data"]["accepted"] == false)
-        );
+        assert!(events.iter().any(|event| event["stage"] == "packing_all"
+            && event["data"]["carrier_bytes"] == carrier
+            && event["data"]["units"] == 3
+            && event["data"]["prelude_files"] == 2));
         assert!(
             !events
                 .iter()
                 .any(|event| event["stage"] == "worker_reply_ready")
         );
-        assert!(
-            serde_json::to_value(&prepared)
-                .unwrap()
-                .get("trace")
-                .is_none()
-        );
-        assert!(
-            text.len().div_ceil(4) <= 12000 && content::fits(&reply, content::reply_envelope())
-        );
-        // Required implementation wins over a higher-ranked optional test under a tight cap.
-        let mut tight_units = original_units.clone();
-        tight_units[0].required = false;
-        let mut tight_prelude = original_prelude.clone();
-        let mut tight_omitted = Vec::new();
-        let tight = fit_packet(
-            &prepared,
-            &sources,
-            &mut tight_units,
-            &mut tight_prelude,
-            &mut tight_omitted,
-            5000,
-        )
-        .unwrap();
-        let PeerReply::Complete { text, .. } = tight else {
-            panic!("expected packet")
-        };
-        assert!(text.contains("## implementation.alpha") && !text.contains("## large-test.alpha"));
-        assert!(text.starts_with("prepare: partial"));
 
-        // Test, setup and import context are one unit: a small budget must not split it.
+        // Test, setup and import context of one bundle all arrive with the other units.
         let bundle: Vec<_> = [(0, 3200), (6400, 9600), (12800, 16000)]
             .into_iter()
             .map(|range| {
-                let mut unit = original_units[0].clone();
+                let mut unit = units[0].clone();
                 unit.range = range;
                 unit.bundle = Some(0);
                 unit
             })
             .collect();
         let mut bundled = bundle.clone();
-        bundled.push(original_units[2].clone());
-        let mut bundle_omitted = Vec::new();
-        fit_packet(
-            &prepared,
-            &sources,
-            &mut bundled,
-            &mut Vec::new(),
-            &mut bundle_omitted,
-            2000,
-        )
-        .unwrap();
-        assert!(bundled.iter().all(|unit| unit.file != 0));
-        assert!(bundled.iter().any(|unit| unit.file == 2));
-        assert_eq!(
-            bundle_omitted
-                .iter()
-                .filter(|note| note.contains("large-test.alpha"))
-                .count(),
-            3
-        );
-        let mut fitting = bundle.clone();
-        fit_packet(
-            &prepared,
-            &sources,
-            &mut fitting,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            5000,
-        )
-        .unwrap();
-        assert_eq!(fitting.len(), 3);
-        // An independent delivered overlap cannot hide omissions of the rest of the bundle.
-        let mut overlap = bundle[0].clone();
-        overlap.bundle = None;
-        let mut partial = vec![overlap];
-        partial.extend(bundle);
-        let mut missing = Vec::new();
-        fit_packet(
-            &prepared,
-            &sources,
-            &mut partial,
-            &mut Vec::new(),
-            &mut missing,
-            2000,
-        )
-        .unwrap();
-        assert_eq!(partial.len(), 1);
-        assert_eq!(
-            missing
-                .iter()
-                .filter(|note| note.contains("large-test.alpha"))
-                .count(),
-            3
-        );
-
-        // Naming a manifest explicitly keeps it even when it only exists in the prelude.
-        prepared.packet.task = "Update the test script in package.json".into();
-        let mut named_units = original_units.clone();
-        let mut named_prelude = original_prelude.clone();
-        let named = fit_packet(
-            &prepared,
-            &sources,
-            &mut named_units,
-            &mut named_prelude,
-            &mut Vec::new(),
-            12000,
-        )
-        .unwrap();
-        let PeerReply::Complete { text, .. } = named else {
+        bundled.push(units[2].clone());
+        let bundle_reply =
+            select_packet(&prepared, &sources, &mut bundled, &mut Vec::new(), &[]).unwrap();
+        let PeerReply::Complete { text, .. } = bundle_reply else {
             panic!("expected packet")
         };
-        assert!(text.contains("--- package.json") && text.contains("--- AGENTS.md"));
-        assert!(text.len().div_ceil(4) <= 12000);
+        assert!(
+            text.contains("## large-test.alpha — lines 1-50, 101-150, 201-250 of 260"),
+            "{text}"
+        );
+        assert!(text.contains("\n 50\t") || text.contains("\n50\t"));
+        assert!(text.contains("\n150\t") && text.contains("\n250\t"));
+        assert!(text.contains("## small.alpha — whole file"), "{text}");
 
-        // The JSON carrier remains binding even when the requested token allowance is large.
-        prepared.packet.task = "Repair observed failures".into();
-        let mut wide_units = original_units;
-        let mut wide_prelude = original_prelude;
-        let wide = fit_packet(
-            &prepared,
-            &sources,
-            &mut wide_units,
-            &mut wide_prelude,
-            &mut Vec::new(),
-            100000,
-        )
-        .unwrap();
-        assert!(content::fits(&wide, content::reply_envelope()));
-        let mut small_units = units.clone();
-        let mut large_rules = vec![PreludeFile::new(
-            "AGENTS.md".into(),
-            ("r".repeat(11999) + "\n").as_bytes(),
-        )];
-        let mut small_gaps = Vec::new();
-        let small = fit_packet(
-            &prepared,
-            &sources,
-            &mut small_units,
-            &mut large_rules,
-            &mut small_gaps,
-            1024,
-        )
-        .unwrap();
-        let PeerReply::Complete { text, .. } = &small else {
-            panic!("expected bounded packet")
-        };
-        assert!(text.len().div_ceil(4) <= 1024 && !text.starts_with("prepare: complete"));
-        assert!(small_gaps.iter().any(|gap| gap.contains("AGENTS.md")));
-        assert!(content::fits(&small, content::reply_envelope()));
-        // A skipped unit is not omitted when a later whole-file selection covers its rows.
+        // Overlapping selections are both kept and render as merged rows.
         let mut costly = units[0].clone();
         costly.range = (0, 32 * 50);
         costly.reasons = vec!["explanation".repeat(6000)];
         let mut whole = units[0].clone();
         whole.rank = 1;
         let mut overlap = vec![costly, whole];
-        let mut overlap_gaps = Vec::new();
-        let overlap_reply = fit_packet(
-            &prepared,
-            &sources,
-            &mut overlap,
-            &mut Vec::new(),
-            &mut overlap_gaps,
-            12000,
-        )
-        .unwrap();
-        assert_eq!(
-            overlap.len(),
-            1,
-            "the oversized explanation should have been skipped"
-        );
-        assert!(
-            overlap_gaps.is_empty(),
-            "covered source rows must not be labelled omitted"
-        );
+        let overlap_reply =
+            select_packet(&prepared, &sources, &mut overlap, &mut Vec::new(), &[]).unwrap();
         let PeerReply::Complete { text, .. } = overlap_reply else {
             panic!("expected packet")
         };
         assert!(text.starts_with("prepare: complete"));
+        assert!(text.contains("## large-test.alpha — whole file"), "{text}");
+        assert_eq!(
+            text.matches("\n260\t").count(),
+            1,
+            "merged rows render once"
+        );
+
+        // A manifest already delivered whole as ranked source is not repeated in the prelude.
+        let mut as_source = units.clone();
+        let mut duplicate = vec![PreludeFile::new(
+            "small.alpha".into(),
+            sources[2].text.as_bytes(),
+        )];
+        select_packet(&prepared, &sources, &mut as_source, &mut duplicate, &[]).unwrap();
+        assert!(duplicate.is_empty());
     }
 
     /// Explicit manifest names do not accidentally protect a different root manifest.
@@ -2383,13 +1964,12 @@ mod tests {
         assert_eq!(line_span(text, 3, 7), (2, 3));
     }
 
-    /// A long prelude file keeps whole lines and reports its full size.
+    /// A long prelude file is carried whole, byte for byte.
     #[test]
-    fn prelude_head_is_line_bounded_and_counted() {
-        let line = "x".repeat(99) + "\n";
-        let file = PreludeFile::new("AGENTS.md".into(), line.repeat(100).as_bytes());
-        assert!(file.head.len() <= PRELUDE_FILE_BYTES && file.head.ends_with('\n'));
-        assert_eq!(file.total, 10_000);
+    fn prelude_file_is_carried_whole() {
+        let text = ("é".repeat(49) + "\n").repeat(1_000);
+        let file = PreludeFile::new("AGENTS.md".into(), text.as_bytes());
+        assert_eq!(file.text, text);
     }
 
     /// Declaration lines carry a bounded one-line signature, or kind and name without one.
@@ -2434,19 +2014,6 @@ mod tests {
         assert!(!rows_exist(text, 0, 2), "zero line");
         assert!(!rows_exist(text, 3, 2), "reversed");
         assert!(!rows_exist(text, 2, 4), "past the end");
-    }
-
-    /// Prelude files past the limit are returned for `omitted:`, never dropped.
-    #[test]
-    fn prelude_over_the_limit_is_reported() {
-        let paths: Vec<std::path::PathBuf> = (0..MAX_PRELUDE_FILES + 3)
-            .map(|index| format!("d{index}/AGENTS.md").into())
-            .collect();
-        let (read, rest) = split_prelude(paths.clone());
-        assert_eq!(read, paths[..MAX_PRELUDE_FILES]);
-        assert_eq!(rest, paths[MAX_PRELUDE_FILES..]);
-        let (read, rest) = split_prelude(paths[..2].to_vec());
-        assert_eq!((read.len(), rest.len()), (2, 0));
     }
 
     /// A failure after model admission never reads as free: the pass's whole budget counts as

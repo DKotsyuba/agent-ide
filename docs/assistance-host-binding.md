@@ -225,9 +225,9 @@ native hooks can find the same daemon without any operator-configured runtime or
   working: the oldest settled records of a full scope are evicted, never a live session's.
 
 `agent-ide codex-hook --managed` is the managed hook command: it ignores every credential and
-runtime environment override, reads stdin once (at most 8 MiB plus an overflow byte; a payload
-over 64 KiB is projected down to its identity fields, and only a projection still over that
-transport bound is dropped as oversize) inside one
+runtime environment override, reads stdin once (a payload over 64 KiB, of any size, is streamed
+and projected down to its identity fields without buffering its tool bodies, and only a
+projection still over that transport bound is dropped as oversize) inside one
 250 ms total deadline, discovers exactly one live route, submits once, and renders only a
 successful `PostToolUse` feedback result. Missing, ambiguous, stale, or contended routes,
 malformed or oversized payloads, unsupported phases, and deadline expiry all exit 0 with empty
@@ -251,8 +251,9 @@ optional `agent_id`, and optional `agent_type` fields. The placeholder-only exam
 implemented; `permission_mode` is never mapped to OS authority, and the same `allowed_roots`
 policy applies as on Codex.
 
-The hook command reads at most 8 MiB plus one overflow byte (a larger payload's tool bodies are
-projected away before submission) and uses a separate **250 ms
+The hook command keeps a payload up to 64 KiB exact and streams a larger one, keeping only the
+projected identity fields (and the routing `cwd`) while skipping its tool bodies unbuffered; it
+uses a separate **250 ms
 total deadline** for stdin, parsing, connect, dispatch and reply. An open stdin pipe cannot
 hold up process exit. Missing/invalid attachment, absent daemon, invalid or oversized
 JSON, malformed or ambiguous identity, transport loss and timeout all exit successfully
@@ -276,10 +277,13 @@ then fail, and for real ingress failures (`hook_input_*`, `hook_no_cwd`): the da
 hook it refuses on a channel that already holds a binding per call (`hook_refused:<cause>`), and
 the client journals a submission that outlived its 250 ms budget per call (`hook_submit_timeout`,
 a lost pre). Large host payloads
-no longer drop their event: the hook reads up to 8 MiB on the same deadline and projects the
-payload down to the identity fields the daemon consumes, so a multi-megabyte Read/Write tool
-body is discarded rather than the lifecycle; only a projection that itself exceeds the 64 KiB
-transport bound is refused as `hook_input_oversize`.
+no longer drop their event, whatever their size: the hook streams the payload on the same
+deadline and keeps only the identity fields the daemon consumes (Claude's `agent_type` and its
+writer-tool `file_path`/`notebook_path` included), so a multi-megabyte Read/Write tool body or
+`tool_response` is skipped rather than the lifecycle; a repeated projected field is malformed,
+and only a projection that itself exceeds the 64 KiB transport bound is refused as
+`hook_input_oversize`. Memory stays proportional to the longest single string token the
+parser must decode (a kept field or an object key), never to the skipped bodies.
 
 ### Restart recovery (T15B follow-up)
 

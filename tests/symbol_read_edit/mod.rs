@@ -1143,8 +1143,8 @@ async fn a_location_on_a_closing_container_line_reads_the_container() {
     finished(actor, daemon, &fixture).await;
 }
 
-/// A file with a small function and a `big` one whose numbered text is larger than one reply
-/// page. Unit lines of `big`: 1 is its header, 2-6001 the repeated `let`, 6002-6003 its tail.
+/// A file with a small function and a `big` one whose numbered text is larger than the former
+/// reply page. Unit lines of `big`: 1 is its header, 2-6001 the repeated `let`, 6002-6003 its tail.
 #[cfg(feature = "test-seams")]
 fn paged_source() -> String {
     format!(
@@ -1170,12 +1170,12 @@ async fn paged_started(name: &'static str) -> (ProductFixture, OwnedDaemon, Prod
     (fixture, daemon, actor)
 }
 
-/// A unit read that is cut into pages counts as read only up to the last row its first page
-/// delivered: a window edit of a row on a later page is unguarded and echoes what it replaces,
-/// although the unit is unchanged since the read (symbol-read-edit-v1 §3.2 rule 3).
+/// A large unit read is delivered whole, so it counts as read through its last row: a window
+/// edit of a row far into the unit is guarded and does not echo what it replaces
+/// (symbol-read-edit-v1 §3.2 rule 3; Read is never paged).
 #[cfg(feature = "test-seams")]
 #[tokio::test]
-async fn a_paged_read_guards_only_the_rows_it_delivered() {
+async fn a_large_read_guards_every_row_it_delivered() {
     let (fixture, daemon, mut actor) = paged_started("sre-paged").await;
     let (_, text) = call(
         &mut actor,
@@ -1185,26 +1185,37 @@ async fn a_paged_read_guards_only_the_rows_it_delivered() {
     )
     .await;
     assert!(
-        text.contains("page 1;") && !text.contains("\n5990\t"),
-        "the read must be cut before row 5990: {}",
+        !text.contains("page 1;") && text.contains("\n5990\t"),
+        "the whole unit is delivered: {}",
         &text[..text.len().min(300)]
     );
-    let (_, text) = call(
+    let (reply, text) = call(
         &mut actor,
         &fixture,
         "ide.edit",
         json!({"symbol":"src/batch.rs#big:5990-5990","content":"    let a = 2;"}),
     )
     .await;
-    assert!(text.contains("; was:\n    5990\t    let a = 1;"), "{text}");
+    // Guarded: the edit applies without echoing the replaced lines.
+    assert_eq!(reply["result"]["outcome"], "replaced", "{reply}");
+    assert!(
+        text.starts_with("edit: replaced; path src/batch.rs"),
+        "{text}"
+    );
+    assert!(!text.contains("; was:"), "{text}");
+    assert!(
+        std::fs::read_to_string(fixture.root.join("src/batch.rs"))
+            .unwrap()
+            .contains("    let a = 2;")
+    );
     finished(actor, daemon, &fixture).await;
 }
 
-/// A batch read remembers a unit only when its block is delivered in the reply: a block cut from
-/// the reply leaves its unit unguarded, so a window edit there echoes what it replaces.
+/// A batch read delivers the large block whole beside the small one and remembers both units, so
+/// a window edit inside the large unit is guarded and does not echo what it replaces.
 #[cfg(feature = "test-seams")]
 #[tokio::test]
-async fn a_batch_read_guards_only_the_blocks_it_delivered() {
+async fn a_batch_read_guards_every_block_it_delivered() {
     let (fixture, daemon, mut actor) = paged_started("sre-batch-cut").await;
     let (_, text) = call(
         &mut actor,
@@ -1214,17 +1225,28 @@ async fn a_batch_read_guards_only_the_blocks_it_delivered() {
     )
     .await;
     assert!(
-        text.contains("1\tpub fn small() -> u32 {") && !text.contains("src/batch.rs#big  ("),
-        "the big block must be cut: {}",
+        text.contains("1\tpub fn small() -> u32 {") && text.contains("src/batch.rs#big  ("),
+        "both blocks are delivered: {}",
         &text[..text.len().min(400)]
     );
-    let (_, text) = call(
+    let (reply, text) = call(
         &mut actor,
         &fixture,
         "ide.edit",
         json!({"symbol":"src/batch.rs#big:100-100","content":"    let a = 2;"}),
     )
     .await;
-    assert!(text.contains("; was:\n    100\t    let a = 1;"), "{text}");
+    // Guarded: the edit applies without echoing the replaced lines.
+    assert_eq!(reply["result"]["outcome"], "replaced", "{reply}");
+    assert!(
+        text.starts_with("edit: replaced; path src/batch.rs"),
+        "{text}"
+    );
+    assert!(!text.contains("; was:"), "{text}");
+    assert!(
+        std::fs::read_to_string(fixture.root.join("src/batch.rs"))
+            .unwrap()
+            .contains("    let a = 2;")
+    );
     finished(actor, daemon, &fixture).await;
 }

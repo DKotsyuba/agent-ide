@@ -17,10 +17,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::{
-    batch::{
-        ReadCounts, ReadForm, ReadItem, edit_checked_draft, read_follow_up, read_summary,
-        summarize_diagnostics, unchanged_line,
-    },
+    batch::{ReadCounts, edit_checked_draft, read_summary, summarize_diagnostics, unchanged_line},
     facade::{
         AssistanceTool, CatalogHost, SERVER_INSTRUCTIONS, StdioFacade, tool_schemas, validate_call,
     },
@@ -381,7 +378,6 @@ fn batch_surfaces() -> Vec<Surface> {
         cut: 1,
         failed: 0,
     };
-    let cut = ReadItem::Symbol("src/c.rs#C".to_owned());
     let pending = vec![(
         "src/a.rs".to_owned(),
         EditDiagnostics::Pending {
@@ -395,11 +391,6 @@ fn batch_surfaces() -> Vec<Surface> {
         reply_surface(
             "batch unchanged line",
             unchanged_line("ref-1", "src/a.rs", "1  a\n2  b\n"),
-            false,
-        ),
-        reply_surface(
-            "batch read follow-up",
-            read_follow_up(ReadForm::Items, &[&cut]),
             false,
         ),
         reply_surface("batch pending diagnostics", words, true),

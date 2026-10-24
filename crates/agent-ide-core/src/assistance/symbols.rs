@@ -261,8 +261,8 @@ impl Worker<'_> {
     /// `ide.read {symbol}`, `ide.read {path, lines}` or `ide.read {path}`: numbered source with
     /// the header.
     ///
-    /// `path` alone reads the whole file (`(empty file)` when it has no lines), paged by bytes
-    /// like any read. Any readable text file answers the `path` forms, whatever its type; a file
+    /// `path` alone reads the whole file (`(empty file)` when it has no lines) in one reply; a read
+    /// is never paged. Any readable text file answers the `path` forms, whatever its type; a file
     /// no IDE language analyzes ends with [`NO_ANALYSIS_NOTE`]. A binary or unreadable file
     /// is refused as `source_unavailable` with a `read:not_text:` or `read:source_unavailable:`
     /// detail (a soft refusal naming native tools, never `internal`); a `lines` range (`N`, `N-M`,
@@ -527,12 +527,10 @@ impl Worker<'_> {
     /// The summary line comes first:
     /// `read: <n> items in <f> files — <d> delivered, <u> unchanged, <c> not included, <x> failed`.
     /// Unknown symbols, missing files and ranges past the end are reported per item in place
-    /// without failing the rest; an exactly duplicated item renders once (duplicates footer); a
-    /// block is never cut mid-body — whole blocks are fitted in request order, skipping those
-    /// that do not fit and naming them with the exact follow-up call in the request's own form.
-    /// Only delivered blocks receive read memory and their files retain source observations.
-    /// When no whole source block fits, the first source block uses ordinary byte paging and every
-    /// other item is named in the footer.
+    /// without failing the rest; an exactly duplicated item renders once (duplicates footer).
+    /// Every block is delivered whole in request order: Read output has no size ceiling, so no
+    /// block is cut, skipped or paged and the summary's `not included` count is always 0. Every
+    /// delivered block receives read memory and its file retains its source observation.
     ///
     /// Item forms: a `{symbol}` item resolves through the file's outline; a `{path}` item renders
     /// the whole text of any readable text file; a `{path, lines}` item (and a legacy `ranges`
@@ -651,7 +649,7 @@ impl Worker<'_> {
                     let found = legacy.as_ref().and_then(|symbol| outline.find(symbol));
                     let block = match (unit, found) {
                         (Some((text, read)), _) => {
-                            // Remembered below, only if this block is delivered in the reply.
+                            // Remembered below, with the delivered block.
                             unit_reads.push((items.len(), read));
                             (text, Some(index))
                         }
@@ -773,19 +771,6 @@ impl Worker<'_> {
         };
         // Which files' blocks were delivered decides the reply's trailing note and which
         // observations stay retained as edit bases.
-        let reference = job.reference.clone();
-        let fits = |text: &str| {
-            content::fits(
-                &PeerReply::Complete {
-                    kind: ResultKind::Read,
-                    text: text.to_owned(),
-                    detail_ref: Some(reference.clone()),
-                    truncated: true,
-                    continuation: false,
-                },
-                content::reply_envelope(),
-            )
-        };
         let source_line = |delivered: &[usize]| {
             // Text read of a file no IDE language analyzes: say so once, at the end of the reply.
             let note = if delivered
@@ -804,148 +789,61 @@ impl Worker<'_> {
             .map(|(_, _, item)| item.file())
             .collect::<std::collections::BTreeSet<_>>()
             .len();
-        // The whole reply when the blocks of `shown` (indexes into `items`, request order) are
-        // delivered and every other item is named in the follow-up footer, with the files those
-        // blocks retain as edit bases.
-        let compose = |shown: &[usize]| -> (String, Vec<usize>) {
-            let mut delivered: Vec<usize> = Vec::new();
-            for &index in shown {
-                if let Some(file) = items[index].1
-                    && !delivered.contains(&file)
-                {
-                    delivered.push(file);
-                }
+        // Every block is delivered whole in request order: Read output has no size ceiling, so
+        // nothing is skipped, cut or paged (`content::fits` accepts any Read reply). `delivered`
+        // lists each file with a block, in first-delivery order, for its retained edit base.
+        let mut delivered: Vec<usize> = Vec::new();
+        for (_, file, _) in &items {
+            if let Some(file) = *file
+                && !delivered.contains(&file)
+            {
+                delivered.push(file);
             }
-            let cut: Vec<&ReadItem> = (0..items.len())
-                .filter(|index| !shown.contains(index))
-                .map(|index| &items[index].2)
-                .collect();
-            let failed = shown
-                .iter()
-                .filter(|&&index| items[index].1.is_none())
-                .count();
-            let repeated = shown.iter().filter(|&&index| unchanged[index]).count();
-            let mut text = batch::read_summary(&batch::ReadCounts {
-                items: items.len(),
-                files: files_named,
-                delivered: shown.len() - failed - repeated,
-                unchanged: repeated,
-                cut: cut.len(),
-                failed,
-            });
-            for &index in shown {
-                text.push_str(&items[index].0);
-            }
-            text.push_str(&source_line(&delivered));
-            if !duplicates.is_empty() {
-                text.push_str(&duplicates_footer(&duplicates));
-            }
-            if !cut.is_empty() {
-                text.push_str(&batch::read_follow_up(form, &cut));
-            }
-            (text, delivered)
-        };
-        // Try the complete response first: removing the omission footer can make it fit.
-        // Otherwise skip oversized blocks without starving smaller later requests. Every
-        // trial includes the exact summary, omissions and serialized reply envelope.
-        let all: Vec<usize> = (0..items.len()).collect();
-        let included = if fits(&compose(&all).0) {
-            all
-        } else {
-            let mut shown = Vec::new();
-            for index in 0..items.len() {
-                shown.push(index);
-                if !fits(&compose(&shown).0) {
-                    shown.pop();
-                }
-            }
-            shown
-        };
-        let authority = self.authority(&binding).await.ok();
-        // Failure-only replies do not replace source paging: still deliver the first source
-        // page when none of the selected blocks contains source text.
-        if !included.iter().any(|&index| items[index].1.is_some())
-            && let Some(index) = items.iter().position(|(_, file, _)| file.is_some())
-        {
-            // One block larger than the whole budget: deliver it alone through the ordinary
-            // byte paging (editable once its last page has been delivered, T16B); the summary
-            // and the footer name every other item.
-            let (oversized, _) = compose(&[index]);
-            let file = items[index].1.expect("selected item carries a file");
-            let (reply, page) = ContextPageState::new(oversized, 0, false, ResultKind::Read)
-                .next(&job.reference)?;
-            self.shared.set_context_page(&job.reference, page);
-            for (item_index, read) in unit_reads {
-                if item_index == index {
-                    let last = target::delivered_last(&reply, read.last);
-                    self.remember_unit_read(&binding, read, last);
-                }
-            }
-            if matches!(&items[index].2, ReadItem::Path(_) | ReadItem::Lines(_, _)) {
-                let (_, observed, source, outline) = &files[file];
-                let range = match &items[index].2 {
-                    ReadItem::Lines(_, lines) => crate::assistance::facade::parse_read_range(lines)
-                        .ok_or(FailureCode::Internal)?,
-                    _ => LineRange::new(1, lang::line_count(source)),
-                };
-                self.remember_file_read(job, observed, source, range, &reply, outline.as_ref())
-                    .await;
-            }
-            return Ok((reply, authority, Some(files[file].1.clone())));
         }
-        let (text, delivered) = compose(&included);
+        let failed = items.iter().filter(|(_, file, _)| file.is_none()).count();
+        let repeated = unchanged.iter().filter(|&&repeat| repeat).count();
+        let mut text = batch::read_summary(&batch::ReadCounts {
+            items: items.len(),
+            files: files_named,
+            delivered: items.len() - failed - repeated,
+            unchanged: repeated,
+            cut: 0,
+            failed,
+        });
+        for (block, _, _) in &items {
+            text.push_str(block);
+        }
+        text.push_str(&source_line(&delivered));
+        if !duplicates.is_empty() {
+            text.push_str(&duplicates_footer(&duplicates));
+        }
+        let authority = self.authority(&binding).await.ok();
         // Remember the blocks this reply carries in full, so their repeat can answer unchanged.
         if epoch.is_some()
             && let Ok(mut ledger) = self.shared.ledger.lock()
         {
             let memory = ledger.read_memory.entry(binding.clone()).or_default();
-            for &index in &included {
-                let (block, file, item) = &items[index];
+            for (index, (block, file, item)) in items.iter().enumerate() {
                 if file.is_some() && !unchanged[index] {
                     memory.remember(epoch, &item.label(), block, &job.reference);
                 }
             }
         }
         // Retain one edit base per delivered file: the first returns through the job tuple, the
-        // rest ride the same detail as extra sources. A file whose every block was cut gets none.
+        // rest ride the same detail as extra sources.
         let mut sources: Vec<SourceObservation> = delivered
             .iter()
             .map(|&index| files[index].1.clone())
             .collect();
         let job_source = (!sources.is_empty()).then(|| sources.remove(0));
         self.shared.add_edit_sources(&job.reference, sources);
-        let truncated = included.len() < items.len();
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Read).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
-        let reply = match reply {
-            PeerReply::Complete {
-                kind,
-                text,
-                detail_ref,
-                ..
-            } => PeerReply::Complete {
-                kind,
-                text,
-                detail_ref,
-                truncated,
-                continuation: false,
-            },
-            other => other,
-        };
-        // Preserve request order across address and file reads of the same unit. Cut blocks
-        // record nothing; only whole delivered blocks update read memory.
+        // Preserve request order across address and file reads of the same unit; every block is
+        // delivered whole, so each one updates read memory.
         let mut unit_reads = unit_reads.into_iter().peekable();
         for (index, (block, file, item)) in items.iter().enumerate() {
-            if !included.contains(&index) {
-                if unit_reads
-                    .peek()
-                    .is_some_and(|(unit_index, _)| *unit_index == index)
-                {
-                    unit_reads.next();
-                }
-                continue;
-            }
             if unit_reads
                 .peek()
                 .is_some_and(|(unit_index, _)| *unit_index == index)
