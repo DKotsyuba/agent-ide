@@ -476,6 +476,9 @@ impl ContextService {
             json!({"candidates":candidate_trace(&candidates)}),
         )?;
         let mut remaining = self.config.max_new_calls;
+        // With vectors, retrieval admits the lexical and semantic shortlists' whole union; the
+        // fused top `candidates` is what survives when no selector judgment is available.
+        let mut fusion_capped: Option<BTreeSet<String>> = None;
         if let (Some(client), Some(config)) = (&self.embedding, &self.config.embedding) {
             let journal = journal.as_ref().expect("model journal constructed");
             let space = config.space_id().map_err(io::Error::other)?;
@@ -502,7 +505,7 @@ impl ContextService {
                     {
                         Ok(response) => {
                             trace.record("embedding_query", json!({"journal":journal.path(&space,&request),"model":config.model,"space":space,"generation":documents.generation}))?;
-                            let (found, ranking) = index.hybrid_search_traced(
+                            let (found, ranking) = index.hybrid_union_search_traced(
                                 task,
                                 &documents,
                                 &space,
@@ -513,6 +516,23 @@ impl ContextService {
                                 "hybrid_ranking",
                                 serde_json::to_value(ranking).map_err(io::Error::other)?,
                             )?;
+                            fusion_capped = Some(
+                                found
+                                    .iter()
+                                    .take(packet_options.candidates)
+                                    .map(|candidate| candidate.file.id.clone())
+                                    .collect(),
+                            );
+                            let mut found = found;
+                            // A wide request's union can exceed the packet's 256-file limit even
+                            // without anchors; its fused tail goes first.
+                            if found.len() > MAX_PACKET_CANDIDATES {
+                                result.warnings.push(format!(
+                                    "{} retrieved candidates omitted at the 256-file safety limit",
+                                    found.len() - MAX_PACKET_CANDIDATES
+                                ));
+                                found.truncate(MAX_PACKET_CANDIDATES);
+                            }
                             candidates = found;
                             result.embedding_used = true;
                         }
@@ -635,6 +655,12 @@ impl ContextService {
         trace.record("readiness_exclusions", json!({"files":candidates.iter().filter(|c| !ready_files.contains(&c.file.path)).map(|c| json!({"path":c.file.path,"reason":"no published document"})).collect::<Vec<_>>()}))?;
         candidates.retain(|c| ready_files.contains(&c.file.path));
         if self.jev.is_none() {
+            candidates.retain(|candidate| {
+                protected(candidate, &pinned, task)
+                    || fusion_capped
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(&candidate.file.id))
+            });
             rank_without_selector(&mut candidates, &pinned);
         }
         if let Some(client) = &self.jev {
@@ -766,11 +792,13 @@ impl ContextService {
                 &pinned,
                 task,
                 self.config.include_threshold,
+                fusion_capped.as_ref(),
             );
             trace.record("jev_selection", json!({"threshold":self.config.include_threshold,
                 "files":before_selection.iter().map(|c|json!({"id":c.file.id,"path":c.file.path,
                     "retained":candidates.iter().any(|kept|kept.file.id==c.file.id),
                     "pinned_tier":pinned.get(&c.file.path),"assessment":assessments.get(&c.file.id),
+                    "in_fusion_cap":fusion_capped.as_ref().is_none_or(|ids|ids.contains(&c.file.id)),
                     "task_names_path":task.contains(c.file.path.to_string_lossy().as_ref())})).collect::<Vec<_>>() }))?;
         }
         trace.record("retrieval_status",json!({"generation":index.snapshot()?.map(|s|s.generation),"embedding_used":result.embedding_used,"embedding_complete":result.embedding_complete,"jev_used":result.jev_used,"calls":result.calls,"warnings":result.warnings}))?;
@@ -1097,25 +1125,37 @@ fn candidate_evidence(
     (views, notes)
 }
 
-/// Applies the selector's judgments without changing delivery shape. Unknown candidates, relevant
-/// ones and those whose exclusion needs more evidence (`expansion` ≥ 0.5) survive, as do
-/// public-evidence tiers and task-named paths. An expansion answer is uncertainty about
-/// excluding a candidate, not a request for its whole file: preferred spans and `whole_file`
-/// stay as retrieval set them, and the dependency evidence comes from the anchors' direct
-/// imports. Both estimates are recorded as reasons.
+/// Most candidates one packet accepts (`ContextIndex::prepare_candidates` refuses more).
+const MAX_PACKET_CANDIDATES: usize = 256;
+
+/// Whether a candidate survives selection regardless of judgments: a public-evidence tier
+/// (failure anchor or its direct import) or a path the task names.
+fn protected(candidate: &super::Candidate, pinned: &BTreeMap<PathBuf, u8>, task: &str) -> bool {
+    pinned.contains_key(&candidate.file.path)
+        || task.contains(candidate.file.path.to_string_lossy().as_ref())
+}
+
+/// Applies the selector's judgments without changing delivery shape. Protected candidates
+/// survive; an assessed one survives only on `relevance` ≥ `include_threshold`; an unassessed
+/// one survives only inside `fusion_capped` (`None`: every retrieved file), so a missing
+/// judgment never widens the packet beyond the capped retrieval. `expansion` is uncertainty
+/// about excluding a file, not evidence of use, so it neither retains a file nor requests its
+/// whole source: preferred spans and `whole_file` stay as retrieval set them. Both estimates
+/// are recorded as reasons.
 fn apply_assessments(
     candidates: &mut Vec<super::Candidate>,
     assessments: &BTreeMap<String, super::select::Assessment>,
     pinned: &BTreeMap<PathBuf, u8>,
     task: &str,
     include_threshold: f64,
+    fusion_capped: Option<&BTreeSet<String>>,
 ) {
     candidates.retain(|candidate| {
-        pinned.contains_key(&candidate.file.path)
-            || task.contains(candidate.file.path.to_string_lossy().as_ref())
-            || assessments
-                .get(&candidate.file.id)
-                .is_none_or(|value| value.relevance >= include_threshold || value.expansion >= 0.5)
+        protected(candidate, pinned, task)
+            || match assessments.get(&candidate.file.id) {
+                Some(value) => value.relevance >= include_threshold,
+                None => fusion_capped.is_none_or(|ids| ids.contains(&candidate.file.id)),
+            }
     });
     rank_selected(candidates, pinned, task, |candidate| {
         assessments
@@ -1489,8 +1529,8 @@ fn merge_anchor_candidates(
             anchors.push(candidate);
         }
     }
-    let omitted = anchors.len().saturating_sub(256);
-    anchors.truncate(256);
+    let omitted = anchors.len().saturating_sub(MAX_PACKET_CANDIDATES);
+    anchors.truncate(MAX_PACKET_CANDIDATES);
     (anchors, omitted)
 }
 
@@ -2159,23 +2199,77 @@ mod tests {
         );
     }
 
-    /// The selector's expansion answer keeps an otherwise irrelevant candidate but never turns it
-    /// into a whole-file delivery: its preferred spans stay, and a large file with spans is still
-    /// delivered localized. Low relevance without expansion drops; public tiers always stay.
+    /// Without judgments the fusion cap decides: inside it (or with no cap, the lexical-only
+    /// path) a file survives; outside it only a protected or task-named file does.
     #[test]
-    fn expansion_retains_without_whole_file_delivery() {
+    fn unassessed_candidates_follow_the_fusion_cap() {
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new("context-fusion-cap");
+        for name in [
+            "needle-head",
+            "needle-tail",
+            "needle-named",
+            "needle-anchor",
+        ] {
+            std::fs::write(root.join(format!("{name}.alpha")), "needle\n").unwrap();
+        }
+        let mut index = ContextIndex::open(&root).unwrap();
+        index
+            .refresh(&crate::project::structure::StructureOptions::default())
+            .unwrap();
+        let all = index.search("needle", 12).unwrap();
+        assert_eq!(all.len(), 4);
+        let id = |path: &str| {
+            all.iter()
+                .find(|candidate| candidate.file.path == Path::new(path))
+                .unwrap()
+                .file
+                .id
+                .clone()
+        };
+        let pinned = BTreeMap::from([(PathBuf::from("needle-anchor.alpha"), 0)]);
+        let task = "needle in needle-named.alpha";
+        let kept = |cap: Option<&BTreeSet<String>>| {
+            let mut candidates = all.clone();
+            apply_assessments(&mut candidates, &BTreeMap::new(), &pinned, task, 0.5, cap);
+            let mut paths: Vec<_> = candidates
+                .iter()
+                .map(|candidate| candidate.file.path.display().to_string())
+                .collect();
+            paths.sort_unstable();
+            paths
+        };
+        assert_eq!(kept(None).len(), 4);
+        let cap = BTreeSet::from([id("needle-head.alpha")]);
+        assert_eq!(
+            kept(Some(&cap)),
+            [
+                "needle-anchor.alpha",
+                "needle-head.alpha",
+                "needle-named.alpha"
+            ]
+        );
+    }
+
+    /// Only relevance retains a judged candidate: a high expansion answer neither keeps an
+    /// irrelevant file nor turns a relevant one into a whole-file delivery (its preferred spans
+    /// stay). Unjudged files survive only inside the capped fusion; public tiers always stay.
+    #[test]
+    fn relevance_alone_retains_without_whole_file_delivery() {
         crate::lang::testing::install();
         let root = crate::scratch::ScratchDir::new("context-expansion-shape");
         let source = format!("{}\nneedle\n{}", "x".repeat(6000), "y".repeat(6000));
         std::fs::write(root.join("needle-big.alpha"), &source).unwrap();
         std::fs::write(root.join("needle-other.alpha"), "needle other\n").unwrap();
         std::fs::write(root.join("needle-anchor.alpha"), "needle anchor\n").unwrap();
+        std::fs::write(root.join("needle-kept.alpha"), "needle kept\n").unwrap();
+        std::fs::write(root.join("needle-tail.alpha"), "needle tail\n").unwrap();
         let mut index = ContextIndex::open(&root).unwrap();
         index
             .refresh(&crate::project::structure::StructureOptions::default())
             .unwrap();
         let mut candidates = index.search("needle", 12).unwrap();
-        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates.len(), 5);
         let span = (6001, 6008);
         for candidate in &mut candidates {
             if candidate.file.path == Path::new("needle-big.alpha") {
@@ -2202,24 +2296,44 @@ mod tests {
             )
         };
         let assessments = BTreeMap::from([
-            assessment("needle-big.alpha", 0.1, 0.9),
-            assessment("needle-other.alpha", 0.1, 0.1),
+            assessment("needle-big.alpha", 0.6, 0.9),
+            assessment("needle-other.alpha", 0.1, 0.9),
             assessment("needle-anchor.alpha", 0.1, 0.1),
         ]);
         let pinned = BTreeMap::from([(PathBuf::from("needle-anchor.alpha"), 0)]);
-        apply_assessments(&mut candidates, &assessments, &pinned, "needle", 0.5);
-        let kept: Vec<_> = candidates
+        let capped = BTreeSet::from([id("needle-kept.alpha")]);
+        apply_assessments(
+            &mut candidates,
+            &assessments,
+            &pinned,
+            "needle",
+            0.5,
+            Some(&capped),
+        );
+        let mut kept: Vec<_> = candidates
             .iter()
             .map(|candidate| candidate.file.path.to_str().unwrap())
             .collect();
-        assert_eq!(kept, ["needle-anchor.alpha", "needle-big.alpha"]);
-        let uncertain = &candidates[1];
+        assert_eq!(kept[0], "needle-anchor.alpha");
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            [
+                "needle-anchor.alpha",
+                "needle-big.alpha",
+                "needle-kept.alpha"
+            ]
+        );
+        let uncertain = candidates
+            .iter()
+            .find(|candidate| candidate.file.path == Path::new("needle-big.alpha"))
+            .unwrap();
         assert!(!uncertain.whole_file);
         assert_eq!(uncertain.preferred_spans, [span]);
         assert!(
             uncertain
                 .reasons
-                .contains(&"Jev relevance estimate: 0.10; additional evidence: 0.90".to_owned())
+                .contains(&"Jev relevance estimate: 0.60; additional evidence: 0.90".to_owned())
         );
         let packet = index
             .prepare_candidates("needle", &PacketOptions::default(), vec![uncertain.clone()])

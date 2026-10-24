@@ -32,6 +32,32 @@ use crate::LANGUAGE;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TypeScript;
 
+/// Test toolchain configuration families, each in the runner's own lookup order.
+const TEST_TOOLCHAIN_CONFIGS: &[&[&str]] = &[
+    &[
+        "vitest.config.ts",
+        "vitest.config.mts",
+        "vitest.config.cts",
+        "vitest.config.js",
+        "vitest.config.mjs",
+        "vitest.config.cjs",
+        "vite.config.ts",
+        "vite.config.mts",
+        "vite.config.cts",
+        "vite.config.js",
+        "vite.config.mjs",
+        "vite.config.cjs",
+        "jest.config.ts",
+        "jest.config.mts",
+        "jest.config.cts",
+        "jest.config.js",
+        "jest.config.mjs",
+        "jest.config.cjs",
+        "jest.config.json",
+    ],
+    &["tsconfig.json"],
+];
+
 /// Extensions of files this module treats as scripts.
 const SCRIPT_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
@@ -463,6 +489,11 @@ impl LanguageSupport for TypeScript {
             ],
             ..agent_ide_core::lang::regions::GENERIC_RULES
         }
+    }
+
+    /// The test runner's configuration (Vitest, its Vite fallback, or Jest) and `tsconfig.json`.
+    fn test_toolchain_configs(&self) -> &'static [&'static [&'static str]] {
+        TEST_TOOLCHAIN_CONFIGS
     }
 
     /// `*.test.*`, `*.spec.*` and anything under `__tests__/`, for every script extension.
@@ -2587,6 +2618,19 @@ src/transport.ts  (29 lines, typescript)
         for file in ["src/a.ts", "a.test.json", "tests/a.ts"] {
             assert!(!TypeScript.is_test_file(Path::new(file)), "{file}");
         }
+    }
+
+    /// Vitest's own config wins over its Vite fallback and Jest; `tsconfig.json` is its own family.
+    #[test]
+    fn test_toolchain_families_follow_runner_lookup_order() {
+        let families = TypeScript.test_toolchain_configs();
+        assert_eq!(families.len(), 2);
+        let runner = families[0];
+        let position = |name: &str| runner.iter().position(|entry| *entry == name).unwrap();
+        assert_eq!(runner[0], "vitest.config.ts");
+        assert!(position("vitest.config.mjs") < position("vite.config.ts"));
+        assert!(position("vite.config.cjs") < position("jest.config.ts"));
+        assert_eq!(families[1], ["tsconfig.json"]);
     }
 
     /// A project with only the given environment facts.

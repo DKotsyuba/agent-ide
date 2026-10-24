@@ -610,11 +610,9 @@ pub(crate) enum DocumentEligibility {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HybridOutcome {
-    /// Within the final `limit` after fusion.
-    Selected,
     /// In the lexical top-`limit` or represented by an eligible document of the semantic
-    /// top-`limit`, but ranked beyond `limit` after fusion.
-    CutAtFusion,
+    /// top-`limit`: a member of the admitted union, whatever its fused rank.
+    Selected,
     /// Scored lexically or semantically, but in neither top-`limit`.
     OutsideBothLimits,
     /// No matched term and no eligible scored document.
@@ -625,8 +623,11 @@ pub(crate) enum HybridOutcome {
 /// The fixed parameters one hybrid search ran with.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct HybridTraceConfig {
-    /// Files kept after fusion; also the lexical file and semantic document shortlist sizes.
+    /// Lexical file and semantic document shortlist sizes. Preparation admits their whole
+    /// fused union (at most twice this many files), not only the top `limit` fused files.
     pub limit: usize,
+    /// How fused files are admitted: `lexical_union_semantic`, every file of either shortlist.
+    pub admission: &'static str,
     /// Reciprocal-rank constant.
     pub rrf_offset: usize,
 }
@@ -659,7 +660,7 @@ pub(crate) struct DocumentRank {
 }
 
 #[cfg(any(feature = "jev-pilot", test))]
-/// One fused file before truncation.
+/// One fused file of the admitted union, in fused order.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct FusionRank {
     pub rank: usize,
@@ -669,6 +670,7 @@ pub(crate) struct FusionRank {
     pub lexical_rank: Option<usize>,
     /// Rank of the file's first eligible document within the semantic top-`limit`.
     pub first_semantic_rank: Option<usize>,
+    /// Admitted to relevance selection; always true, since the union admits every fused file.
     pub selected: bool,
 }
 
@@ -733,10 +735,14 @@ impl ContextIndex {
     }
 
     #[cfg(any(feature = "jev-pilot", test))]
-    /// [`Self::hybrid_search`]'s exact selection plus a [`HybridTrace`] of every stage. The
-    /// selection consumes the same inputs as `hybrid_search`; the complete rankings are computed
-    /// beside it for the trace only.
-    pub(crate) fn hybrid_search_traced(
+    /// The UNION of the lexical top-`limit` files and the semantic top-`limit` documents' files,
+    /// in [`Self::hybrid_search`]'s fused order, plus a [`HybridTrace`] of every stage.
+    ///
+    /// Unlike `hybrid_search` (at most `limit` files) no file of either shortlist is dropped at
+    /// fusion: relevance selection decides, so a file one ranking places high cannot fall out
+    /// only because the other ranking does not see it. The complete rankings are computed
+    /// beside the selection for the trace only.
+    pub(crate) fn hybrid_union_search_traced(
         &self,
         task: &str,
         batch: &DocumentBatch,
@@ -811,7 +817,7 @@ impl ContextIndex {
                 score: file.score,
                 lexical_rank: file.lexical_rank,
                 first_semantic_rank: file.first_semantic_rank,
-                selected: rank < limit,
+                selected: true,
             })
             .collect();
         let lexical_by_file: std::collections::BTreeMap<_, _> = lexical_ranks
@@ -843,8 +849,7 @@ impl ContextIndex {
                     .collect();
                 let fused = fused_by_file.get(record.id.as_str()).copied();
                 let outcome = match fused {
-                    Some(fused) if fused.selected => HybridOutcome::Selected,
-                    Some(_) => HybridOutcome::CutAtFusion,
+                    Some(_) => HybridOutcome::Selected,
                     None if lexical.is_some() || !eligible.is_empty() => {
                         HybridOutcome::OutsideBothLimits
                     }
@@ -868,6 +873,7 @@ impl ContextIndex {
         let trace = HybridTrace {
             config: HybridTraceConfig {
                 limit,
+                admission: "lexical_union_semantic",
                 rrf_offset: RRF_OFFSET,
             },
             lexical_terms: terms.len(),
@@ -881,15 +887,11 @@ impl ContextIndex {
             fusion: fusion_ranks,
             files,
         };
-        let selected = fused
-            .into_iter()
-            .take(limit)
-            .map(|file| file.candidate)
-            .collect();
+        let selected = fused.into_iter().map(|file| file.candidate).collect();
         Ok((selected, trace))
     }
 
-    /// The hybrid fusion shared by [`Self::hybrid_search`] and [`Self::hybrid_search_traced`]:
+    /// The hybrid fusion shared by [`Self::hybrid_search`] and [`Self::hybrid_union_search_traced`]:
     /// lexical rank and the first eligible document rank of each file add `1 / (61 + rank)`;
     /// files are ordered by score desc, path asc, untruncated. An unknown or stale document is
     /// skipped but keeps its rank slot.
@@ -973,7 +975,7 @@ mod tests {
     /// needle-a's document 0.95, needle-a 0.9, sem-y 0.8, the rest 0.0. Path cards and
     /// novec.alpha's source document have no vector.
     #[test]
-    fn traced_hybrid_search_keeps_the_selection_and_explains_every_file() {
+    fn traced_union_search_keeps_both_shortlists_and_explains_every_file() {
         crate::lang::testing::install();
         let root = crate::scratch::ScratchDir::new("context-hybrid-trace");
         for name in [
@@ -1058,11 +1060,21 @@ mod tests {
             ["needle-a.alpha", "sem-x.alpha", "needle-b.alpha"]
         );
         let (traced, trace) = index
-            .hybrid_search_traced("needle", &batch, space, &query, 3)
+            .hybrid_union_search_traced("needle", &batch, space, &query, 3)
             .unwrap();
-        assert_eq!(paths(&traced), paths(&plain));
+        // The capped selection first, in the same order and with the same evidence, then the
+        // lexical shortlist's needle-c that the capped fusion cut.
         assert_eq!(
-            traced
+            paths(&traced),
+            [
+                "needle-a.alpha",
+                "sem-x.alpha",
+                "needle-b.alpha",
+                "needle-c.alpha"
+            ]
+        );
+        assert_eq!(
+            traced[..3]
                 .iter()
                 .map(|candidate| (&candidate.reasons, &candidate.preferred_spans))
                 .collect::<Vec<_>>(),
@@ -1071,6 +1083,7 @@ mod tests {
                 .map(|candidate| (&candidate.reasons, &candidate.preferred_spans))
                 .collect::<Vec<_>>()
         );
+        assert_eq!(trace.config.admission, "lexical_union_semantic");
         let outcome = |path: &str| {
             trace
                 .files
@@ -1082,10 +1095,7 @@ mod tests {
         assert_eq!(outcome("needle-a.alpha").ineligible_documents, 1);
         assert_eq!(outcome("sem-x.alpha").outcome, HybridOutcome::Selected);
         assert_eq!(outcome("needle-b.alpha").outcome, HybridOutcome::Selected);
-        assert_eq!(
-            outcome("needle-c.alpha").outcome,
-            HybridOutcome::CutAtFusion
-        );
+        assert_eq!(outcome("needle-c.alpha").outcome, HybridOutcome::Selected);
         assert_eq!(outcome("needle-c.alpha").fusion_rank, Some(3));
         for path in ["needle-d.alpha", "sem-y.alpha", "plain.alpha"] {
             assert_eq!(
@@ -1138,10 +1148,10 @@ mod tests {
                 .iter()
                 .map(|rank| rank.selected)
                 .collect::<Vec<_>>(),
-            [true, true, true, false]
+            [true, true, true, true]
         );
         let json = serde_json::to_string(&trace).unwrap();
-        assert!(json.contains("\"outcome\":\"cut_at_fusion\""));
+        assert!(!json.contains("\"outcome\":\"cut_at_fusion\""));
         assert!(!json.contains("needle-a.alpha\\n"), "no source text");
     }
 }

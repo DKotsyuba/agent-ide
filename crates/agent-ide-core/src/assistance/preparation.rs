@@ -744,7 +744,7 @@ impl Worker<'_> {
             if let Some(trace) = &prepared.trace {
                 trace.record("packing_input", serde_json::json!({"operation_ref":job.reference,
                     "requested_token_budget":pending.budget,
-                    "prelude_policy":{"manifests":MANIFEST_FILES,"instructions":RULE_FILES},
+                    "prelude_policy":{"manifests":MANIFEST_FILES,"instructions":RULE_FILES,"test_toolchain":"language-declared"},
                     "units":units.iter().map(|u| serde_json::json!({"path":sources[u.file].path,
                         "content_hash":sources[u.file].hash,"range":u.range,"rank":u.rank,"required":u.required,
                         "bundle":u.bundle,"role":u.role,"complete_unit":u.complete})).collect::<Vec<_>>(),
@@ -1206,9 +1206,11 @@ impl PreludeFile {
     }
 }
 
-/// Worktree-relative rule files (root first, then nearer directories) and the nearest manifest
-/// of every delivered file plus the root manifest, each a regular file and listed once. The
-/// list is bounded by the delivered files' ancestors.
+/// Worktree-relative rule files (root first, then nearer directories), the nearest manifest
+/// of every delivered file plus the root manifest, then the nearest member of every test
+/// toolchain configuration family its language declares
+/// ([`crate::lang::LanguageSupport::test_toolchain_configs`]) for every delivered test file;
+/// each a regular file and listed once. The list is bounded by the delivered files' ancestors.
 ///
 /// Only the ancestors of `files` are probed with `symlink_metadata`: no walk, no Git call and no
 /// path outside `root`. A symlink or non-regular file declares nothing.
@@ -1222,6 +1224,7 @@ fn prelude_paths<'a>(
     };
     let mut rules = Vec::new();
     let mut manifests = Vec::new();
+    let mut toolchain = Vec::new();
     for name in MANIFEST_FILES {
         if regular(std::path::Path::new(name)) {
             manifests.push(std::path::PathBuf::from(name));
@@ -1250,8 +1253,30 @@ fn prelude_paths<'a>(
         {
             manifests.push(path);
         }
+        let Some(support) = crate::lang::Language::for_path(file)
+            .map(crate::lang::Language::support)
+            .filter(|support| support.is_test_file(file))
+        else {
+            continue;
+        };
+        for family in support.test_toolchain_configs() {
+            let nearest = directories.iter().rev().find_map(|directory| {
+                family
+                    .iter()
+                    .map(|name| directory.join(name))
+                    .find(|path| regular(path))
+            });
+            if let Some(path) = nearest
+                && !manifests.contains(&path)
+                && !rules.contains(&path)
+                && !toolchain.contains(&path)
+            {
+                toolchain.push(path);
+            }
+        }
     }
     rules.extend(manifests);
+    rules.extend(toolchain);
     rules
 }
 
@@ -2075,5 +2100,35 @@ mod tests {
                 "crates/a/Cargo.toml"
             ]
         );
+    }
+
+    /// A delivered test file brings the nearest member of each of its language's toolchain
+    /// families, once; a delivered non-test file brings none.
+    #[test]
+    fn prelude_paths_add_test_toolchain_configs() {
+        crate::lang::testing::install();
+        let scratch = crate::scratch::ScratchDir::new("prelude-toolchain");
+        let root: &std::path::Path = &scratch;
+        std::fs::create_dir_all(root.join("pkg/src")).unwrap();
+        std::fs::write(root.join("package.json"), "{}\n").unwrap();
+        std::fs::write(root.join("types.config"), "types\n").unwrap();
+        std::fs::write(root.join("runner.config"), "root\n").unwrap();
+        std::fs::write(root.join("pkg/runner.base"), "pkg\n").unwrap();
+        let only_source = [std::path::PathBuf::from("pkg/src/a.alpha")];
+        let paths = prelude_paths(root, only_source.iter().map(std::path::PathBuf::as_path));
+        assert_eq!(paths, [std::path::PathBuf::from("package.json")]);
+        let files = [
+            std::path::PathBuf::from("pkg/src/a.alpha"),
+            std::path::PathBuf::from("pkg/src/test_a.alpha"),
+            std::path::PathBuf::from("pkg/src/test_b.alpha"),
+        ];
+        let paths = prelude_paths(root, files.iter().map(std::path::PathBuf::as_path));
+        let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        assert_eq!(paths, ["package.json", "pkg/runner.base", "types.config"]);
+        // Within one directory the family's first alternative wins.
+        std::fs::write(root.join("pkg/runner.config"), "pkg first\n").unwrap();
+        let paths = prelude_paths(root, files.iter().map(std::path::PathBuf::as_path));
+        assert_eq!(paths[1], std::path::PathBuf::from("pkg/runner.config"));
+        assert_eq!(paths.len(), 3);
     }
 }

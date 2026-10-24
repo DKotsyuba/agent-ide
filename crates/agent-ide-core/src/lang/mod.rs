@@ -700,6 +700,14 @@ pub trait LanguageSupport: Send + Sync {
     /// Whether `file` is a test file by the language's conventions (`tests/`, `test_*.py`, `*.test.ts`).
     fn is_test_file(&self, file: &Path) -> bool;
 
+    /// Configuration families that decide how this language's test files compile and run, each
+    /// a list of alternative file names in preference order (`vitest.config.ts`, …;
+    /// `tsconfig.json`). Preparation delivers, for every delivered test file, the nearest
+    /// ancestor directory's first existing member of each family. The default declares none.
+    fn test_toolchain_configs(&self) -> &'static [&'static [&'static str]] {
+        &[]
+    }
+
     /// Builds the runner command for a target, run from the project root.
     fn test_selection(
         &self,
@@ -1389,6 +1397,10 @@ pub(crate) mod testing {
             _where_: InsertWhere,
         ) -> Result<InsertSite, LangError> {
             Err(LangError::UnknownSymbol(anchor.clone()))
+        }
+        /// A runner family (`runner.config`, else `runner.base`) and a `types.config` family.
+        fn test_toolchain_configs(&self) -> &'static [&'static [&'static str]] {
+            &[&["runner.config", "runner.base"], &["types.config"]]
         }
         /// Files named `test_*` are tests.
         fn is_test_file(&self, file: &Path) -> bool {
