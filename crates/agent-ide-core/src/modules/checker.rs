@@ -27,7 +27,7 @@ use super::{
 use crate::{
     checks::{
         BoxFuture, CheckRequest, Checker, ProblemSnapshot, UnavailableReason,
-        runner::{ConfinedRunner, RunOutput},
+        runner::{ConfinedRunner, RunOutput, RunSpec},
     },
     lang::Language,
 };
@@ -269,6 +269,15 @@ impl EffectRunner for CheckEffects<'_> {
                     );
                 }
             };
+            if let Err(error) = prepare_cache_directories(&spec, &self.request.cache_dir) {
+                return (
+                    EffectOutcome::Refused {
+                        cause: Cause::Exited,
+                        message: format!("creating cache directory: {}", error.kind()),
+                    },
+                    Vec::new(),
+                );
+            }
             let failed_run = (spec.program.clone(), spec.args.clone(), spec.env.clone());
             match self.runner.run(spec).await {
                 Ok(output) => {
@@ -291,6 +300,25 @@ impl EffectRunner for CheckEffects<'_> {
             }
         })
     }
+}
+
+/// Creates, before a run starts, the directories it is handed inside the private `cache_dir`:
+/// its write roots there and its temporary directory (`TMPDIR`, `TMP`, `TEMP`). The process may
+/// write only its declared roots and may not be able to create them itself; a compiler that
+/// cannot create its temporary file fails the whole build. Paths outside the cache are left as
+/// they are.
+fn prepare_cache_directories(spec: &RunSpec, cache_dir: &Path) -> std::io::Result<()> {
+    let temporary = spec
+        .env
+        .iter()
+        .filter(|(name, _)| matches!(name.as_str(), "TMPDIR" | "TMP" | "TEMP"))
+        .map(|(_, value)| PathBuf::from(value));
+    for directory in spec.write_roots.iter().cloned().chain(temporary) {
+        if directory.starts_with(cache_dir) {
+            std::fs::create_dir_all(&directory)?;
+        }
+    }
+    Ok(())
 }
 
 /// File in a check's private cache that holds the operator diagnostic of its last failed run.
@@ -359,9 +387,8 @@ mod tests {
     use std::{collections::BTreeMap, sync::Mutex};
 
     use super::*;
-    use crate::{
-        checks::runner::RunSpec,
-        modules::payload::{Arg, EffectRecipe, ExecutableSlot, Param, RunClass, SlotSource, Stdin},
+    use crate::modules::payload::{
+        Arg, EffectRecipe, ExecutableSlot, Param, RunClass, SlotSource, Stdin,
     };
 
     /// Runs the launcher program `tool` with one literal argument.
@@ -381,6 +408,34 @@ mod tests {
         capture_bytes: 64 << 20,
         assets: &[],
     }];
+
+    /// The cache root and a temporary directory inside it exist before a run; a temporary
+    /// directory outside the cache is not created.
+    #[test]
+    fn cache_directories_exist_before_a_run() {
+        let scratch = crate::scratch::ScratchDir::new("cache-directories");
+        let cache = scratch.join("language");
+        let outside = scratch.join("elsewhere/tmp");
+        let mut spec = RunSpec {
+            program: PathBuf::from("/bin/tool"),
+            args: Vec::new(),
+            cwd: scratch.to_path_buf(),
+            env: vec![
+                ("TMPDIR".to_owned(), cache.join("tmp").display().to_string()),
+                ("TEMP".to_owned(), outside.display().to_string()),
+            ],
+            read_roots: Vec::new(),
+            write_roots: vec![cache.clone()],
+            read_denies: Vec::new(),
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 1,
+        };
+        prepare_cache_directories(&spec, &cache).unwrap();
+        assert!(cache.join("tmp").is_dir());
+        assert!(!outside.exists());
+        spec.env.clear();
+        prepare_cache_directories(&spec, &cache).unwrap();
+    }
 
     /// A failed run leaves its whole diagnostic in the cache, owner-only, replacing the last.
     #[test]
@@ -435,12 +490,15 @@ mod tests {
     }
 
     /// An admitted recipe runs through the runner with the core's working directory and returns
-    /// its outcome with stdout and stderr attachments; an unknown recipe is refused unrun.
+    /// its outcome with stdout and stderr attachments; its write roots inside the private cache
+    /// exist before it starts and its failure leaves the run log; an unknown recipe is refused
+    /// unrun.
     #[tokio::test]
     async fn effects_run_admitted_recipes_and_refuse_the_rest() {
+        let scratch = crate::scratch::ScratchDir::new("check-effects");
         let request = CheckRequest {
             worktree: PathBuf::from("/work/tree"),
-            cache_dir: PathBuf::from("/cache/alpha"),
+            cache_dir: scratch.join("alpha"),
             input_generation: 7,
             read_denies: Vec::new(),
         };
@@ -490,7 +548,15 @@ mod tests {
             assert_eq!(specs[0].program, PathBuf::from("/bin/sh"));
             assert_eq!(specs[0].args, ["--json"]);
             assert_eq!(specs[0].cwd, request.worktree);
+            let cache_roots: Vec<_> = specs[0]
+                .write_roots
+                .iter()
+                .filter(|root| root.starts_with(&request.cache_dir))
+                .collect();
+            assert!(!cache_roots.is_empty(), "{:?}", specs[0].write_roots);
+            assert!(cache_roots.iter().all(|root| root.is_dir()));
         }
+        assert!(request.cache_dir.join(FAILED_RUN_LOG).is_file());
         let (outcome, output) = effects.run(&fence, effect("other")).await;
         assert!(matches!(
             outcome,
