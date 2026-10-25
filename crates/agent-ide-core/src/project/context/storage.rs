@@ -417,6 +417,9 @@ impl ContextIndex {
                         plain_remaining = plain_remaining.saturating_sub(bytes.len());
                         record.content_hash = Some(blake3::hash(&bytes).to_hex().to_string());
                     }
+                    // A file that turns out not to be text (a NUL byte or invalid UTF-8) is
+                    // skipped like any binary file; it is not a gap in discovery.
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {}
                     Err(_) => {
                         record.truncated = true;
                         discovery_complete = false;
@@ -758,6 +761,8 @@ fn eligible_plain_text(path: &Path) -> bool {
 }
 
 /// Reads bounded regular UTF-8 text without following a final symlink or opening devices/pipes.
+/// Content that is not text (a NUL byte or invalid UTF-8) fails with
+/// [`io::ErrorKind::InvalidData`]; every other failure, the size limit included, is a read gap.
 fn read_plain_text(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     use std::io::Read;
     let file = OpenOptions::new()
@@ -770,8 +775,11 @@ fn read_plain_text(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > limit || bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
-        return Err(io::Error::other("not bounded UTF-8 text"));
+    if bytes.len() > limit {
+        return Err(io::Error::other("plain text exceeds source limit"));
+    }
+    if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not UTF-8 text"));
     }
     Ok(bytes)
 }
@@ -806,6 +814,39 @@ fn extensionless_script(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod initialization_tests {
     use super::*;
+
+    /// A text-named file whose bytes are not UTF-8 is skipped like a binary file: discovery
+    /// stays complete and readable text beside it is still indexed.
+    #[test]
+    fn non_utf8_text_named_file_is_skipped_without_a_discovery_gap() {
+        let root = crate::scratch::ScratchDir::new("index-non-utf8");
+        // A repository, so the walk can prove its ignore rules and claim completeness at all.
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("notes.md"), "readable\n").unwrap();
+        std::fs::write(root.join("answer.md"), [0xff, 0xfe, 0x01]).unwrap();
+        let mut index = ContextIndex::open(&root).unwrap();
+        index
+            .refresh(&crate::project::structure::StructureOptions::default())
+            .unwrap();
+        let snapshot = index.snapshot().unwrap().unwrap();
+        assert!(snapshot.discovery_complete);
+        let records = index.records().unwrap();
+        let hashed = |name: &str| {
+            records
+                .iter()
+                .find(|record| record.path == Path::new(name))
+                .is_some_and(|record| record.content_hash.is_some())
+        };
+        assert!(hashed("notes.md"));
+        assert!(!hashed("answer.md"));
+    }
 
     /// An interrupted legacy root insert is not ready to readers and is repaired only when empty.
     #[test]
