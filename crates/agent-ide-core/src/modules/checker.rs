@@ -269,8 +269,14 @@ impl EffectRunner for CheckEffects<'_> {
                     );
                 }
             };
+            let failed_run = (spec.program.clone(), spec.args.clone(), spec.env.clone());
             match self.runner.run(spec).await {
-                Ok(output) => completed(output),
+                Ok(output) => {
+                    if output.status != Some(0) {
+                        record_failed_run(&self.request.cache_dir, &failed_run, &output);
+                    }
+                    completed(output)
+                }
                 Err(error) => (
                     EffectOutcome::Refused {
                         cause: if error.kind() == std::io::ErrorKind::NotFound {
@@ -285,6 +291,48 @@ impl EffectRunner for CheckEffects<'_> {
             }
         })
     }
+}
+
+/// File in a check's private cache that holds the operator diagnostic of its last failed run.
+pub const FAILED_RUN_LOG: &str = "last-failed-run.log";
+
+/// Writes the operator diagnostic of one failed check run to [`FAILED_RUN_LOG`] in `cache_dir`:
+/// program, arguments, the complete (allowlisted) environment, exit status and the whole captured
+/// stderr. The agent's reply keeps only its bounded cause line; this file lets an operator see
+/// the underlying error (for example a build script's own output). Best effort, owner-only, and
+/// replaced by the next failed run; a write failure never changes the check result.
+fn record_failed_run(
+    cache_dir: &std::path::Path,
+    (program, args, env): &(PathBuf, Vec<std::ffi::OsString>, Vec<(String, String)>),
+    output: &RunOutput,
+) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut text = format!(
+        "status: {:?}\nprogram: {}\nargs:",
+        output.status,
+        program.display()
+    );
+    for arg in args {
+        text.push(' ');
+        text.push_str(&arg.to_string_lossy());
+    }
+    text.push_str("\nenv:\n");
+    for (name, value) in env {
+        text.push_str(&format!("  {name}={value}\n"));
+    }
+    text.push_str("stderr:\n");
+    let path = cache_dir.join(FAILED_RUN_LOG);
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.write_all(&output.stderr)
+        });
 }
 
 /// The outcome and output attachments (stdout 1, stderr 2) of a completed run.
@@ -333,6 +381,39 @@ mod tests {
         capture_bytes: 64 << 20,
         assets: &[],
     }];
+
+    /// A failed run leaves its whole diagnostic in the cache, owner-only, replacing the last.
+    #[test]
+    fn a_failed_run_records_its_diagnostic_in_the_cache() {
+        let cache = crate::scratch::ScratchDir::new("failed-run-log");
+        let run = (
+            PathBuf::from("/bin/tool"),
+            vec![std::ffi::OsString::from("check")],
+            vec![("CC".to_owned(), "/x/clang".to_owned())],
+        );
+        let output = |stderr: &[u8]| RunOutput {
+            status: Some(101),
+            stderr: stderr.to_vec(),
+            ..RunOutput::default()
+        };
+        record_failed_run(&cache, &run, &output(b"first"));
+        record_failed_run(
+            &cache,
+            &run,
+            &output(b"--- stderr\nfatal: header not found\n"),
+        );
+        let path = cache.join(FAILED_RUN_LOG);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("status: Some(101)\nprogram: /bin/tool\nargs: check\n"));
+        assert!(text.contains("  CC=/x/clang\n"));
+        assert!(text.ends_with("stderr:\n--- stderr\nfatal: header not found\n"));
+        assert!(!text.contains("first"));
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     /// Records every spec and answers a fixed failed run.
     #[derive(Default)]

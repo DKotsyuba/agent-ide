@@ -279,7 +279,10 @@ Check caches live outside every runtime directory, under
 never collide; at daemon start, cache directories
 whose recorded worktree no longer exists are removed. A new worktree's Rust cache is cloned
 copy-on-write from the most recently completed sibling worktree of the same repository when
-possible.
+possible. A check process that exits nonzero leaves `last-failed-run.log` (mode `0600`) in its
+cache: program, arguments, the allowlisted environment, exit status and the whole captured
+stderr, replaced by the next failed run. It is an operator diagnostic; the agent's reply keeps
+only the bounded cause line.
 
 Lifecycle: the first MCP server that finds no live daemon spawns one shared per-repository daemon
 (runtime directory `/private/tmp/ai-r-<16 hex of the rendezvous key digest>`); later MCP servers of
