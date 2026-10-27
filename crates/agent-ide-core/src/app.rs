@@ -817,6 +817,7 @@ pub async fn dispatch_method_if_running(
         AssistanceMethod::Prepare => "prepare",
         AssistanceMethod::Symbol => "symbol",
         AssistanceMethod::Graph => "graph",
+        AssistanceMethod::Tree => "tree",
         AssistanceMethod::Test => "test",
         AssistanceMethod::HookSubmit => return MethodDispatchTransportResult::Unavailable,
     };
@@ -2055,6 +2056,7 @@ fn drop_reply_for_test(method: AssistanceMethod) -> bool {
         AssistanceMethod::Prepare => "prepare",
         AssistanceMethod::Symbol => "symbol",
         AssistanceMethod::Graph => "graph",
+        AssistanceMethod::Tree => "tree",
         AssistanceMethod::Test => "test",
         AssistanceMethod::HookSubmit => return false,
     };

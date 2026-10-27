@@ -193,31 +193,6 @@
   },
   {
     "annotations": {
-      "destructiveHint": false,
-      "openWorldHint": true,
-      "readOnlyHint": false
-    },
-    "description": "Task source packet in one call, selected source whole; operator-configured models. If pending, one ide.inspect of its detail_ref waits for it. Check gaps.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "task": {
-          "type": "string"
-        },
-        "token_budget": {
-          "description": "Deprecated; ignored.",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "task"
-      ],
-      "type": "object"
-    },
-    "name": "ide.prepare"
-  },
-  {
-    "annotations": {
       "openWorldHint": false,
       "readOnlyHint": true
     },
@@ -434,5 +409,27 @@
       "type": "object"
     },
     "name": "ide.test"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Project map in one call: directories and files with sizes and authors' one-line descriptions (manifests, module docs, READMEs); no source bodies. path zooms in.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "description": "Levels to expand; default 2 at root, 1 below.",
+          "type": "integer"
+        },
+        "path": {
+          "description": "A directory to zoom into; default: the project root.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.tree"
   }
 ]

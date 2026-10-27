@@ -127,6 +127,70 @@ impl Worker<'_> {
         ))
     }
 
+    /// `ide.tree {path?, depth?}`: the project map of a worktree directory (the root by default),
+    /// expanding `depth` directory levels (2 at the root, 1 below). Read-only: the directory must
+    /// resolve inside the activated worktree; a file path is refused (read the file instead).
+    /// Documentation comes from each file's own language.
+    pub(super) async fn tree(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let path = job
+            .parameters
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_owned();
+        let authority = self.authority(&binding).await?;
+        let root = std::fs::canonicalize(authority.worktree().worktree_path())
+            .map_err(|_| FailureCode::SourceUnavailable)?;
+        let requested = root.join(&path);
+        if requested.is_file() {
+            return Ok((
+                PeerReply::InvalidParameters {
+                    message: format!(
+                        "{path} is a file; ide.tree maps directories. Read the file itself to see its contents."
+                    ),
+                },
+                Some(authority),
+                None,
+            ));
+        }
+        let directory =
+            std::fs::canonicalize(&requested).map_err(|_| FailureCode::NoSuchFile(path.clone()))?;
+        let relative = directory
+            .strip_prefix(&root)
+            .map_err(|_| FailureCode::OutsideAllowedRoots)?
+            .to_path_buf();
+        let depth = job.parameters.get("depth").and_then(Value::as_u64).map_or(
+            if relative.as_os_str().is_empty() {
+                2
+            } else {
+                1
+            },
+            |depth| depth as usize,
+        );
+        let text = match render::project_tree(&root, &relative, depth).await {
+            Ok(text) => text,
+            Err(error) => {
+                return Err(
+                    match error.get_ref().and_then(|inner| {
+                        inner.downcast_ref::<crate::modules::contract::ModuleUnavailable>()
+                    }) {
+                        Some(failure) => module_failure(job, failure),
+                        None => FailureCode::SourceUnavailable,
+                    },
+                );
+            }
+        };
+        let (reply, page) =
+            ContextPageState::new(text, 0, false, ResultKind::Outline).next(&job.reference)?;
+        self.shared.set_context_page(&job.reference, page);
+        Ok((reply, Some(authority), None))
+    }
+
     /// `ide.outline {path}`: the file skeleton; the `{paths}` and `{glob}` forms outline each file
     /// through this same path (`batch_outline`).
     pub(super) async fn outline(

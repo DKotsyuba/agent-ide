@@ -154,6 +154,8 @@ pub enum AssistanceMethod {
     Graph,
     /// v0.4 `ide.test` explicit test run/status, wire version 4.
     Test,
+    /// `ide.tree` on-demand project map, wire version 5.
+    Tree,
 }
 
 impl AssistanceMethod {
@@ -162,7 +164,7 @@ impl AssistanceMethod {
         match self {
             Self::Edit | Self::Outline | Self::Read | Self::Symbol => 3,
             Self::Test => 4,
-            Self::Graph | Self::Prepare => 5,
+            Self::Graph | Self::Prepare | Self::Tree => 5,
             _ => 2,
         }
     }
@@ -193,6 +195,7 @@ impl AssistanceMethod {
             "symbol" if version == 3 => Some(Self::Symbol),
             "test" if version == 4 => Some(Self::Test),
             "graph" if version == 5 => Some(Self::Graph),
+            "tree" if version == 5 => Some(Self::Tree),
             _ => None,
         }
     }

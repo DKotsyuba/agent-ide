@@ -126,7 +126,8 @@ Preserve the safety invariants, required full gate and staged cutover qualificat
 
 `schemas/tools.json` exports the real binary's `tools/list` array for Claude;
 `schemas/tools-codex.json` exports Codex (`mcp --runtime-dir <dir> --host codex`).
-The current production source defines eleven tools per host, including `ide.graph` and `ide.prepare`.
+The current production source defines eleven public tools per host, including `ide.graph` and
+`ide.tree`; `ide.prepare` is retired from the catalogs but remains routable for internal tests.
 Both snapshots are generated from the rebuilt binary and contain the eleven public names.
 The complete project gate remains required before claiming this candidate is done.
 Both source catalogs have the same eleven public names. Public `ide.context` is
@@ -151,8 +152,9 @@ the managed launcher form. After any change to the tool surface in
 update`, review the diff, and commit it together with the source change; CI
 and the gate fail on drift.
 
-`ide.prepare {"task":"…"}` is the opt-in task reconnaissance call after
-`ide.start`. It returns one text reply carrying every selected unit whole, without
+`ide.tree {"path":"…"}` is the on-demand project map (directories, files, sizes and the
+authors' one-line descriptions; no source bodies). The retired `ide.prepare {"task":"…"}` was the
+opt-in task reconnaissance call after `ide.start`. It returns one text reply carrying every selected unit whole, without
 pagination or size cuts (`token_budget` is accepted only for compatibility and ignored); a
 preparation outliving the call's 45 s wait answers `pending`, and one `ide.inspect` of its
 `detail_ref` waits for and returns that packet. `partial` and `needs_evidence` are not successful

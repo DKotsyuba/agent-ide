@@ -539,7 +539,19 @@ impl LanguageSupport for RustSupport {
         integration_test_bin(file)
     }
 
-    /// The first non-empty `//!` or `///` line of the leading comment block.
+    /// A crate's library root, then its binary root, then a module's own root file.
+    fn package_doc_files(&self) -> &'static [&'static str] {
+        &["src/lib.rs", "src/main.rs", "lib.rs", "mod.rs", "main.rs"]
+    }
+
+    /// `[package] description` of `Cargo.toml` in `directory`.
+    fn manifest_description(&self, directory: &Path) -> Option<String> {
+        let text = std::fs::read_to_string(directory.join("Cargo.toml")).ok()?;
+        agent_ide_core::lang::toml_section_string(&text, "package", "description")
+    }
+
+    /// The first paragraph (consecutive non-empty lines) of the leading `//!` or `///` comment
+    /// block, joined with spaces.
     fn file_doc(&self, text: &str) -> Option<String> {
         let lines: Vec<_> = text.lines().collect();
 
@@ -558,9 +570,14 @@ impl LanguageSupport for RustSupport {
                 break;
             }
         }
-        docs.into_iter()
-            .find(|doc| !doc.is_empty())
-            .map(str::to_owned)
+        // The first paragraph: consecutive non-empty doc lines from the first one, so a sentence
+        // wrapped across lines is not cut at the line break.
+        let paragraph: Vec<&str> = docs
+            .into_iter()
+            .skip_while(|doc| doc.is_empty())
+            .take_while(|doc| !doc.is_empty())
+            .collect();
+        (!paragraph.is_empty()).then(|| paragraph.join(" "))
     }
 
     /// Plans a formatter from its target's effective Cargo project and edition. The returned
@@ -2190,6 +2207,10 @@ mod tests {
         assert_eq!(
             RustSupport.file_doc("//! Rust docs\nfn a() {}"),
             Some("Rust docs".into())
+        );
+        assert_eq!(
+            RustSupport.file_doc("//! Managed units of the sole\n//! writer.\n//!\n//! Detail.\n"),
+            Some("Managed units of the sole writer.".into())
         );
     }
 

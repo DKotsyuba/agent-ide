@@ -17,6 +17,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::lang::{Language, Symbol, line_count, regions, render::outline_text};
 
+/// Paths Git ignores below `directory` (both relative to `root`; an ignored directory is listed
+/// once, as the directory), read with the same filter-safe Git invocation the builder uses and
+/// limited to that subtree.
+pub fn ignored_paths(root: &Path, directory: &Path) -> io::Result<Vec<PathBuf>> {
+    git::ignored_under(root, directory)
+}
+
 /// Informational comparison policy, presented once instead of as an operational failure.
 const GIT_FILTER_NOTICE: &str =
     "Git content filters disabled; observations use unfiltered worktree bytes";

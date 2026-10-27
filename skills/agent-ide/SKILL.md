@@ -7,14 +7,9 @@ description: Task-based Agent IDE workflow, compatible batches, native fallback 
 
 The tool descriptions define each call; this skill holds the rules. Call `ide.start` first.
 
-For an unfamiliar task, an enabled `ide.prepare {"task":"exact task"}`
-returns a source shortlist from the active project. Read its gaps and source ranges before
-planning edits; omitted files are not proven irrelevant. The operator controls indexing and
-model services. If disabled, use the normal outline/read/search workflow. Indexing and private
-model reads are not edit-read receipts: use the normal addressed read when an edit guard
-requires it. A slow preparation answers `pending` with a `detail_ref`: call `ide.inspect` with
-it once; that call waits for the whole packet. Do not repeat the prepare request, and do not edit
-before it settles: an edit cancels the preparation.
+To find your way in an unfamiliar project, `ide.tree {}` returns a map: directories and
+files with sizes and the authors' one-line descriptions, no source bodies. Zoom in with
+`ide.tree {"path":"crates/store"}`; then outline or read the files that matter.
 
 ## One bounded batch per topic
 

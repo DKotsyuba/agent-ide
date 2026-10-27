@@ -972,6 +972,21 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Files, relative to a directory, whose module documentation describes that directory as a
+    /// package (a project map shows it next to the directory), in preference order. The default
+    /// declares none.
+    fn package_doc_files(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The description this language's package manifest in `directory` declares, read from the
+    /// file as plain text, or `None` (the default) when there is no manifest, no description or
+    /// the manifest cannot be read.
+    fn manifest_description(&self, directory: &Path) -> Option<String> {
+        let _ = directory;
+        None
+    }
+
     /// Collects requested source-only details from the same immutable bytes. Languages may
     /// reuse one parser tree; disabled consumers are not invoked. Missing results are unavailable.
     fn source_details(
@@ -1122,6 +1137,37 @@ pub fn kind_of(kind: lsp::SymbolKind) -> SymbolKind {
         lsp::SymbolKind::VARIABLE => SymbolKind::Variable,
         _ => SymbolKind::Other,
     }
+}
+
+/// The basic string value of `key` inside the `[section]` table of a TOML manifest, read line
+/// by line without a TOML parser: `key = "value"` or `key = 'value'` on one line. Escapes and
+/// multi-line strings are not interpreted and yield `None`, never a partial value.
+pub fn toml_section_string(text: &str, section: &str, key: &str) -> Option<String> {
+    let header = format!("[{section}]");
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            inside = line == header;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+        let value = value.trim();
+        let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let inner = value.strip_prefix(quote)?;
+        let end = inner.find(quote)?;
+        let inner = &inner[..end];
+        return (!inner.contains('\\') && !value.starts_with("\"\"\"")).then(|| inner.to_owned());
+    }
+    None
 }
 
 /// Neutral languages for unit tests of language-independent code.
@@ -1423,6 +1469,24 @@ pub(crate) mod testing {
                 failed: stdout.lines().filter(|line| *line == "fail").count() as u32,
                 ..TestReport::default()
             }
+        }
+        /// `pkg.alpha` (then `pkg.beta`, …) documents its directory as a package.
+        fn package_doc_files(&self) -> &'static [&'static str] {
+            match self.0 {
+                "alpha" => &["pkg.alpha"],
+                _ => &[],
+            }
+        }
+        /// An alpha manifest is a `manifest.alpha` whose `description:` line is the description.
+        fn manifest_description(&self, directory: &Path) -> Option<String> {
+            if self.0 != "alpha" {
+                return None;
+            }
+            std::fs::read_to_string(directory.join("manifest.alpha"))
+                .ok()?
+                .lines()
+                .find_map(|line| line.strip_prefix("description:"))
+                .map(|value| value.trim().to_owned())
         }
         /// A leading `#!doc ` line is the module documentation.
         fn file_doc(&self, text: &str) -> Option<String> {

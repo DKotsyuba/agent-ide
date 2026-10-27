@@ -136,7 +136,20 @@ fn paths(bytes: &[u8]) -> io::Result<Vec<PathBuf>> {
 
 /// Lists ignored untracked paths/directories relative to the requested root.
 pub(super) fn ignored(root: &Path) -> io::Result<Vec<PathBuf>> {
+    ignored_under(root, Path::new("."))
+}
+
+/// [`ignored`] limited to `pathspec` (relative to `root`), so Git walks only that subtree.
+pub(super) fn ignored_under(root: &Path, pathspec: &Path) -> io::Result<Vec<PathBuf>> {
     let git = Git::new(root)?;
+    let pathspec = if pathspec.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        pathspec
+    };
+    let pathspec = pathspec
+        .to_str()
+        .ok_or_else(|| io::Error::other("non-UTF-8 pathspec"))?;
     let bytes = git.run(&[
         "ls-files",
         "--others",
@@ -145,7 +158,7 @@ pub(super) fn ignored(root: &Path) -> io::Result<Vec<PathBuf>> {
         "--directory",
         "-z",
         "--",
-        ".",
+        pathspec,
     ])?;
     Ok(paths(&bytes)?
         .into_iter()

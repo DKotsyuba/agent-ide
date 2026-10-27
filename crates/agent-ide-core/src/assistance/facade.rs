@@ -96,6 +96,9 @@ pub enum AssistanceTool {
     Graph,
     /// Runs or inspects one explicitly requested project test job.
     Test,
+    /// Returns an on-demand project map: directories and files with sizes and the authors'
+    /// one-line descriptions, no source bodies.
+    Tree,
 }
 
 impl AssistanceTool {
@@ -115,6 +118,7 @@ impl AssistanceTool {
             Self::Symbol => "ide.symbol",
             Self::Graph => "ide.graph",
             Self::Test => "ide.test",
+            Self::Tree => "ide.tree",
         }
     }
 
@@ -153,6 +157,7 @@ impl AssistanceTool {
             Self::Symbol => AssistanceMethod::Symbol,
             Self::Graph => AssistanceMethod::Graph,
             Self::Test => AssistanceMethod::Test,
+            Self::Tree => AssistanceMethod::Tree,
         }
     }
 }
@@ -168,7 +173,10 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
             )
             | (AssistanceTool::Diff, ResultKind::Diff)
             | (AssistanceTool::Stop, ResultKind::Stop)
-            | (AssistanceTool::Outline, ResultKind::Outline)
+            | (
+                AssistanceTool::Outline | AssistanceTool::Tree,
+                ResultKind::Outline
+            )
             | (AssistanceTool::Read, ResultKind::Read)
             | (AssistanceTool::Prepare, ResultKind::Prepare)
             | (AssistanceTool::Edit, ResultKind::EditProgress)
@@ -237,9 +245,10 @@ fn describe_languages(description: &str) -> String {
         .replace("{manifests_tail}", &tail)
 }
 
-/// Returns eleven public schemas and the private Context validation schema, independent of availability.
-/// Public router registration and catalog projection exclude Context; stable indexes remain internal.
-pub fn tool_schemas() -> [ToolSchema; 12] {
+/// Returns the public schemas and the private Context validation schema, independent of
+/// availability. Public router registration and catalog projection exclude Context, and the
+/// catalog also leaves out the retired Prepare route; stable indexes remain internal.
+pub fn tool_schemas() -> [ToolSchema; 13] {
     let mut environment_languages = checked_language_ids();
     environment_languages.sort_unstable();
     let example_language = environment_languages.first().copied().unwrap_or("language");
@@ -419,6 +428,13 @@ pub fn tool_schemas() -> [ToolSchema; 12] {
             json!({"type":"object","additionalProperties":false,"required":["task"],"properties":{
                 "task":{"type":"string","minLength":1,"maxLength":16384},
                 "token_budget":{"type":"integer","minimum":0,"description":"Deprecated; ignored."}
+            }}),
+        ),
+        schema(
+            AssistanceTool::Tree,
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "path":{"type":"string","minLength":1,"maxLength":MAX_RELATIVE_PATH_BYTES,"description":"A directory to zoom into; default: the project root."},
+                "depth":{"type":"integer","minimum":1,"maximum":crate::lang::render::TREE_MAX_DEPTH,"description":"Levels to expand; default 2 at root, 1 below."}
             }}),
         ),
     ]
@@ -780,6 +796,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "patch",
         ],
         AssistanceTool::Outline => &["path", "kinds", "paths", "glob"],
+        AssistanceTool::Tree => &["path", "depth"],
         AssistanceTool::Read => &[
             "symbol",
             "path",
@@ -1040,6 +1057,24 @@ pub(crate) fn validate_normalized_call(
                 return Err(invalid_field(
                     "token_budget",
                     FieldRule::OneOf("nonnegative integer"),
+                ));
+            }
+        }
+        AssistanceTool::Tree => {
+            if object.contains_key("path") {
+                let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+                if let Some(rule) = path_shape_rule(path.strip_suffix('/').unwrap_or(path)) {
+                    return Err(invalid_field("path", rule));
+                }
+            }
+            if let Some(depth) = object.get("depth")
+                && !depth.as_u64().is_some_and(|depth| {
+                    (1..=crate::lang::render::TREE_MAX_DEPTH as u64).contains(&depth)
+                })
+            {
+                return Err(invalid_field(
+                    "depth",
+                    FieldRule::OneOf("an integer from 1 to 4"),
                 ));
             }
         }
@@ -5386,6 +5421,17 @@ impl StdioFacade {
             .await
     }
 
+    /// Project map in one call: directories and files with sizes and authors' one-line descriptions (manifests, module docs, READMEs); no source bodies. path zooms in.
+    #[tool(name = "ide.tree", input_schema = tool_schemas()[12].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = true, open_world_hint = false))]
+    async fn tree(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Tree, parameters, context).await
+    }
+
     /// Batch items: {symbol} or {path, offset, limit}. Addresses: file#Type/f, #@imports, path:line, …:3-5. Current source, every item whole; unchanged acknowledged, force:true resends.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
@@ -5525,7 +5571,8 @@ impl CatalogHost {
     pub fn catalog(self, tools: Vec<rmcp::model::Tool>) -> Vec<rmcp::model::Tool> {
         tools
             .into_iter()
-            .filter(|tool| &*tool.name != "ide.context")
+            // Context is private; Prepare is retired from the catalog but stays routable.
+            .filter(|tool| !matches!(&*tool.name, "ide.context" | "ide.prepare"))
             .map(|mut tool| {
                 // The whole-source result annotation is Claude Code's own contract; Codex ignores
                 // it, so its catalog does not carry the bytes.

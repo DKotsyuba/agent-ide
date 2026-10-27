@@ -808,6 +808,16 @@ fn assert_compact_envelope(reply: &Value) {
         // File outlines begin with a complete addressed unit row; a directory still uses its
         // header, and a batch or empty file explains its exceptional delivery.
         ("complete", Some("outline")) if body.starts_with("outline: ") => {}
+        // An `ide.tree` project map opens with its own `tree <dir> · N files · depth D` header.
+        ("complete", Some("outline")) if body.starts_with("tree ") => {
+            assert!(
+                body.lines()
+                    .next()
+                    .unwrap_or_default()
+                    .contains(" files · depth "),
+                "{reply}"
+            );
+        }
         ("complete", Some("outline")) => {
             let header = body.lines().next().unwrap_or_default();
             if let Some((file, details)) = header.split_once("  (") {
@@ -1302,7 +1312,8 @@ async fn server_identity_and_tool_annotations_are_pinned() {
         ("ide.outline", read_only.clone()),
         ("ide.read", read_only.clone()),
         ("ide.symbol", read_only.clone()),
-        ("ide.graph", read_only),
+        ("ide.graph", read_only.clone()),
+        ("ide.tree", read_only),
         (
             "ide.start",
             json!({
@@ -1322,10 +1333,6 @@ async fn server_identity_and_tool_annotations_are_pinned() {
             }),
         ),
         ("ide.test", json!({"readOnlyHint": false})),
-        (
-            "ide.prepare",
-            json!({"readOnlyHint": false, "destructiveHint": false, "openWorldHint": true}),
-        ),
         (
             "ide.edit",
             json!({
@@ -1368,12 +1375,12 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
             "ide.graph",
             "ide.inspect",
             "ide.outline",
-            "ide.prepare",
             "ide.read",
             "ide.start",
             "ide.stop",
             "ide.symbol",
-            "ide.test"
+            "ide.test",
+            "ide.tree"
         ]
     );
     assert!(
@@ -1588,12 +1595,12 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
             "ide.graph",
             "ide.inspect",
             "ide.outline",
-            "ide.prepare",
             "ide.read",
             "ide.start",
             "ide.stop",
             "ide.symbol",
-            "ide.test"
+            "ide.test",
+            "ide.tree"
         ]
     );
     let unavailable = mcp
@@ -14576,6 +14583,78 @@ async fn product_directory_outline_lists_files_and_rejects_escaping_symlinks() {
         .await;
     assert_eq!(
         actor.settle(&fixture, refused).await["code"],
+        "outside_allowed_roots"
+    );
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// `ide.tree` maps the activated worktree without a language server: package descriptions from
+/// a manifest, file descriptions from module docs, zooming in by path, a file refused, and an
+/// escaping symlink refused.
+#[tokio::test]
+async fn product_tree_maps_the_worktree_with_author_descriptions() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::create_dir_all(fixture.root.join("store/src")).unwrap();
+    std::fs::write(
+        fixture.root.join("store/Cargo.toml"),
+        "[package]\nname = \"store\"\ndescription = \"Durable record store. Second sentence.\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("store/src/lib.rs"),
+        "//! Store entry points\npub fn open() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("store/src/journal.rs"),
+        "//! Append-only journal\npub fn append() {}\n",
+    )
+    .unwrap();
+    let outside = fixture.base.join("outside-tree");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, fixture.root.join("escape")).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "project-tree").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"project-tree"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let root = actor.call(&fixture, "ide.tree", json!({})).await;
+    let root = actor.settle(&fixture, root).await;
+    assert_eq!(root["kind"], "outline", "{root}");
+    let text = root["text"].as_str().unwrap();
+    assert!(text.starts_with("tree . · "), "{text}");
+    let store = text
+        .lines()
+        .find(|line| line.starts_with("store/"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(store.ends_with("Durable record store."), "{text}");
+    assert!(!text.contains("escape"), "{text}");
+    let zoomed = actor
+        .call(&fixture, "ide.tree", json!({"path":"store/src"}))
+        .await;
+    let zoomed = actor.settle(&fixture, zoomed).await;
+    let text = zoomed["text"].as_str().unwrap();
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("journal.rs") && line.ends_with("Append-only journal")),
+        "{text}"
+    );
+    let file = actor
+        .call(&fixture, "ide.tree", json!({"path":"store/src/lib.rs"}))
+        .await;
+    let file = actor.settle(&fixture, file).await;
+    assert!(file.to_string().contains("is a file"), "{file}");
+    let escaped = actor
+        .call(&fixture, "ide.tree", json!({"path":"escape"}))
+        .await;
+    assert_eq!(
+        actor.settle(&fixture, escaped).await["code"],
         "outside_allowed_roots"
     );
     daemon.kill().await.unwrap();

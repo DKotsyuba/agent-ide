@@ -4338,6 +4338,7 @@ impl<'a> Worker<'a> {
                     }
                     AssistanceTool::Diff => Box::pin(self.diff(job)).await,
                     AssistanceTool::Outline => Box::pin(self.outline(job)).await,
+                    AssistanceTool::Tree => Box::pin(self.tree(job)).await,
                     AssistanceTool::Read => {
                         panic_seam(job);
                         Box::pin(self.read(job)).await
@@ -9243,7 +9244,7 @@ fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
         AssistanceTool::Inspect => crate::errorlog::Method::Inspect,
         AssistanceTool::Stop => crate::errorlog::Method::Stop,
         AssistanceTool::Edit => crate::errorlog::Method::Edit,
-        AssistanceTool::Outline => crate::errorlog::Method::Outline,
+        AssistanceTool::Outline | AssistanceTool::Tree => crate::errorlog::Method::Outline,
         AssistanceTool::Read => crate::errorlog::Method::Read,
         AssistanceTool::Symbol => crate::errorlog::Method::Symbol,
         AssistanceTool::Graph => crate::errorlog::Method::Graph,

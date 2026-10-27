@@ -855,6 +855,30 @@ impl LanguageSupport for TypeScript {
         crate::environment::command_argv(worktree, argv, config)
     }
 
+    /// A package's index module, at its root or under `src/`.
+    fn package_doc_files(&self) -> &'static [&'static str] {
+        &[
+            "index.ts",
+            "index.tsx",
+            "index.js",
+            "src/index.ts",
+            "src/index.tsx",
+            "src/index.js",
+        ]
+    }
+
+    /// The `description` string of `package.json` in `directory`.
+    fn manifest_description(&self, directory: &Path) -> Option<String> {
+        let text = std::fs::read_to_string(directory.join("package.json")).ok()?;
+        let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+        manifest
+            .get("description")?
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+
     /// A leading `//` comment, or the first text line of a leading `/** */` block.
     fn file_doc(&self, text: &str) -> Option<String> {
         let lines: Vec<_> = text.lines().collect();

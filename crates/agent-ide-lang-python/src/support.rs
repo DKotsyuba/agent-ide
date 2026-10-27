@@ -801,6 +801,17 @@ impl LanguageSupport for Python {
         crate::environment::command_env(worktree, cwd, program)
     }
 
+    /// A package's `__init__.py`.
+    fn package_doc_files(&self) -> &'static [&'static str] {
+        &["__init__.py"]
+    }
+
+    /// `[project] description` of `pyproject.toml` in `directory`.
+    fn manifest_description(&self, directory: &Path) -> Option<String> {
+        let text = std::fs::read_to_string(directory.join("pyproject.toml")).ok()?;
+        agent_ide_core::lang::toml_section_string(&text, "project", "description")
+    }
+
     /// The module docstring's first line (or the line after an empty opening quote).
     fn file_doc(&self, text: &str) -> Option<String> {
         let lines: Vec<_> = text.lines().collect();

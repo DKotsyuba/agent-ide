@@ -82,6 +82,8 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 | `ide.graph` (`symbol`, `direction`, `depth`, `tests`; live bounded caller/callee tree; only functions and methods are nodes, and tests collapse to one `+N tests` line per parent unless `tests: true` expands them with `[test]` marks) | implemented (historical wire version 5: 11 tools; current public catalog: 10) |
 | `ide.diff` cleanup (compact default, `provenance` flag, plain-`git diff` fallback, untracked symlinks listed) | implemented (v0.6.1) |
 | `ide.inspect` project problems and file diagnostics | implemented; no separate problems tool |
+| `ide.tree` on-demand project map (`path`, `depth`) | implemented |
+| `ide.prepare` task source packet | retired from both public catalogs; the route and code remain for internal tests |
 | Live language server sessions for Python and TypeScript (one per binding and language) | implemented |
 
 ## 0. Principles
@@ -672,7 +674,34 @@ Total: about two weeks; Rust is fully implemented by the end of the first week.
 2. Is the project card in the `ide.start` response (with `ide.project` to retrieve it again) accepted?
 3. Are the ceilings accepted: 16 KB per response, 30 usage lines, and a 120-second test budget?
 
+## ide.tree
+
+Arguments: optional `path` (a worktree directory; default the root) and `depth` (1–4; default 2
+at the root, 1 below). Requires an active binding (`ide.start`). Read-only, no edit authority and
+no read receipts. A file path is refused; a path resolving outside the worktree is refused as
+`outside_allowed_roots`.
+
+The reply is one plain-text map, at most 32 KiB, never paged:
+
+```text
+tree crates/store/src · 37 files · depth 1
+ops/             4 files  Closed storage operation inventory of the single resident writer.
+admission.rs   348 lines  Atomic SQLite admission for durable agent ownership.
+zoom in: ide.tree {"path":"crates/store/src/ops"}
+```
+
+Subdirectories are expanded `depth` levels with recursive file counts; files are listed only for
+the requested directory, with line counts. Every description is existing author text cut to its
+first sentence (at most 120 characters), first found: the language's package manifest
+description (`Cargo.toml`, `package.json`, `pyproject.toml`), the module documentation of a
+package root file the language declares, then the first paragraph of a `README.md`. Nothing is
+generated. Hidden names, build/dependency/cache directories, Git-ignored paths and symlinks are
+left out. Entries past the size bound are cut with a count and a narrowing hint.
+
 ## ide.prepare
+
+Retired from both public catalogs (2026-10-26): a controlled comparison showed no speed gain over
+native search and one quality loss. The route below stays callable for internal tests.
 
 Arguments: required nonempty `task` (up to 16384 UTF-8 bytes). `token_budget` (a nonnegative
 integer) is accepted for compatibility only: it is ignored, never limits the packet, and the

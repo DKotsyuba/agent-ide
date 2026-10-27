@@ -243,7 +243,9 @@ fn log_binding_unavailable(
         super::facade::AssistanceTool::Inspect => errorlog::Method::Inspect,
         super::facade::AssistanceTool::Stop => errorlog::Method::Stop,
         super::facade::AssistanceTool::Edit => errorlog::Method::Edit,
-        super::facade::AssistanceTool::Outline => errorlog::Method::Outline,
+        super::facade::AssistanceTool::Outline | super::facade::AssistanceTool::Tree => {
+            errorlog::Method::Outline
+        }
         super::facade::AssistanceTool::Read => errorlog::Method::Read,
         super::facade::AssistanceTool::Symbol => errorlog::Method::Symbol,
         super::facade::AssistanceTool::Graph => errorlog::Method::Graph,
@@ -911,6 +913,7 @@ impl ProductDispatcher {
                     AssistanceMethod::Prepare => super::facade::AssistanceTool::Prepare,
                     AssistanceMethod::Symbol => super::facade::AssistanceTool::Symbol,
                     AssistanceMethod::Graph => super::facade::AssistanceTool::Graph,
+                    AssistanceMethod::Tree => super::facade::AssistanceTool::Tree,
                     AssistanceMethod::Test => super::facade::AssistanceTool::Test,
                     AssistanceMethod::HookSubmit => return Err(HostBindingCause::InvalidMetadata),
                 };
@@ -1552,6 +1555,7 @@ impl AssistanceDispatcher for ProductDispatcher {
                     AssistanceMethod::Prepare => Some(super::facade::AssistanceTool::Prepare),
                     AssistanceMethod::Symbol => Some(super::facade::AssistanceTool::Symbol),
                     AssistanceMethod::Graph => Some(super::facade::AssistanceTool::Graph),
+                    AssistanceMethod::Tree => Some(super::facade::AssistanceTool::Tree),
                     AssistanceMethod::Test => Some(super::facade::AssistanceTool::Test),
                     AssistanceMethod::HookSubmit => None,
                 };

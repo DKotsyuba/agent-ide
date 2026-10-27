@@ -814,6 +814,307 @@ pub async fn directory_outline(root: &Path, directory: &Path) -> std::io::Result
     Ok(out)
 }
 
+/// Most bytes one project map answer carries (about 8,000 tokens); later entries are cut with an
+/// explicit count and a narrowing hint, never paged.
+pub const TREE_MAX_BYTES: usize = 32 * 1024;
+/// Deepest directory level a project map expands.
+pub const TREE_MAX_DEPTH: usize = 4;
+/// Longest one-line description a project map shows.
+const TREE_DESCRIPTION_CHARS: usize = 120;
+
+/// One directory of a project map: its listed subdirectories and files.
+struct TreeDir {
+    name: String,
+    relative: std::path::PathBuf,
+    dirs: Vec<TreeDir>,
+    files: Vec<String>,
+    /// Regular files at any depth below, with the same exclusions as the listing.
+    file_count: usize,
+}
+
+/// Whether a directory entry is left out of project listings: hidden names and build, dependency
+/// and cache directories.
+fn skipped_entry(name: &str) -> bool {
+    name.starts_with('.') || matches!(name, "target" | "node_modules" | "__pycache__")
+}
+
+/// Reads `directory` (relative to `root`) into a [`TreeDir`] whose subdirectories are expanded
+/// `depth - 1` more levels; files are kept by name, sorted, and every directory counts its files.
+/// Entries Git ignores (`ignored`, relative paths) are left out like hidden and build entries.
+fn read_tree(
+    root: &Path,
+    relative: &Path,
+    depth: usize,
+    ignored: &std::collections::BTreeSet<std::path::PathBuf>,
+) -> std::io::Result<TreeDir> {
+    let absolute = root.join(relative);
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let mut file_count = 0;
+    for entry in std::fs::read_dir(&absolute)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child = relative.join(&name);
+        if skipped_entry(&name) || ignored.contains(&child) {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            let dir = if depth > 1 {
+                read_tree(root, &child, depth - 1, ignored)?
+            } else {
+                TreeDir {
+                    name: name.clone(),
+                    file_count: count_tree_files(root, &child, ignored)?,
+                    relative: child,
+                    dirs: Vec::new(),
+                    files: Vec::new(),
+                }
+            };
+            file_count += dir.file_count;
+            dirs.push(TreeDir { name, ..dir });
+        } else if kind.is_file() {
+            file_count += 1;
+            files.push(name);
+        }
+    }
+    dirs.sort_by(|a, b| a.name.cmp(&b.name));
+    files.sort();
+    Ok(TreeDir {
+        name: relative
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        relative: relative.to_path_buf(),
+        dirs,
+        files,
+        file_count,
+    })
+}
+
+/// Counts the regular files below `relative`, with the same exclusions as [`read_tree`].
+fn count_tree_files(
+    root: &Path,
+    relative: &Path,
+    ignored: &std::collections::BTreeSet<std::path::PathBuf>,
+) -> std::io::Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(root.join(relative))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child = relative.join(&name);
+        if skipped_entry(&name) || ignored.contains(&child) {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            count += count_tree_files(root, &child, ignored)?;
+        } else if kind.is_file() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// The first sentence of `text`, on one line and at most [`TREE_DESCRIPTION_CHARS`] characters.
+fn first_sentence(text: &str) -> Option<String> {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let end = line
+        .match_indices(". ")
+        .map(|(index, _)| index + 1)
+        .next()
+        .unwrap_or(line.len());
+    let sentence = line[..end].trim();
+    (!sentence.is_empty()).then(|| clip(sentence, TREE_DESCRIPTION_CHARS))
+}
+
+/// The first paragraph of a `README.md` in `directory`, skipping headings, badges and fences.
+fn readme_description(directory: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(directory.join("README.md")).ok()?;
+    let mut paragraph = String::new();
+    for line in text.lines().take(80) {
+        let line = line.trim();
+        if line.is_empty() {
+            if paragraph.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if line.starts_with('#')
+            || line.starts_with("```")
+            || line.starts_with("[!")
+            || line.starts_with("![")
+            || line.starts_with('<')
+        {
+            if paragraph.is_empty() {
+                continue;
+            }
+            break;
+        }
+        paragraph.push(' ');
+        paragraph.push_str(line);
+    }
+    first_sentence(&paragraph)
+}
+
+/// The author's description of `directory` as a package, first found: a manifest's description,
+/// the module documentation of a package root file, then a `README.md` first paragraph. Every
+/// source is existing text; nothing is generated.
+async fn directory_description(
+    root: &Path,
+    relative: &Path,
+) -> Result<Option<String>, crate::modules::contract::ModuleUnavailable> {
+    let directory = root.join(relative);
+    let languages = crate::lang::registered();
+    for language in languages {
+        if let Some(text) = language.support().manifest_description(&directory)
+            && let Some(sentence) = first_sentence(&text)
+        {
+            return Ok(Some(sentence));
+        }
+    }
+    for language in languages {
+        for file in language.support().package_doc_files() {
+            let path = directory.join(file);
+            if !path.is_file() {
+                continue;
+            }
+            let Ok((_, prefix)) = read_file_lines_and_prefix(&path) else {
+                continue;
+            };
+            if let Some(doc) = first_file_doc(root, &path, &prefix).await?
+                && let Some(sentence) = first_sentence(&doc)
+            {
+                return Ok(Some(sentence));
+            }
+        }
+    }
+    Ok(readme_description(&directory))
+}
+
+/// Writes one aligned project-map entry: `name`, a right-aligned measure and a description.
+fn tree_line(
+    out: &mut String,
+    indent: usize,
+    name: &str,
+    width: usize,
+    measure: &str,
+    doc: Option<&str>,
+) {
+    let pad = width.saturating_sub(name.chars().count());
+    out.push_str(&" ".repeat(indent * 2));
+    out.push_str(name);
+    out.push_str(&" ".repeat(pad + 2));
+    out.push_str(measure);
+    if let Some(doc) = doc {
+        out.push_str("  ");
+        out.push_str(doc);
+    }
+    let kept = out.trim_end_matches(' ').len();
+    out.truncate(kept);
+    out.push('\n');
+}
+
+/// Renders the project map of `directory` (relative to `root`, empty for the root): its
+/// subdirectories expanded `depth` levels with recursive file counts and descriptions, then the
+/// files of `directory` itself with line counts and their module documentation's first sentence.
+/// Deeper files are counted, not listed. The answer stays within [`TREE_MAX_BYTES`]; entries
+/// past it are cut with a count and a narrowing hint. Hidden names, build, dependency and cache
+/// directories, Git-ignored paths and symlinks are left out; nothing is followed outside `root`.
+pub async fn project_tree(root: &Path, directory: &Path, depth: usize) -> std::io::Result<String> {
+    let depth = depth.clamp(1, TREE_MAX_DEPTH);
+    // Outside a Git repository nothing is ignored beyond hidden and build entries.
+    let ignored = crate::project::structure::ignored_paths(root, directory)
+        .map(|paths| paths.into_iter().collect())
+        .unwrap_or_default();
+    let tree = read_tree(root, directory, depth, &ignored)?;
+    let shown = if directory.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        directory.display().to_string()
+    };
+    let mut out = format!("tree {shown} · {} files · depth {depth}\n", tree.file_count);
+    let mut omitted = 0usize;
+    let mut first_omitted: Option<String> = None;
+    // Directories, breadth by level so a cut keeps the shallow overview.
+    let mut lines: Vec<(usize, &TreeDir)> = Vec::new();
+    fn walk<'a>(dir: &'a TreeDir, indent: usize, lines: &mut Vec<(usize, &'a TreeDir)>) {
+        for child in &dir.dirs {
+            lines.push((indent, child));
+            walk(child, indent + 1, lines);
+        }
+    }
+    walk(&tree, 0, &mut lines);
+    let width = lines
+        .iter()
+        .map(|(indent, dir)| dir.name.chars().count() + 1 + indent * 2)
+        .chain(tree.files.iter().map(|name| name.chars().count()))
+        .max()
+        .unwrap_or(0)
+        .min(36);
+    for (indent, dir) in &lines {
+        if out.len() >= TREE_MAX_BYTES {
+            omitted += 1;
+            first_omitted.get_or_insert_with(|| dir.relative.display().to_string());
+            continue;
+        }
+        let doc = directory_description(root, &dir.relative)
+            .await
+            .map_err(std::io::Error::other)?;
+        let label = format!("{}/", dir.name);
+        let measure = format!(
+            "{:>4} {}",
+            dir.file_count,
+            if dir.file_count == 1 {
+                "file "
+            } else {
+                "files"
+            }
+        );
+        tree_line(
+            &mut out,
+            *indent,
+            &label,
+            width.saturating_sub(indent * 2),
+            &measure,
+            doc.as_deref(),
+        );
+    }
+    for name in &tree.files {
+        if out.len() >= TREE_MAX_BYTES {
+            omitted += 1;
+            first_omitted.get_or_insert_with(|| directory.join(name).display().to_string());
+            continue;
+        }
+        let path = root.join(directory).join(name);
+        let (line_count, prefix) = read_file_lines_and_prefix(&path)?;
+        let doc = first_file_doc(root, &path, &prefix)
+            .await
+            .map_err(std::io::Error::other)?
+            .and_then(|doc| first_sentence(&doc));
+        tree_line(
+            &mut out,
+            0,
+            name,
+            width,
+            &format!("{line_count:>4} lines"),
+            doc.as_deref(),
+        );
+    }
+    if omitted > 0 {
+        let hint = first_omitted.unwrap_or_default();
+        out.push_str(&format!(
+            "… {omitted} more entries; narrow with ide.tree {{\"path\":\"{hint}\"}} or a smaller depth\n"
+        ));
+    } else if let Some((_, dir)) = lines.iter().find(|(indent, _)| *indent == 0) {
+        out.push_str(&format!(
+            "zoom in: ide.tree {{\"path\":\"{}\"}}\n",
+            dir.relative.display()
+        ));
+    }
+    Ok(out)
+}
+
 /// Counts file lines in constant memory and retains only the first 4 KiB for documentation.
 fn read_file_lines_and_prefix(path: &Path) -> std::io::Result<(u32, Vec<u8>)> {
     use std::io::Read;
@@ -1248,6 +1549,89 @@ mod tests {
     use super::*;
     use crate::lang::SymbolPath;
     use std::path::PathBuf;
+
+    /// A project map lists subdirectories with recursive file counts and the first description
+    /// found (manifest, package root file doc, README), then the directory's own files with line
+    /// counts and doc sentences; hidden and build directories are left out.
+    #[tokio::test]
+    async fn project_tree_maps_directories_and_files_with_author_descriptions() {
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new("project-tree");
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "core/manifest.alpha",
+            "name: core\ndescription: Core engine. Extra words.\n",
+        );
+        write("core/src/a.alpha", "#!doc Alpha source\nline\n");
+        write("util/pkg.alpha", "#!doc Helper package for parsing\n");
+        write(
+            "docs/README.md",
+            "# Docs\n\nUser guides and references. More text.\n",
+        );
+        write("plain/x.txt", "x\n");
+        write("target/skip.alpha", "x\n");
+        write(".hidden/skip.alpha", "x\n");
+        write("main.alpha", "#!doc Entry point\none\ntwo\n");
+        let text = project_tree(&root, Path::new(""), 2).await.unwrap();
+        assert!(text.starts_with("tree . · 6 files · depth 2\n"), "{text}");
+        let line = |prefix: &str| {
+            text.lines()
+                .find(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("{prefix}: {text}"))
+                .to_owned()
+        };
+        assert!(line("core/").contains("2 files") && line("core/").ends_with("Core engine."));
+        assert!(line("src/").starts_with("  src/"), "{text}");
+        assert!(
+            line("util/").ends_with("Helper package for parsing"),
+            "{text}"
+        );
+        assert!(
+            line("docs/").ends_with("User guides and references."),
+            "{text}"
+        );
+        assert!(line("plain/").ends_with("1 file"), "{text}");
+        assert!(
+            line("main.alpha").contains("3 lines") && line("main.alpha").ends_with("Entry point")
+        );
+        assert!(
+            !text.contains("target") && !text.contains(".hidden"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("zoom in: ide.tree {\"path\":\"core\"}\n"),
+            "{text}"
+        );
+        let below = project_tree(&root, Path::new("core"), 1).await.unwrap();
+        assert!(
+            below.starts_with("tree core · 2 files · depth 1\n"),
+            "{below}"
+        );
+        assert!(
+            below.contains("src/") && !below.contains("a.alpha"),
+            "{below}"
+        );
+    }
+
+    /// Operator preview of a real project's map: `PROJECT_TREE_ROOT` and optional
+    /// `PROJECT_TREE_PATH`/`PROJECT_TREE_DEPTH`; prints the map and its time.
+    #[tokio::test]
+    #[ignore = "operator preview of a real project"]
+    async fn project_tree_preview() {
+        let root = PathBuf::from(std::env::var("PROJECT_TREE_ROOT").unwrap());
+        let path = std::env::var("PROJECT_TREE_PATH").unwrap_or_default();
+        let depth = std::env::var("PROJECT_TREE_DEPTH")
+            .ok()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(2);
+        let started = std::time::Instant::now();
+        let text = project_tree(&root, Path::new(&path), depth).await.unwrap();
+        eprintln!("{text}--- {} bytes in {:?}", text.len(), started.elapsed());
+    }
 
     #[tokio::test]
     async fn directory_outline_lists_docs_and_counts_child_files() {
