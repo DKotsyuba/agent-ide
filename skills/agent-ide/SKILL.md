@@ -7,9 +7,9 @@ description: Task-based Agent IDE workflow, compatible batches, native fallback 
 
 The tool descriptions define each call; this skill holds the rules. Call `ide.start` first.
 
-To find your way in an unfamiliar project, `ide.tree {}` returns a map: directories and
-files with sizes and the authors' one-line descriptions, no source bodies. Zoom in with
-`ide.tree {"path":"crates/store"}`; then outline or read the files that matter.
+In an unfamiliar project, call `ide.tree {}` first: one call maps directories and files with
+sizes and the authors' one-line purpose, replacing rounds of ls/find/rg; no source bodies. Zoom
+in with `ide.tree {"path":"crates/store"}`; then outline or read the files that matter.
 
 ## One bounded batch per topic
 

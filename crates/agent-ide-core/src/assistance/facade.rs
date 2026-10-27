@@ -433,8 +433,8 @@ pub fn tool_schemas() -> [ToolSchema; 13] {
         schema(
             AssistanceTool::Tree,
             json!({"type":"object","additionalProperties":false,"properties":{
-                "path":{"type":"string","minLength":1,"maxLength":MAX_RELATIVE_PATH_BYTES,"description":"A directory to zoom into; default: the project root."},
-                "depth":{"type":"integer","minimum":1,"maximum":crate::lang::render::TREE_MAX_DEPTH,"description":"Levels to expand; default 2 at root, 1 below."}
+                "path":{"type":"string","minLength":1,"maxLength":MAX_RELATIVE_PATH_BYTES,"description":"Directory to zoom into; default: project root."},
+                "depth":{"type":"integer","minimum":1,"maximum":crate::lang::render::TREE_MAX_DEPTH,"description":"Levels; default 2 at root, 1 below."}
             }}),
         ),
     ]
@@ -5421,7 +5421,7 @@ impl StdioFacade {
             .await
     }
 
-    /// Project map in one call: directories and files with sizes and authors' one-line descriptions (manifests, module docs, READMEs); no source bodies. path zooms in.
+    /// Project map: call first in an unfamiliar repo. One call lists directories and files with sizes and the authors' one-line purpose, replacing rounds of ls/find/rg. No source bodies; path zooms in.
     #[tool(name = "ide.tree", input_schema = tool_schemas()[12].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn tree(

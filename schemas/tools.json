@@ -505,16 +505,16 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Project map in one call: directories and files with sizes and authors' one-line descriptions (manifests, module docs, READMEs); no source bodies. path zooms in.",
+    "description": "Project map: call first in an unfamiliar repo. One call lists directories and files with sizes and the authors' one-line purpose, replacing rounds of ls/find/rg. No source bodies; path zooms in.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "depth": {
-          "description": "Levels to expand; default 2 at root, 1 below.",
+          "description": "Levels; default 2 at root, 1 below.",
           "type": "integer"
         },
         "path": {
-          "description": "A directory to zoom into; default: the project root.",
+          "description": "Directory to zoom into; default: project root.",
           "type": "string"
         }
       },
