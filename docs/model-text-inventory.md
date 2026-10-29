@@ -48,7 +48,7 @@ unknown/lexical evidence, and do not print source authority/version bookkeeping.
 Inspect queries keep the public name and are retained like other deferred results. Public
 `ide.context` is unregistered; only the private transport/validation engine remains.
 Every production reply is one text block without `structuredContent`; deferred graph, test and
-edit-check results stay retained and Bridge delivers them automatically when configured, owning
+edit-check results stay retained and Bridge delivers them automatically, owning
 carrier and timing (no polling or `wait_ms` advice; IDE has no `Stop`, reply or hook deferred carrier).
 
 The active model workflow in `docs/contracts/tools-v0.4.md` is guarded too: r5 refusal
@@ -134,8 +134,8 @@ table tests `content::refusal_table::every_rewritten_refusal_has_a_bounded_head_
 |---|---|---|---|---|
 | Diagnostics feedback fact (G via render) | `worker.rs` `FeedbackDelta::new`, `facade.rs` `render` | `Fact:/Next:/Freshness:` labels, "latest context result" | one line plus `ide.inspect {"detail_ref":…}`, "Read the flagged symbols with ide.read" | rewritten |
 | Problem-feed overflow line | `delivery.rs` | `ide.context` with kind problems | `ide.inspect {"kind":"problems"}` | rewritten |
-| `test-finished`, `started`, running lines (G) | `test_fact.rs` | claimed unconditional arrival | retained reference plus conditional Bridge delivery | rewritten |
-| `edit-checked`, `job-ready` facts (handed to Bridge) | `outbox.rs`, `delivery.rs` | already unlabelled | unchanged | kept |
+| `test-finished`, `started`, running lines (G) | `test_fact.rs`, `worker.rs` | full logs displaced saved completions; repeated pages repeated log bytes | compact summary/failures/target exits; explicit numbered output pages; repeated pages return one pointer; output selector restores retained bodies after context loss; automatic Bridge delivery | rewritten |
+| `edit-checked`, `job-ready` facts (handed to Bridge) | `outbox.rs`, `delivery.rs` | known unavailability produced redundant wakes while later unavailability lost accepted waiters | known reason stays inline before acceptance; every accepted check settles with actual result, unavailable, cancellation or superseding cause | rewritten |
 | `ide.stop` reply (G) | `worker.rs` | n/a | unchanged | kept |
 | Project feed plates (`rust: …`) | `project.rs` states (G via `surfaces()`) | n/a | unchanged | kept |
 

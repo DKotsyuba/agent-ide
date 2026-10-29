@@ -726,7 +726,8 @@ impl Worker<'_> {
         let deadline = job
             .deadline
             .checked_sub(EDIT_SETTLEMENT_RESERVE)
-            .map(|deadline| deadline.min(tokio::time::Instant::now() + EDIT_CHECK_WAIT));
+            .map(|deadline| deadline.min(tokio::time::Instant::now() + EDIT_CHECK_WAIT))
+            .filter(|deadline| *deadline > tokio::time::Instant::now());
         let mut stages = Vec::new();
         let mut unchecked = Vec::new();
         let mut generations: BTreeMap<String, Option<u64>> = BTreeMap::new();
@@ -757,6 +758,11 @@ impl Worker<'_> {
                 ));
                 continue;
             };
+            if let Some(reason) = self.known_check_unavailable(&authority, &report.path) {
+                unchecked.push((report.path.clone(), EditDiagnostics::NotAnalysed { reason }));
+                job.check_scheduled = true;
+                continue;
+            }
             // One generation per language: the first written file of the language triggers it,
             // the rest of that language read the same check.
             let generation = *generations
@@ -818,16 +824,18 @@ impl Worker<'_> {
         self.finish_batch_check(job, check).await
     }
 
-    /// Answers a parked multi-file edit once every per-file check result is known, or with
-    /// `unknown` diagnostics at its deadline or on cancellation; otherwise parks it again for a
-    /// quarter second. The answer retains every written file's post-write observation, so the
-    /// reply's `source_ref` is an edit base for each.
+    /// Answers a parked multi-file edit once its per-file checks settle; cancellation/deadline
+    /// closes missing results as `not_analysed` with the actual lifecycle cause. Otherwise parks
+    /// for a quarter second. Retains the captured post-write observations; capture may be partial,
+    /// so a source reference never proves every committed file was observed. Accepted check work
+    /// still receives one terminal Bridge fact, subject to the complete-source publication proof.
     pub(super) async fn finish_batch_check(
         &mut self,
         job: &mut Job,
         mut check: BatchCheck,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
-        let expired = *job.cancel.borrow() || tokio::time::Instant::now() >= check.deadline;
+        let cancelled = *job.cancel.borrow();
+        let expired = cancelled || tokio::time::Instant::now() >= check.deadline;
         let mut diagnostics = Vec::with_capacity(check.stages.len() + check.unchecked.len());
         for stage in &check.stages {
             let JobStage::EditAwaitingCheck { path, .. } = stage else {
@@ -835,7 +843,9 @@ impl Worker<'_> {
             };
             match self.check_diagnostics(stage) {
                 Some(found) => diagnostics.push((path.clone(), found)),
-                None if expired => diagnostics.push((path.clone(), EditDiagnostics::Unknown {})),
+                None if expired => diagnostics.push((path.clone(), EditDiagnostics::NotAnalysed {
+                    reason: if cancelled { "project check cancelled after the edit committed" } else { "project check unavailable: matching diagnostics did not finish before the deadline" }.into(),
+                })),
                 None => {
                     self.reply_batch_early(job, &mut check);
                     job.stage = Some(JobStage::EditBatchAwaitingCheck(Box::new(check)));

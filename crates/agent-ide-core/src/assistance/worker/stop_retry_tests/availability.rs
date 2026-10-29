@@ -546,7 +546,7 @@ async fn a_loading_symbol_answers_approximately_then_precisely() {
     assert!(text.starts_with("approximate: "), "{text}");
     assert!(
         text.contains(
-            "the precise answer is retained under its reference; Bridge delivers it automatically when configured"
+            "the precise answer is retained under its reference; Bridge delivers it automatically"
         ),
         "{text}"
     );

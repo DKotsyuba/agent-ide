@@ -234,20 +234,22 @@ fn combine(plan: &BatchPlan, ran: &[Ran], elapsed: Duration) -> RunResult {
             Ran::Cancelled => {
                 report.incomplete = true;
                 stopped = true;
+                if exit == Some(0) {
+                    exit = None;
+                }
                 output.push_str("not run: cancelled by owner\n");
             }
             Ran::Skipped => {
                 report.incomplete = true;
                 stopped = true;
+                if exit == Some(0) {
+                    exit = None;
+                }
                 output.push_str("not run: the budget was spent\n");
             }
         }
     }
-    let mut start = output.len().saturating_sub(MAX_OUTPUT);
-    while !output.is_char_boundary(start) {
-        start += 1;
-    }
-    let output = output[start..].to_owned();
+    let output = retained_output(&output, MAX_OUTPUT, output.len() > MAX_OUTPUT);
     let targets = plan
         .targets
         .iter()
@@ -262,7 +264,7 @@ fn combine(plan: &BatchPlan, ran: &[Ran], elapsed: Duration) -> RunResult {
                         |run| run_outcome(run, ran.get(run)),
                     )
             });
-            format!("target {} {}: {outcome}", index + 1, target.label)
+            crate::assistance::test_fact::target_outcome(index + 1, &target.label, &outcome)
         })
         .collect();
     RunResult {
@@ -271,9 +273,9 @@ fn combine(plan: &BatchPlan, ran: &[Ran], elapsed: Duration) -> RunResult {
         output_paged: false,
         elapsed,
         stopped,
-        cancelled: ran
-            .iter()
-            .any(|run| matches!(run, Ran::Result(result) if result.cancelled)),
+        cancelled: ran.iter().any(|run| {
+            matches!(run, Ran::Cancelled) || matches!(run, Ran::Result(result) if result.cancelled)
+        }),
         exit,
         budget: plan.budget,
         detail_ref: plan.detail_ref.clone(),
@@ -286,7 +288,8 @@ fn combine(plan: &BatchPlan, ran: &[Ran], elapsed: Duration) -> RunResult {
 
 /// The outcome a target line shows for invocation `run` (zero-based): its counts (`run 2 — 3
 /// passed, 0 failed`, plus `, stopped at budget`), `no test results (exit N)` when it counted
-/// nothing, why it could not start, or that the budget was spent before it.
+/// nothing, why it could not start, or that the budget was spent before it. A command that
+/// never started has no observed exit; unparsed output never supplies test counts.
 fn run_outcome(run: usize, ran: Option<&Ran>) -> String {
     let number = run + 1;
     match ran {
@@ -296,7 +299,14 @@ fn run_outcome(run: usize, ran: Option<&Ran>) -> String {
                 let exit = result
                     .exit
                     .map_or_else(|| "unavailable".to_owned(), |code| code.to_string());
-                format!("run {number} — exit {exit}; test counts unavailable")
+                let state = if result.cancelled {
+                    "; cancelled"
+                } else if result.stopped {
+                    "; stopped at budget"
+                } else {
+                    ""
+                };
+                format!("run {number} — exit {exit}; test counts unavailable{state}")
             } else if report.passed == 0
                 && report.failed == 0
                 && result.exit.is_some_and(|code| code != 0)
@@ -307,8 +317,12 @@ fn run_outcome(run: usize, ran: Option<&Ran>) -> String {
                 )
             } else {
                 let mut line = format!(
-                    "run {number} — {} passed, {} failed",
-                    report.passed, report.failed
+                    "run {number} — {} passed, {} failed (exit {})",
+                    report.passed,
+                    report.failed,
+                    result
+                        .exit
+                        .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
                 );
                 if report.incomplete && !result.stopped {
                     line.push_str(", partial counts");
@@ -321,9 +335,15 @@ fn run_outcome(run: usize, ran: Option<&Ran>) -> String {
                 line
             }
         }
-        Some(Ran::NotStarted(error)) => format!("run {number} — could not start: {error}"),
-        Some(Ran::Cancelled) => format!("run {number} — not run: cancelled by owner"),
-        Some(Ran::Skipped) | None => format!("run {number} — not run: the budget was spent"),
+        Some(Ran::NotStarted(error)) => {
+            format!("run {number} — exit unavailable; could not start: {error}")
+        }
+        Some(Ran::Cancelled) => {
+            format!("run {number} — not run: cancelled by owner (exit unavailable)")
+        }
+        Some(Ran::Skipped) | None => {
+            format!("run {number} — not run: the budget was spent (exit unavailable)")
+        }
     }
 }
 
@@ -370,6 +390,11 @@ mod batch_tests {
         let line = run_outcome(0, Some(&Ran::Result(Box::new(result))));
         assert_eq!(line, "run 1 — exit 0; test counts unavailable");
         assert!(!line.contains("passed"));
+        let refused = run_outcome(0, Some(&Ran::NotStarted("long reason ".repeat(100))));
+        assert!(
+            crate::assistance::test_fact::target_outcome(1, "command", &refused)
+                .contains("exit unavailable")
+        );
     }
 
     /// Cancellation reaps the active invocation, skips later commands and preserves a terminal
@@ -489,10 +514,10 @@ mod batch_tests {
         assert_eq!(
             result.targets,
             [
-                "target 1 symbol a.rs#f: run 1 — 2 passed, 0 failed",
-                "target 2 symbol a.rs#g: run 1 — 2 passed, 0 failed",
+                "target 1 symbol a.rs#f: run 1 — 2 passed, 0 failed (exit 0)",
+                "target 2 symbol a.rs#g: run 1 — 2 passed, 0 failed (exit 0)",
                 "target 3 path b.rs: no tests in b.rs; the file has no tests",
-                "target 4 pattern slow: run 2 — 1 passed, 1 failed",
+                "target 4 pattern slow: run 2 — 1 passed, 1 failed (exit 0)",
             ]
         );
         assert!(
@@ -541,7 +566,7 @@ mod batch_tests {
         assert!(result.stopped);
         assert_eq!(
             result.targets[0],
-            "target 1 pattern a: run 1 — could not start: program not found"
+            "target 1 pattern a: run 1 — exit unavailable; could not start: program not found"
         );
         assert!(
             result.targets[1].starts_with("target 2 pattern b: run 2 — "),
@@ -550,7 +575,7 @@ mod batch_tests {
         );
         assert_eq!(
             result.targets[2],
-            "target 3 pattern c: run 3 — not run: the budget was spent"
+            "target 3 pattern c: run 3 — not run: the budget was spent (exit unavailable)"
         );
     }
 }

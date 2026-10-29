@@ -1,5 +1,9 @@
 //! Executable MCP roundtrips for static discovery, separated ingress, and finite daemon routing.
 
+/// Compact test results and explicit output-page product checks.
+#[path = "result_economy/mod.rs"]
+mod result_economy;
+
 use std::{
     os::unix::{ffi::OsStrExt, fs::DirBuilderExt, fs::PermissionsExt},
     path::{Path, PathBuf},
@@ -688,6 +692,7 @@ fn assert_compact_envelope(reply: &Value) {
                 || text.starts_with("tests: could not start ")
                 || text.starts_with("tests: no tests in ")
                 || text.starts_with("tests: no retained runs")
+                || text.starts_with("output page ")
                 || text.starts_with("page ")
                 || (structured["detail_ref"].is_string() && !body.is_empty()),
             "{reply}"
@@ -762,7 +767,7 @@ fn assert_compact_envelope(reply: &Value) {
         ("unavailable", _) => assert!(text.contains("\nRepair: "), "{reply}"),
         ("pending", _) => assert!(
             text.contains("Result retained under")
-                && text.contains("Bridge delivers it automatically when configured."),
+                && text.contains("Bridge delivers it automatically."),
             "{reply}"
         ),
         // A durable edit refusal is a head sentence and one Repair line; an applied edit leads
@@ -6739,7 +6744,7 @@ async fn pending_and_batch_replies_never_invite_polling() {
     assert!(
         edit["text"].as_str().is_some_and(|text| {
             text.contains("diagnostics: pending; project check retained under")
-                && text.contains("Bridge delivers it automatically when configured")
+                && text.contains("Bridge delivers it automatically")
         }),
         "{edit}"
     );
@@ -9979,7 +9984,7 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     assert_eq!(
         start_text.trim_end(),
         "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); the result \
-         is retained under its reference; Bridge delivers it automatically when configured",
+         is retained under its reference; Bridge delivers it automatically",
         "{start_text}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -10037,7 +10042,11 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     };
     assert_eq!(verbose_result["detail_ref"], verbose_ref);
     let mut page = actor
-        .call(&fixture, "ide.inspect", json!({"detail_ref":verbose_ref}))
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":format!("{verbose_ref}/output/1")}),
+        )
         .await;
     assert_eq!(
         page["continuation"], true,
@@ -10048,7 +10057,7 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
             .call(
                 &fixture,
                 "ide.inspect",
-                json!({"detail_ref":verbose_result["detail_ref"]}),
+                json!({"detail_ref":page["detail_ref"]}),
             )
             .await;
     }
@@ -10596,7 +10605,7 @@ async fn configured_product_cold_rust_symbol_and_graph_never_answer_pending() {
         if text.starts_with("approximate: ") {
             assert!(
                 text.contains(
-                    "the precise answer is retained under its reference; Bridge delivers it automatically when configured"
+                    "the precise answer is retained under its reference; Bridge delivers it automatically"
                 ),
                 "{text}"
             );
@@ -14734,7 +14743,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
         assert!(
             text.starts_with("approximate: rust-analyzer is still indexing;")
                 && text.contains(
-                    "the precise answer is retained under its reference; Bridge delivers it automatically when configured"
+                    "the precise answer is retained under its reference; Bridge delivers it automatically"
                 ),
             "{reply}"
         );
@@ -15842,7 +15851,7 @@ async fn configured_product_activation_reply_includes_the_project_card() {
     assert!(text.contains("\nlayout: src/ 1"), "{text}");
     assert!(text.contains("\ndocs: README.md"), "{text}");
     assert!(
-        text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it; its result is retained under its reference and Bridge delivers it when configured"),
+        text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it; its result is retained under its reference and Bridge delivers it"),
         "{text}"
     );
     // start-index-state §1: the call-signature block ends the reply, after the card and its

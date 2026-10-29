@@ -1,0 +1,52 @@
+HANDOFF_WRITTEN
+
+The restored implementation, tests and docs are staged as the 25 paths in
+paths-1.txt. HEAD remains e1fe1d7e2ab61e249ab234479c48d1a98033b406.
+Commit with the complete report in commit-1.txt. Do not include handoff files.
+git commit -S failed because the runtime GPG keyring has no secret key.
+No signing configuration, host configuration, push or merge was attempted.
+
+CHECKS
+Passed: cargo fmt --all --check; git diff --check and --cached --check.
+Passed: cargo clippy --offline --locked -p agent-ide-core -p agent-ide
+  --all-targets --features test-seams -- -D warnings.
+Passed: cargo test --offline --locked --features test-seams -p agent-ide-core
+  --lib assistance::worker:: -- --test-threads=1 (209 tests).
+Passed through ide.test: cargo test --offline --locked -p agent-ide-core --lib
+  --features test-seams -- --test-threads=1 assistance::test_fact::
+  assistance::batch:: assistance::outbox:: assistance::content::
+  assistance::tests:: (116 tests).
+Passed: cargo test --offline --locked --features test-seams
+  --test product_mcp_contract -- --include-ignored --test-threads=1 --nocapture
+  result_economy:: test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun
+  multi_file_edit_runs_one_project_check_and_reports_each_file
+  slow_multi_file_edit_check_answers_at_once_with_pending_diagnostics
+  pending_and_batch_replies_never_invite_polling
+  configured_product_test_runs_in_background_and_reports_failures (7 tests).
+Product/worker socket cases used the authorized escalation, supplied provider
+exports, short assigned TMPDIR/TMP/TEMP and process-only fixture signing override.
+Initial unprivileged assistance run had 491 passes and 55 environment-denied
+failures; relevant scoped reruns passed with socket access.
+
+BOUNDARY CONTROL
+Correct: 2,000 real Cargo tests, 1 failure, 414-byte completion; product passed.
+Mutation: changed terminal_fact to take zero failure entries. The same public
+case failed at tests/result_economy/mod.rs:235 because names/messages disappeared.
+Restored: exact original failure collection restored; all 7 selected product
+cases passed, including the 413-byte completion, explicit pages, repeated-page
+pointers, saved-result history eviction, broken/working check delivery.
+Mutation is absent from staged source. Only documentation cleanup followed.
+
+Evidence: /private/tmp/m037-products.log, m037-mutant.log,
+m037-restored-products.log, m037-worker-tests.log, m037-clippy.log.
+Staged patch backup: /private/tmp/m037-restored-candidate.patch.
+Agent IDE unit result: tests #1 (116 passed).
+
+UNFINISHED
+Orchestrator must create the signed commit and return its full SHA, run the
+full cargo xtask check and whole include-ignored product suite, and arrange
+independent review. T-001/T-002 are done; T-003 retains the two required gate
+checks as not_run. Commit import and definite Module candidate need that SHA.
+No full gate or whole include-ignored suite was run by this replacement.
+
+TIMEOUT_SOURCE: none; the terminal delivery blocker is signing, not timeout.

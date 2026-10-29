@@ -474,6 +474,17 @@ impl ProjectProblemFeed {
         None
     }
 
+    /// Reads the last policy-valid attempt for an accepted check's exact language, including a
+    /// transient failure that leaves the ordinary problem feed's last usable report intact.
+    /// Returns `None` before completion or after environment/policy invalidation; never runs work.
+    pub(crate) fn latest_attempt(
+        &self,
+        worktree: &Path,
+        language: Language,
+    ) -> Option<ProblemSnapshot> {
+        self.scheduler.latest_attempt(worktree, language)
+    }
+
     /// Returns the `<agent-ide>` block due for `binding`, marking it delivered, or `None`.
     ///
     /// Reads only in-memory snapshots and never waits for a running check. `None` means the
@@ -867,8 +878,8 @@ fn problem_line(problem: &Problem, addresses: &crate::lang::render::LocationAddr
     )
 }
 
-/// Maps one unavailable reason to the same plain phrase shown in the status plate.
-fn unavailable_reason(reason: UnavailableReason) -> &'static str {
+/// Maps an unavailable check reason to the shared plain phrase used by plates and edit receipts.
+pub(super) fn unavailable_reason(reason: UnavailableReason) -> &'static str {
     match reason {
         UnavailableReason::Disabled => "checks disabled",
         UnavailableReason::ReadRestricted => "unavailable: read_restricted",

@@ -127,8 +127,8 @@ struct Job {
     /// Set by a symbol or line-range edit whose project formatter moved lines: the reply then
     /// states the movement so the next line-addressed edit does not reuse stale line numbers.
     format_note: Option<String>,
-    /// `true` once the edit scheduled its project check itself (post-edit diagnostics), so the
-    /// reply path must not schedule a second run that would shift the worktree's generation.
+    /// `true` once the edit handled check admission, including known unavailable checks, so
+    /// the reply path cannot duplicate a run or start work already explained inline.
     check_scheduled: bool,
     /// Earliest retry time when an external provider/check condition is not ready.
     park_until: Option<tokio::time::Instant>,
@@ -369,6 +369,81 @@ impl ContextPageState {
             len = snapped / 2;
         }
     }
+
+    /// Delivers the requested one-based test-output page, advancing only in order.
+    /// Earlier pages return a one-line pointer without repeating bytes. Future pages refuse.
+    /// A final-page receipt retains the bounded captured log until its owning detail expires;
+    /// result reads and repeat requests never reset this cursor. The caller owns the ledger lock
+    /// and has already proved the original reference's binding and disclosure authority.
+    fn test_output_page(
+        &self,
+        reference: &str,
+        requested: usize,
+    ) -> Result<(PeerReply, Self), FailureCode> {
+        if requested > self.page || (requested == self.page && self.delivered == self.text.len()) {
+            return Err(FailureCode::InvalidDetail);
+        }
+        if requested < self.page {
+            let text = format!(
+                "output page {requested} already delivered; result: ide.test {}",
+                serde_json::json!({"detail_ref": reference})
+            );
+            return Ok((
+                PeerReply::Complete {
+                    kind: ResultKind::Test,
+                    text,
+                    detail_ref: None,
+                    truncated: false,
+                    continuation: false,
+                },
+                self.clone(),
+            ));
+        }
+        let next_reference = format!("{reference}/output/{}", self.page + 1);
+        let (mut reply, next) = self.next(&next_reference)?;
+        if let PeerReply::Complete {
+            detail_ref,
+            continuation,
+            ..
+        } = &mut reply
+        {
+            *detail_ref = (*continuation).then_some(next_reference);
+        }
+        let next = next.unwrap_or_else(|| Self {
+            delivered: self.text.len(),
+            page: self.page + 1,
+            ..self.clone()
+        });
+        Ok((reply, next))
+    }
+
+    /// Restores any valid one-based captured test page after context loss without advancing
+    /// ordinary delivery. Replays deterministic cuts from the bounded retained buffer; no I/O
+    /// or test execution occurs. A malformed/out-of-range page returns `InvalidDetail`.
+    fn recover_test_output_page(
+        &self,
+        reference: &str,
+        requested: usize,
+    ) -> Result<PeerReply, FailureCode> {
+        if requested == 0 || self.text.is_empty() {
+            return Err(FailureCode::InvalidDetail);
+        }
+        let mut cursor = Self {
+            delivered: 0,
+            page: 1,
+            ..self.clone()
+        };
+        loop {
+            let (reply, next) = cursor.test_output_page(reference, cursor.page)?;
+            if cursor.page == requested {
+                return Ok(reply);
+            }
+            cursor = next;
+            if cursor.delivered == cursor.text.len() {
+                return Err(FailureCode::InvalidDetail);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +458,72 @@ mod context_page_tests {
             } => (text, *continuation),
             other => panic!("not a page: {other:?}"),
         }
+    }
+
+    /// Numbered log pages refuse skips and acknowledge repeats while retaining recovery bytes.
+    #[test]
+    fn test_output_pages_are_explicit_and_never_repeat_bytes() {
+        let state = ContextPageState::new("log line\n".into(), 0, false, ResultKind::Test);
+        assert!(matches!(
+            state.test_output_page("ref", 2),
+            Err(FailureCode::InvalidDetail)
+        ));
+        let (first, finished) = state.test_output_page("ref", 1).unwrap();
+        assert_eq!(page(&first), ("log line\n", false));
+        assert_eq!(finished.text, "log line\n");
+        assert_eq!(
+            page(&finished.recover_test_output_page("ref", 1).unwrap()),
+            page(&first)
+        );
+        assert!(matches!(
+            finished.test_output_page("ref", 2),
+            Err(FailureCode::InvalidDetail)
+        ));
+        let (again, _) = finished.test_output_page("ref", 1).unwrap();
+        assert_eq!(
+            page(&again),
+            (
+                r#"output page 1 already delivered; result: ide.test {"detail_ref":"ref"}"#,
+                false
+            )
+        );
+    }
+
+    /// Explicit recovery restores first/final bodies without advancing ordinary delivery and
+    /// refuses pages beyond the bounded capture, including after ordinary completion.
+    #[test]
+    fn explicit_test_output_recovery_preserves_bodies_and_cursor() {
+        let text = "test passed with an ordinary long output line\n".repeat(2500);
+        let state = ContextPageState::new(text, 0, false, ResultKind::Test);
+        let first = state.recover_test_output_page("ref", 1).unwrap();
+        assert!(page(&first).1);
+        let (ordinary, mut cursor) = state.test_output_page("ref", 1).unwrap();
+        assert_eq!(ordinary, first);
+        assert_eq!(cursor.recover_test_output_page("ref", 1).unwrap(), first);
+        let mut last = ordinary;
+        let mut last_number = 1;
+        while page(&last).1 {
+            last_number = cursor.page;
+            (last, cursor) = cursor.test_output_page("ref", last_number).unwrap();
+        }
+        assert_eq!(cursor.recover_test_output_page("ref", 1).unwrap(), first);
+        assert_eq!(
+            cursor.recover_test_output_page("ref", last_number).unwrap(),
+            last
+        );
+        assert!(matches!(
+            cursor.recover_test_output_page("ref", last_number + 1),
+            Err(FailureCode::InvalidDetail)
+        ));
+        assert!(matches!(
+            cursor.recover_test_output_page("ref", 0),
+            Err(FailureCode::InvalidDetail)
+        ));
+        assert!(
+            page(&cursor.test_output_page("ref", last_number).unwrap().0)
+                .0
+                .contains("already delivered")
+        );
     }
 
     /// A head that fits one page keeps a page of its own and the tail follows on the next one;
@@ -661,6 +802,8 @@ struct Inspection {
     binding: BindingRef,
     /// Opaque result handle supplied by the model; it does not confer ownership.
     reference: String,
+    /// True only for explicit domain `ide.test {output}` recovery; leaves ordinary paging intact.
+    recover_test_output: bool,
     /// Optional owner/path constraint for method-specific detail retrieval.
     expected: Option<(AssistanceTool, [u8; 32])>,
     /// Finite IPC caller waiting for the current authorized result.
@@ -1086,10 +1229,10 @@ impl Shared {
         }
     }
     /// Answers one settled run's terminal text and, for the owning binding, hands the run's
-    /// whole raw output to its retained detail as pages exactly once: the pager starts
-    /// undelivered, so the first `ide.inspect` of that detail cuts page one itself, and the
-    /// run's buffered copy is dropped only after the detail owns the pages. A later lookup
-    /// finds the copy empty and leaves the retained pages as they are.
+    /// raw output to its explicit `/output/N` pages exactly once. The original detail always
+    /// reads the compact terminal result; only a numbered output reference advances the log.
+    /// The run's buffered copy is dropped after the detail owns it. Repeated result reads
+    /// preserve the output cursor and do not count as output delivery.
     fn settled_test_reply(
         &self,
         id: u64,
@@ -1107,32 +1250,41 @@ impl Shared {
         }
         (text, owns_detail.then_some(result.detail_ref.clone()))
     }
-    /// Retains settled output before any completion carrier advertises its detail reference.
-    /// Only the exact owning binding may populate the page; concurrent status or settle calls
-    /// never replace already retained output or reset its cursor. Missing details keep the run's
-    /// bounded output intact. This transfer does not mark a fact or a run observed.
+    /// Retains the compact completion and its explicit output cursor before advertising a result.
+    /// Only the original binding may write the detail. Repeated reads refresh the same compact
+    /// receipt without resetting the log cursor; missing details keep the run's output intact.
+    /// The saved completion survives the test-history TTL/four-run limit for the session's own
+    /// detail lifetime. This transfer does not mark a run observed or a page delivered.
     fn retain_test_output(&self, id: u64, binding: &BindingRef, result: &super::tests::RunResult) {
-        if result.output_paged || result.output.is_empty() {
-            return;
-        }
         if let Ok(mut ledger) = self.ledger.lock()
             && let Some(detail) = ledger
                 .details
                 .get_mut(&result.detail_ref)
                 .filter(|detail| detail.binding == *binding)
-            && self
-                .test_runs
-                .settled_result(id)
-                .is_some_and(|current| !current.output_paged)
         {
-            detail.context_page = Some(ContextPageState::new(
-                result.output.clone(),
-                0,
-                false,
-                ResultKind::Test,
-            ));
-            detail.context_page_fresh = false;
-            self.test_runs.clear_output(id, &binding.fingerprint());
+            detail.reply = PeerReply::Complete {
+                kind: ResultKind::Test,
+                text: test_result_text(id, result, true, false),
+                detail_ref: Some(result.detail_ref.clone()),
+                truncated: false,
+                continuation: false,
+            };
+            if !result.output_paged
+                && !result.output.is_empty()
+                && self
+                    .test_runs
+                    .settled_result(id)
+                    .is_some_and(|current| !current.output_paged)
+            {
+                detail.context_page = Some(ContextPageState::new(
+                    result.output.clone(),
+                    0,
+                    result.output.starts_with(super::tests::OUTPUT_CUT),
+                    ResultKind::Test,
+                ));
+                detail.context_page_fresh = false;
+                self.test_runs.clear_output(id, &binding.fingerprint());
+            }
         }
     }
     /// Marks `binding`'s retained feedback as already submitted to a live caller, but only when
@@ -1973,9 +2125,22 @@ impl WorkerHandle {
     ) -> PeerReply {
         let binding = invocation.binding_ref().clone();
         let expected = Some((tool, selection(&parameters)));
-        if let Some(reference) = parameters.get("detail_ref").and_then(Value::as_str) {
+        let output = (tool == AssistanceTool::Test)
+            .then(|| parameters.get("output"))
+            .flatten();
+        if let Some(reference) = parameters
+            .get("detail_ref")
+            .or(output)
+            .and_then(Value::as_str)
+        {
             return self
-                .inspect(binding, reference.to_owned(), attachment, expected)
+                .inspect_with_output(
+                    binding,
+                    reference.to_owned(),
+                    attachment,
+                    expected,
+                    output.is_some(),
+                )
                 .await;
         }
         if self.target(attachment).is_none() {
@@ -2030,7 +2195,7 @@ impl WorkerHandle {
                 Ok(Ok(reply)) => reply,
                 _ => {
                     let reply = self
-                        .inspect_reserved(binding, reference.clone(), expected, permit)
+                        .inspect_reserved(binding, reference.clone(), expected, permit, false)
                         .await;
                     // The caller leaves with `pending`: the final answer becomes a pushed
                     // `job-ready` fact instead of something to ask for again (OUTBOX §3.2).
@@ -2147,6 +2312,20 @@ impl WorkerHandle {
         attachment: &str,
         expected: Option<(AssistanceTool, [u8; 32])>,
     ) -> PeerReply {
+        self.inspect_with_output(binding, reference, attachment, expected, false)
+            .await
+    }
+
+    /// Reads a retained result through the same ownership/authority path, optionally recovering
+    /// an explicitly requested Test output body. Recovery never schedules work or moves its cursor.
+    async fn inspect_with_output(
+        &self,
+        binding: BindingRef,
+        reference: String,
+        attachment: &str,
+        expected: Option<(AssistanceTool, [u8; 32])>,
+        recover_test_output: bool,
+    ) -> PeerReply {
         if self.target(attachment).is_none() {
             return PeerReply::Error {
                 code: FailureCode::LauncherConfiguration,
@@ -2163,7 +2342,7 @@ impl WorkerHandle {
                 };
             }
         };
-        self.inspect_reserved(binding, reference, expected, permit)
+        self.inspect_reserved(binding, reference, expected, permit, recover_test_output)
             .await
     }
 
@@ -2174,6 +2353,7 @@ impl WorkerHandle {
         reference: String,
         expected: Option<(AssistanceTool, [u8; 32])>,
         permit: mpsc::OwnedPermit<Inspection>,
+        recover_test_output: bool,
     ) -> PeerReply {
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             ledger
@@ -2184,6 +2364,7 @@ impl WorkerHandle {
         permit.send(Inspection {
             binding,
             reference,
+            recover_test_output,
             expected,
             reply,
             delivery: DELIVERY.try_with(Arc::clone).ok(),
@@ -5827,8 +6008,12 @@ impl<'a> Worker<'a> {
                 JobStage::EditAwaitingCheck { deadline, .. } => *deadline,
                 JobStage::EditBatchAwaitingCheck(check) => check.deadline,
             };
-            let diagnostics = if *job.cancel.borrow() || tokio::time::Instant::now() >= deadline {
-                Some(EditDiagnostics::Unknown {})
+            let diagnostics = if *job.cancel.borrow() {
+                Some(EditDiagnostics::NotAnalysed {
+                    reason: "project check cancelled after the edit committed".into(),
+                })
+            } else if tokio::time::Instant::now() >= deadline {
+                Some(EditDiagnostics::NotAnalysed { reason: "project check unavailable: matching diagnostics did not finish before the deadline".into() })
             } else {
                 self.check_diagnostics(&stage)
             };
@@ -6147,11 +6332,31 @@ impl<'a> Worker<'a> {
         } else {
             EditDiagnostics::Unknown {}
         };
+        let unavailable = if job
+            .deadline
+            .checked_sub(EDIT_SETTLEMENT_RESERVE)
+            .is_none_or(|deadline| deadline <= tokio::time::Instant::now())
+        {
+            Some("no time was left in this call for the project check".into())
+        } else {
+            self.known_check_unavailable(&authority, &request.path)
+        };
+        if await_check
+            && result == expected
+            && result.outcome.has_post_source()
+            && let Some(reason) = &unavailable
+        {
+            diagnostics = unchecked_file_diagnostics(&diagnostics, Some(reason));
+            // Admission was deliberately skipped: the generic post-write trigger must not
+            // create the content-free background check this inline reason already explains.
+            job.check_scheduled = true;
+        }
         // A scheduled project check classifies new problems against the pre-write file result;
         // its durable receipt is safe while this job is parked.
         // A multi-file operation (rename) never parks: it must write every file and answer once,
         // so it skips the wait and reports diagnostics as unknown until the next check lands.
         if await_check
+            && unavailable.is_none()
             && result == expected
             && result.outcome.has_post_source()
             && let Some(stage) = self.edit_check_stage(
@@ -6216,6 +6421,13 @@ impl<'a> Worker<'a> {
         let feed = self.shared.project_feed.as_ref()?;
         let language = Language::for_path(std::path::Path::new(path))
             .filter(|language| language.checks().is_some())?;
+        let deadline = job
+            .deadline
+            .checked_sub(EDIT_SETTLEMENT_RESERVE)?
+            .min(tokio::time::Instant::now() + EDIT_CHECK_WAIT);
+        if deadline <= tokio::time::Instant::now() {
+            return None;
+        }
         // The edit's own language is the only one forced: a `.py` edit must not also start a
         // cargo check in a mixed worktree, while every other configured language still re-arms
         // through the ordinary fingerprint-gated trigger.
@@ -6223,10 +6435,6 @@ impl<'a> Worker<'a> {
             feed.changed_generation(&job.invocation.binding_ref().fingerprint(), Some(path))?;
         job.check_scheduled = true;
         let worktree = authority.worktree().worktree_path().to_path_buf();
-        let deadline = job
-            .deadline
-            .checked_sub(EDIT_SETTLEMENT_RESERVE)?
-            .min(tokio::time::Instant::now() + EDIT_CHECK_WAIT);
         Some(JobStage::EditAwaitingCheck {
             result,
             refreshed,
@@ -6276,9 +6484,32 @@ impl<'a> Worker<'a> {
             .unwrap_or_default()
     }
 
-    /// Returns the matching generation's diagnostics without waiting; absence means the job parks.
-    /// Missing feed state preserves the provider fallback, while a completed non-ready snapshot
-    /// and a matching ready snapshot map to the same states used by the former bounded wait.
+    /// Returns a bounded known-unavailable cause before check acceptance, or `None` when a
+    /// check may run. This reads only the configured feed and its latest in-memory snapshot;
+    /// it never triggers work or treats an old unavailable snapshot as current diagnostics.
+    /// A retained Fatal/Timeout describes one failed attempt, not established unavailability,
+    /// so it cannot suppress a later edit's fresh check admission.
+    fn known_check_unavailable(&self, authority: &AuthorityStamp, path: &str) -> Option<String> {
+        let Some(feed) = self.shared.project_feed.as_ref() else {
+            return Some("checks disabled in this session".into());
+        };
+        let language = Language::for_path(Path::new(path))?;
+        let snapshot = feed
+            .latest(authority.worktree().worktree_path())
+            .into_iter()
+            .find(|snapshot| snapshot.language == language)?;
+        if crate::checks::scheduler::is_transient_failure(&snapshot.state) {
+            return None;
+        }
+        let crate::checks::CheckState::Unavailable(reason) = snapshot.state else {
+            return None;
+        };
+        Some(check_unavailable_reason(reason, snapshot.detail.as_deref()))
+    }
+
+    /// Returns the accepted generation's terminal diagnostics without waiting; absence parks.
+    /// A newer generation supersedes this check rather than verifying its older edit. Known
+    /// unavailable state is handled before acceptance; later unavailable snapshots must match.
     /// A multi-file stage has no single file of its own and yields its fallback-free `Unknown`;
     /// its per-file stages are asked one by one instead.
     fn check_diagnostics(&self, stage: &JobStage) -> Option<EditDiagnostics> {
@@ -6298,16 +6529,28 @@ impl<'a> Worker<'a> {
         let Some(feed) = self.shared.project_feed.as_ref() else {
             return Some(fallback.clone());
         };
-        let snapshot = feed.latest(worktree).into_iter().find(|snapshot| {
-            snapshot.language == *language && snapshot.input_generation >= *generation
-        })?;
+        let snapshot = feed
+            .latest_attempt(worktree, *language)
+            .filter(|snapshot| snapshot.input_generation >= *generation)?;
+        if snapshot.input_generation > *generation {
+            return Some(EditDiagnostics::NotAnalysed {
+                reason: "project check superseded by a newer source generation".into(),
+            });
+        }
         let not_analysed = || {
             language
                 .checks()
                 .and_then(|checks| checks.not_analysed(worktree, std::path::Path::new(wanted)))
         };
+        if let CheckState::Unavailable(reason) = snapshot.state {
+            let reason = check_unavailable_reason(reason, snapshot.detail.as_deref());
+            return Some(unchecked_file_diagnostics(
+                fallback,
+                Some(&bounded_utf8_prefix(&reason, 256)),
+            ));
+        }
         if !matches!(snapshot.state, CheckState::Ready | CheckState::Partial) {
-            return Some(unchecked_file_diagnostics(fallback, not_analysed()));
+            return None;
         }
         let mut preexisting = preexisting.clone();
         let mut errors = 0u32;
@@ -6841,16 +7084,48 @@ async fn reprove_disclosure(
 /// reference path, so a newly denied secondary file invalidates its cached page.
 /// Complete diff hunks on a delivered continuation join the binding's incremental memory;
 /// an authorization, freshness or encoding refusal never records that page as delivered.
-async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
+/// Test results keep their compact body under the original reference; numbered `/output/N`
+/// references deliver log pages once, advancing only after a successful receiver handoff.
+async fn serve_inspection(
+    workspace: &DurableWorkspace<'_>,
+    shared: &Shared,
+    mut request: Inspection,
+) {
+    let output_page = request
+        .reference
+        .rsplit_once("/output/")
+        .filter(|(_, page)| !page.is_empty() && page.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|(base, page)| {
+            page.parse::<usize>()
+                .ok()
+                .filter(|page| *page > 0)
+                .map(|page| (base.to_owned(), page))
+        });
+    if let Some((base, _)) = &output_page {
+        request.reference.clone_from(base);
+    }
     if fault_seam("inspection") {
         panic!("agent-ide test seam: deliberate inspection panic");
     }
+    let mut output_advance = None;
     let result: Result<PeerReply, InspectFailure> = async {
+        if request.recover_test_output
+            && (output_page.is_none()
+                || !request
+                    .expected
+                    .as_ref()
+                    .is_some_and(|expected| expected.0 == AssistanceTool::Test))
+        {
+            return Err(InspectFailure::new(FailureCode::InvalidDetail));
+        }
         // A known test-run handle (`tests #N`, `tests-N`, `#N`, `N`) names a background
         // run rather than a retained detail. Its status belongs to the actor and channel, so it
         // answers before the liveness check, including after `ide.stop`; an unknown id is a
         // distinct invalid-detail refusal.
         if let Some(id) = test_run_handle(&request.reference) {
+            if output_page.is_some() {
+                return Err(InspectFailure::new(FailureCode::InvalidDetail));
+            }
             let Some(status) = shared.test_runs.find(id, &request.binding) else {
                 return Ok(PeerReply::Error {
                     code: FailureCode::InvalidDetail,
@@ -6965,6 +7240,58 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 stage: error.stage,
             });
         }
+        // Result and output references share the original ownership/authority proof above.
+        // Reading a saved test result never consumes log pages or replays their last body.
+        if let Some(status) = shared
+            .test_runs
+            .started_run(&request.reference, &request.binding)
+        {
+            let text = if status.result.is_some() {
+                shared
+                    .settled_test_reply(status.id, &request.binding, &status)
+                    .0
+            } else {
+                super::test_fact::running_line(status.id)
+            };
+            if output_page.is_some() && status.result.is_none() {
+                return Err(InspectFailure::new(FailureCode::InvalidDetail));
+            }
+            if output_page.is_none() {
+                return Ok(PeerReply::Complete {
+                    kind: ResultKind::Test,
+                    text,
+                    detail_ref: Some(request.reference.clone()),
+                    truncated: false,
+                    continuation: false,
+                });
+            }
+        }
+        if let Some((_, requested)) = output_page {
+            let mut ledger = shared
+                .ledger
+                .lock()
+                .map_err(|_| InspectFailure::new(FailureCode::Internal))?;
+            let detail = ledger
+                .details
+                .get_mut(&request.reference)
+                .filter(|detail| detail.binding == request.binding)
+                .ok_or_else(|| InspectFailure::new(FailureCode::InvalidDetail))?;
+            let page = detail
+                .context_page
+                .as_ref()
+                .filter(|page| page.kind == ResultKind::Test)
+                .ok_or_else(|| InspectFailure::new(FailureCode::InvalidDetail))?;
+            if request.recover_test_output {
+                return page
+                    .recover_test_output_page(&request.reference, requested)
+                    .map_err(InspectFailure::new);
+            }
+            let (reply, next) = page
+                .test_output_page(&request.reference, requested)
+                .map_err(InspectFailure::new)?;
+            output_advance = Some(next);
+            return Ok(reply);
+        }
         if let Some(page) = diff_page {
             if diff_page_fresh {
                 // `reply` already holds this exact page's composed text, produced by the job
@@ -7052,6 +7379,9 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             return Ok::<_, InspectFailure>(next);
         }
         if let Some(page) = context_page {
+            if page.kind == ResultKind::Test {
+                return Ok(reply);
+            }
             if context_page_fresh {
                 // Same first-page semantics as the Diff branch above: page one was already
                 // composed and stored by the job; hand it over unchanged and let a later call
@@ -7112,6 +7442,13 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
     );
     let terminal = retrieved && !matches!(reply, PeerReply::Pending { .. });
     if request.reply.send(reply.clone()).is_ok() {
+        if let Some(next) = output_advance
+            && let Ok(mut ledger) = shared.ledger.lock()
+            && let Some(detail) = ledger.details.get_mut(&request.reference)
+            && detail.binding == request.binding
+        {
+            detail.context_page = Some(next);
+        }
         shared.mark_diff_body_delivered(&request.binding, &request.reference, &reply);
         if terminal {
             // Read through its own reference: the job's deferral ends (OUTBOX §3.2).
@@ -7351,6 +7688,28 @@ fn unchecked_file_diagnostics(fallback: &EditDiagnostics, reason: Option<&str>) 
         },
         _ => EditDiagnostics::Unknown {},
     }
+}
+
+/// Renders one check environment/lifecycle cause with bounded, control-free checker detail.
+/// It owns no scheduling state and never implies the edited source was checked successfully.
+fn check_unavailable_reason(
+    reason: crate::checks::UnavailableReason,
+    detail: Option<&str>,
+) -> String {
+    let text = format!(
+        "checks unavailable: {}{}",
+        super::problems::unavailable_reason(reason),
+        detail
+            .map(|detail| format!(" ({detail})"))
+            .unwrap_or_default()
+    );
+    bounded_utf8_prefix(
+        &text
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>(),
+        256,
+    )
 }
 
 /// Checks edit diagnostic attribution against the file's prior project-check snapshot.
@@ -8424,7 +8783,7 @@ mod tool_reply_fix_tests {
         assert!(quoted.len() <= 4096, "{} bytes", quoted.len());
         assert!(quoted.is_char_boundary(quoted.len()));
         assert!(
-            reply.contains("full output: ide.test {\"detail_ref\":\"test-detail\"}"),
+            reply.contains("full output: ide.test {\"detail_ref\":\"test-detail/output/1\"}"),
             "{reply}"
         );
     }
@@ -12543,6 +12902,7 @@ mod stop_retry_tests {
             let delivery = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (reply, reply_rx) = oneshot::channel();
             let request = Inspection {
+                recover_test_output: false,
                 binding: binding.clone(),
                 reference: reference.to_owned(),
                 expected: None,
@@ -12602,6 +12962,7 @@ mod stop_retry_tests {
             &worker.workspace,
             &worker.shared,
             Inspection {
+                recover_test_output: false,
                 binding: production_call(&worker, "delivery-other", "other-call")
                     .binding_ref()
                     .clone(),
@@ -13589,6 +13950,258 @@ mod stop_retry_tests {
         assert!(ledger.details.contains_key(&new_reference));
     }
 
+    /// Accepted checks settle actual current failures, supersede older source generations and
+    /// close cancelled/deadline stages explicitly; unavailable admission reads never run work.
+    #[tokio::test]
+    async fn accepted_checks_preserve_generation_failure_and_cancel_outcomes() {
+        crate::lang::testing::install();
+        use crate::checks::{CheckState, ProblemSnapshot, UnavailableReason};
+        for state in [
+            CheckState::Ready,
+            CheckState::Unavailable(UnavailableReason::Fatal),
+            CheckState::Unavailable(UnavailableReason::Timeout),
+        ] {
+            let fixture = Fixture::new();
+            std::fs::write(fixture.root.join("alpha.toml"), "").unwrap();
+            let store = fixture.store();
+            let workspace = DurableWorkspace::open(&store).await.unwrap();
+            let mut worker = worker(&store, workspace, fixture.root.clone());
+            worker.observations.install_schema().await.unwrap();
+            let language = crate::lang::testing::ALPHA;
+            let mut snapshot =
+                ProblemSnapshot::from_problems(language, state.clone(), Vec::new(), 1, 0);
+            snapshot.detail = Some("actual checker cause".into());
+            let checker = Arc::new(crate::checks::FakeChecker::new(language, snapshot));
+            let completed = Arc::new(tokio::sync::Notify::new());
+            let done = completed.clone();
+            let scheduler = crate::checks::scheduler::Scheduler::new(
+                vec![checker.clone()],
+                Duration::from_millis(1),
+                1,
+                fixture.base.join("cache"),
+            )
+            .with_completion_hook(Arc::new(move |_| done.notify_one()));
+            let feed = Arc::new(ProjectProblemFeed::new(
+                scheduler.clone(),
+                vec![fixture.root.clone()],
+                vec![language],
+            ));
+            Arc::get_mut(&mut worker.shared).unwrap().project_feed = Some(feed.clone());
+            let (binding, authority) =
+                activate_worktree(&mut worker, "attempt-owner", "attempt-start").await;
+            feed.activated(
+                binding.fingerprint(),
+                &fixture.root,
+                Path::new("repo"),
+                false,
+            );
+            tokio::time::timeout(Duration::from_secs(5), completed.notified())
+                .await
+                .unwrap();
+            let generation = scheduler
+                .latest_attempt(&fixture.root, language)
+                .unwrap()
+                .input_generation;
+            let stage = |generation| JobStage::EditAwaitingCheck {
+                result: EditResult {
+                    operation_id: "attempt-op".into(),
+                    path: "a.alpha".into(),
+                    outcome: ChangesEditOutcome::Replaced,
+                    source_ref: None,
+                },
+                refreshed: None,
+                authority: authority.clone(),
+                path: "a.alpha".into(),
+                fallback: EditDiagnostics::Unknown {},
+                generation,
+                worktree: fixture.root.clone(),
+                wanted: "a.alpha".into(),
+                preexisting: BTreeMap::new(),
+                language,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            };
+            match (&state, worker.check_diagnostics(&stage(generation))) {
+                (CheckState::Ready, Some(EditDiagnostics::CurrentClean { .. })) => {}
+                (CheckState::Unavailable(_), Some(EditDiagnostics::NotAnalysed { reason })) => {
+                    assert!(reason.contains("actual checker cause"), "{reason}")
+                }
+                (_, other) => panic!("wrong accepted outcome: {other:?}"),
+            }
+            assert!(worker.check_diagnostics(&stage(generation + 1)).is_none());
+            assert!(
+                matches!(worker.check_diagnostics(&stage(generation - 1)), Some(EditDiagnostics::NotAnalysed { reason }) if reason.contains("superseded"))
+            );
+            let before = checker.requests().len();
+            if matches!(state, CheckState::Unavailable(_)) {
+                assert!(
+                    worker
+                        .known_check_unavailable(&authority, "a.alpha")
+                        .is_none()
+                );
+                assert_eq!(checker.requests().len(), before);
+            }
+            for cancelled in [true, false] {
+                let invocation = production_call(
+                    &worker,
+                    "attempt-owner",
+                    if cancelled {
+                        "cancel-check"
+                    } else {
+                        "deadline-check"
+                    },
+                );
+                let (mut job, cancel) = tool_job(
+                    &fixture.root,
+                    invocation,
+                    "attempt-ref",
+                    AssistanceTool::Edit,
+                    serde_json::json!({"path":"a.alpha"}),
+                );
+                let mut saved = stage(generation + 1);
+                if cancelled {
+                    cancel.send(true).unwrap();
+                } else if let JobStage::EditAwaitingCheck { deadline, .. } = &mut saved {
+                    *deadline = tokio::time::Instant::now();
+                }
+                job.stage = Some(saved);
+                let (reply, _, _) = worker.edit(&mut job).await.unwrap();
+                assert!(
+                    matches!(reply, PeerReply::Edit { diagnostics: EditDiagnostics::NotAnalysed { reason }, .. } if reason.contains(if cancelled { "cancelled" } else { "deadline" }))
+                );
+            }
+            scheduler.shutdown().await;
+        }
+    }
+
+    /// Retained output recovery uses the originating Test identity and live owning authority.
+    /// Ordinary final consumption retains the body, explicit recovery leaves its cursor intact,
+    /// and foreign, wrong-tool, malformed, expired and beyond-end selectors refuse.
+    #[tokio::test]
+    async fn explicit_output_recovery_reproves_authority_and_retains_final_body() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, authority) =
+            activate_worktree(&mut worker, "output-owner", "output-start").await;
+        let reference = "output-reference";
+        retain_detail(
+            &worker,
+            &binding,
+            reference,
+            AssistanceTool::Test,
+            &authority,
+        );
+        worker
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .details
+            .get_mut(reference)
+            .unwrap()
+            .context_page = Some(ContextPageState::new(
+            "retained output body\n".into(),
+            0,
+            false,
+            ResultKind::Test,
+        ));
+        let query = async |binding: BindingRef, reference: &str, tool: AssistanceTool, recover| {
+            let (reply, receive) = oneshot::channel();
+            serve_inspection(
+                &worker.workspace,
+                &worker.shared,
+                Inspection {
+                    binding,
+                    reference: reference.into(),
+                    expected: Some((tool, selection(&serde_json::json!({})))),
+                    recover_test_output: recover,
+                    reply,
+                    delivery: None,
+                },
+            )
+            .await;
+            receive.await.unwrap()
+        };
+        let output = format!("{reference}/output/1");
+        let first = query(binding.clone(), &output, AssistanceTool::Test, false).await;
+        assert!(
+            matches!(&first, PeerReply::Complete { text, continuation: false, .. } if text == "retained output body\n")
+        );
+        let cursor = worker.shared.ledger.lock().unwrap().details[reference]
+            .context_page
+            .clone()
+            .unwrap();
+        assert_eq!(
+            query(binding.clone(), &output, AssistanceTool::Test, true).await,
+            first
+        );
+        let after = worker.shared.ledger.lock().unwrap().details[reference]
+            .context_page
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (after.page, after.delivered, &after.text),
+            (cursor.page, cursor.delivered, &cursor.text)
+        );
+        assert!(
+            matches!(query(binding.clone(), &output, AssistanceTool::Test, false).await,
+            PeerReply::Complete { text, .. } if text.contains("already delivered"))
+        );
+        for malformed in [
+            format!("{reference}/output/0"),
+            format!("{reference}/output/+1"),
+            format!("{reference}/output/no"),
+            format!("{reference}/output/2"),
+            reference.into(),
+            "tests #1/output/1".into(),
+        ] {
+            assert!(
+                matches!(
+                    query(binding.clone(), &malformed, AssistanceTool::Test, true).await,
+                    PeerReply::Error {
+                        code: FailureCode::InvalidDetail,
+                        ..
+                    }
+                ),
+                "{malformed}"
+            );
+        }
+        assert!(matches!(
+            query(binding.clone(), &output, AssistanceTool::Read, true).await,
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                ..
+            }
+        ));
+        assert!(matches!(
+            query(
+                BindingRef::fixture("foreign", "other", 1),
+                &output,
+                AssistanceTool::Test,
+                true
+            )
+            .await,
+            PeerReply::Error { .. }
+        ));
+        worker
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .details
+            .remove(reference);
+        assert!(matches!(
+            query(binding, &output, AssistanceTool::Test, true).await,
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                ..
+            }
+        ));
+    }
+
     /// A retained test run's output detail is never evicted, so its full output stays readable
     /// between polls: the next-oldest settled detail yields instead.
     #[tokio::test]
@@ -13788,6 +14401,7 @@ mod stop_retry_tests {
                 &worker.workspace,
                 &worker.shared,
                 Inspection {
+                    recover_test_output: false,
                     binding: binding.clone(),
                     reference: job.reference.clone(),
                     expected: None,
@@ -13904,6 +14518,7 @@ mod stop_retry_tests {
                 &worker.workspace,
                 &worker.shared,
                 Inspection {
+                    recover_test_output: false,
                     binding: binding.clone(),
                     reference: job.reference.clone(),
                     expected: None,
@@ -14011,6 +14626,7 @@ mod stop_retry_tests {
             &worker.workspace,
             &worker.shared,
             Inspection {
+                recover_test_output: false,
                 binding: binding.clone(),
                 reference: "never-retained".into(),
                 expected: None,
@@ -14064,6 +14680,7 @@ mod stop_retry_tests {
             Inspection {
                 binding,
                 reference: "foreign-detail".into(),
+                recover_test_output: false,
                 expected: None,
                 reply: reply_tx,
                 delivery: None,
@@ -14355,6 +14972,7 @@ mod stop_retry_tests {
             let request = Inspection {
                 binding,
                 reference,
+                recover_test_output: false,
                 expected: None,
                 reply: reply_tx,
                 delivery: None,
@@ -14478,6 +15096,7 @@ mod stop_retry_tests {
                 &worker.workspace,
                 &worker.shared,
                 Inspection {
+                    recover_test_output: false,
                     binding: caller,
                     reference: reference.into(),
                     expected: Some((expected_tool, selection(&serde_json::json!({})))),
@@ -14520,6 +15139,7 @@ mod stop_retry_tests {
                 &worker.workspace,
                 &worker.shared,
                 Inspection {
+                    recover_test_output: false,
                     binding: binding.clone(),
                     reference,
                     expected: None,
@@ -14557,7 +15177,9 @@ mod stop_retry_tests {
         };
         assert!(
             completed.starts_with("tests #1: 1 passed, 0 failed")
-                && completed.contains("full output: ide.test {\"detail_ref\":\"echo-run-detail\"}"),
+                && completed.contains(
+                    "full output: ide.test {\"detail_ref\":\"echo-run-detail/output/1\"}"
+                ),
             "{completed}"
         );
 
@@ -14659,6 +15281,7 @@ mod stop_retry_tests {
             Inspection {
                 binding,
                 reference: "start-first".into(),
+                recover_test_output: false,
                 expected: Some((AssistanceTool::Start, selection(&retry))),
                 reply: reply_tx,
                 delivery: None,
@@ -14924,6 +15547,7 @@ mod stop_retry_tests {
             &worker.workspace,
             &worker.shared,
             Inspection {
+                recover_test_output: false,
                 binding: binding.clone(),
                 reference: job.reference.clone(),
                 expected: None,
@@ -14951,6 +15575,7 @@ mod stop_retry_tests {
             &worker.workspace,
             &worker.shared,
             Inspection {
+                recover_test_output: false,
                 binding: binding.clone(),
                 reference: job.reference.clone(),
                 expected: None,
@@ -14973,6 +15598,7 @@ mod stop_retry_tests {
             &worker.workspace,
             &worker.shared,
             Inspection {
+                recover_test_output: false,
                 binding: binding.clone(),
                 reference: job.reference.clone(),
                 expected: None,
@@ -15378,6 +16004,7 @@ mod stop_retry_tests {
                 Inspection {
                     binding,
                     reference: "never-issued".to_owned(),
+                    recover_test_output: false,
                     expected: None,
                     reply: reply_tx,
                     delivery: None,

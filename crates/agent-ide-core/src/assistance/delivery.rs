@@ -387,7 +387,7 @@ fn edit_checked_fact(
                 false,
             ),
             None,
-            false,
+            true,
         ),
         EditDiagnostics::Unknown {} | EditDiagnostics::Pending { .. } => {
             ("1 file, diagnostics unknown".to_owned(), None, false)
@@ -410,6 +410,49 @@ fn edit_checked_fact(
             path: result.path.clone(),
             digest: None,
         }],
+    }
+}
+
+/// Closes a check that owed a terminal result but could not produce matching diagnostics.
+/// The edit already settled; this failed job notice never claims the write failed or vanished.
+pub(super) fn incomplete_check_fact(reference: &str, operation_id: &str) -> FactDraft {
+    FactDraft {
+        kind: FactKind::JobReady,
+        subject: bounded(&format!("edit {operation_id}"), MAX_SUBJECT_BYTES, false),
+        summary: "edit settled; checks unavailable: matching diagnostics did not finish".into(),
+        detail: None,
+        detail_ref: Some(reference.to_owned()),
+        failed: true,
+        source_bearing: false,
+        fence_paths: Vec::new(),
+    }
+}
+
+/// Selects a terminal edit completion without discarding required failures.
+/// This runs only after accepted work was registered: even an unavailable check must settle it.
+/// An unknown matching result closes its outstanding wait with a failed job notice.
+/// Every other terminal job outcome still produces a fact so an early caller is not stranded.
+fn edit_completion_fact(reference: &str, reply: &PeerReply) -> FactDraft {
+    match reply {
+        PeerReply::Edit {
+            result,
+            diagnostics: EditDiagnostics::Unknown {},
+            ..
+        } => incomplete_check_fact(reference, &result.operation_id),
+        PeerReply::Edit {
+            result,
+            diagnostics,
+            ..
+        } => edit_checked_fact(reference, result, diagnostics),
+        _ => job_fact(
+            reference,
+            reply,
+            &DeferSpec {
+                tool: AssistanceTool::Edit,
+                target: reference.to_owned(),
+                fence_paths: Vec::new(),
+            },
+        ),
     }
 }
 
@@ -574,7 +617,8 @@ impl Shared {
                 }
                 continue;
             };
-            let source_proof = if draft.source_bearing || draft.detail.is_some() {
+            let check_result = draft.kind == FactKind::EditChecked;
+            let source_proof = if check_result || draft.source_bearing || draft.detail.is_some() {
                 draft.detail_ref.as_ref().and_then(|reference| {
                     self.ledger.lock().ok().and_then(|ledger| {
                         ledger
@@ -586,6 +630,7 @@ impl Shared {
                                     detail.authority.clone(),
                                     detail.source.clone(),
                                     detail.diff_provenance.clone(),
+                                    detail.extra_sources.clone(),
                                 )
                             })
                     })
@@ -616,13 +661,13 @@ impl Shared {
                 // without an authority retain the already checked active-binding boundary.
                 let has_authority = source_proof
                     .as_ref()
-                    .is_some_and(|(authority, _, _)| authority.is_some());
-                if draft.source_bearing || has_authority {
+                    .is_some_and(|(authority, _, _, _)| authority.is_some());
+                if check_result || draft.source_bearing || has_authority {
                     let permitted =
-                        if let (Some(workspace), Some((Some(authority), source, paths))) =
+                        if let (Some(workspace), Some((Some(authority), source, paths, extras))) =
                             (workspace, source_proof)
                         {
-                            super::reprove_disclosure(
+                            let mut permitted = super::reprove_disclosure(
                                 &workspace,
                                 &bindings,
                                 &binding,
@@ -631,7 +676,23 @@ impl Shared {
                                 paths.as_ref(),
                             )
                             .await
-                            .is_ok()
+                            .is_ok();
+                            for extra in &extras {
+                                if !permitted {
+                                    break;
+                                }
+                                permitted = super::reprove_disclosure(
+                                    &workspace,
+                                    &bindings,
+                                    &binding,
+                                    Some(&authority),
+                                    Some(extra),
+                                    None,
+                                )
+                                .await
+                                .is_ok();
+                            }
+                            permitted
                         } else {
                             false
                         };
@@ -691,6 +752,11 @@ impl Shared {
         reply: &PeerReply,
         deferred: Option<(DeferSpec, JobEpoch)>,
     ) {
+        if let Some(status) = self.test_runs.started_run(reference, owner)
+            && let Some(result) = status.result.as_ref()
+        {
+            self.retain_test_output(status.id, owner, result);
+        }
         let held = self.outbox.take_work(reference);
         if let PeerReply::Edit { result, .. } = reply
             && result.outcome.has_post_source()
@@ -709,19 +775,11 @@ impl Shared {
             self.push_or_transfer(std::slice::from_ref(owner), draft);
             return;
         }
-        if let (
-            Some(work),
-            PeerReply::Edit {
-                result,
-                diagnostics,
-                ..
-            },
-        ) = (held, reply)
-        {
-            self.push_or_transfer(
-                std::slice::from_ref(&work.owner),
-                edit_checked_fact(reference, result, diagnostics),
-            );
+        if let Some(work) = held {
+            let draft = edit_completion_fact(reference, reply);
+            let mut recipients = vec![work.owner];
+            recipients.extend(work.subscribers);
+            self.push_or_transfer(&recipients, draft);
         }
     }
 
@@ -879,6 +937,55 @@ mod tests {
             call_target(AssistanceTool::Read, &serde_json::json!({ "path": long })).len(),
             MAX_TARGET_BYTES
         );
+    }
+
+    /// Every accepted check settles, including postacceptance unavailable diagnostics; known
+    /// unavailable checks never register work and therefore never reach this publication path.
+    #[test]
+    fn unavailable_checks_do_not_hide_required_terminal_failures() {
+        let result = EditResult {
+            operation_id: "availability".into(),
+            path: "src/lib.rs".into(),
+            outcome: crate::changes::edit::EditOutcome::Replaced,
+            source_ref: None,
+        };
+        let unchecked = PeerReply::Edit {
+            result: result.clone(),
+            diagnostics: EditDiagnostics::NotAnalysed {
+                reason: "checks unavailable: missing cargo home".into(),
+            },
+            note: None,
+            operation: None,
+        };
+        let unavailable = edit_completion_fact("edit-ref", &unchecked);
+        assert!(unavailable.summary.contains("missing cargo home"));
+        assert!(unavailable.validate().is_ok());
+        let reply = PeerReply::Edit {
+            result,
+            diagnostics: EditDiagnostics::CurrentClean { project_errors: 0 },
+            note: None,
+            operation: None,
+        };
+        assert_eq!(
+            edit_completion_fact("edit-ref", &reply).kind,
+            FactKind::EditChecked
+        );
+        let mut timeout = reply.clone();
+        if let PeerReply::Edit { diagnostics, .. } = &mut timeout {
+            *diagnostics = EditDiagnostics::Unknown {};
+        }
+        assert_eq!(
+            edit_completion_fact("edit-ref", &timeout).kind,
+            FactKind::JobReady
+        );
+        let fatal = PeerReply::Error {
+            code: super::super::super::reply::FailureCode::Internal,
+            detail: None,
+        };
+        let fact = edit_completion_fact("edit-ref", &fatal);
+        assert!(fact.failed);
+        assert_eq!(fact.kind, FactKind::JobReady);
+        assert_eq!(fact.validate(), Ok(()));
     }
 
     /// A settled run becomes a `test-finished` draft that is exactly M-024's terminal text, valid
@@ -1500,7 +1607,7 @@ mod worker_tests {
         let (sent, received) = tokio::sync::oneshot::channel();
         let server = std::thread::spawn(move || {
             let mut bodies = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(3)))
@@ -1549,6 +1656,12 @@ mod worker_tests {
                 "SOURCE_MUST_NOT_LEAK",
                 true,
             ),
+            (
+                FactKind::EditChecked,
+                "clean check",
+                "OLD_CLEAN_MUST_NOT_LEAK",
+                false,
+            ),
         ] {
             assert!(handle.shared.push_or_transfer(
                 std::slice::from_ref(&owner),
@@ -1589,6 +1702,11 @@ mod worker_tests {
             !bodies
                 .iter()
                 .any(|body| body.contains("SOURCE_MUST_NOT_LEAK"))
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|body| body.contains("OLD_CLEAN_MUST_NOT_LEAK"))
         );
     }
 

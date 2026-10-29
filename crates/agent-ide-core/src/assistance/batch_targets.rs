@@ -351,7 +351,7 @@ impl Worker<'_> {
                 }
                 None => {
                     entry.text = format!(
-                        "pending: {} - result retained under {}; Bridge delivers it automatically when configured\n",
+                        "pending: {} - result retained under {}; Bridge delivers it automatically\n",
                         entry.name, job.reference
                     );
                     entry.state = EntryState::Deferred;
@@ -706,7 +706,7 @@ mod tests {
             ),
             entry(
                 "c.py#h",
-                "pending: c.py#h - result retained under ref-1; Bridge delivers it automatically when configured\n",
+                "pending: c.py#h - result retained under ref-1; Bridge delivers it automatically\n",
                 EntryState::Deferred,
             ),
             entry("d.rs#x", "error: unknown_symbol\n", EntryState::Failed),
@@ -722,7 +722,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("\npending: c.py#h - result retained under ref-1; Bridge delivers it automatically when configured\n"),
+            text.contains("\npending: c.py#h - result retained under ref-1; Bridge delivers it automatically\n"),
             "{text}"
         );
         batch::assert_no_polling(&text);

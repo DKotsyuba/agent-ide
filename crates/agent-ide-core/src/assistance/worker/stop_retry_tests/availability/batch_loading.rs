@@ -6,10 +6,10 @@ use super::*;
 
 /// While the server loads, `ide.symbol {symbols}` answers its waiter at once: the entry whose
 /// definition the source outline finds is approximate, the bare name the lexical scan cannot
-/// resolve names the retained batch reference and conditional Bridge delivery. The job re-runs
+/// resolve names the retained batch reference and automatic Bridge delivery. The job re-runs
 /// only those entries; once the server answers it settles with the precise blocks, and its final
-/// reply is retained under the batch `detail_ref` and handed to Bridge as one `job-ready` fact
-/// when configured, with a subject naming both indexes.
+/// reply is retained under the batch `detail_ref` and handed to Bridge as one `job-ready` fact,
+/// with a subject naming both indexes.
 #[tokio::test]
 async fn a_loading_batch_answers_per_entry_at_once_then_one_fact() {
     use crate::lang::testing::fixture_serve_session;
@@ -39,7 +39,7 @@ async fn a_loading_batch_answers_per_entry_at_once_then_one_fact() {
     assert!(text.contains("b.epsilon:2  ~ a(1)"), "{text}");
     assert!(
         text.ends_with(
-            "pending: a - result retained under waiting-bl-1; Bridge delivers it automatically when configured\n"
+            "pending: a - result retained under waiting-bl-1; Bridge delivers it automatically\n"
         ),
         "{text}"
     );

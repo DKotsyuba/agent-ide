@@ -77,7 +77,7 @@ Event retained.
 Host binding released.
 {%- endif -%}
 {%- if state == "pending" -%}
-Result retained under {{ detail_ref }}. Bridge delivers it automatically when configured.
+Result retained under {{ detail_ref }}. Bridge delivers it automatically.
 {%- endif -%}
 {%- if state == "error" -%}
 {%- if code.no_such_file is defined -%}
@@ -253,7 +253,7 @@ edit: {{ outcome }}; path {{ result.path }}; diagnostics: unknown (ide.inspect {
 {%- elif diagnostics.state == "not_analysed" -%}
 edit: {{ outcome }}; path {{ result.path }}; diagnostics: not_analysed ({{ diagnostics.reason }})
 {%- elif diagnostics.state == "pending" -%}
-edit: {{ outcome }}; path {{ result.path }}; diagnostics: pending; result retained under {{ diagnostics.detail_ref }}; Bridge delivers it automatically when configured
+edit: {{ outcome }}; path {{ result.path }}; diagnostics: pending; result retained under {{ diagnostics.detail_ref }}; Bridge delivers it automatically
 {%- endif -%}
 {%- if note %}{{ "\n" }}{{ note }}{%- endif %}
 {%- endif -%}

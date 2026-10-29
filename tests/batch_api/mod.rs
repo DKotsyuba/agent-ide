@@ -1106,7 +1106,7 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
             .map(|(_, words)| words.to_owned())
     };
     // The first reply may be the immediate `pending` one (the check stays retained and is
-    // Bridge-delivered when configured); the
+    // Bridge-delivered); the
     // retry then answers the settled diagnostics, which are never pending.
     let first_pending = summary(&text).is_some_and(|words| words.starts_with("pending"));
     if first_pending {
@@ -1205,10 +1205,7 @@ async fn slow_multi_file_edit_check_answers_at_once_with_pending_diagnostics() {
         text.contains("diagnostics: pending; project check retained under"),
         "{text}"
     );
-    assert!(
-        text.contains("Bridge delivers it automatically when configured"),
-        "{text}"
-    );
+    assert!(text.contains("Bridge delivers it automatically"), "{text}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -1376,7 +1373,7 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
     assert!(
         text.starts_with(
             "tests #1: started — 5 targets in 3 runs (budget 120 s); the result is retained under \
-             its reference; Bridge delivers it automatically when configured\n"
+             its reference; Bridge delivers it automatically\n"
         ),
         "{text}"
     );

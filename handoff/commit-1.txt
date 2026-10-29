@@ -1,0 +1,24 @@
+fix(assistance): keep test completions compact and check wakes useful
+
+Result:
+Keep summary, failures and target exits in test completions. Retain compact
+saved results separately from explicit numbered log pages; repeated pages
+return a pointer. Report unavailable checks inline and suppress redundant
+diagnostic wakes while retaining terminal failures. Remove the async hedge.
+
+Checks:
+passed | scoped worker regressions | 209 tests with test-seams, serialized
+passed | renderer, batch, outbox and runner regressions | 116 tests with test-seams
+passed | selected product contracts | 7 cases with test-seams, include-ignored, serialized
+passed | compact completion | 2,000 real Cargo tests, one failure, 413-byte result
+passed | mutation control | failure omission rejected; restored product passed
+passed | formatting | cargo fmt --all --check
+passed | lint | cargo clippy --offline --locked -p agent-ide-core -p agent-ide --all-targets --features test-seams -- -D warnings
+not_run | full gate | run by the orchestrator on this committed candidate
+
+Gaps:
+Full gate and whole include-ignored product suite pending orchestrator run.
+Initial unprivileged socket tests hit sandbox denials; authorized scoped reruns passed.
+
+Followups:
+Apply any failures returned by the orchestrator's full gate.
