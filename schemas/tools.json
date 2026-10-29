@@ -412,7 +412,7 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Runs a batch of tests and checks as targets ({symbol}, {path}, {pattern} or {command:[argv]}): in\norder at the worktree root, one budget_s, per-target outcomes. result:N reads a run,\nhistory:true lists runs, cancel:N cancels yours.",
+    "description": "Run up to 8 targets ({symbol}, {path}, {pattern} or {command:[argv]}) in order at worktree\nroot with one budget_s. Read result:N/history:true, cancel:N, or restore retained logs\nwith output:\"<ref>/output/N\".",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -449,6 +449,10 @@
             true
           ],
           "type": "boolean"
+        },
+        "output": {
+          "description": "Restore retained /output/N after context loss; exclusive, read-only.",
+          "type": "string"
         },
         "result": {
           "type": "integer"

@@ -127,7 +127,7 @@ impl AssistanceTool {
     pub fn mutates_with(self, parameters: &Value) -> bool {
         self.mutates()
             && !(self == Self::Test
-                && ["result", "status", "history", "detail_ref"]
+                && ["result", "status", "history", "detail_ref", "output"]
                     .iter()
                     .any(|field| parameters.get(*field).is_some()))
     }
@@ -397,6 +397,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "cancel": {"type":"integer", "minimum":1},
                     "result": {"type":"integer", "minimum":1},
                     "history": {"type":"boolean", "enum":[true]},
+                    "output": {"type":"string", "minLength":1, "maxLength":MAX_DETAIL_REF_BYTES, "description":"Restore retained /output/N after context loss; exclusive, read-only."},
                     "detail_ref": {"type":"string", "minLength":1, "maxLength":MAX_DETAIL_REF_BYTES},
                     "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped; at most 600."},
                     "targets": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_TEST_TARGETS, "items":{"type":"object", "additionalProperties":false, "minProperties":1, "maxProperties":1, "properties":{"symbol":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "path":{"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES}, "pattern":{"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES}, "command":{"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_COMMAND_BYTES}}}}, "description":"Up to 8."}
@@ -789,6 +790,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "cancel",
             "result",
             "history",
+            "output",
             "detail_ref",
             "budget_s",
             "targets",
@@ -1109,6 +1111,15 @@ pub(crate) fn validate_normalized_call(
             }
             if object.get("tests").is_some_and(|value| !value.is_boolean()) {
                 return Err(invalid_field("tests", FieldRule::Boolean));
+            }
+        }
+        AssistanceTool::Test if object.contains_key("output") => {
+            let output = required_string(object, "output", MAX_DETAIL_REF_BYTES)?;
+            if output.as_bytes().contains(&0) {
+                return Err(invalid_field("output", FieldRule::NoNul));
+            }
+            if object.len() != 1 {
+                return Err(invalid_field("output", FieldRule::OneOf("used alone")));
             }
         }
         AssistanceTool::Test if object.contains_key("targets") => {
@@ -5235,9 +5246,9 @@ impl StdioFacade {
         self.call(AssistanceTool::Graph, parameters, context).await
     }
 
-    /// Runs a batch of tests and checks as targets ({symbol}, {path}, {pattern} or {command:[argv]}): in
-    /// order at the worktree root, one budget_s, per-target outcomes. result:N reads a run,
-    /// history:true lists runs, cancel:N cancels yours.
+    /// Run up to 8 targets ({symbol}, {path}, {pattern} or {command:[argv]}) in order at worktree
+    /// root with one budget_s. Read result:N/history:true, cancel:N, or restore retained logs
+    /// with output:"<ref>/output/N".
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false))]
     async fn test(
@@ -5294,11 +5305,9 @@ impl StdioFacade {
 /// The workflow rules live once, in the shipped `agent-ide` skill, which Claude loads on demand.
 pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server tools (ide.*) for source work. The agent-ide skill holds their workflow rules; read it before the first ide.* call.";
 
-/// Codex connect-time instructions: how to reach the tools without printing the catalog, and the
-/// no-duplicate-work and pending-result rules. Codex code mode shows tools only through
-/// `ALL_TOOLS`, whose descriptions cost 26-40 KB per cell when printed (matrix 2026-10-17), so
-/// this text carries the rules itself; the Codex skill does not repeat them.
-pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE (ide.*): call each tool by its exact name. In code mode list names only (ALL_TOOLS.map(t=>t.name)); never print ALL_TOOLS or tool descriptions. Call forms: the ide.start reply and the agent-ide skill. Rules: one bounded source batch per topic; never re-read natively what an IDE reply delivered; never refetch a passed log or an already delivered page; run native tests or checks only for a gap an IDE reply names. A pending result: continue independent work or end the turn, Bridge delivers it; without delivery send one bounded ide.inspect with wait_s before any native fallback. Never poll. Send ide.stop together with the last ide.diff.";
+/// Codex connect-time rules for selective schema discovery, reuse, native verification and
+/// ordered lifecycle. The Codex skill supplies examples rather than another rule copy.
+pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE: discover needed exact names/schemas; never dump ALL_TOOLS. Batch compatible independent calls. Read known addresses, outline structure, symbol references; graph for needed chains. Reuse sufficient source/results/diffs; repeat or use native tools for a named gap/change/refusal. Required independent/broader checks remain valid. ide.diff is optional after reviewed Git diff; final diff precedes ide.stop. Bridge automatically delivers accepted async results: end the turn, keep task/session; never poll or finish/stop with owed work. One bounded ide.inspect wait_s (1..30) is recovery only. Try Repair once; fall back if unavailable. Verify uncertain writes before mutation.";
 
 /// Which per-host catalog `tools/list` and the connect-time instructions answer with.
 ///
@@ -5446,6 +5455,7 @@ fn test_api_queries_and_codex_patch_projection_are_unambiguous() {
         json!({"status":3}),
         json!({"history":true}),
         json!({"detail_ref":"test-output"}),
+        json!({"output":"test-ref/output/1"}),
     ] {
         let call = validate_call(AssistanceTool::Test, read).unwrap();
         assert!(!call.tool().mutates_with(call.parameters()));
@@ -5478,6 +5488,10 @@ fn test_api_queries_and_codex_patch_projection_are_unambiguous() {
         json!({"result":1,"status":1}),
         json!({"result":1,"budget_s":1}),
         json!({"detail_ref":""}),
+        json!({"output":""}),
+        json!({"output":"x".repeat(MAX_DETAIL_REF_BYTES + 1)}),
+        json!({"output":1}),
+        json!({"output":"test-ref/output/1","force":true}),
     ] {
         assert!(
             validate_call(AssistanceTool::Test, invalid.clone()).is_err(),
@@ -5485,6 +5499,35 @@ fn test_api_queries_and_codex_patch_projection_are_unambiguous() {
         );
     }
     let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
+    for selector in [
+        "symbol",
+        "path",
+        "pattern",
+        "command",
+        "targets",
+        "result",
+        "status",
+        "history",
+        "cancel",
+        "detail_ref",
+        "budget_s",
+        "cwd",
+        "env",
+    ] {
+        let mut invalid = json!({"output":"test-ref/output/1"});
+        invalid[selector] = json!(1);
+        assert!(
+            validate_call(AssistanceTool::Test, invalid).is_err(),
+            "{selector}"
+        );
+    }
+    assert!(
+        validate_call(
+            AssistanceTool::Test,
+            json!({"output":format!("x{}", char::from(0))})
+        )
+        .is_err()
+    );
     let edit = |host: CatalogHost| {
         host.catalog(facade.router.list_all())
             .into_iter()
@@ -5492,6 +5535,14 @@ fn test_api_queries_and_codex_patch_projection_are_unambiguous() {
             .unwrap()
     };
     let codex = edit(CatalogHost::Codex);
+    for host in [CatalogHost::Claude, CatalogHost::Codex] {
+        let test = host
+            .catalog(facade.router.list_all())
+            .into_iter()
+            .find(|tool| tool.name == "ide.test")
+            .unwrap();
+        assert_eq!(test.input_schema["properties"]["output"]["type"], "string");
+    }
     assert_eq!(codex.input_schema["required"], json!(["patch"]));
     assert_eq!(
         codex.input_schema["properties"]
@@ -5512,6 +5563,17 @@ fn test_api_queries_and_codex_patch_projection_are_unambiguous() {
             .get("patch")
             .is_none()
     );
+}
+
+/// Public and daemon validation preserve the exclusive output selector verbatim and classify
+/// it as a query, so lost-reply handling cannot replay or invent a test execution.
+#[test]
+fn explicit_test_output_selector_survives_normalization_without_mutation() {
+    let parameters = json!({"output":"test-ref/output/1"});
+    let public = validate_call(AssistanceTool::Test, parameters.clone()).unwrap();
+    let daemon = validate_normalized_call(public.tool(), public.parameters().clone()).unwrap();
+    assert_eq!(daemon.parameters(), &parameters);
+    assert!(!daemon.tool().mutates_with(daemon.parameters()));
 }
 
 /// Removes the bound keywords (`minLength`, `maxLength`, `minItems`, `maxItems`, `minimum`,
@@ -5613,10 +5675,9 @@ fn advertised_text_never_teaches_waiting() {
 
 /// The advertised catalog stays inside its byte budgets: the server paragraph under 700 bytes,
 /// every tool description under 600 bytes, every property description under 160 bytes
-/// (harness-reply-v1 section 3), and the per-host catalog totals of E-005 M-038. The Claude
-/// catalog is sent with every model request: the e1fe1d7e export of 15,276 bytes cost 9,069
-/// first-request tokens in the 2026-10-17 matrix, so 8,000 bytes keeps it under 5k tokens even
-/// when every one of those tokens is charged to the catalog bytes.
+/// (harness-reply-v1 section 3), and the per-host catalog totals of E-005 M-038. These are
+/// export-byte regression limits only. Token/context acceptance requires actual assembled-host
+/// catalog plus skill measurements; the historical 9,069-token prompt delta is not a byte scale.
 #[test]
 fn catalog_stays_within_the_budgets() {
     for (host, paragraph, total_limit) in [
@@ -5693,7 +5754,14 @@ fn per_host_catalogs_differ_only_by_the_declared_subset() {
             .instructions()
             .contains("agent-ide skill")
     );
-    for rule in ["ALL_TOOLS", "wait_s", "re-read", "passed log", "ide.stop"] {
+    for rule in [
+        "exact names/schemas",
+        "wait_s",
+        "independent/broader",
+        "final diff precedes ide.stop",
+        "automatically",
+        "owed work",
+    ] {
         assert!(CatalogHost::Codex.instructions().contains(rule), "{rule}");
     }
     assert_eq!(CatalogHost::parse("codex"), Some(CatalogHost::Codex));

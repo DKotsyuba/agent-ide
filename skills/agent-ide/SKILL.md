@@ -1,6 +1,6 @@
 ---
 name: agent-ide
-description: Workflow rules for the Agent IDE ide.* tools - one batch per topic, no duplicate native work, pending results. Read before the first ide.* call.
+description: Task-based Agent IDE workflow, compatible batches, native fallback and automatic async delivery.
 ---
 
 # Agent IDE
@@ -12,8 +12,9 @@ The tool descriptions define each call; this skill holds the rules. Call `ide.st
 Collect the related set, then send one call per phase instead of one per file, symbol or hunk.
 Split only at an advertised limit or for newly found work.
 
-1. Discover with `ide.outline` paths/glob and `ide.symbol` symbols. For shared signatures,
-   indirect faults or wider impact:
+1. Choose the needed information: a known address goes directly to `ide.read`, needed structure
+   to `ide.outline` paths/glob, definitions/references to `ide.symbol` symbols. No preliminary
+   outline or graph is required. For needed call chains:
    `ide.graph {"symbols":["src/a.rs#Store/get","src/b.rs#load"],"direction":"callers","depth":2}`.
 2. Read: `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"docs/b.md","offset":1,"limit":80}]}`.
 3. Edit production code and tests together:
@@ -22,26 +23,26 @@ Split only at an advertised limit or for newly found work.
 
 ## No duplicate work
 
-- Never re-read natively (Read, cat, sed, grep for content) what an IDE reply already delivered.
+- Reuse sufficient delivered source, check results and diffs. Additional or native reads/tests
+  need a named gap, changed source, refusal or unavailability; required independent or broader
+  verification remains valid.
   An acknowledgement for an unchanged item means: use the copy you hold; `force:true` only after
   lost context. Do not re-read your own successful edit; an edit reply that names committed files
   is the write, so skip ls or git status checks.
-- Never refetch a passed test log or a page already delivered; open more output only for a
-  failure you need to read.
-- Run native tests, builds or type checks only for a gap an IDE reply names (unavailable counts,
-  unknown diagnostics, a target ide.test cannot run), and say which gap. Unavailable test counts
-  are not a pass.
-- `ide.diff` is optional; native `git diff` is valid. Send `ide.stop` in the same tool batch as
-  the last `ide.diff`.
+- Do not refetch sufficient passed logs or delivered pages. Explicit output recovery after
+  context loss is valid. Unavailable test counts are not a pass.
+- `ide.diff` is optional after an equivalent reviewed Git diff. Group independent compatible
+  protocol calls; preserve dependencies. Any needed final diff completes before `ide.stop`.
 
 ## Pending results
 
-A `pending` reply or retained result is not a failure. Plain file reads answer at once; an edit
-at the inline wait limit replies `edit_progress` with the files it committed. Continue independent
-work; with Bridge delivery, end the turn and the result arrives. When your host keeps the turn
-open, send one bounded `ide.inspect` (the reply's `detail_ref` and `wait_s`) before any native
-fallback. Never poll, sleep or repeat the original call, and never call finish or `ide.stop`
-while a result is pending.
+A `pending` reply or retained result is not a failure. Plain file reads answer synchronously.
+A committed edit receipt identifies actual written files independently of background checks;
+zero-commit `edit_progress` is unresolved. Bridge automatically delivers accepted async results.
+Continue independent work or end the turn while retaining the task/session. Never poll, sleep,
+repeat the original call, finish or `ide.stop` with required work still owed. One bounded
+`ide.inspect` with the reply's `detail_ref` and `wait_s` (1..30) is recovery only, never an
+ordinary read/edit step.
 
 ## Failures
 
