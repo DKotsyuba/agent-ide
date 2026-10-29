@@ -1194,20 +1194,23 @@ async fn slow_multi_file_edit_check_answers_at_once_with_pending_diagnostics() {
     .await;
     assert_eq!(
         edit["state"], "edit_batch",
-        "the check never parks the reply: {edit} {text}"
+        "a committed edit returns its durable receipt: {edit} {text}"
     );
-    assert!(
-        text.starts_with("edit: applied 2 of 2 files; diagnostics: pending"),
-        "{text}"
-    );
-    assert_no_source_ref(&text);
-    assert!(
-        text.contains("diagnostics: pending; project check retained under"),
-        "{text}"
-    );
-    assert!(
-        text.contains("Bridge delivers it automatically when configured"),
-        "{text}"
+    assert_eq!(edit["files"][0]["state"], "replaced", "{edit}");
+    assert_eq!(edit["files"][1]["state"], "replaced", "{edit}");
+    assert!(text.contains("diagnostics: pending"), "{text}");
+    let reference = edit["source_ref"].as_str().unwrap();
+    let next = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"slow-batch-next",
+        "path":"src/a.rs","source_ref":reference,"content":"pub fn f() -> i32 {\n    3\n}\n"}),
+        )
+        .await;
+    assert_eq!(
+        next["result"]["outcome"], "replaced",
+        "every pending batch source is retained: {next}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;

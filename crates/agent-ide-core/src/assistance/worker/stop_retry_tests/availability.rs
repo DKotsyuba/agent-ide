@@ -24,6 +24,7 @@ async fn scripted_symbol_attempt(
     let (cancel_sender, cancel) = watch::channel(false);
     let _keep = cancel_sender;
     let mut job = Job {
+        progress: Default::default(),
         reference: format!("attempt-{call}"),
         invocation,
         tool: AssistanceTool::Symbol,
@@ -53,6 +54,7 @@ async fn provider_start_text(worker: &mut Worker<'_>, actor: &str, id: &str) -> 
     let invocation = production_call(worker, actor, id);
     let (_cancel_sender, cancel) = watch::channel(false);
     let mut job = Job {
+        progress: Default::default(),
         reference: format!("provider-text-{id}"),
         invocation,
         tool: AssistanceTool::Start,
@@ -447,6 +449,7 @@ fn waiting_job(
     worker.shared.ledger.lock().unwrap().details.insert(
         reference.clone(),
         Detail {
+            progress: Default::default(),
             binding: invocation.binding_ref().clone(),
             reply: PeerReply::Pending {
                 detail_ref: reference.clone(),
@@ -467,6 +470,7 @@ fn waiting_job(
     let (send, wait) = oneshot::channel();
     let (cancel_sender, cancel) = watch::channel(false);
     let job = Job {
+        progress: Default::default(),
         reference,
         invocation,
         tool,

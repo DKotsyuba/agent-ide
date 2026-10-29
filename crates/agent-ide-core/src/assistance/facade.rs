@@ -163,6 +163,7 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
             | (AssistanceTool::Stop, ResultKind::Stop)
             | (AssistanceTool::Outline, ResultKind::Outline)
             | (AssistanceTool::Read, ResultKind::Read)
+            | (AssistanceTool::Edit, ResultKind::EditProgress)
             | (AssistanceTool::Symbol, ResultKind::Symbol)
             | (AssistanceTool::Graph, ResultKind::Graph)
             | (AssistanceTool::Test, ResultKind::Test)
@@ -281,6 +282,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false, "minProperties": 1,
                 "properties": {
                     "kind": {"type":"string", "enum":["problems", "diagnostics"], "description":"problems: project checks; diagnostics: file provider reports."},
+                    "wait_s": {"type":"integer", "minimum":1, "maximum":30, "description":"Completion seconds."},
                     "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"With diagnostics: worktree-relative file."},
                     "language": {"type":"string", "enum":checked_language_ids(), "description":"With problems: limit to one language."},
                     "offset": {"type":"integer", "minimum":0, "maximum":MAX_PROBLEM_OFFSET, "description":"With problems: continue from this problem index."},
@@ -729,6 +731,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "detail_ref",
             "detail_refs",
             "wait_ms",
+            "wait_s",
             "kind",
             "path",
             "language",
@@ -1435,6 +1438,20 @@ pub(crate) fn validate_normalized_call(
             // OUTBOX-r3 §8.5: one reference or up to eight in order, each with an optional bounded
             // wait; naming neither is refused because no session fact list exists to read.
             optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+            if let Some(wait) = object.get("wait_s") {
+                if wait.as_u64().is_none_or(|wait| !(1..=30).contains(&wait)) {
+                    return Err(invalid_field(
+                        "wait_s",
+                        FieldRule::IntegerRange { min: 1, max: 30 },
+                    ));
+                }
+                if object.contains_key("wait_ms") {
+                    return Err(invalid_field(
+                        "wait_s",
+                        FieldRule::OneOf("not together with wait_ms"),
+                    ));
+                }
+            }
             if !object.contains_key("detail_ref") && !object.contains_key("detail_refs") {
                 return Err(invalid_field("detail_ref", FieldRule::Required));
             }
@@ -5570,9 +5587,8 @@ fn debug_redacts_trusted_transport_and_host_metadata() {
     }
 }
 
-/// Nothing the host shows the model teaches waiting: the server paragraph and every advertised
-/// tool schema (descriptions included) omit `wait_ms` and any "wait once when idle" advice, while
-/// the call validator still accepts `wait_ms` (harness-reply-v1 R6).
+/// Advertised guidance allows one bounded retained-result wait and still forbids idle polling.
+/// The old millisecond parameter stays private compatibility; public waits use seconds.
 #[test]
 fn advertised_text_never_teaches_waiting() {
     let mut advertised = SERVER_INSTRUCTIONS.to_owned();
@@ -5580,7 +5596,7 @@ fn advertised_text_never_teaches_waiting() {
     for tool in facade.router.list_all() {
         advertised.push_str(&serde_json::to_string(&tool).unwrap());
     }
-    for banned in ["wait_ms", "nothing else to do", "wait once"] {
+    for banned in ["wait_ms", "nothing else to do", "poll every", "poll until"] {
         assert!(
             !advertised.contains(banned),
             "advertised text names {banned}"
@@ -5593,6 +5609,32 @@ fn advertised_text_never_teaches_waiting() {
         )
         .is_ok()
     );
+    assert!(advertised.contains("wait_s"));
+    for wait in [
+        json!(0),
+        json!(31),
+        json!(-1),
+        json!(1.5),
+        json!("1"),
+        json!(true),
+    ] {
+        assert!(
+            validate_call(
+                AssistanceTool::Inspect,
+                json!({"detail_ref":"a", "wait_s":wait})
+            )
+            .is_err()
+        );
+    }
+    for wait in [1, 30] {
+        assert!(
+            validate_call(
+                AssistanceTool::Inspect,
+                json!({"detail_ref":"a", "wait_s":wait})
+            )
+            .is_ok()
+        );
+    }
 }
 
 /// The advertised catalog stays inside the harness-reply-v1 byte budgets: every tool description

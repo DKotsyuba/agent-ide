@@ -86,7 +86,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 3. **Keep responses compact.** Responses contain no internal bookkeeping fields (`authority_epoch`, hashes, generations). Lists have ceilings and report “N more”; retrieve the complete list through `detail_ref`.
 4. Model refusals follow harness-reply-v1 r5: one head sentence (at most 160 UTF-8 bytes), exactly one Repair line (at most 120 bytes), and optional bounded current text. Internal reason/stage codes remain in operator journals and typed compatibility data, not model text.
 5. The language server runs as it would in a human's editor and remains alive for the session.
-6. Every host returns an immediately available result directly. Long work stays retained under its reference; Bridge delivers it automatically when configured. The reference allows explicit retrieval of its body without polling or waiting.
+6. Every host returns an immediately available result directly. Long work stays retained under its reference; Bridge delivers it automatically when configured. Explicit retrieval may include one bounded `ide.inspect` wait; repeated polling instructions remain prohibited.
 
 `ide.start` refusals name the actionable cause: an absent requested root includes the nearest existing ancestor under an allowed root; Git discovery failures include a short reason; unresolved worktrees and durable state failures have distinct stages. A worktree conflict says whether another actor owns it, this actor's other channel owns it, or this actor already owns another worktree, and names `ide.stop` or reuse as the remedy. An `ide.start` of another root by the actor that already holds an activation elsewhere hands that activation over without an `ide.stop` when nothing is pending on it (no queued or pending job, no edit that is unsettled or `outcome_unknown`, no running test): the old authority, provider ownership and leases are released as a stop would release them, the same session's grant moves to the new root in one durable step (a stopped session cannot start again), another session of the actor is revoked and stopped first, and the handover is journaled (`handover: released <path>`). Otherwise the `start:actor_owns_another_worktree` refusal stays, names the held worktree path and what keeps it (`; worktree <path>; kept: <reason>`), and releases nothing; another actor's activation is never touched by that handover. A writer start that meets another actor's writer takes it over only when that holder's session ended (its MCP front's lease closed and nothing arrived from it since) or when it has had no tool call and no IDE work in flight for 30 minutes; the reply names the displaced holder and the evidence, and the displaced actor's next call answers `taken_over` ([start-index-state](start-index-state-v1.md) §4). Provider cache namespace conflicts have their own stage and recovery. A successful repeat by the same actor and binding reports the existing activation idempotently. The start card explains which tools can answer from source while a language server starts. Its baseline says why coverage is partial: Git metadata and source bytes are captured separately, so an atomic window is not proven.
 
@@ -369,6 +369,13 @@ graph: callees of src/Button.tsx#Button (depth 2, 2 nodes, 1 edges)
 
 Input: `{symbol}`, `{path, lines: "120-180"}` or `{path}` (the whole file).
 
+Plain whole-file and line-range reads, including batch items and `ranges`, return authorized
+source text without starting or awaiting a language provider. Provider-based symbol enrichment
+is available separately through `ide.symbol`; no semantic completeness is implied by a lexical
+read. Source freshness, confinement and delivered-window edit guards still apply.
+Local name-index links may accompany the text; a building index cannot postpone plain source
+delivery and reports its availability separately.
+
 Output is code with line numbers and the header included:
 
 ```text
@@ -399,6 +406,21 @@ A file no IDE language analyzes (a log, `README.md`, YAML, a script, `Cargo.toml
 Errors: `no_such_file` (the requested path does not exist in the worktree; fix the path or use `ide.symbol` with a bare name), `unknown_symbol`, `unsupported_file` (symbol address into a file no IDE language reads), `source_unavailable` (binary or unreadable file, or a line range past the end).
 
 ### 2.5 `ide.edit` — edit a symbol or range (implemented)
+
+When the eight-second inline reply window expires before settlement, the reply has
+`state: complete`, `kind: edit_progress`, and the retained `detail_ref`. Its text names requested
+paths, the confirmed committed subset (or `committed: none`), and the active stage (`queued`,
+`plan`, `format`, `gate`, `commit`, `check`, or `provider_wait`). This is nonterminal progress,
+never an applied outcome or a promise that a check environment is available. Inspect the same
+reference for the eventual outcome; do not repeat the edit to obtain its result. Before a check
+has produced an analysable snapshot, committed-file/stage progress replaces a pending-check
+promise. Unavailable checks keep their explicit classification in the settled result.
+Escaped path labels longer than 256 bytes end in an ellipsis to preserve the bounded carrier.
+
+Each read/edit request journals exclusive stage durations under its correlation/reference;
+edit stages are plan, format, gate, commit, check and provider_wait, while reads record plan and
+provider_wait. A stage exceeding the inline window is a warning visible in `agent-ide errors`.
+Stage records include duration_ms and no source text or file paths.
 
 > E-003 (symbol-read-edit-v1 §3-§5): no form needs `source_ref` or `operation_id` (a missing id is generated); the current text is the base. New forms: a unit window (`file#Type/m:3-5` with `content`, guarded by the session's last read of the unit), `old`/`new` scoped to a unit, a window or the file (aliases `file_path`, `old_string`, `new_string`), `@` regions, `add_import`/`remove_import`, a whole-file `content` replacement, and Codex `patch` (Add File and Update File). Every success reply lists the changed lines by address (`  file#unit:N-M (L<a>-<b>)  <verb> (<k> lines → <m>)`), prints no `source_ref`, and arrives without waiting for the project check. Where the text below says otherwise, this note wins.
 
@@ -567,6 +589,16 @@ In a plain directory, `ide.diff` answers `source_unavailable (diff:not_a_git_rep
 Input: `{"kind":"problems","language"?:"rust","offset"?:0}` or
 `{"kind":"diagnostics","path":"src/a.rs"}`. Language/offset apply only to problems;
 path applies only to diagnostics. Retained pages use `detail_ref` separately.
+
+Retained references accept `wait_s`, an integer from 1 through 30 seconds, with `detail_ref` or
+`detail_refs`. Omission retrieves the current state immediately. A single bounded wait returns
+when a result settles or at the requested deadline, whichever comes first; expiry cancels no
+work and returns truthful progress. The bound covers the whole reference batch. It cannot be
+combined with private legacy `wait_ms` or the problems/diagnostics query modes. Guidance may
+teach this single bounded retrieval; instructions to poll, sleep and retry, or wait until idle
+remain prohibited. Automatic Bridge completion remains available when configured.
+If inspection itself cannot finish its authority/source checks within the bound, it returns a
+deadline refusal without revealing unverified progress; the retained job continues.
 
 Problems use the existing project feed, capped at 20 entries per page with `next_offset`.
 File diagnostics use the existing provider observation and generation/version checks;

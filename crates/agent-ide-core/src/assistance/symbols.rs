@@ -1,8 +1,8 @@
 //! Symbol-addressed worker jobs: `ide.outline`, `ide.read`, `ide.symbol` and `ide.graph` (v0.4).
 //!
-//! Every job observes the source through Workspace, asks the binding's live language server for
-//! document symbols, normalizes them through the language module and renders the compact text the
-//! contract specifies. Results are retained with the source observation; a later `ide.edit` is
+//! Every job observes the source through Workspace. Plain file/range reads return that text
+//! without provider outlines or semantic enrichment. Symbol requests normalize provider symbols
+//! through the language module. Results retain their source observation; a later `ide.edit` is
 //! checked against the file's current bytes and needs no file-version reference (the deprecated,
 //! unadvertised `source_ref` is still honoured when a caller supplies one).
 
@@ -140,6 +140,8 @@ impl Worker<'_> {
     /// counts in `summary` for a batch's listed-only cut. Counts come from the exact observed
     /// outline/map before pagination, never from model-facing headers; directory answers leave
     /// `summary` absent. Authority/source observations and failure behavior match `outline`.
+    /// Available source structure answers before provider admission. A language without source
+    /// structure uses an already-ready provider or refuses precisely without starting/waiting.
     pub(super) async fn outline_with_summary(
         &mut self,
         job: &mut Job,
@@ -186,7 +188,35 @@ impl Worker<'_> {
         if let Some(code) = no_such_file(observed.state(), &path) {
             return Err(code);
         }
-        let (outline, _, lexical) = self.outline_of(job, &observed, &bytes).await?;
+        let language = Lang::for_path(observed.path())
+            .ok_or_else(|| FailureCode::UnsupportedFile(path.clone()))?;
+        let source_outline = self
+            .source_outline(
+                job,
+                language,
+                root,
+                observed.path(),
+                observed_text(&observed, &bytes)?,
+            )
+            .await?;
+        let from_source = source_outline.is_some();
+        let (outline, lexical) = if let Some(outline) = source_outline {
+            (outline, None)
+        } else {
+            let ready = match self.session_server(observed.path()) {
+                Some(server) => {
+                    matches!(self.session_readiness(&binding, server).await, Some(Ok(())))
+                }
+                None => false,
+            };
+            if !ready {
+                job.set_stage_failure(&FailureCode::ProviderUnavailable,
+                    "source structure unavailable; provider not ready; ide.read still returns source");
+                return Err(FailureCode::ProviderUnavailable);
+            }
+            let (outline, _, lexical) = self.outline_of(job, &observed, &bytes).await?;
+            (outline, lexical)
+        };
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         let map = lang::address::AddressMap::build(&outline, observed_text(&observed, &bytes)?);
         *summary = Some((
@@ -212,7 +242,9 @@ impl Worker<'_> {
             }
             None => render::address_outline_text(&outline, &map, None),
         };
-        if let Some(why) = lexical.as_ref()
+        if from_source {
+            text.push_str("outline: from source, exact; semantic coverage not requested\n");
+        } else if let Some(why) = lexical.as_ref()
             && let Some(note) = self.lexical_note(job, observed.path(), why)
         {
             text.push_str(&note);
@@ -236,7 +268,9 @@ impl Worker<'_> {
     /// `file has <n> lines; nothing at <range>`. The `symbol` form still needs an outline, so a file no
     /// IDE language reads answers `unsupported_file`. File/range reads also retain the former
     /// context related-links block for the requested lines; it follows numbered source, shares
-    /// its continuation, and source/authority are rechecked after the index lookup.
+    /// its continuation, and source/authority are rechecked after the index lookup. Plain file
+    /// and range reads never start or await a provider; an index still building annotates its
+    /// availability without postponing source delivery.
     pub(super) async fn read(
         &mut self,
         job: &mut Job,
@@ -339,6 +373,9 @@ impl Worker<'_> {
             return Ok((reply, Some(authority), Some(observed)));
         }
         let authority = self.authority(&binding).await?;
+        // Local name-index links require no language server. A still-building index may
+        // annotate its availability, but must not park delivery of plain source text.
+        let prior_park = job.park_until;
         let links = self
             .related_links(
                 job,
@@ -348,6 +385,9 @@ impl Worker<'_> {
                 range.unwrap_or_else(|| LineRange::new(1, total.max(1))),
             )
             .await;
+        if requested.is_none() {
+            job.park_until = prior_park;
+        }
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         let mut text = match range {
             Some(range) => render::read_text(
@@ -643,10 +683,8 @@ impl Worker<'_> {
                             &binding,
                             &mut files,
                             file.clone(),
-                            // A range of a language file keeps the outline its ranges read always
-                            // took, which registers it with the language session before any edit;
-                            // a whole-file item needs none, like `ide.read {path}`.
-                            range.is_some() && Lang::for_path(&file).is_some(),
+                            // Plain file/range content requires no provider outline.
+                            false,
                         )
                         .await
                     {
@@ -694,9 +732,11 @@ impl Worker<'_> {
                 _ => LineRange::new(1, lang::line_count(source).max(1)),
             };
             let authority = self.authority(&binding).await?;
+            let prior_park = job.park_until;
             let links = self
                 .related_links(job, authority.worktree(), path, source.as_bytes(), range)
                 .await;
+            job.park_until = prior_park;
             self.finish_symbol_job(job, &binding, observed).await?;
             if !links.is_empty() {
                 text.push('\n');
@@ -920,8 +960,8 @@ impl Worker<'_> {
     /// Observes, outlines and finishes one file of a batch read once: every item of that file
     /// shares the observation, the outline and the deadline/authority/source checks.
     ///
-    /// `outline` asks for the file's outline. It is false for a whole-file text item and for the
-    /// ranges of a file no IDE language reads: neither needs one, so any readable file answers
+    /// `outline` asks for the file's outline. It is false for every plain file or range item:
+    /// neither needs one, so any readable file answers
     /// them, and the file is retained with `None` for its outline. A later item of the same file
     /// that asks for an outline gets it computed then, so item order never changes an answer; an
     /// outline that cannot be computed fails like a first request would (`UnsupportedFile` for a
@@ -1818,13 +1858,14 @@ impl Worker<'_> {
     /// unavailable refusal. Returns the outline, the worktree root for path rendering, and why
     /// the outline came from the text alone (replies then say so in one compact line; an
     /// address it does not contain waits for the server while it loads — see
-    /// [`missing_symbol`]).
+    /// [`missing_symbol`]). The job accumulates this interval as provider-wait timing.
     pub(super) async fn outline_of(
         &mut self,
         job: &mut Job,
         observed: &SourceObservation,
         bytes: &[u8],
     ) -> Result<(Outline, std::path::PathBuf, Option<Lexical>), FailureCode> {
+        let _timing = progress::Progress::enter(&job.progress, "provider_wait");
         // A file no registered language reads (`Cargo.toml`, a script) has no outline at all: the
         // caller asked the wrong tool, which a provider-unavailable answer would hide.
         let language = Lang::for_path(observed.path()).ok_or_else(|| {
@@ -3205,7 +3246,9 @@ impl Worker<'_> {
                     return Err(FailureCode::EditRefused);
                 }
             };
-        let formatted = self.format_candidate(&observed, &file, candidate).await;
+        let formatted = self
+            .format_candidate(job, &observed, &file, candidate)
+            .await;
         // Pre-write structural gate, shared with batches and file creation: a candidate that
         // does not parse is not written; a base that already failed is edited with a note.
         let gated = self
@@ -3638,7 +3681,7 @@ impl Worker<'_> {
             }
         };
         let candidate = self
-            .format_candidate(observed, &file, spliced.clone())
+            .format_candidate(job, observed, &file, spliced.clone())
             .await;
         // Pre-write structural gate: a candidate that does not parse is not written; a file that
         // already failed the same check before the edit is still edited, with a note.
@@ -3753,7 +3796,7 @@ impl Worker<'_> {
         } else {
             String::new()
         };
-        let candidate = self.format_candidate(&observed, &file, content).await;
+        let candidate = self.format_candidate(job, &observed, &file, content).await;
         // The same pre-write structural gate as every edit: new content that does not parse is
         // not written (an empty base can never have carried a pre-existing error).
         let gated = self
@@ -3799,14 +3842,17 @@ impl Worker<'_> {
             .await
     }
 
-    /// Runs the project's stdin formatter over a candidate text; the candidate is returned
-    /// unchanged when there is no formatter, it fails, or it takes longer than ten seconds.
+    /// Runs the project's stdin formatter over a candidate text, timing its exclusive interval
+    /// on `job`. Returns the candidate unchanged when no formatter exists, it fails, or it exceeds
+    /// ten seconds. The admitted observation supplies the worktree; formatting writes no source.
     pub(super) async fn format_candidate(
         &mut self,
+        job: &Job,
         observed: &SourceObservation,
         file: &Path,
         candidate: String,
     ) -> String {
+        let _timing = progress::Progress::enter(&job.progress, "format");
         let Some(language) = Lang::for_path(file) else {
             return candidate;
         };
@@ -3935,7 +3981,7 @@ impl Worker<'_> {
     /// per-change attribution. `Ok(Some(note))` proceeds with that note line. One error-log
     /// event records the gate's outcome for every edit — `gate: clean`, `gate: failed …`, or
     /// `gate: unchecked: <reason>` — so a gate that silently cannot engage is diagnosable from
-    /// `~/.agent-ide/logs`.
+    /// `~/.agent-ide/logs`. The job records the exclusive gate interval for its stage journal.
     async fn gate_candidate(
         &mut self,
         job: &Job,
@@ -3944,6 +3990,7 @@ impl Worker<'_> {
         base: &str,
         candidate: &str,
     ) -> Result<Option<String>, (u32, String)> {
+        let _timing = progress::Progress::enter(&job.progress, "gate");
         let (verdict, unchecked) = self.syntax_verdict_of(job, observed, file, candidate).await;
         let record_gate = |outcome: crate::errorlog::Outcome, detail: String| {
             crate::errorlog::record(

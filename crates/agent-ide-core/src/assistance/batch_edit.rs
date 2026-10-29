@@ -289,6 +289,29 @@ impl Worker<'_> {
         let committed = self
             .commit_files(job, binding, operation_id, files, &existing, planned)
             .await?;
+        // Durable write history is not proof that the candidate files still exist unchanged.
+        if existing.settled
+            && committed
+                .reports
+                .iter()
+                .all(|report| report.state.written())
+            && !self
+                .shared
+                .committed_edit_proof_current(
+                    &self.workspace,
+                    binding,
+                    &job.reference,
+                    &committed.authority,
+                    &committed.sources,
+                )
+                .await
+        {
+            return Ok((
+                historical_edit_source_unavailable(),
+                Some(committed.authority),
+                None,
+            ));
+        }
         // A settled operation answers the diagnostics its settled check recorded.
         if let Some(stored) = existing.diagnostics.as_deref()
             && committed
@@ -340,7 +363,7 @@ impl Worker<'_> {
                 )));
             }
             let candidate = self
-                .format_candidate(&observed, Path::new(&path), content.clone())
+                .format_candidate(job, &observed, Path::new(&path), content.clone())
                 .await;
             return Ok(Ok(Planned {
                 path,
@@ -443,6 +466,7 @@ impl Worker<'_> {
     /// `not reached`. No error after the first write leaves this function: each becomes the
     /// file's state, so the caller can always say exactly what was written. A fully written
     /// operation is settled; an unknown write keeps the binding unsettled for the handover guard.
+    /// The job's exclusive commit interval is timed and only confirmed writes enter progress.
     async fn commit_files(
         &mut self,
         job: &mut Job,
@@ -452,6 +476,7 @@ impl Worker<'_> {
         receipt: &BatchReceipt,
         mut planned: Vec<Option<Planned>>,
     ) -> Result<Committed, FailureCode> {
+        let _timing = progress::Progress::enter(&job.progress, "commit");
         let authority = self.authority(binding).await?;
         let receipts = self.edits.batches();
         let mut reports: Vec<FileReport> = Vec::with_capacity(files.len());
@@ -471,6 +496,9 @@ impl Worker<'_> {
                 continue;
             }
             if row.written {
+                if let Ok(mut progress) = job.progress.lock() {
+                    progress.committed.push(file.path.clone());
+                }
                 if let Ok((observed, _)) = self.observe(binding, file.path.clone().into()).await
                     && observed.bytes().map(|bytes| *bytes.digest()) == Some(row.candidate)
                 {
@@ -495,6 +523,9 @@ impl Worker<'_> {
                         continue;
                     };
                     if observed.bytes().map(|bytes| *bytes.digest()) == Some(row.candidate) {
+                        if let Ok(mut progress) = job.progress.lock() {
+                            progress.committed.push(file.path.clone());
+                        }
                         sources.push(observed);
                         let _ = receipts.mark_written(operation_id, index).await;
                         reports.push(report(
@@ -567,6 +598,9 @@ impl Worker<'_> {
                 | Written::CapacityNoEffect => (FileState::NotWritten(NotWritten::IoError), None),
             };
             if let Some(read) = read {
+                if let Ok(mut progress) = job.progress.lock() {
+                    progress.committed.push(plan.path.clone());
+                }
                 let _ = receipts.mark_written(operation_id, index).await;
                 if let Some(observed) = self
                     .post_write_source(
@@ -708,7 +742,7 @@ impl Worker<'_> {
     /// Triggers the one project check of the written files — one check generation per affected
     /// checked language — and parks the job until it lands or its deadline passes; without a
     /// project feed, without written files of a checked language, or without time left, it
-    /// answers at once.
+    /// answers at once. The job's progress changes to the check stage before that decision.
     async fn schedule_batch_check(
         &mut self,
         job: &mut Job,
@@ -716,6 +750,9 @@ impl Worker<'_> {
         operation_id: &str,
         committed: Committed,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if let Ok(mut progress) = job.progress.lock() {
+            progress.switch(Some("check"));
+        }
         let Committed {
             reports,
             sources,
@@ -785,7 +822,8 @@ impl Worker<'_> {
                 authority: authority.clone(),
                 path: report.path.clone(),
                 fallback: EditDiagnostics::Unknown {},
-                generation,
+                generation: Some(generation),
+                provider_pending: false,
                 worktree: worktree.clone(),
                 wanted: report.path.trim_start_matches("./").to_owned(),
                 // A file written by an earlier call has no pre-write record: the latest check
@@ -878,10 +916,10 @@ impl Worker<'_> {
     }
 
     /// Answers a multi-file edit whose project check is still running with `diagnostics:
-    /// pending` at once, right after the writes (symbol-read-edit-v1 §3.3), as the one-file edit
-    /// does.
+    /// pending` after the writes (symbol-read-edit-v1 §3.3), independently of provider readiness.
+    /// The retained receipt and every post-write source are usable while the check is pending.
     ///
-    /// Only a caller still waiting is answered, only once, and only when the session ledger can
+    /// A live caller is answered only once, after retention, when the session ledger can
     /// track the check as in-flight work under the job's reference: the job stays parked on its
     /// check, and [`Self::finish_batch_check`] then hands one `edit-checked` fact for the whole
     /// operation to Bridge. Otherwise nothing changes and the final reply carries the diagnostics.
@@ -889,12 +927,8 @@ impl Worker<'_> {
         if check.answered_early {
             return;
         }
-        let waiting = job
-            .stop_reply
-            .as_ref()
-            .is_some_and(|sender| !sender.is_closed());
         let binding = job.invocation.binding_ref().clone();
-        if !waiting || !self.shared.outbox.is_open(&binding) {
+        if !self.shared.outbox.is_open(&binding) {
             return;
         }
         if !self.shared.outbox.begin_work(&job.reference, &binding) {
@@ -920,12 +954,12 @@ impl Worker<'_> {
             &check.reports,
             &pending,
         );
+        self.shared
+            .retain_edit_receipt(job, &reply, &check.authority, check.sources.clone());
+        check.answered_early = true;
         if let Some(sender) = job.stop_reply.take() {
-            if sender.send(reply).is_err() {
-                let _ = self.shared.outbox.take_work(&job.reference);
-                return;
-            }
-            check.answered_early = true;
+            // A lost receipt does not cancel the accepted check or its terminal delivery.
+            let _ = sender.send(reply);
         }
     }
 
@@ -958,6 +992,23 @@ impl Worker<'_> {
                 let committed = self
                     .commit_files(job, binding, operation_id, &files, &existing, planned)
                     .await?;
+                if !self
+                    .shared
+                    .committed_edit_proof_current(
+                        &self.workspace,
+                        binding,
+                        &job.reference,
+                        &committed.authority,
+                        &committed.sources,
+                    )
+                    .await
+                {
+                    return Ok(Some((
+                        historical_edit_source_unavailable(),
+                        Some(committed.authority),
+                        None,
+                    )));
+                }
                 Ok(Some(self.partial_rename(job, operation_id, committed)))
             }
             _ => Ok(None),
@@ -1068,8 +1119,8 @@ impl Worker<'_> {
         let Committed {
             reports,
             mut sources,
+            mut preexisting,
             authority,
-            ..
         } = committed;
         let last = reports.last().ok_or(FailureCode::Internal)?;
         let outcome = match last.state {
@@ -1077,15 +1128,51 @@ impl Worker<'_> {
             FileState::Unchanged => ChangesEditOutcome::Unchanged,
             _ => ChangesEditOutcome::Replaced,
         };
-        let diagnostics = self.file_diagnostics(job, binding, &last.path).await;
+        let mut diagnostics = EditDiagnostics::Unknown {};
         let result = EditResult {
             operation_id: operation_id.to_owned(),
             path: last.path.clone(),
             outcome,
             source_ref: Some(job.reference.clone()),
         };
-        let first = (!sources.is_empty()).then(|| sources.remove(0));
+        let refreshed = sources
+            .iter()
+            .position(|source| source.path().to_str() == Some(&last.path))
+            .map(|index| sources.remove(index));
         self.shared.add_edit_sources(&job.reference, sources);
+        job.format_note = Some(note.clone());
+        let provider_pending = match self.ready_edit_provider_fallback(job, &last.path).await {
+            Ok(ready) => ready,
+            Err(reason) => {
+                diagnostics = EditDiagnostics::NotAnalysed {
+                    reason: reason.to_owned(),
+                };
+                false
+            }
+        };
+        if let Some(stage) = self.edit_check_stage(
+            job,
+            &authority,
+            &last.path,
+            result.clone(),
+            refreshed.clone(),
+            (
+                diagnostics.clone(),
+                preexisting.remove(&last.path).unwrap_or_default(),
+                provider_pending,
+                true,
+            ),
+        ) {
+            match self.check_diagnostics(&stage) {
+                Some(checked) => diagnostics = checked,
+                None => {
+                    self.reply_edit_early(job, &stage);
+                    job.stage = Some(stage);
+                    job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    return Err(FailureCode::ProviderLoading);
+                }
+            }
+        }
         Ok((
             PeerReply::Edit {
                 result,
@@ -1094,7 +1181,7 @@ impl Worker<'_> {
                 operation: Some("renamed".to_owned()),
             },
             Some(authority),
-            first,
+            refreshed,
         ))
     }
 
@@ -1143,49 +1230,6 @@ impl Worker<'_> {
             job.failure_detail = Some("edit:batch_receipt_unreadable".to_owned());
             FailureCode::Internal
         })
-    }
-
-    /// The language server's diagnostics for one just-written file, as a one-file edit reports
-    /// them without waiting for the project check: `unknown` when no exact provider answer
-    /// arrives before the edit's diagnostic deadline.
-    async fn file_diagnostics(
-        &mut self,
-        job: &mut Job,
-        binding: &BindingRef,
-        path: &str,
-    ) -> EditDiagnostics {
-        let Ok((observed, bytes)) = self.observe(binding, path.into()).await else {
-            return EditDiagnostics::Unknown {};
-        };
-        let Some(deadline) = edit_diagnostic_deadline(job.deadline) else {
-            return EditDiagnostics::Unknown {};
-        };
-        let original = std::mem::replace(&mut job.deadline, deadline);
-        let result = self
-            .semantic_context(
-                job,
-                &observed,
-                &bytes,
-                crate::intelligence::context::ContextQuery::File,
-            )
-            .await;
-        job.deadline = original;
-        match result {
-            Ok(Some(provider)) => {
-                let map = if provider.diagnostics.diagnostics.is_empty() {
-                    None
-                } else {
-                    self.optional_address_map(job, &observed, &bytes).await
-                };
-                EditDiagnostics::from_snapshot(
-                    path.trim_start_matches("./"),
-                    &provider.context,
-                    &provider.diagnostics,
-                    map.as_deref(),
-                )
-            }
-            _ => EditDiagnostics::Unknown {},
-        }
     }
 }
 

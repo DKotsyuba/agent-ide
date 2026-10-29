@@ -1,0 +1,27 @@
+fix(assistance): return source and truthful edit progress inline
+
+Result:
+Plain file and range reads bypass provider waits. Edits expose confirmed committed
+files and the current stage at the inline deadline. Inspect supports a bounded
+seconds wait, preserves cancelled source pages, and request stages are journaled.
+Both generated tool catalogs and the public contract describe the new behavior.
+
+Checks:
+passed | formatting | cargo fmt --all --check
+passed | scoped clippy | cargo clippy --offline --locked -p agent-ide-core -p agent-ide --all-targets -- -D warnings
+passed | public progress and bounded inspect | edit_progress_and_bounded_inspect_preserve_committed_files
+passed | mutation control | hiding committed filenames failed the same public test; restored candidate passed
+passed | cold request shapes | cold_matrix_reply_shapes_journal_stage_timings with --include-ignored
+passed | range-read edit freshness | configured_product_batch_ranges_read_then_edit_by_those_lines_without_reread; standalone retry passed after an initial activation outcome_unknown
+passed | no polling and slow batch | pending_and_batch_replies_never_invite_polling; batch_api::slow_multi_file_edit_check_answers_at_once_with_pending_diagnostics
+passed | Rust syntax gate | configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existing_errors
+passed | source-link parity and pagination | cargo test --offline --locked --features test-seams --test module_context_links -- --test-threads=1 (4 passed)
+passed | unit boundaries | stage warning journal, bounded progress labels, wait validation, cancelled inspection pages, unchanged bridge fixture
+passed | catalog export | cargo run --offline --locked -p xtask -- contract update; reviewed both generated snapshots
+not_run | full gate | run by the orchestrator
+not_run | full product include-ignored suite | run by the orchestrator
+
+Gaps:
+Full gate and full product include-ignored suite pending orchestrator run.
+
+Followups:

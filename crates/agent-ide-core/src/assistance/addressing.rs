@@ -367,7 +367,9 @@ impl Worker<'_> {
     /// (never parking the job for a loading server), at most [`MAX_ADDRESS_FILES`] files per
     /// call. Once [`ADDRESS_BUDGET`] is spent, or when the server cannot outline a file, the
     /// file is outlined from its language's source outline instead, which gives the same
-    /// addresses. A location neither outline resolves answers `None`; no address is guessed.
+    /// addresses. Read-job link enrichment uses only the source outline so plain source never
+    /// starts or awaits a provider. A location neither outline resolves answers `None`; no
+    /// address is guessed.
     pub(super) async fn position_addresses(
         &mut self,
         job: &mut Job,
@@ -390,7 +392,9 @@ impl Worker<'_> {
                     out.reason.get_or_insert("file limit");
                     None
                 } else {
-                    let served = if started.elapsed() >= ADDRESS_BUDGET {
+                    let served = if job.tool == AssistanceTool::Read
+                        || started.elapsed() >= ADDRESS_BUDGET
+                    {
                         None
                     } else {
                         Box::pin(self.scanned_map(job, &authority, file)).await

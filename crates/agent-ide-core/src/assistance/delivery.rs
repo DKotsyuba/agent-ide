@@ -8,7 +8,11 @@
 //! is synchronous bookkeeping under short locks, except the detached Bridge publication; nothing
 //! awaits while a lock is held.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeSet,
+    path::{Component, PathBuf},
+    sync::Arc,
+};
 
 use serde_json::Value;
 
@@ -413,11 +417,212 @@ fn edit_checked_fact(
     }
 }
 
+/// Normalizes only harmless current-directory components of an admitted relative edit path.
+/// Empty, absolute, root, prefix and parent-traversing inputs have no usable source identity.
+fn normalized_edit_path(path: &std::path::Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+/// Re-proves one owned edit-proof snapshot for recovery or detached publication. A primary is
+/// mandatory; normalized expected paths must be nonempty and exactly covered by digest-bearing
+/// primary/extra captures in the same authority/worktree/epoch. Every capture is freshly
+/// authorized/reread; failure returns false. The caller establishes ownership of the reference
+/// before taking this snapshot. No ledger mutation, writes or task detachment occurs here.
+pub(super) async fn reprove_edit_sources(
+    workspace: &crate::workspace::durable::DurableWorkspace<'_>,
+    bindings: &std::sync::Mutex<super::HostBindingGuard>,
+    binding: &BindingRef,
+    authority: &super::AuthorityStamp,
+    expected: &BTreeSet<PathBuf>,
+    primary: &super::SourceObservation,
+    extra: &[super::SourceObservation],
+) -> bool {
+    let Some(expected) = expected
+        .iter()
+        .map(|path| normalized_edit_path(path))
+        .collect::<Option<BTreeSet<_>>>()
+    else {
+        return false;
+    };
+    if expected.is_empty() || extra.len() + 1 != expected.len() {
+        return false;
+    }
+    let captured = std::iter::once(primary)
+        .chain(extra)
+        .map(|source| {
+            (source.bytes().is_some()
+                && source.worktree() == authority.worktree()
+                && source.authority_epoch() == authority.epoch())
+            .then(|| normalized_edit_path(source.path()))
+            .flatten()
+        })
+        .collect::<Option<BTreeSet<_>>>();
+    if captured.as_ref() != Some(&expected) {
+        return false;
+    }
+    for source in std::iter::once(primary).chain(extra) {
+        if super::reprove_disclosure(
+            workspace,
+            bindings,
+            binding,
+            Some(authority),
+            Some(source),
+            None,
+        )
+        .await
+        .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+impl Shared {
+    /// Returns the exact expected committed path set retained with this result, independent of
+    /// successful source capture. Missing/poisoned/empty/unsafe state is unproven (`None`). Only
+    /// harmless current-directory components are normalized; absolute/root/parent/prefix paths
+    /// refuse. This performs no I/O and grants no authority: the caller must establish binding,
+    /// reauthorize and compare every captured path/digest before using it as clean-check proof.
+    pub(super) fn committed_edit_paths(&self, reference: &str) -> Option<BTreeSet<PathBuf>> {
+        let progress = self
+            .ledger
+            .lock()
+            .ok()?
+            .details
+            .get(reference)?
+            .progress
+            .clone();
+        let progress = progress.lock().ok()?;
+        let paths = progress
+            .committed
+            .iter()
+            .map(|path| normalized_edit_path(std::path::Path::new(path)))
+            .collect::<Option<BTreeSet<_>>>()?;
+        (!paths.is_empty()).then_some(paths)
+    }
+
+    /// Proves a complete current edit source set for an already-owned result reference. The
+    /// expected paths come only from retained committed effects; every capture must have a digest,
+    /// match this authority/worktree/epoch, and cover exactly that nonempty set without duplicates.
+    /// Reauthorization and source rereads run outside all ledger locks; missing/poisoned state
+    /// or any failed proof returns false. This neither rewrites nor changes
+    /// historical receipts and is shared by current-result recovery and checked-fact publication.
+    pub(super) async fn committed_edit_proof_current(
+        &self,
+        workspace: &crate::workspace::durable::DurableWorkspace<'_>,
+        binding: &BindingRef,
+        reference: &str,
+        authority: &crate::workspace::authority::AuthorityStamp,
+        sources: &[crate::workspace::observation::SourceObservation],
+    ) -> bool {
+        let Some(expected) = self.committed_edit_paths(reference) else {
+            return false;
+        };
+        let owned = || {
+            self.ledger.lock().is_ok_and(|ledger| {
+                ledger
+                    .details
+                    .get(reference)
+                    .is_some_and(|detail| detail.binding == *binding)
+            })
+        };
+        if !owned() || sources.len() != expected.len() {
+            return false;
+        }
+        let Some((primary, extra)) = sources.split_first() else {
+            return false;
+        };
+        if !reprove_edit_sources(
+            workspace,
+            &self.bindings,
+            binding,
+            authority,
+            &expected,
+            primary,
+            extra,
+        )
+        .await
+        {
+            return false;
+        }
+        owned()
+    }
+
+    /// Retains the committed receipt and exact post-write sources before returning it to a caller.
+    /// This does not settle the independently accepted check or publish a terminal fact. A prior
+    /// progress deferral is replaced by that check's existing in-flight registration, so a lost
+    /// initial reply cannot cause a duplicate job-ready fact or repeat a write.
+    pub(super) fn retain_edit_receipt(
+        &self,
+        job: &Job,
+        reply: &PeerReply,
+        authority: &crate::workspace::authority::AuthorityStamp,
+        sources: Vec<crate::workspace::observation::SourceObservation>,
+    ) {
+        if let Ok(mut ledger) = self.ledger.lock()
+            && let Some(detail) = ledger.details.get_mut(&job.reference)
+            && detail.binding == *job.invocation.binding_ref()
+        {
+            let mut sources = sources.into_iter();
+            detail.reply = reply.clone();
+            detail.authority = Some(authority.clone());
+            detail.source = sources.next();
+            detail.extra_sources = sources.collect();
+            detail.native_epoch = job.native_epoch;
+            detail.line_movement = super::reply_line_movement(reply);
+            if let Ok(mut progress) = detail.progress.lock() {
+                progress.check_pending = true;
+                progress.usable_reply(
+                    job.tool,
+                    &job.reference,
+                    self.request_of(&job.reference).as_deref(),
+                    reply,
+                    detail.source.is_some(),
+                );
+            }
+            ledger.deferred.remove(&job.reference);
+        }
+        if self.committed_edit_paths(&job.reference).is_none() {
+            crate::errorlog::record(
+                crate::errorlog::Method::Daemon,
+                crate::errorlog::Outcome::Incomplete,
+                crate::errorlog::Fields {
+                    correlation: Some(&job.reference),
+                    detail: Some("edit_receipt: committed path proof unavailable"),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// Whether a retained committed receipt still has an accepted check to settle. Poisoned or
+    /// missing state is never treated as a pending receipt; ordinary inspection still reauthorizes.
+    pub(super) fn edit_check_pending(&self, reference: &str) -> bool {
+        let progress = self.ledger.lock().ok().and_then(|ledger| {
+            ledger
+                .details
+                .get(reference)
+                .map(|detail| detail.progress.clone())
+        });
+        progress
+            .is_some_and(|progress| progress.lock().is_ok_and(|progress| progress.check_pending))
+    }
+}
+
 impl Worker<'_> {
     /// Answers an edit whose project check is still running with `diagnostics: pending` at once,
     /// right after the write is observed, without waiting for the check (symbol-read-edit-v1 §3.3).
     ///
-    /// Only a caller still waiting is answered, and only when the session ledger can track the
+    /// A live caller is answered after the receipt is retained, when the session ledger tracks the
     /// check as in-flight work under the job's reference: the job stays parked on its check and
     /// its settlement hands one `edit-checked` fact to Bridge ([`Shared::job_settled`]). The write
     /// is counted before the registration, so the fact's fence epoch includes its own edit.
@@ -426,12 +631,8 @@ impl Worker<'_> {
         let JobStage::EditAwaitingCheck { result, .. } = stage else {
             return;
         };
-        let waiting = job
-            .stop_reply
-            .as_ref()
-            .is_some_and(|sender| !sender.is_closed());
         let binding = job.invocation.binding_ref().clone();
-        if !waiting || !self.shared.outbox.is_open(&binding) {
+        if self.shared.edit_check_pending(&job.reference) || !self.shared.outbox.is_open(&binding) {
             return;
         }
         if result.outcome.has_post_source() {
@@ -451,10 +652,25 @@ impl Worker<'_> {
                 .filter(|_| result.outcome.has_post_source()),
             operation: edit_operation(&job.parameters),
         };
-        if let Some(sender) = job.stop_reply.take()
-            && sender.send(reply).is_err()
+        let JobStage::EditAwaitingCheck {
+            refreshed,
+            authority,
+            ..
+        } = stage
+        else {
+            return;
+        };
+        let mut sources: Vec<_> = refreshed.iter().cloned().collect();
+        if let Ok(ledger) = self.shared.ledger.lock()
+            && let Some(detail) = ledger.details.get(&job.reference)
         {
-            let _ = self.shared.outbox.take_work(&job.reference);
+            sources.extend(detail.extra_sources.iter().cloned());
+        }
+        self.shared
+            .retain_edit_receipt(job, &reply, authority, sources);
+        if let Some(sender) = job.stop_reply.take() {
+            // The check remains owed even if the transport receiver already left.
+            let _ = sender.send(reply);
         }
     }
 }
@@ -486,6 +702,14 @@ impl SessionOutbox for Shared {
         let Some(detail) = ledger.details.get(reference) else {
             return false;
         };
+        if detail
+            .progress
+            .lock()
+            .is_ok_and(|progress| progress.check_pending)
+        {
+            // The durable receipt is ready; its independently held check owns terminal delivery.
+            return false;
+        }
         let owner = detail.binding.clone();
         // The state the job started from (OUTBOX §3.1); a job still queued has not started, so
         // the session's state now is the closest earlier bound.
@@ -1120,6 +1344,7 @@ mod worker_tests {
         handle.shared.ledger.lock().unwrap().details.insert(
             reference.to_owned(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply,
                 selection: (

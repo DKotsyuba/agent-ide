@@ -1,9 +1,8 @@
-//! `ide.inspect` consolidation (OUTBOX-r3 §8.5): `detail_ref`, `detail_refs` and `wait_ms`.
+//! `ide.inspect` consolidation: retained references and a bounded `wait_s` completion wait.
 //!
 //! One `ide.inspect` call reads one reference (as before) or up to eight references in order.
-//! `wait_ms` waits inside the daemon, outside the worker's inspection loop, so a waiting agent
-//! spends one model turn instead of many polls and never blocks other sessions' inspections. A
-//! wait that ends without a result cancels nothing.
+//! Waiting runs outside the worker's inspection loop and never blocks other sessions. Expiry
+//! cancels no job. The unadvertised `wait_ms` remains compatible for existing clients.
 
 use std::{sync::Arc, time::Duration};
 
@@ -13,7 +12,7 @@ use super::super::{
     content::{self, Envelope},
     host_binding::BindingRef,
     outbox::{MAX_DETAIL_REFS, MAX_WAIT_MS},
-    reply::{PeerReply, ResultKind},
+    reply::{FailureCode, PeerReply, ResultKind},
 };
 use super::WorkerHandle;
 
@@ -56,11 +55,40 @@ fn inspect_reply(text: String) -> PeerReply {
 }
 
 impl WorkerHandle {
+    /// Retrieves one reference under its ordinary delivery context, bounding the retrieval
+    /// itself when a deadline exists. Expiry preserves the job and refuses disclosure because
+    /// the inspection has not completed its authority/source checks.
+    async fn inspect_until(
+        &self,
+        binding: BindingRef,
+        reference: String,
+        attachment: &str,
+        delivery: Arc<std::sync::atomic::AtomicBool>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> PeerReply {
+        let inspect = self.with_delivery(
+            delivery,
+            self.inspect(binding, reference.clone(), attachment, None),
+        );
+        match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, inspect)
+                    .await
+                    .unwrap_or(PeerReply::Error {
+                        code: FailureCode::Deadline,
+                        detail: Some("inspect:deadline".to_owned()),
+                    })
+            }
+            None => inspect.await,
+        }
+    }
+
     /// Serves one `ide.inspect` call in any of its forms (OUTBOX §8.5).
     ///
     /// `parameters` are the validated call arguments: `detail_ref` (one reference, the original
-    /// form) or `detail_refs` (1-8 references answered in order), each with an optional `wait_ms`
-    /// (clamped to [`MAX_WAIT_MS`]). `delivery` is the call's QW-4 delivery flag. A wait returns as
+    /// form) or `detail_refs` (1-8 references answered in order), with optional `wait_s` (1–30
+    /// seconds) or legacy `wait_ms` (clamped to [`MAX_WAIT_MS`]), never both. `delivery` is the
+    /// call's QW-4 delivery flag. A wait returns as
     /// soon as a named reference settles; at its deadline it answers with what is there and cancels
     /// nothing. Arguments naming neither form are refused; the facade validator never admits them.
     pub async fn inspect_call(
@@ -70,26 +98,68 @@ impl WorkerHandle {
         attachment: &str,
         delivery: Arc<std::sync::atomic::AtomicBool>,
     ) -> PeerReply {
+        let references = parameters
+            .get("detail_ref")
+            .and_then(Value::as_str)
+            .into_iter()
+            .chain(
+                parameters
+                    .get("detail_refs")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            );
+        for reference in references.collect::<std::collections::BTreeSet<_>>() {
+            let progress = self.shared.ledger.lock().ok().and_then(|ledger| {
+                ledger
+                    .details
+                    .get(reference)
+                    .filter(|detail| detail.binding == binding)
+                    .map(|detail| detail.progress.clone())
+            });
+            if let Some(progress) = progress
+                && let Ok(mut progress) = progress.lock()
+                && progress.check_pending
+            {
+                progress.recovery(reference, false);
+            }
+        }
         let wait = parameters
-            .get("wait_ms")
+            .get("wait_s")
             .and_then(Value::as_u64)
-            .map(|ms| Duration::from_millis(ms.min(MAX_WAIT_MS)))
+            .map(|seconds| Duration::from_secs(seconds.min(30)))
+            .or_else(|| {
+                parameters
+                    .get("wait_ms")
+                    .and_then(Value::as_u64)
+                    .map(|ms| Duration::from_millis(ms.min(MAX_WAIT_MS)))
+            })
             .unwrap_or_default();
         let deadline = tokio::time::Instant::now() + wait;
         if let Some(reference) = parameters.get("detail_ref").and_then(Value::as_str) {
             loop {
                 let reply = self
-                    .with_delivery(
+                    .inspect_until(
+                        binding.clone(),
+                        reference.to_owned(),
+                        attachment,
                         delivery.clone(),
-                        self.inspect(binding.clone(), reference.to_owned(), attachment, None),
+                        (!wait.is_zero()).then_some(deadline),
                     )
                     .await;
-                if !matches!(reply, PeerReply::Pending { .. })
-                    || tokio::time::Instant::now() >= deadline
-                {
-                    return reply;
+                let pending = matches!(reply, PeerReply::Pending { .. })
+                    || self.shared.edit_check_pending(reference);
+                if pending && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(
+                        REREAD_PAUSE
+                            .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    )
+                    .await;
                 }
-                tokio::time::sleep(REREAD_PAUSE.min(deadline - tokio::time::Instant::now())).await;
+                if !pending || tokio::time::Instant::now() >= deadline {
+                    return self.progress_reply(&binding, reference, reply);
+                }
             }
         }
         if let Some(references) = parameters.get("detail_refs").and_then(Value::as_array) {
@@ -100,7 +170,14 @@ impl WorkerHandle {
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             return self
-                .inspect_many(&binding, &references, attachment, delivery, deadline)
+                .inspect_many(
+                    &binding,
+                    &references,
+                    attachment,
+                    delivery,
+                    deadline,
+                    !wait.is_zero(),
+                )
                 .await;
         }
         PeerReply::InvalidParameters {
@@ -117,33 +194,45 @@ impl WorkerHandle {
         attachment: &str,
         delivery: Arc<std::sync::atomic::AtomicBool>,
         deadline: tokio::time::Instant,
+        bounded: bool,
     ) -> PeerReply {
         loop {
             let mut replies = Vec::with_capacity(references.len());
             for reference in references {
                 let reply = self
-                    .with_delivery(
+                    .inspect_until(
+                        binding.clone(),
+                        reference.clone(),
+                        attachment,
                         delivery.clone(),
-                        self.inspect(binding.clone(), reference.clone(), attachment, None),
+                        bounded.then_some(deadline),
                     )
                     .await;
                 replies.push(reply);
             }
-            let settled = replies
-                .iter()
-                .any(|reply| !matches!(reply, PeerReply::Pending { .. }));
+            let settled = references.iter().zip(&replies).any(|(reference, reply)| {
+                !matches!(reply, PeerReply::Pending { .. })
+                    && !self.shared.edit_check_pending(reference)
+            });
+            if !settled && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(
+                    REREAD_PAUSE
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await;
+            }
             if settled || tokio::time::Instant::now() >= deadline {
                 let share = REPLY_TEXT_BUDGET / references.len().max(1);
                 let sections = references
                     .iter()
                     .zip(&replies)
                     .map(|(reference, reply)| {
-                        format!("== {reference} ==\n{}", cut(&compact(reply), share))
+                        let reply = self.progress_reply(binding, reference, reply.clone());
+                        format!("== {reference} ==\n{}", cut(&compact(&reply), share))
                     })
                     .collect::<Vec<_>>();
                 return inspect_reply(sections.join("\n"));
             }
-            tokio::time::sleep(REREAD_PAUSE.min(deadline - tokio::time::Instant::now())).await;
         }
     }
 }

@@ -305,6 +305,8 @@ impl ExecutionProfileCause {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultKind {
+    /// Nonterminal edit progress, naming requested paths, confirmed commits and current stage.
+    EditProgress,
     /// Durable Workspace activated and authorized the exact binding.
     Activation,
     /// Private legacy source context. Public positional/diagnostic queries use Symbol/Inspect.
@@ -433,8 +435,8 @@ pub enum EditDiagnostics {
 impl EditDiagnostics {
     /// Converts one correlated provider snapshot without interpreting silence as cleanliness.
     ///
-    /// Current semantic context, matching source/generation/version identities, and an explicit
-    /// clean or reported readiness are all required. Unavailable, stale, lexical, unversioned, or
+    /// Current source context, matching source/generation/version identities, and an explicit
+    /// clean or reported readiness are all required. Unavailable, stale, unversioned, or
     /// unready snapshots return [`Self::Unknown`]. Messages name `path`, the worktree-relative
     /// edited file (see [`diagnostic_line_at`]); `map` is the address map of the edited text, when
     /// the caller has one, and puts each message's position address in its row.

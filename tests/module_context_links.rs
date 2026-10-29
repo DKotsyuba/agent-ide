@@ -91,10 +91,9 @@ async fn settled(mode: &str, requests: &[Value]) -> Vec<String> {
     let started = std::time::Instant::now();
     let replies = loop {
         let replies = context(&fixture, &mut session, requests).await;
-        if replies
-            .iter()
-            .all(|reply| !reply.contains("unavailable for:"))
-            || started.elapsed() > std::time::Duration::from_secs(40)
+        if replies.iter().all(|reply| {
+            !reply.contains("unavailable for:") && !reply.contains("related_links: unavailable")
+        }) || started.elapsed() > std::time::Duration::from_secs(40)
         {
             break replies;
         }
@@ -176,6 +175,7 @@ async fn the_related_links_block_is_identical_in_every_mixed_setting() {
 /// Every usage row stays in the block, past the card's ceiling of 30: the rows that do not fit the
 /// first reply page follow on the reply's own `detail_ref` pages. Read keeps its exact numbered
 /// source before the links, and the fully delivered reference still authorizes the same bytes.
+/// Warm the advisory index explicitly: lexical source delivery no longer waits for it.
 #[tokio::test]
 async fn long_usage_lists_continue_on_the_replys_own_pages() {
     const FILES: usize = 1200;
@@ -202,11 +202,11 @@ async fn long_usage_lists_continue_on_the_replys_own_pages() {
             .call(
                 &fixture,
                 source_query_tool(&json!({"path":"wide.css"})),
-                json!({"path":"wide.css"}),
+                json!({"path":"wide.css", "force":true}),
             )
             .await;
         let text = reply["text"].as_str().unwrap_or_default();
-        if !text.contains("unavailable for:")
+        if (!text.contains("unavailable for:") && !text.contains("related_links: unavailable"))
             || started.elapsed() > std::time::Duration::from_secs(40)
         {
             break reply;

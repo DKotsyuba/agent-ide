@@ -1,0 +1,50 @@
+HANDOFF_WRITTEN
+
+Restored checked candidate is staged on aw/e005-reply-wait.
+Base HEAD (unchanged): e1fe1d7e2ab61e249ab234479c48d1a98033b406
+Staged tree: c45944b1b3f4a1d1735a604148dd4ef931d8c0d2
+Scope: 18 files, 981 insertions, 85 deletions. See paths-1.txt and patch-1.diff.
+Commit message: commit-1.txt. No new commit was created.
+
+Signing failure:
+The process-only gpg.ssh.defaultKeyCommand contained a pipeline. Git passed the
+pipeline as ssh-add arguments, which failed with invalid option -n, then refused
+SSH signing because user.signingKey was not set. SSH-agent read access had passed.
+Per assignment, do not silently create an unsigned commit: the authorized
+committer should use valid SSH signing configuration and the supplied message.
+Do not stage the handoff directory as part of the code candidate.
+
+Verified checks:
+- cargo fmt --all --check: passed.
+- cargo clippy --offline --locked -p agent-ide-core -p agent-ide --all-targets -- -D warnings: passed.
+- Public edit_progress_and_bounded_inspect_preserve_committed_files: correct passed,
+  hidden-committed-files mutant failed at the intended assertion, restored passed.
+- cold_matrix_reply_shapes_journal_stage_timings: selected 1, passed with final provider env.
+- configured_product_batch_ranges_read_then_edit_by_those_lines_without_reread:
+  initial activation outcome_unknown before read/edit; standalone retry selected 1 and passed.
+- pending_and_batch_replies_never_invite_polling: selected 1, passed.
+- batch_api::slow_multi_file_edit_check_answers_at_once_with_pending_diagnostics: selected 1, passed.
+- configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existing_errors:
+  unique-prefix rerun selected 1 and passed; earlier exact filter selected zero and is not evidence.
+- module_context_links: all 4 passed, including 1200-file pagination and mixed-mode parity.
+- Core stage-warning journal, bounded/escaped progress and stalled-authorization refusal,
+  inspect wait validation, cancelled-page preservation: each selected 1 and passed.
+- Unchanged bridge route-retirement fixture passed under the authorized shorter temporary root.
+- cargo run --offline --locked -p xtask -- contract update: passed; both generated snapshots reviewed.
+
+Evidence logs and process-only check environment:
+/Users/pluto/projects/tmp/agent-ide/m035/
+Use checks-env-recovery.sh for the orchestrator-provided environment; it exports
+TMPDIR/TMP/TEMP=/Users/pluto/projects/tmp/agent-ide/m035/t and no host configuration was changed.
+
+Outstanding:
+Signed commit, commit import/definite SHA submission, independent review, and the
+full gate plus complete product include-ignored suite (run by the orchestrator).
+The initial broad gate failed before the final fixes/environment and is not a
+passing gate on this candidate. No full gate was launched after its withdrawal.
+
+TIMEOUT_SOURCE:
+crates/agent-ide-core/src/assistance/worker.rs::INLINE_REPLY_WAIT is 8 seconds.
+Provider wait dominated prior cold reads; final lexical reads record provider_wait=0.
+The syntax gate dominates small-fixture edits. Held first checks exercise progress
+and warning journals beyond the inline limit without claiming terminal success.

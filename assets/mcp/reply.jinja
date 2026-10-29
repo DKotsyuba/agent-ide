@@ -120,7 +120,10 @@ Result retained under {{ detail_ref }}. Bridge delivers it automatically when co
 {{ refusal("The requested range is unavailable.", "Read a valid range with ide.read.", resolution_message) }}
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("read:not_text:") -%}
 {{ refusal("This file is not readable text.", "Inspect it with a native file tool.", resolution_message) }}
+{%- elif code == "source_unavailable" and resolution_detail == "edit:historical_source_unavailable" -%}
+{{ refusal("This operation wrote the files earlier; their current sources changed or are unavailable. Nothing was rewritten.", "Read the current files with ide.read; use a new operation_id for a new edit.") }}
 {%- elif code == "source_unavailable" -%}
+
 {{ refusal("The requested source could not be read safely.", "Read it with a native tool.", resolution_message if (resolution_detail is startingwith("context:observation_failed:") or resolution_detail is startingwith("read:source_unavailable:")) else "") }}
 {%- elif code == "resolution_unverified" -%}
 {{ refusal("The language server could not verify project membership.", 'Read the project problems with ide.inspect {"kind":"problems"}.', resolution_detail if resolution_detail not in ["outline:resolution_unverified", "read:resolution_unverified", "symbol:resolution_unverified", "context:resolution_unverified", "edit:resolution_unverified"] else "") }}
@@ -232,7 +235,7 @@ Result retained under {{ detail_ref }}. Bridge delivers it automatically when co
 {%- if state == "complete" and (kind == "activation" or kind == "stop") -%}
 {{ text }}
 {%- endif -%}
-{%- if state == "complete" and (kind == "context" or kind == "diff" or kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect") -%}
+{%- if state == "complete" and (kind == "context" or kind == "diff" or kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect" or kind == "edit_progress") -%}
 {{ text }}
 {%- if truncated and detail_ref and continuation -%}
 {%- set next_tool = "ide." ~ kind if kind in ["read", "graph", "test"] else "ide.inspect" -%}

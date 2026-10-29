@@ -57,6 +57,8 @@ mod links;
 mod navigation;
 #[path = "worker/patch_edit.rs"]
 mod patch_edit;
+#[path = "progress.rs"]
+mod progress;
 #[path = "providers.rs"]
 mod providers;
 #[path = "snapshots.rs"]
@@ -79,10 +81,10 @@ use std::{
 };
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
-/// Time reserved after an edit diagnostic attempt for reaping, receipt settlement, and reply
-/// delivery before the operation or foreground-helper ticket expires.
+/// Time reserved after a background edit check for reaping and terminal settlement before the
+/// operation or foreground-helper ticket expires; the committed receipt is already available.
 const EDIT_SETTLEMENT_RESERVE: Duration = Duration::from_secs(2);
-/// Longest an edit reply waits for the project check it scheduled before answering `unknown`.
+/// Longest an accepted edit check remains pending before its terminal unavailable result.
 const EDIT_CHECK_WAIT: Duration = Duration::from_secs(90);
 /// Whole budget for the `ide.start` project card (language detection, git plumbing, the tree
 /// walk, and the render). The work is blocking, so it runs off the runtime under this deadline;
@@ -103,6 +105,8 @@ const TEST_INLINE_COMPLETION_WAIT: Duration = Duration::from_secs(6);
 
 /// A bounded asynchronous operation whose identity never includes the transient MCP call ID.
 struct Job {
+    /// Stage timing and confirmed commits shared with the retained result slot.
+    progress: Arc<Mutex<progress::Progress>>,
     /// Same-binding opaque result key retained in the result ledger.
     reference: String,
     /// Validated host invocation for this exact operation.
@@ -145,9 +149,9 @@ struct Job {
 // One stage lives per parked job, so the variant size difference costs nothing measurable.
 #[allow(clippy::large_enum_variant)]
 enum JobStage {
-    /// The edit is settled; only its target project-check snapshot and reply remain.
+    /// The write is settled; accepted project-check and/or ready-provider diagnostic work remains.
     EditAwaitingCheck {
-        /// Settled Changes result returned to the caller after diagnostics are resolved.
+        /// Durable Changes receipt returned before independent diagnostics settle.
         result: EditResult,
         /// Fresh post-edit observation retained for the source reference and detail ledger.
         refreshed: Option<SourceObservation>,
@@ -155,10 +159,12 @@ enum JobStage {
         authority: AuthorityStamp,
         /// Edited relative path, retained alongside the check cursor.
         path: String,
-        /// Exact provider answer retained if the project feed disappears before resume.
+        /// Exact provider answer retained when the project check cannot analyse the edited file.
         fallback: EditDiagnostics,
-        /// Project-check generation created by the edit.
-        generation: u64,
+        /// Accepted project-check generation; None means no project check was accepted.
+        generation: Option<u64>,
+        /// An already-ready provider still owes an exact bounded post-write snapshot.
+        provider_pending: bool,
         /// Worktree used to normalize checker-reported paths.
         worktree: PathBuf,
         /// Normalized edited path matched against checker output.
@@ -177,6 +183,8 @@ enum JobStage {
 
 /// A retained outcome requiring exact binding ownership and fresh durable authorization on access.
 pub(super) struct Detail {
+    /// Advisory stage timing and write progress; never replaces authority or source guards.
+    progress: Arc<Mutex<progress::Progress>>,
     /// Immutable owner binding, checked separately from the opaque reference.
     binding: BindingRef,
     /// Current pending, error or owner-generated result.
@@ -1063,6 +1071,9 @@ impl Shared {
         if let Ok(mut ledger) = self.ledger.lock()
             && let Some(detail) = ledger.details.get_mut(reference)
         {
+            if let Ok(mut progress) = detail.progress.lock() {
+                progress.check_pending = false;
+            }
             detail.reply = reply;
             detail.authority = authority;
             detail.source = source;
@@ -1956,8 +1967,9 @@ impl WorkerHandle {
     }
     /// Enqueues an exact query and waits up to [`INLINE_REPLY_WAIT`] for its completed reply.
     ///
-    /// A job still running at the limit returns its retained pending detail; callers can retrieve
-    /// later completion with `ide.inspect`. The initial inspection permit is reserved before
+    /// A read/edit still running at the limit returns requested targets, confirmed commits and
+    /// its current stage; other tools retain their pending detail. Callers can retrieve later
+    /// completion with `ide.inspect`. The initial inspection permit is reserved before
     /// enqueueing so timeout always has capacity to return the current detail. A completed reply
     /// uses the worker's normal delivery path, preserving continuation and feedback semantics.
     ///
@@ -1974,15 +1986,45 @@ impl WorkerHandle {
         let binding = invocation.binding_ref().clone();
         let expected = Some((tool, selection(&parameters)));
         if let Some(reference) = parameters.get("detail_ref").and_then(Value::as_str) {
-            return self
+            let reply = self
                 .inspect(binding, reference.to_owned(), attachment, expected)
                 .await;
+            return self.progress_reply(invocation.binding_ref(), reference, reply);
         }
         if self.target(attachment).is_none() {
             return PeerReply::Error {
                 code: FailureCode::LauncherConfiguration,
                 detail: None,
             };
+        }
+        // Joining an admitted edit or retained ordinary single receipt is recovery, not a second write/check.
+        // The normal inspection path re-proves current binding, authority and source disclosure.
+        // A completed rename uses its durable multi-file history route, including per-file proof.
+        let retry_reference = (tool == AssistanceTool::Edit)
+            .then(|| {
+                let operation_id = parameters.get("operation_id").and_then(Value::as_str)?;
+                let ledger = self.shared.ledger.lock().ok()?;
+                ledger.details.iter().find_map(|(reference, detail)| {
+                    let mut progress = detail.progress.lock().ok()?;
+                    (detail.binding == binding
+                        && detail.selection == (tool, selection(&parameters))
+                        && progress.operation_id.as_deref() == Some(operation_id)
+                        && (matches!(detail.reply, PeerReply::Pending { .. })
+                            || progress.check_pending
+                            || (parameters.get("op").and_then(Value::as_str) != Some("rename")
+                                && matches!(&detail.reply, PeerReply::Edit { result, .. } if result.outcome.has_post_source()))))
+                        .then(|| {
+                            progress.recovery(reference, false);
+                            reference.clone()
+                        })
+                })
+            })
+            .flatten();
+        if let Some(reference) = retry_reference {
+            let reply = self
+                .inspect(binding.clone(), reference.clone(), attachment, expected)
+                .await;
+            return self.progress_reply(&binding, &reference, reply);
         }
         if (tool == AssistanceTool::Graph
             || tool == AssistanceTool::Edit
@@ -2030,20 +2072,90 @@ impl WorkerHandle {
                 Ok(Ok(reply)) => reply,
                 _ => {
                     let reply = self
-                        .inspect_reserved(binding, reference.clone(), expected, permit)
+                        .inspect_reserved(binding.clone(), reference.clone(), expected, permit)
                         .await;
                     // The caller leaves with `pending`: the final answer becomes a pushed
                     // `job-ready` fact instead of something to ask for again (OUTBOX §3.2).
                     if matches!(reply, PeerReply::Pending { .. }) {
                         self.shared.defer_pending(&reference, tool, target);
                     }
-                    reply
+                    self.progress_reply(&binding, &reference, reply)
                 }
             },
             Err(code) => PeerReply::Error {
                 detail: (code.code == FailureCode::Capacity).then_some(code.stage),
                 code: code.code,
             },
+        }
+    }
+
+    /// Adds truthful stage and confirmed-write content to an unfinished read/edit response.
+    /// Internal inspection keeps its Pending variant so waiting and delivery semantics stay intact.
+    /// Each escaped label is capped at 256 bytes (with an ellipsis) to fit worst-case batches.
+    pub(super) fn progress_reply(
+        &self,
+        binding: &BindingRef,
+        reference: &str,
+        reply: PeerReply,
+    ) -> PeerReply {
+        if !matches!(reply, PeerReply::Pending { .. }) {
+            return reply;
+        }
+        let Some((tool, progress)) = self.shared.ledger.lock().ok().and_then(|ledger| {
+            let detail = ledger.details.get(reference)?;
+            (detail.binding == *binding
+                && matches!(
+                    detail.selection.0,
+                    AssistanceTool::Edit | AssistanceTool::Read
+                ))
+            .then(|| (detail.selection.0, detail.progress.clone()))
+        }) else {
+            return reply;
+        };
+        let Ok(mut progress) = progress.lock() else {
+            return reply;
+        };
+        progress.recovery(reference, true);
+        let label = |path: &String| {
+            let text = content::display_safe(path);
+            if text.len() > 256 {
+                format!("{}…", super::reply::bounded_utf8_prefix(&text, 256))
+            } else {
+                text
+            }
+        };
+        let committed = if progress.committed.is_empty() {
+            "none".to_owned()
+        } else {
+            progress
+                .committed
+                .iter()
+                .map(label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let requested = progress
+            .requested
+            .iter()
+            .map(label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        PeerReply::Complete {
+            kind: if tool == AssistanceTool::Edit {
+                ResultKind::EditProgress
+            } else {
+                ResultKind::Read
+            },
+            text: format!(
+                "{}: in progress; requested: {}; committed: {}; stage: {}; detail_ref: {reference}",
+                tool.mcp_name(),
+                requested,
+                committed,
+                progress.stage()
+            ),
+            detail_ref: Some(reference.to_owned()),
+            truncated: false,
+            continuation: false,
         }
     }
 
@@ -2445,11 +2557,13 @@ impl WorkerHandle {
             if ledger.details.len() >= self.shared.launcher.limits.details {
                 return Err(InspectFailure::stage(
                     FailureCode::Capacity,
-                    if ledger
-                        .details
-                        .values()
-                        .all(|detail| !matches!(detail.reply, PeerReply::Pending { .. }))
-                    {
+                    if ledger.details.values().all(|detail| {
+                        !matches!(detail.reply, PeerReply::Pending { .. })
+                            && detail
+                                .progress
+                                .lock()
+                                .is_ok_and(|progress| !progress.check_pending)
+                    }) {
                         "worker:actor_share_full"
                     } else {
                         "worker:result_store_full"
@@ -2472,10 +2586,40 @@ impl WorkerHandle {
                 .or_insert_with(|| watch::channel(false).0)
                 .subscribe()
         };
+        let mut requested = Vec::new();
+        for field in ["path", "symbol"] {
+            if let Some(path) = parameters.get(field).and_then(Value::as_str) {
+                requested.push(path.to_owned());
+            }
+        }
+        for field in ["files", "items", "symbols"] {
+            if let Some(items) = parameters.get(field).and_then(Value::as_array) {
+                for item in items {
+                    if let Some(path) = item.as_str().or_else(|| {
+                        item.get("path")
+                            .or_else(|| item.get("symbol"))
+                            .and_then(Value::as_str)
+                    }) {
+                        requested.push(path.to_owned());
+                    }
+                }
+            }
+        }
+        let progress = Arc::new(Mutex::new(progress::Progress {
+            operation_id: parameters
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            requested_at: Some(std::time::Instant::now()),
+            active: Some(("queue", std::time::Instant::now())),
+            requested,
+            ..Default::default()
+        }));
         if retain_detail {
             ledger.details.insert(
                 reference.clone(),
                 Detail {
+                    progress: progress.clone(),
                     binding: binding.clone(),
                     reply: PeerReply::Pending {
                         detail_ref: reference.clone(),
@@ -2504,6 +2648,7 @@ impl WorkerHandle {
             requests.insert(reference.clone(), request.to_owned());
         }
         let job = Job {
+            progress,
             reference: reference.clone(),
             invocation,
             tool,
@@ -2571,9 +2716,9 @@ fn queue_capacity(ordinary: usize, tool: AssistanceTool) -> usize {
 }
 
 /// Display word naming the symbol-edit operation an edit reply reports, from the call's `op`
-/// argument: `inserted` and `deleted` replace the durable `replaced` outcome word so the reply
-/// names what happened. `None` (replace, the line-range form, every plain edit) keeps the
-/// outcome word; rename builds its own summary reply.
+/// argument: `inserted`, `deleted` and `renamed` replace the durable `replaced` outcome word.
+/// `None` (replace, the line-range form, every plain edit) keeps the outcome word; a parked
+/// rename preserves its operation label when its check resumes.
 fn edit_operation(parameters: &Value) -> Option<String> {
     // A one-entry `changes` call (every single-symbol form is rewritten to one) names its entry's
     // operation.
@@ -2585,6 +2730,7 @@ fn edit_operation(parameters: &Value) -> Option<String> {
     match op.and_then(Value::as_str) {
         Some("insert") => Some("inserted".to_owned()),
         Some("delete") => Some("deleted".to_owned()),
+        Some("rename") => Some("renamed".to_owned()),
         _ => None,
     }
 }
@@ -2617,8 +2763,13 @@ const FAIR_DETAILS_PER_BINDING: usize = 8;
 const IDLE_BINDING_DETAILS_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Returns whether a terminal detail is unpinned and therefore safe to evict.
-fn detail_evictable(reference: &str, reply: &PeerReply, pinned: &BTreeSet<String>) -> bool {
-    !matches!(reply, PeerReply::Pending { .. }) && !pinned.contains(reference)
+fn detail_evictable(reference: &str, detail: &Detail, pinned: &BTreeSet<String>) -> bool {
+    !matches!(detail.reply, PeerReply::Pending { .. })
+        && detail
+            .progress
+            .lock()
+            .is_ok_and(|progress| !progress.check_pending)
+        && !pinned.contains(reference)
 }
 
 /// Extracts the monotonic per-boot counter from a detail reference, which determines its age.
@@ -2670,7 +2821,7 @@ fn evict_binding_oldest(
         .iter()
         .filter(|(reference, detail)| {
             detail.binding == *owner
-                && detail_evictable(reference, &detail.reply, pinned)
+                && detail_evictable(reference, detail, pinned)
                 && !protected.contains(*reference)
         })
         .map(|(reference, _)| (detail_sequence(reference), reference.clone()))
@@ -2680,7 +2831,7 @@ fn evict_binding_oldest(
         .details
         .iter()
         .filter(|(reference, detail)| {
-            detail.binding == *owner && detail_evictable(reference, &detail.reply, pinned)
+            detail.binding == *owner && detail_evictable(reference, detail, pinned)
         })
         .count();
     let mut removed = 0;
@@ -2728,7 +2879,7 @@ fn evict_settled_details(
                 .is_some_and(|last| {
                     now.saturating_duration_since(*last) > IDLE_BINDING_DETAILS_TTL
                 });
-            detail_evictable(reference, &detail.reply, pinned)
+            detail_evictable(reference, detail, pinned)
                 && (!ledger.cancellation.contains_key(&detail.binding) || idle)
         })
         .map(|(reference, _)| reference.clone())
@@ -3692,7 +3843,11 @@ impl<'a> Worker<'a> {
         }
     }
     /// Rechecks queued liveness, executes only the selected owner operation, and fences every result.
+    /// Starts/resumes exclusive stage timing and journals read/edit totals only on settlement.
     async fn perform(&mut self, job: &mut Job) {
+        if let Ok(mut progress) = job.progress.lock() {
+            progress.switch(Some(if job.stage.is_some() { "check" } else { "plan" }));
+        }
         let binding = job.invocation.binding_ref().clone();
         self.providers.begin_job();
         let was_parked = job.park_until.take().is_some();
@@ -3821,6 +3976,11 @@ impl<'a> Worker<'a> {
             self.answer_while_loading(job).await;
         }
         if job.park_until.is_some() {
+            if job.stage.is_none()
+                && let Ok(mut progress) = job.progress.lock()
+            {
+                progress.switch(Some("provider_wait"));
+            }
             return;
         }
         self.settle_session_health(job).await;
@@ -3868,6 +4028,20 @@ impl<'a> Worker<'a> {
             },
             other => other,
         };
+        if let Ok(mut progress) = job.progress.lock() {
+            progress.usable_reply(
+                job.tool,
+                &job.reference,
+                self.shared.request_of(&job.reference).as_deref(),
+                &reply,
+                source.is_some(),
+            );
+            progress.journal(
+                job.tool,
+                &job.reference,
+                self.shared.request_of(&job.reference).as_deref(),
+            );
+        }
         self.journal_job_failure(job, &reply);
         if let Some(authority) = &authority {
             self.observe_head(&binding, authority);
@@ -5822,11 +5996,17 @@ impl<'a> Worker<'a> {
         {
             return self.finish_batch_check(job, *check).await;
         }
-        if let Some(stage @ JobStage::EditAwaitingCheck { .. }) = job.stage.take() {
+        if let Some(mut stage @ JobStage::EditAwaitingCheck { .. }) = job.stage.take() {
             let deadline = match &stage {
                 JobStage::EditAwaitingCheck { deadline, .. } => *deadline,
                 JobStage::EditBatchAwaitingCheck(check) => check.deadline,
             };
+            if !*job.cancel.borrow()
+                && tokio::time::Instant::now() < deadline
+                && self.check_diagnostics(&stage).is_none()
+            {
+                self.poll_edit_provider(job, &mut stage).await;
+            }
             let diagnostics = if *job.cancel.borrow() || tokio::time::Instant::now() >= deadline {
                 Some(EditDiagnostics::Unknown {})
             } else {
@@ -5962,6 +6142,8 @@ impl<'a> Worker<'a> {
 
     /// Writes one prepared edit whose base observation is already known: the full-file form
     /// resolves it from a retained detail, the symbol forms observe the file themselves.
+    /// After the required precommit gates, durable settlement and post-write observations never
+    /// wait for semantic enrichment; an accepted project check retains its independent stage.
     pub(super) async fn edit_with_source(
         &mut self,
         job: &mut Job,
@@ -5970,6 +6152,9 @@ impl<'a> Worker<'a> {
         source: SourceObservation,
         await_check: bool,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if let Ok(mut progress) = job.progress.lock() {
+            progress.switch(Some("commit"));
+        }
         let binding = job.invocation.binding_ref().clone();
         let authority = match self.authority(&binding).await {
             Ok(authority) => authority,
@@ -6064,6 +6249,12 @@ impl<'a> Worker<'a> {
             | crate::workspace::edit::EditOutcome::Unchanged(read) => Some(read),
             _ => None,
         };
+        if let Ok(mut progress) = job.progress.lock() {
+            if known {
+                progress.committed.push(request.path.clone());
+            }
+            progress.switch(Some("check"));
+        }
         let (refreshed, diagnostics) = if known {
             match self.observe(&binding, request.path.clone().into()).await {
                 Ok((observed, bytes)) => {
@@ -6092,34 +6283,6 @@ impl<'a> Worker<'a> {
                     }
                     if !exact {
                         (None, EditDiagnostics::Unknown {})
-                    } else if let Some(deadline) = edit_diagnostic_deadline(job.deadline) {
-                        let original = std::mem::replace(&mut job.deadline, deadline);
-                        let result = self
-                            .semantic_context(
-                                job,
-                                &observed,
-                                &bytes,
-                                crate::intelligence::context::ContextQuery::File,
-                            )
-                            .await;
-                        job.deadline = original;
-                        let diagnostics = match result {
-                            Ok(Some(provider)) => {
-                                let map = if provider.diagnostics.diagnostics.is_empty() {
-                                    None
-                                } else {
-                                    self.optional_address_map(job, &observed, &bytes).await
-                                };
-                                EditDiagnostics::from_snapshot(
-                                    request.path.trim_start_matches("./"),
-                                    &provider.context,
-                                    &provider.diagnostics,
-                                    map.as_deref(),
-                                )
-                            }
-                            Ok(None) | Err(_) => EditDiagnostics::Unknown {},
-                        };
-                        (Some(observed), diagnostics)
                     } else {
                         (Some(observed), EditDiagnostics::Unknown {})
                     }
@@ -6147,10 +6310,17 @@ impl<'a> Worker<'a> {
         } else {
             EditDiagnostics::Unknown {}
         };
+        let provider_pending = match self.ready_edit_provider_fallback(job, &request.path).await {
+            Ok(ready) => ready,
+            Err(reason) => {
+                diagnostics = EditDiagnostics::NotAnalysed {
+                    reason: reason.to_owned(),
+                };
+                false
+            }
+        };
         // A scheduled project check classifies new problems against the pre-write file result;
         // its durable receipt is safe while this job is parked.
-        // A multi-file operation (rename) never parks: it must write every file and answer once,
-        // so it skips the wait and reports diagnostics as unknown until the next check lands.
         if await_check
             && result == expected
             && result.outcome.has_post_source()
@@ -6160,7 +6330,7 @@ impl<'a> Worker<'a> {
                 &request.path,
                 result.clone(),
                 refreshed.clone(),
-                (diagnostics.clone(), preexisting),
+                (diagnostics.clone(), preexisting, provider_pending, true),
             )
         {
             match self.check_diagnostics(&stage) {
@@ -6171,6 +6341,7 @@ impl<'a> Worker<'a> {
                         JobStage::EditBatchAwaitingCheck(check) => check.deadline,
                     } =>
                 {
+                    self.reply_edit_early(job, &stage);
                     job.stage = Some(stage);
                     job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(250));
                     return Err(FailureCode::ProviderLoading);
@@ -6198,12 +6369,158 @@ impl<'a> Worker<'a> {
         ))
     }
 
-    /// Captures the matching check generation and reply state for a settled edit.
-    ///
-    /// Returns `None` when checks are unavailable, the file type is unsupported, or no generation
-    /// exists, leaving the provider answer untouched. Otherwise the saved stage retains the edit
-    /// result, source, authority, path, provider fallback, and absolute check deadline so the
-    /// worker can probe snapshots without repeating the write or sleeping inside the job.
+    /// Uses only a configured session already observed ready. WorkerHandle::submit validates the
+    /// direct Bridge capability/exact recipient before any Edit is enqueued or written; legacy
+    /// delivery mode cannot acquire this new deferred obligation. This never starts a provider.
+    async fn ready_edit_provider_fallback(
+        &mut self,
+        job: &Job,
+        path: &str,
+    ) -> Result<bool, &'static str> {
+        let Some(server) = self.session_server(Path::new(path)) else {
+            return Ok(false);
+        };
+        if !job
+            .target
+            .providers
+            .iter()
+            .any(|launch| launch.language == server.language())
+        {
+            return Ok(false);
+        }
+        if !matches!(
+            self.session_readiness(job.invocation.binding_ref(), server)
+                .await,
+            Some(Ok(()))
+        ) {
+            return Err("provider diagnostics not scheduled: no already-ready provider session");
+        }
+        if !self.shared.direct_delivery() {
+            return Err("provider diagnostics not scheduled: no qualified Bridge delivery route");
+        }
+        Ok(true)
+    }
+
+    /// Polls one exact diagnostic snapshot from the already-owned session after its receipt was
+    /// returned. File synchronization never waits for pushes; the existing module Diagnostics
+    /// query has a bounded readiness-sized budget. Unknown/stale/unversioned snapshots keep the
+    /// same job parked; source change, request failure or deadline settles honestly without a
+    /// cold launch, detached task, new write or alternate carrier.
+    async fn poll_edit_provider(&mut self, job: &mut Job, stage: &mut JobStage) {
+        let (observed, authority, path, deadline) = match stage {
+            JobStage::EditAwaitingCheck {
+                refreshed: Some(source),
+                authority,
+                path,
+                deadline,
+                provider_pending: true,
+                ..
+            } => (source.clone(), authority.clone(), path.clone(), *deadline),
+            _ => return,
+        };
+        let binding = job.invocation.binding_ref().clone();
+        let mut captures = vec![observed.clone()];
+        if let Ok(ledger) = self.shared.ledger.lock()
+            && let Some(detail) = ledger.details.get(&job.reference)
+        {
+            captures.extend(detail.extra_sources.iter().cloned());
+        }
+        let proof = self
+            .shared
+            .committed_edit_proof_current(
+                &self.workspace,
+                &binding,
+                &job.reference,
+                &authority,
+                &captures,
+            )
+            .await;
+        let result = if !proof {
+            Err("post-write source changed or unavailable; provider diagnostics superseded")
+        } else {
+            use crate::workspace::observation::{
+                MAX_SOURCE_BYTES, SourceReadLimits, read_authorized_source,
+            };
+            let read = read_authorized_source(
+                observed.worktree(),
+                observed.path(),
+                SourceReadLimits::new(1024, MAX_SOURCE_BYTES).expect("fixed source limits"),
+            );
+            match read {
+                Ok(read) if observed.bytes() == Some(read.bytes()) => {
+                    let budget =
+                        Duration::from_millis(100 + crate::modules::provider::READINESS_MARGIN_MS)
+                            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                    match self
+                        .owned_edit_diagnostics(
+                            &binding,
+                            &authority,
+                            &observed,
+                            read.contents(),
+                            budget,
+                        )
+                        .await
+                    {
+                        Ok(Some(provider)) => Ok(Some(EditDiagnostics::from_snapshot(
+                            &path,
+                            &provider.context,
+                            &provider.diagnostics,
+                            None,
+                        ))),
+                        Ok(None) => Err("already-ready provider session became unavailable"),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                        Err(_) => Err("ready provider diagnostic snapshot request failed"),
+                    }
+                }
+                _ => Err("post-write source changed or unavailable; diagnostics superseded"),
+            }
+        };
+        let current = self
+            .shared
+            .committed_edit_proof_current(
+                &self.workspace,
+                &binding,
+                &job.reference,
+                &authority,
+                &captures,
+            )
+            .await;
+        if let JobStage::EditAwaitingCheck {
+            fallback,
+            provider_pending,
+            ..
+        } = stage
+        {
+            match result {
+                Ok(Some(
+                    found @ (EditDiagnostics::CurrentReported { .. }
+                    | EditDiagnostics::CurrentClean { .. }),
+                )) if current => {
+                    *fallback = found;
+                    *provider_pending = false;
+                }
+                Ok(_) if current => {}
+                Err(reason) => {
+                    *fallback = EditDiagnostics::NotAnalysed {
+                        reason: reason.to_owned(),
+                    };
+                    *provider_pending = false;
+                }
+                _ => {
+                    *fallback = EditDiagnostics::NotAnalysed {
+                        reason: "post-write source changed; diagnostics superseded".to_owned(),
+                    };
+                    *provider_pending = false;
+                }
+            }
+        }
+    }
+
+    /// Retains an accepted project check and/or already-ready provider fallback for a settled edit.
+    /// `check_allowed=false` suppresses project admission when its current configuration is known
+    /// unavailable; provider-only work has no generation. Missing supported work or settlement
+    /// time returns `None`. The same job/source/result/authority and absolute deadline survive
+    /// parking, so snapshots never repeat the write or wait on pushes inside the serial worker.
     fn edit_check_stage(
         &self,
         job: &mut Job,
@@ -6211,22 +6528,45 @@ impl<'a> Worker<'a> {
         path: &str,
         result: EditResult,
         refreshed: Option<SourceObservation>,
-        (fallback, preexisting): (EditDiagnostics, BTreeMap<String, u32>),
+        (fallback, preexisting, provider_pending, check_allowed): (
+            EditDiagnostics,
+            BTreeMap<String, u32>,
+            bool,
+            bool,
+        ),
     ) -> Option<JobStage> {
-        let feed = self.shared.project_feed.as_ref()?;
-        let language = Language::for_path(std::path::Path::new(path))
-            .filter(|language| language.checks().is_some())?;
-        // The edit's own language is the only one forced: a `.py` edit must not also start a
-        // cargo check in a mixed worktree, while every other configured language still re-arms
-        // through the ordinary fingerprint-gated trigger.
-        let generation =
-            feed.changed_generation(&job.invocation.binding_ref().fingerprint(), Some(path))?;
-        job.check_scheduled = true;
-        let worktree = authority.worktree().worktree_path().to_path_buf();
+        let language = Language::for_path(std::path::Path::new(path))?;
         let deadline = job
             .deadline
             .checked_sub(EDIT_SETTLEMENT_RESERVE)?
             .min(tokio::time::Instant::now() + EDIT_CHECK_WAIT);
+        if deadline <= tokio::time::Instant::now() {
+            return None;
+        }
+        // The edit's own language is the only one forced: a `.py` edit must not also start a
+        // cargo check in a mixed worktree, while every other configured language still re-arms
+        // through the ordinary fingerprint-gated trigger.
+        let generation = check_allowed
+            .then(|| self.shared.project_feed.as_ref())
+            .flatten()
+            .filter(|_| language.checks().is_some())
+            .and_then(|feed| {
+                feed.changed_generation(&job.invocation.binding_ref().fingerprint(), Some(path))
+            });
+        if generation.is_none() && !provider_pending {
+            return None;
+        }
+        if generation.is_some() {
+            job.check_scheduled = true;
+        }
+        if generation.is_none() && provider_pending {
+            let reason = "project check unavailable";
+            job.format_note = Some(match job.format_note.take() {
+                Some(note) => format!("{note}\n{reason}"),
+                None => reason.to_owned(),
+            });
+        }
+        let worktree = authority.worktree().worktree_path().to_path_buf();
         Some(JobStage::EditAwaitingCheck {
             result,
             refreshed,
@@ -6234,6 +6574,7 @@ impl<'a> Worker<'a> {
             path: path.to_owned(),
             fallback,
             generation,
+            provider_pending,
             worktree,
             wanted: path.trim_start_matches("./").to_owned(),
             preexisting,
@@ -6290,13 +6631,17 @@ impl<'a> Worker<'a> {
             wanted,
             preexisting,
             language,
+            provider_pending,
             ..
         } = stage
         else {
             return Some(EditDiagnostics::Unknown {});
         };
+        let Some(generation) = generation else {
+            return (!provider_pending).then(|| fallback.clone());
+        };
         let Some(feed) = self.shared.project_feed.as_ref() else {
-            return Some(fallback.clone());
+            return (!provider_pending).then(|| fallback.clone());
         };
         let snapshot = feed.latest(worktree).into_iter().find(|snapshot| {
             snapshot.language == *language && snapshot.input_generation >= *generation
@@ -6307,6 +6652,9 @@ impl<'a> Worker<'a> {
                 .and_then(|checks| checks.not_analysed(worktree, std::path::Path::new(wanted)))
         };
         if !matches!(snapshot.state, CheckState::Ready | CheckState::Partial) {
+            if *provider_pending {
+                return None;
+            }
             return Some(unchecked_file_diagnostics(fallback, not_analysed()));
         }
         let mut preexisting = preexisting.clone();
@@ -6366,6 +6714,10 @@ impl<'a> Worker<'a> {
                 EditDiagnostics::Unknown {}
             } else if let Some(reason) = not_analysed() {
                 // Naming no problem in a file the check never compiled proves nothing about it.
+                // Its ready provider can still report this exact source after the early receipt.
+                if *provider_pending {
+                    return None;
+                }
                 unchecked_file_diagnostics(fallback, Some(reason))
             } else {
                 // The file is clean; every error the check reported lies elsewhere.
@@ -6782,7 +7134,17 @@ impl InspectFailure {
     }
 }
 
+/// Refuses only a current-state claim for a completed historical write whose complete source
+/// proof was lost or changed. The durable outcome remains and no target is dispatched again.
+fn historical_edit_source_unavailable() -> PeerReply {
+    PeerReply::Error {
+        code: FailureCode::SourceUnavailable,
+        detail: Some("edit:historical_source_unavailable".to_owned()),
+    }
+}
+
 /// Re-proves cached source disclosure without consuming pages, marking delivery or changing read
+
 /// memory. Both synchronous inspection and asynchronous Bridge publication share this boundary.
 async fn reprove_disclosure(
     workspace: &DurableWorkspace<'_>,
@@ -6841,6 +7203,7 @@ async fn reprove_disclosure(
 /// reference path, so a newly denied secondary file invalidates its cached page.
 /// Complete diff hunks on a delivered continuation join the binding's incremental memory;
 /// an authorization, freshness or encoding refusal never records that page as delivered.
+/// A cancelled inspection retains its composed source page for the next retrieval.
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     if fault_seam("inspection") {
         panic!("agent-ide test seam: deliberate inspection panic");
@@ -6880,6 +7243,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             authority,
             source,
             _native_epoch,
+            extra_sources,
             diff_page,
             diff_page_fresh,
             context_page,
@@ -6933,6 +7297,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 detail.authority.clone(),
                 detail.source.clone(),
                 detail.native_epoch,
+                detail.extra_sources.clone(),
                 detail.diff_page.clone(),
                 detail.diff_page_fresh,
                 detail.context_page.clone(),
@@ -6950,8 +7315,21 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             shared.set_context_page(&request.reference, None);
             code
         };
+        let complete_edit = matches!(&reply, PeerReply::Edit { result, .. } if result.outcome.has_post_source())
+            || matches!(&reply, PeerReply::EditBatch { outcome: super::reply::EditBatchOutcome::Applied, .. });
+        if complete_edit {
+            let mut sources: Vec<_> = source.iter().cloned().collect();
+            sources.extend(extra_sources);
+            let current = match &authority {
+                Some(authority) => shared.committed_edit_proof_current(workspace, &request.binding,
+                    &request.reference, authority, &sources).await,
+                None => false,
+            };
+            if !current { return Ok(historical_edit_source_unavailable()); }
+        }
         if let Err(error) = reprove_disclosure(
             workspace,
+
             &shared.bindings,
             &request.binding,
             authority.as_ref(),
@@ -7110,7 +7488,9 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             ..
         }
     );
-    let terminal = retrieved && !matches!(reply, PeerReply::Pending { .. });
+    let terminal = retrieved
+        && !matches!(reply, PeerReply::Pending { .. })
+        && !shared.edit_check_pending(&request.reference);
     if request.reply.send(reply.clone()).is_ok() {
         shared.mark_diff_body_delivered(&request.binding, &request.reference, &reply);
         if terminal {
@@ -7120,6 +7500,13 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         if carries_feedback {
             shared.mark_feedback_inline_delivered(&request.binding, &request.reference, &reply);
         }
+    } else if let Ok(mut ledger) = shared.ledger.lock()
+        && let Some(detail) = ledger.details.get_mut(&request.reference)
+        && detail.context_page.is_some()
+    {
+        // A bounded inspect can leave while authority is checked or a page is composed.
+        // Keep that undelivered page fresh rather than advancing past it on the next call.
+        detail.context_page_fresh = true;
     }
 }
 
@@ -7534,15 +7921,6 @@ fn exact_post_read_bytes(
     post_read == refreshed && current_epoch == edit_epoch
 }
 
-/// Returns the latest deadline a best-effort edit diagnostic refresh may consume.
-///
-/// `None` means the remaining operation lifetime belongs to known-result settlement, so callers
-/// must skip diagnostic work and return `unknown` without changing the completed edit outcome.
-fn edit_diagnostic_deadline(deadline: tokio::time::Instant) -> Option<tokio::time::Instant> {
-    let diagnostic_deadline = deadline.checked_sub(EDIT_SETTLEMENT_RESERVE)?;
-    (diagnostic_deadline > tokio::time::Instant::now()).then_some(diagnostic_deadline)
-}
-
 /// Proves an intervening native write cannot reuse a post-edit source reference or diagnostics.
 #[test]
 fn intervening_native_write_rejects_post_read_source_chaining() {
@@ -7562,15 +7940,6 @@ fn intervening_native_write_rejects_post_read_source_chaining() {
         !exact_post_read_bytes(b"workspace post-read", b"workspace post-read", 7, 8),
         "a native post between Workspace post-read and observation fences even restored bytes"
     );
-}
-
-/// Proves diagnostics surrender the settlement reserve instead of consuming a known edit deadline.
-#[test]
-fn diagnostics_reserve_known_edit_settlement_time() {
-    let now = tokio::time::Instant::now();
-    let deadline = now + EDIT_SETTLEMENT_RESERVE + Duration::from_millis(50);
-    assert!(edit_diagnostic_deadline(deadline).is_some());
-    assert!(edit_diagnostic_deadline(now + Duration::from_millis(1)).is_none());
 }
 
 /// Resolves the directory an activation works from and admits it against `allowed_roots`.
@@ -8827,6 +9196,7 @@ mod stop_retry_tests {
             parameters["root"] = serde_json::json!(root);
         }
         let mut job = Job {
+            progress: Default::default(),
             reference: format!("provider-{id}"),
             invocation,
             tool: AssistanceTool::Start,
@@ -8863,6 +9233,7 @@ mod stop_retry_tests {
         let (cancel_sender, cancel) = watch::channel(false);
         let _keep = cancel_sender;
         let mut job = Job {
+            progress: Default::default(),
             reference: format!("provider-{call}"),
             invocation,
             tool: AssistanceTool::Symbol,
@@ -8933,6 +9304,7 @@ mod stop_retry_tests {
         let binding = invocation.binding_ref().clone();
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut job = Job {
+            progress: Default::default(),
             reference: format!("production-{id}"),
             invocation,
             tool: AssistanceTool::Start,
@@ -9933,6 +10305,7 @@ mod stop_retry_tests {
         let (observed, _) = worker.observe(&binding, file.clone()).await.unwrap();
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut job = Job {
+            progress: Default::default(),
             reference: "provider-sh-1".into(),
             invocation,
             tool: AssistanceTool::Symbol,
@@ -10004,6 +10377,7 @@ mod stop_retry_tests {
         let (cancel_sender, cancel) = watch::channel(false);
         let _keep = cancel_sender;
         let mut job = Job {
+            progress: Default::default(),
             reference: format!("scripted-{call}"),
             invocation,
             tool,
@@ -10684,6 +11058,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             reference.to_owned(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply,
                 selection: (
@@ -10790,6 +11165,7 @@ mod stop_retry_tests {
         let invocation = production_call(worker, actor, call);
         let (cancel_sender, cancel) = watch::channel(false);
         let job = Job {
+            progress: Default::default(),
             reference: format!("start-{call}"),
             invocation,
             tool: AssistanceTool::Start,
@@ -10970,6 +11346,207 @@ mod stop_retry_tests {
         );
     }
 
+    /// A lost initial receiver preserves the committed receipt, usable source and independent
+    /// check obligation. That receipt is not evictable or re-deferred as an empty job-ready wake.
+    #[tokio::test]
+    async fn lost_edit_receipt_keeps_source_and_check_obligation() {
+        crate::lang::testing::install();
+        for (generation, provider_pending) in [(Some(1), false), (None, true)] {
+            let fixture = Fixture::new();
+            let store = fixture.store();
+            let workspace = DurableWorkspace::open(&store).await.unwrap();
+            let mut worker = worker(&store, workspace, fixture.root.clone());
+            worker.observations.install_schema().await.unwrap();
+            let (binding, _) = production_start(&mut worker, "lost-receipt", "lost-start").await;
+            let authority = worker.authority(&binding).await.unwrap();
+            std::fs::write(fixture.root.join("main.alpha"), "committed bytes\n").unwrap();
+            let (source, _) = worker.observe(&binding, "main.alpha".into()).await.unwrap();
+            let (mut job, _cancel) = start_job(
+                &worker,
+                "lost-receipt",
+                "lost-edit",
+                serde_json::json!({"operation_id":"lost-once","path":"main.alpha"}),
+            );
+            job.tool = AssistanceTool::Edit;
+            job.progress
+                .lock()
+                .unwrap()
+                .committed
+                .push("./main.alpha".into());
+            let (send, receive) = oneshot::channel();
+            drop(receive);
+            job.stop_reply = Some(send);
+            worker.shared.outbox.open(&binding);
+            worker.shared.ledger.lock().unwrap().details.insert(
+                job.reference.clone(),
+                Detail {
+                    progress: job.progress.clone(),
+                    binding: binding.clone(),
+                    reply: PeerReply::Pending {
+                        detail_ref: job.reference.clone(),
+                    },
+                    selection: (AssistanceTool::Edit, selection(&job.parameters)),
+                    authority: None,
+                    source: None,
+                    native_epoch: 0,
+                    line_movement: None,
+                    diff_page: None,
+                    diff_page_fresh: false,
+                    context_page: None,
+                    context_page_fresh: false,
+                    diff_provenance: None,
+                    extra_sources: Vec::new(),
+                },
+            );
+            let stage = JobStage::EditAwaitingCheck {
+                result: EditResult::new(
+                    "lost-once".into(),
+                    "main.alpha".into(),
+                    ChangesEditOutcome::Replaced,
+                    Some(job.reference.clone()),
+                )
+                .unwrap(),
+                refreshed: Some(source.clone()),
+                authority,
+                path: "main.alpha".into(),
+                fallback: EditDiagnostics::Unknown {},
+                generation,
+                provider_pending,
+                worktree: fixture.root.clone(),
+                wanted: "main.alpha".into(),
+                preexisting: BTreeMap::new(),
+                language: crate::lang::testing::ALPHA,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+            };
+            worker.reply_edit_early(&mut job, &stage);
+            assert!(worker.shared.edit_check_pending(&job.reference));
+            assert_eq!(
+                worker.shared.committed_edit_paths(&job.reference),
+                Some(BTreeSet::from([PathBuf::from("main.alpha")]))
+            );
+            assert!(
+                worker
+                    .shared
+                    .committed_edit_proof_current(
+                        &worker.workspace,
+                        &binding,
+                        &job.reference,
+                        match &stage {
+                            JobStage::EditAwaitingCheck { authority, .. } => authority,
+                            _ => unreachable!(),
+                        },
+                        std::slice::from_ref(&source),
+                    )
+                    .await
+            );
+            std::fs::write(fixture.root.join("other.alpha"), "other committed bytes\n").unwrap();
+            let (other, _) = worker
+                .observe(&binding, "other.alpha".into())
+                .await
+                .unwrap();
+            job.progress
+                .lock()
+                .unwrap()
+                .committed
+                .push("other.alpha".into());
+            let authority = match &stage {
+                JobStage::EditAwaitingCheck { authority, .. } => authority,
+                _ => unreachable!(),
+            };
+            assert!(
+                !worker
+                    .shared
+                    .committed_edit_proof_current(
+                        &worker.workspace,
+                        &binding,
+                        &job.reference,
+                        authority,
+                        std::slice::from_ref(&source),
+                    )
+                    .await,
+                "missing secondary capture is not complete proof"
+            );
+            let captures = [source.clone(), other];
+            assert!(
+                worker
+                    .shared
+                    .committed_edit_proof_current(
+                        &worker.workspace,
+                        &binding,
+                        &job.reference,
+                        authority,
+                        &captures,
+                    )
+                    .await
+            );
+            std::fs::write(fixture.root.join("other.alpha"), "native changed\n").unwrap();
+            assert!(
+                !worker
+                    .shared
+                    .committed_edit_proof_current(
+                        &worker.workspace,
+                        &binding,
+                        &job.reference,
+                        authority,
+                        &captures,
+                    )
+                    .await,
+                "changed secondary source cannot be clean proof"
+            );
+            std::fs::remove_file(fixture.root.join("other.alpha")).unwrap();
+            assert!(
+                !worker
+                    .shared
+                    .committed_edit_proof_current(
+                        &worker.workspace,
+                        &binding,
+                        &job.reference,
+                        authority,
+                        &captures,
+                    )
+                    .await,
+                "deleted secondary source cannot be clean proof"
+            );
+            job.progress.lock().unwrap().committed.pop();
+            job.progress
+                .lock()
+                .unwrap()
+                .committed
+                .push("../escape".into());
+            assert!(worker.shared.committed_edit_paths(&job.reference).is_none());
+            job.progress.lock().unwrap().committed.pop();
+            {
+                let ledger = worker.shared.ledger.lock().unwrap();
+                let detail = &ledger.details[&job.reference];
+                assert!(matches!(
+                    detail.reply,
+                    PeerReply::Edit {
+                        diagnostics: EditDiagnostics::Pending { .. },
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    admitted_edit_source(detail, &binding, &job.reference, "main.alpha"),
+                    Some(source)
+                );
+                assert!(!detail_evictable(&job.reference, detail, &BTreeSet::new()));
+            }
+            assert!(!crate::assistance::outbox::SessionOutbox::defer(
+                &*worker.shared,
+                &job.reference,
+                crate::assistance::outbox::DeferSpec {
+                    tool: AssistanceTool::Edit,
+                    target: "lost-once".into(),
+                    fence_paths: Vec::new(),
+                }
+            ));
+            assert!(
+                worker.shared.outbox.take_work(&job.reference).is_some(),
+                "lost transport reply must keep the accepted check owed"
+            );
+        }
+    }
+
     /// Every supervised panic raises exactly one report alert from its original evidence,
     /// including job panics whose catcher consumes the location before marking the daemon failed.
     #[tokio::test]
@@ -11047,7 +11624,8 @@ mod stop_retry_tests {
             authority,
             path: "main.alpha".to_owned(),
             fallback: EditDiagnostics::Unknown {},
-            generation: 1,
+            generation: Some(1),
+            provider_pending: false,
             worktree: fixture.root.clone(),
             wanted: "main.alpha".to_owned(),
             preexisting: BTreeMap::new(),
@@ -11190,6 +11768,7 @@ mod stop_retry_tests {
         let invocation = production_call(&worker, "edit-actor", "edit-context");
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut context_job = Job {
+            progress: Default::default(),
             reference: "context-source".into(),
             invocation,
             tool: AssistanceTool::Context,
@@ -11210,6 +11789,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             context_job.reference.clone(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply: context_reply,
                 selection: (AssistanceTool::Context, selection(&context_job.parameters)),
@@ -11229,6 +11809,7 @@ mod stop_retry_tests {
         let invocation = production_call(&worker, "edit-actor", "edit-call");
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut edit_job = Job {
+            progress: Default::default(),
             reference: "edit-result".into(),
             invocation,
             tool: AssistanceTool::Edit,
@@ -11277,6 +11858,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             edit_job.reference.clone(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply: reply.clone(),
                 selection: (AssistanceTool::Edit, selection(&edit_job.parameters)),
@@ -11430,6 +12012,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             reference.to_owned(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply,
                 selection: (AssistanceTool::Read, selection(&parameters)),
@@ -11469,6 +12052,7 @@ mod stop_retry_tests {
                     worker.shared.ledger.lock().unwrap().details.insert(
                         reference.to_owned(),
                         Detail {
+                            progress: Default::default(),
                             binding,
                             selection: (AssistanceTool::Edit, selection(&job.parameters)),
                             line_movement: reply_line_movement(&reply),
@@ -12444,6 +13028,7 @@ mod stop_retry_tests {
                 .unwrap()
                 .insert(reference.to_owned(), format!("req-for-{reference}"));
             let job = Job {
+                progress: Default::default(),
                 reference: reference.to_owned(),
                 invocation,
                 tool: AssistanceTool::Context,
@@ -12488,7 +13073,8 @@ mod stop_retry_tests {
     /// inspection hands a retained terminal result to its caller: a settled success and a cached
     /// *failed* result are delivered; a reference this daemon never minted or no longer retains, a
     /// result still `pending`, and a caller that already left are not — and no other inspection of
-    /// the same reference can take or inherit the evidence.
+    /// the same reference can take or inherit the evidence. A cancelled source-page inspection
+    /// leaves its first or expanded page available for the next caller.
     #[tokio::test]
     async fn inspection_reports_typed_delivery_evidence() {
         let fixture = Fixture::new();
@@ -12498,6 +13084,7 @@ mod stop_retry_tests {
         worker.observations.install_schema().await.unwrap();
         let (binding, _) = production_start(&mut worker, "delivery-actor", "delivery-start").await;
         let retained = |reply: PeerReply| Detail {
+            progress: Default::default(),
             binding: binding.clone(),
             reply,
             selection: (AssistanceTool::Read, [0; 32]),
@@ -12596,6 +13183,35 @@ mod stop_retry_tests {
         // next inspection of the same reference starts from its own clean flag — here a refusal
         // (another binding's view of the reference) must not inherit a stale true.
         let (_, _) = inspect("ok-ref", false).await;
+        // Timeout/caller cancellation must preserve both the first and an expanded source page.
+        let (first, page) = ContextPageState::new(
+            "a retained row\n".repeat(20_000),
+            0,
+            false,
+            ResultKind::Read,
+        )
+        .next("paged-ref")
+        .unwrap();
+        assert!(page.is_some());
+        let mut detail = retained(first.clone());
+        detail.context_page = page;
+        detail.context_page_fresh = true;
+        worker
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .details
+            .insert("paged-ref".into(), detail);
+        inspect("paged-ref", false).await;
+        let (received, _) = inspect("paged-ref", true).await;
+        assert_eq!(received.unwrap().encode(), first.encode());
+        inspect("paged-ref", false).await;
+        let composed = worker.shared.ledger.lock().unwrap().details["paged-ref"]
+            .reply
+            .clone();
+        let (received, _) = inspect("paged-ref", true).await;
+        assert_eq!(received.unwrap().encode(), composed.encode());
         let (other_reply, other_rx) = oneshot::channel();
         let other_delivery = Arc::new(std::sync::atomic::AtomicBool::new(false));
         serve_inspection(
@@ -12900,6 +13516,7 @@ mod stop_retry_tests {
         let invocation = production_call(worker, actor, id);
         let (_cancel_sender, cancel) = watch::channel(false);
         let mut job = Job {
+            progress: Default::default(),
             reference: format!("problems-{id}"),
             invocation,
             tool: AssistanceTool::Context,
@@ -13051,6 +13668,7 @@ mod stop_retry_tests {
         let (cancel_sender, cancel) = watch::channel(false);
         (
             Job {
+                progress: Default::default(),
                 reference: "continuation-detail".into(),
                 invocation,
                 tool: AssistanceTool::Context,
@@ -13184,6 +13802,7 @@ mod stop_retry_tests {
         handle.shared.ledger.lock().unwrap().details.insert(
             reference.to_owned(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply,
                 selection: (
@@ -13202,6 +13821,112 @@ mod stop_retry_tests {
                 extra_sources: Vec::new(),
             },
         );
+    }
+
+    /// Queued and pre-commit edits never claim a write; the same retained slot later exposes
+    /// only confirmed paths and escapes labels without replacing its pending internal state.
+    /// Worst-case labels fit both carriers; a blocked authorization refuses at its wait deadline.
+    #[tokio::test]
+    async fn progress_preserves_no_commit_and_confirmed_subset() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 8);
+        let invocation = validated_call(&handle.shared.bindings, "progress", "progress-call");
+        let binding = invocation.binding_ref().clone();
+        let reference = handle
+            .enqueue(
+                invocation,
+                AssistanceTool::Edit,
+                serde_json::json!({"files":[{"path":"first.rs"},{"path":"second.rs"}]}),
+                "stop-retry",
+                None,
+                None,
+            )
+            .unwrap();
+        let pending = PeerReply::Pending {
+            detail_ref: reference.clone(),
+        };
+        let progress = handle.shared.ledger.lock().unwrap().details[&reference]
+            .progress
+            .clone();
+        for stage in [None, Some("format")] {
+            progress.lock().unwrap().switch(stage);
+            let reply = handle.progress_reply(&binding, &reference, pending.clone());
+            let PeerReply::Complete {
+                kind: ResultKind::EditProgress,
+                text,
+                ..
+            } = reply
+            else {
+                panic!("{reply:?}")
+            };
+            assert!(
+                text.contains("committed: none") && text.contains(stage.unwrap_or("queued")),
+                "{text}"
+            );
+            assert!(
+                content::render_with_status(
+                    handle.progress_reply(&binding, &reference, pending.clone()),
+                    None,
+                    content::Envelope::WithStructured
+                )
+                .is_some()
+            );
+        }
+        progress
+            .lock()
+            .unwrap()
+            .committed
+            .push("first.rs\nforged".into());
+        let reply = handle.progress_reply(&binding, &reference, pending);
+        let PeerReply::Complete { text, .. } = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(!text.contains('\n'), "{text}");
+        assert!(
+            text.contains("committed: first.rs") && !text.contains("committed: second.rs"),
+            "{text}"
+        );
+        assert!(matches!(
+            handle.shared.ledger.lock().unwrap().details[&reference].reply,
+            PeerReply::Pending { .. }
+        ));
+        // Worst-case batch labels still fit the actual structured carrier after escaping.
+        {
+            let mut progress = progress.lock().unwrap();
+            progress.requested = vec!["\u{202e}".repeat(512); 32];
+            progress.committed = progress.requested.clone();
+        }
+        let large = handle.progress_reply(
+            &binding,
+            &reference,
+            PeerReply::Pending {
+                detail_ref: reference.clone(),
+            },
+        );
+        assert!(content::fits(&large, content::Envelope::WithStructured));
+        assert!(content::fits(&large, content::Envelope::TextOnly));
+        // An inspection that cannot complete authorization must not reveal ledger progress.
+        let bounded = handle
+            .inspect_call(
+                binding,
+                &serde_json::json!({"detail_ref":reference, "wait_s":1}),
+                "stop-retry",
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
+        assert!(
+            matches!(
+                bounded,
+                PeerReply::Error {
+                    code: FailureCode::Deadline,
+                    ..
+                }
+            ),
+            "{bounded:?}"
+        );
+        let task = handle.task.lock().unwrap().take().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     /// Concurrent start retries coalesce only when their environment selections are identical.
@@ -13742,6 +14467,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             job.reference.clone(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply: PeerReply::Pending {
                     detail_ref: job.reference.clone(),
@@ -13867,6 +14593,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             job.reference.clone(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply: PeerReply::Pending {
                     detail_ref: job.reference.clone(),
@@ -13962,6 +14689,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             job.reference.clone(),
             Detail {
+                progress: Default::default(),
                 binding,
                 reply: PeerReply::Pending {
                     detail_ref: job.reference.clone(),
@@ -14033,6 +14761,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             "foreign-detail".into(),
             Detail {
+                progress: Default::default(),
                 binding: other_binding,
                 reply: PeerReply::Complete {
                     kind: ResultKind::Context,
@@ -14630,6 +15359,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             "start-first".into(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply: PeerReply::Complete {
                     kind: ResultKind::Activation,
@@ -14690,6 +15420,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             job.reference.clone(),
             Detail {
+                progress: Default::default(),
                 binding,
                 reply: PeerReply::Pending {
                     detail_ref: job.reference.clone(),
@@ -14777,6 +15508,7 @@ mod stop_retry_tests {
         worker.shared.ledger.lock().unwrap().details.insert(
             reference.to_owned(),
             Detail {
+                progress: Default::default(),
                 binding: binding.clone(),
                 reply: PeerReply::Pending {
                     detail_ref: reference.to_owned(),
@@ -14805,6 +15537,7 @@ mod stop_retry_tests {
         let (cancel_sender, cancel) = watch::channel(false);
         (
             Job {
+                progress: Default::default(),
                 reference: reference.to_owned(),
                 invocation,
                 tool: AssistanceTool::Diff,
@@ -15069,6 +15802,7 @@ mod stop_retry_tests {
         let (cancel_sender, cancel) = watch::channel(false);
         (
             Job {
+                progress: Default::default(),
                 reference: reference.into(),
                 invocation,
                 tool,
@@ -15281,6 +16015,7 @@ mod stop_retry_tests {
                 let (cancel_sender, cancel) = watch::channel(false);
                 (
                     Job {
+                        progress: Default::default(),
                         reference: "stage-symbol".into(),
                         invocation,
                         tool: AssistanceTool::Symbol,

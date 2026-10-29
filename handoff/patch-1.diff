@@ -1,0 +1,1988 @@
+diff --git a/assets/mcp/reply.jinja b/assets/mcp/reply.jinja
+index e2992a86..509012a1 100644
+--- a/assets/mcp/reply.jinja
++++ b/assets/mcp/reply.jinja
+@@ -232,7 +232,7 @@ Result retained under {{ detail_ref }}. Bridge delivers it automatically when co
+ {%- if state == "complete" and (kind == "activation" or kind == "stop") -%}
+ {{ text }}
+ {%- endif -%}
+-{%- if state == "complete" and (kind == "context" or kind == "diff" or kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect") -%}
++{%- if state == "complete" and (kind == "context" or kind == "diff" or kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect" or kind == "edit_progress") -%}
+ {{ text }}
+ {%- if truncated and detail_ref and continuation -%}
+ {%- set next_tool = "ide." ~ kind if kind in ["read", "graph", "test"] else "ide.inspect" -%}
+diff --git a/crates/agent-ide-core/src/assistance/addressing.rs b/crates/agent-ide-core/src/assistance/addressing.rs
+index 8c8da802..c45efae6 100644
+--- a/crates/agent-ide-core/src/assistance/addressing.rs
++++ b/crates/agent-ide-core/src/assistance/addressing.rs
+@@ -367,7 +367,9 @@ impl Worker<'_> {
+     /// (never parking the job for a loading server), at most [`MAX_ADDRESS_FILES`] files per
+     /// call. Once [`ADDRESS_BUDGET`] is spent, or when the server cannot outline a file, the
+     /// file is outlined from its language's source outline instead, which gives the same
+-    /// addresses. A location neither outline resolves answers `None`; no address is guessed.
++    /// addresses. Read-job link enrichment uses only the source outline so plain source never
++    /// starts or awaits a provider. A location neither outline resolves answers `None`; no
++    /// address is guessed.
+     pub(super) async fn position_addresses(
+         &mut self,
+         job: &mut Job,
+@@ -390,7 +392,9 @@ impl Worker<'_> {
+                     out.reason.get_or_insert("file limit");
+                     None
+                 } else {
+-                    let served = if started.elapsed() >= ADDRESS_BUDGET {
++                    let served = if job.tool == AssistanceTool::Read
++                        || started.elapsed() >= ADDRESS_BUDGET
++                    {
+                         None
+                     } else {
+                         Box::pin(self.scanned_map(job, &authority, file)).await
+diff --git a/crates/agent-ide-core/src/assistance/batch_edit.rs b/crates/agent-ide-core/src/assistance/batch_edit.rs
+index 19e33137..e132856e 100644
+--- a/crates/agent-ide-core/src/assistance/batch_edit.rs
++++ b/crates/agent-ide-core/src/assistance/batch_edit.rs
+@@ -340,7 +340,7 @@ impl Worker<'_> {
+                 )));
+             }
+             let candidate = self
+-                .format_candidate(&observed, Path::new(&path), content.clone())
++                .format_candidate(job, &observed, Path::new(&path), content.clone())
+                 .await;
+             return Ok(Ok(Planned {
+                 path,
+@@ -443,6 +443,7 @@ impl Worker<'_> {
+     /// `not reached`. No error after the first write leaves this function: each becomes the
+     /// file's state, so the caller can always say exactly what was written. A fully written
+     /// operation is settled; an unknown write keeps the binding unsettled for the handover guard.
++    /// The job's exclusive commit interval is timed and only confirmed writes enter progress.
+     async fn commit_files(
+         &mut self,
+         job: &mut Job,
+@@ -452,6 +453,7 @@ impl Worker<'_> {
+         receipt: &BatchReceipt,
+         mut planned: Vec<Option<Planned>>,
+     ) -> Result<Committed, FailureCode> {
++        let _timing = progress::Progress::enter(&job.progress, "commit");
+         let authority = self.authority(binding).await?;
+         let receipts = self.edits.batches();
+         let mut reports: Vec<FileReport> = Vec::with_capacity(files.len());
+@@ -471,6 +473,9 @@ impl Worker<'_> {
+                 continue;
+             }
+             if row.written {
++                if let Ok(mut progress) = job.progress.lock() {
++                    progress.committed.push(file.path.clone());
++                }
+                 if let Ok((observed, _)) = self.observe(binding, file.path.clone().into()).await
+                     && observed.bytes().map(|bytes| *bytes.digest()) == Some(row.candidate)
+                 {
+@@ -495,6 +500,9 @@ impl Worker<'_> {
+                         continue;
+                     };
+                     if observed.bytes().map(|bytes| *bytes.digest()) == Some(row.candidate) {
++                        if let Ok(mut progress) = job.progress.lock() {
++                            progress.committed.push(file.path.clone());
++                        }
+                         sources.push(observed);
+                         let _ = receipts.mark_written(operation_id, index).await;
+                         reports.push(report(
+@@ -567,6 +575,9 @@ impl Worker<'_> {
+                 | Written::CapacityNoEffect => (FileState::NotWritten(NotWritten::IoError), None),
+             };
+             if let Some(read) = read {
++                if let Ok(mut progress) = job.progress.lock() {
++                    progress.committed.push(plan.path.clone());
++                }
+                 let _ = receipts.mark_written(operation_id, index).await;
+                 if let Some(observed) = self
+                     .post_write_source(
+@@ -708,7 +719,7 @@ impl Worker<'_> {
+     /// Triggers the one project check of the written files — one check generation per affected
+     /// checked language — and parks the job until it lands or its deadline passes; without a
+     /// project feed, without written files of a checked language, or without time left, it
+-    /// answers at once.
++    /// answers at once. The job's progress changes to the check stage before that decision.
+     async fn schedule_batch_check(
+         &mut self,
+         job: &mut Job,
+@@ -716,6 +727,9 @@ impl Worker<'_> {
+         operation_id: &str,
+         committed: Committed,
+     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
++        if let Ok(mut progress) = job.progress.lock() {
++            progress.switch(Some("check"));
++        }
+         let Committed {
+             reports,
+             sources,
+@@ -878,8 +892,9 @@ impl Worker<'_> {
+     }
+ 
+     /// Answers a multi-file edit whose project check is still running with `diagnostics:
+-    /// pending` at once, right after the writes (symbol-read-edit-v1 §3.3), as the one-file edit
+-    /// does.
++    /// pending` after the writes (symbol-read-edit-v1 §3.3), once each affected language has
++    /// produced an analysable snapshot. Until then the inline deadline exposes committed files
++    /// and stage without implying an available check environment.
+     ///
+     /// Only a caller still waiting is answered, only once, and only when the session ledger can
+     /// track the check as in-flight work under the job's reference: the job stays parked on its
+@@ -889,6 +904,24 @@ impl Worker<'_> {
+         if check.answered_early {
+             return;
+         }
++        // An accepted check generation alone does not prove a working environment. Keep the
++        // write/stage progress reply until each language has produced an analysable snapshot.
++        if check.stages.iter().any(|stage| match stage {
++            JobStage::EditAwaitingCheck {
++                language, worktree, ..
++            } => !self.shared.project_feed.as_ref().is_some_and(|feed| {
++                feed.latest(worktree).iter().any(|snapshot| {
++                    snapshot.language == *language
++                        && matches!(
++                            snapshot.state,
++                            crate::checks::CheckState::Ready | crate::checks::CheckState::Partial
++                        )
++                })
++            }),
++            _ => false,
++        }) {
++            return;
++        }
+         let waiting = job
+             .stop_reply
+             .as_ref()
+diff --git a/crates/agent-ide-core/src/assistance/delivery.rs b/crates/agent-ide-core/src/assistance/delivery.rs
+index 94bf6a23..c27bcac4 100644
+--- a/crates/agent-ide-core/src/assistance/delivery.rs
++++ b/crates/agent-ide-core/src/assistance/delivery.rs
+@@ -1120,6 +1120,7 @@ mod worker_tests {
+         handle.shared.ledger.lock().unwrap().details.insert(
+             reference.to_owned(),
+             Detail {
++                progress: Default::default(),
+                 binding: binding.clone(),
+                 reply,
+                 selection: (
+diff --git a/crates/agent-ide-core/src/assistance/facade.rs b/crates/agent-ide-core/src/assistance/facade.rs
+index c4109545..97afdb5b 100644
+--- a/crates/agent-ide-core/src/assistance/facade.rs
++++ b/crates/agent-ide-core/src/assistance/facade.rs
+@@ -163,6 +163,7 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
+             | (AssistanceTool::Stop, ResultKind::Stop)
+             | (AssistanceTool::Outline, ResultKind::Outline)
+             | (AssistanceTool::Read, ResultKind::Read)
++            | (AssistanceTool::Edit, ResultKind::EditProgress)
+             | (AssistanceTool::Symbol, ResultKind::Symbol)
+             | (AssistanceTool::Graph, ResultKind::Graph)
+             | (AssistanceTool::Test, ResultKind::Test)
+@@ -281,6 +282,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
+                 "type": "object", "additionalProperties": false, "minProperties": 1,
+                 "properties": {
+                     "kind": {"type":"string", "enum":["problems", "diagnostics"], "description":"problems: project checks; diagnostics: file provider reports."},
++                    "wait_s": {"type":"integer", "minimum":1, "maximum":30, "description":"Completion seconds."},
+                     "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"With diagnostics: worktree-relative file."},
+                     "language": {"type":"string", "enum":checked_language_ids(), "description":"With problems: limit to one language."},
+                     "offset": {"type":"integer", "minimum":0, "maximum":MAX_PROBLEM_OFFSET, "description":"With problems: continue from this problem index."},
+@@ -729,6 +731,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
+             "detail_ref",
+             "detail_refs",
+             "wait_ms",
++            "wait_s",
+             "kind",
+             "path",
+             "language",
+@@ -1435,6 +1438,20 @@ pub(crate) fn validate_normalized_call(
+             // OUTBOX-r3 §8.5: one reference or up to eight in order, each with an optional bounded
+             // wait; naming neither is refused because no session fact list exists to read.
+             optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
++            if let Some(wait) = object.get("wait_s") {
++                if wait.as_u64().is_none_or(|wait| !(1..=30).contains(&wait)) {
++                    return Err(invalid_field(
++                        "wait_s",
++                        FieldRule::IntegerRange { min: 1, max: 30 },
++                    ));
++                }
++                if object.contains_key("wait_ms") {
++                    return Err(invalid_field(
++                        "wait_s",
++                        FieldRule::OneOf("not together with wait_ms"),
++                    ));
++                }
++            }
+             if !object.contains_key("detail_ref") && !object.contains_key("detail_refs") {
+                 return Err(invalid_field("detail_ref", FieldRule::Required));
+             }
+@@ -5570,9 +5587,8 @@ fn debug_redacts_trusted_transport_and_host_metadata() {
+     }
+ }
+ 
+-/// Nothing the host shows the model teaches waiting: the server paragraph and every advertised
+-/// tool schema (descriptions included) omit `wait_ms` and any "wait once when idle" advice, while
+-/// the call validator still accepts `wait_ms` (harness-reply-v1 R6).
++/// Advertised guidance allows one bounded retained-result wait and still forbids idle polling.
++/// The old millisecond parameter stays private compatibility; public waits use seconds.
+ #[test]
+ fn advertised_text_never_teaches_waiting() {
+     let mut advertised = SERVER_INSTRUCTIONS.to_owned();
+@@ -5580,7 +5596,7 @@ fn advertised_text_never_teaches_waiting() {
+     for tool in facade.router.list_all() {
+         advertised.push_str(&serde_json::to_string(&tool).unwrap());
+     }
+-    for banned in ["wait_ms", "nothing else to do", "wait once"] {
++    for banned in ["wait_ms", "nothing else to do", "poll every", "poll until"] {
+         assert!(
+             !advertised.contains(banned),
+             "advertised text names {banned}"
+@@ -5593,6 +5609,32 @@ fn advertised_text_never_teaches_waiting() {
+         )
+         .is_ok()
+     );
++    assert!(advertised.contains("wait_s"));
++    for wait in [
++        json!(0),
++        json!(31),
++        json!(-1),
++        json!(1.5),
++        json!("1"),
++        json!(true),
++    ] {
++        assert!(
++            validate_call(
++                AssistanceTool::Inspect,
++                json!({"detail_ref":"a", "wait_s":wait})
++            )
++            .is_err()
++        );
++    }
++    for wait in [1, 30] {
++        assert!(
++            validate_call(
++                AssistanceTool::Inspect,
++                json!({"detail_ref":"a", "wait_s":wait})
++            )
++            .is_ok()
++        );
++    }
+ }
+ 
+ /// The advertised catalog stays inside the harness-reply-v1 byte budgets: every tool description
+diff --git a/crates/agent-ide-core/src/assistance/hygiene.rs b/crates/agent-ide-core/src/assistance/hygiene.rs
+index 2c7d1051..fafacd61 100644
+--- a/crates/agent-ide-core/src/assistance/hygiene.rs
++++ b/crates/agent-ide-core/src/assistance/hygiene.rs
+@@ -53,11 +53,10 @@ const NEGATED_POLL: [&str; 5] = [
+ /// lowercase and matched after whitespace is collapsed: waiting advice, the file-version
+ /// reference, labelled replies and `Next:` lines, the old truncation trailers, the retired
+ /// `ide.context` read habit and line-first examples.
+-const STALE_FORMS: [&str; 18] = [
++const STALE_FORMS: [&str; 17] = [
+     "wait_ms",
+     "source_ref",
+     "nothing else to do",
+-    "wait once",
+     "next: use",
+     "complete activation",
+     "complete context",
+diff --git a/crates/agent-ide-core/src/assistance/inspection.rs b/crates/agent-ide-core/src/assistance/inspection.rs
+index d074206f..974df0b5 100644
+--- a/crates/agent-ide-core/src/assistance/inspection.rs
++++ b/crates/agent-ide-core/src/assistance/inspection.rs
+@@ -1,9 +1,8 @@
+-//! `ide.inspect` consolidation (OUTBOX-r3 §8.5): `detail_ref`, `detail_refs` and `wait_ms`.
++//! `ide.inspect` consolidation: retained references and a bounded `wait_s` completion wait.
+ //!
+ //! One `ide.inspect` call reads one reference (as before) or up to eight references in order.
+-//! `wait_ms` waits inside the daemon, outside the worker's inspection loop, so a waiting agent
+-//! spends one model turn instead of many polls and never blocks other sessions' inspections. A
+-//! wait that ends without a result cancels nothing.
++//! Waiting runs outside the worker's inspection loop and never blocks other sessions. Expiry
++//! cancels no job. The unadvertised `wait_ms` remains compatible for existing clients.
+ 
+ use std::{sync::Arc, time::Duration};
+ 
+@@ -13,7 +12,7 @@ use super::super::{
+     content::{self, Envelope},
+     host_binding::BindingRef,
+     outbox::{MAX_DETAIL_REFS, MAX_WAIT_MS},
+-    reply::{PeerReply, ResultKind},
++    reply::{FailureCode, PeerReply, ResultKind},
+ };
+ use super::WorkerHandle;
+ 
+@@ -56,11 +55,40 @@ fn inspect_reply(text: String) -> PeerReply {
+ }
+ 
+ impl WorkerHandle {
++    /// Retrieves one reference under its ordinary delivery context, bounding the retrieval
++    /// itself when a deadline exists. Expiry preserves the job and refuses disclosure because
++    /// the inspection has not completed its authority/source checks.
++    async fn inspect_until(
++        &self,
++        binding: BindingRef,
++        reference: String,
++        attachment: &str,
++        delivery: Arc<std::sync::atomic::AtomicBool>,
++        deadline: Option<tokio::time::Instant>,
++    ) -> PeerReply {
++        let inspect = self.with_delivery(
++            delivery,
++            self.inspect(binding, reference.clone(), attachment, None),
++        );
++        match deadline {
++            Some(deadline) => {
++                tokio::time::timeout_at(deadline, inspect)
++                    .await
++                    .unwrap_or(PeerReply::Error {
++                        code: FailureCode::Deadline,
++                        detail: Some("inspect:deadline".to_owned()),
++                    })
++            }
++            None => inspect.await,
++        }
++    }
++
+     /// Serves one `ide.inspect` call in any of its forms (OUTBOX §8.5).
+     ///
+     /// `parameters` are the validated call arguments: `detail_ref` (one reference, the original
+-    /// form) or `detail_refs` (1-8 references answered in order), each with an optional `wait_ms`
+-    /// (clamped to [`MAX_WAIT_MS`]). `delivery` is the call's QW-4 delivery flag. A wait returns as
++    /// form) or `detail_refs` (1-8 references answered in order), with optional `wait_s` (1–30
++    /// seconds) or legacy `wait_ms` (clamped to [`MAX_WAIT_MS`]), never both. `delivery` is the
++    /// call's QW-4 delivery flag. A wait returns as
+     /// soon as a named reference settles; at its deadline it answers with what is there and cancels
+     /// nothing. Arguments naming neither form are refused; the facade validator never admits them.
+     pub async fn inspect_call(
+@@ -71,25 +99,42 @@ impl WorkerHandle {
+         delivery: Arc<std::sync::atomic::AtomicBool>,
+     ) -> PeerReply {
+         let wait = parameters
+-            .get("wait_ms")
++            .get("wait_s")
+             .and_then(Value::as_u64)
+-            .map(|ms| Duration::from_millis(ms.min(MAX_WAIT_MS)))
++            .map(|seconds| Duration::from_secs(seconds.min(30)))
++            .or_else(|| {
++                parameters
++                    .get("wait_ms")
++                    .and_then(Value::as_u64)
++                    .map(|ms| Duration::from_millis(ms.min(MAX_WAIT_MS)))
++            })
+             .unwrap_or_default();
+         let deadline = tokio::time::Instant::now() + wait;
+         if let Some(reference) = parameters.get("detail_ref").and_then(Value::as_str) {
+             loop {
+                 let reply = self
+-                    .with_delivery(
++                    .inspect_until(
++                        binding.clone(),
++                        reference.to_owned(),
++                        attachment,
+                         delivery.clone(),
+-                        self.inspect(binding.clone(), reference.to_owned(), attachment, None),
++                        (!wait.is_zero()).then_some(deadline),
++                    )
++                    .await;
++                if matches!(reply, PeerReply::Pending { .. })
++                    && tokio::time::Instant::now() < deadline
++                {
++                    tokio::time::sleep(
++                        REREAD_PAUSE
++                            .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                     )
+                     .await;
++                }
+                 if !matches!(reply, PeerReply::Pending { .. })
+                     || tokio::time::Instant::now() >= deadline
+                 {
+-                    return reply;
++                    return self.progress_reply(&binding, reference, reply);
+                 }
+-                tokio::time::sleep(REREAD_PAUSE.min(deadline - tokio::time::Instant::now())).await;
+             }
+         }
+         if let Some(references) = parameters.get("detail_refs").and_then(Value::as_array) {
+@@ -100,7 +145,14 @@ impl WorkerHandle {
+                 .map(str::to_owned)
+                 .collect::<Vec<_>>();
+             return self
+-                .inspect_many(&binding, &references, attachment, delivery, deadline)
++                .inspect_many(
++                    &binding,
++                    &references,
++                    attachment,
++                    delivery,
++                    deadline,
++                    !wait.is_zero(),
++                )
+                 .await;
+         }
+         PeerReply::InvalidParameters {
+@@ -117,14 +169,18 @@ impl WorkerHandle {
+         attachment: &str,
+         delivery: Arc<std::sync::atomic::AtomicBool>,
+         deadline: tokio::time::Instant,
++        bounded: bool,
+     ) -> PeerReply {
+         loop {
+             let mut replies = Vec::with_capacity(references.len());
+             for reference in references {
+                 let reply = self
+-                    .with_delivery(
++                    .inspect_until(
++                        binding.clone(),
++                        reference.clone(),
++                        attachment,
+                         delivery.clone(),
+-                        self.inspect(binding.clone(), reference.clone(), attachment, None),
++                        bounded.then_some(deadline),
+                     )
+                     .await;
+                 replies.push(reply);
+@@ -132,18 +188,25 @@ impl WorkerHandle {
+             let settled = replies
+                 .iter()
+                 .any(|reply| !matches!(reply, PeerReply::Pending { .. }));
++            if !settled && tokio::time::Instant::now() < deadline {
++                tokio::time::sleep(
++                    REREAD_PAUSE
++                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
++                )
++                .await;
++            }
+             if settled || tokio::time::Instant::now() >= deadline {
+                 let share = REPLY_TEXT_BUDGET / references.len().max(1);
+                 let sections = references
+                     .iter()
+                     .zip(&replies)
+                     .map(|(reference, reply)| {
+-                        format!("== {reference} ==\n{}", cut(&compact(reply), share))
++                        let reply = self.progress_reply(binding, reference, reply.clone());
++                        format!("== {reference} ==\n{}", cut(&compact(&reply), share))
+                     })
+                     .collect::<Vec<_>>();
+                 return inspect_reply(sections.join("\n"));
+             }
+-            tokio::time::sleep(REREAD_PAUSE.min(deadline - tokio::time::Instant::now())).await;
+         }
+     }
+ }
+diff --git a/crates/agent-ide-core/src/assistance/progress.rs b/crates/agent-ide-core/src/assistance/progress.rs
+new file mode 100644
+index 00000000..6a3f5f0d
+--- /dev/null
++++ b/crates/agent-ide-core/src/assistance/progress.rs
+@@ -0,0 +1,140 @@
++//! Exclusive per-request stage timing and truthful edit progress, retained with each job.
++
++use super::{AssistanceTool, INLINE_REPLY_WAIT};
++use std::{
++    collections::BTreeMap,
++    sync::{Arc, Mutex},
++    time::{Duration, Instant},
++};
++
++/// Bounded request progress; paths come only from admitted request/commit results.
++#[derive(Default)]
++pub(super) struct Progress {
++    /// Active stage and its monotonic start, absent before execution or after settlement.
++    pub(super) active: Option<(&'static str, Instant)>,
++    /// Exclusive accumulated time by the closed stage names used by this module's callers.
++    pub(super) durations: BTreeMap<&'static str, Duration>,
++    /// Paths whose write outcome is confirmed; no speculative candidate is listed here.
++    pub(super) committed: Vec<String>,
++    /// Requested file paths or addresses, preserved without interpreting them as write outcomes.
++    pub(super) requested: Vec<String>,
++}
++
++impl Progress {
++    /// Accounts for elapsed time in the previous stage and starts `stage`, or stops timing.
++    pub(super) fn switch(&mut self, stage: Option<&'static str>) -> Option<&'static str> {
++        let previous = self.active.take().map(|(name, started)| {
++            *self.durations.entry(name).or_default() += started.elapsed();
++            name
++        });
++        self.active = stage.map(|name| (name, Instant::now()));
++        previous
++    }
++
++    /// Starts a nested stage, restoring its parent when the returned guard is dropped.
++    pub(super) fn enter(progress: &Arc<Mutex<Self>>, stage: &'static str) -> StageGuard {
++        let previous = progress
++            .lock()
++            .ok()
++            .and_then(|mut state| state.switch(Some(stage)));
++        StageGuard {
++            progress: progress.clone(),
++            previous,
++        }
++    }
++
++    /// Current queued/running stage for a nonterminal reply; never implies a committed write.
++    pub(super) fn stage(&self) -> &'static str {
++        self.active.map_or("queued", |(stage, _)| stage)
++    }
++
++    /// Stops timing and journals all applicable stage totals under the job's opaque reference.
++    /// Long stages are warnings visible in `agent-ide errors`; no source or paths are logged.
++    pub(super) fn journal(&mut self, tool: AssistanceTool, reference: &str, request: Option<&str>) {
++        self.switch(None);
++        let stages: &[&str] = match tool {
++            AssistanceTool::Edit => &["plan", "format", "gate", "commit", "check", "provider_wait"],
++            AssistanceTool::Read => &["plan", "provider_wait"],
++            _ => return,
++        };
++        for stage in stages {
++            let duration = self.durations.get(stage).copied().unwrap_or_default();
++            let detail = format!(
++                "stage: {stage}; duration_ms: {}; inline_wait_exceeded: {}",
++                duration.as_millis(),
++                duration > INLINE_REPLY_WAIT
++            );
++            crate::errorlog::record(
++                super::errorlog_method(tool),
++                if duration > INLINE_REPLY_WAIT {
++                    crate::errorlog::Outcome::Incomplete
++                } else {
++                    crate::errorlog::Outcome::Completed
++                },
++                crate::errorlog::Fields {
++                    correlation: Some(reference),
++                    request,
++                    detail: Some(&detail),
++                    duration_ms: Some(u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)),
++                    ..Default::default()
++                },
++            );
++        }
++    }
++}
++
++/// Owns a nested timing interval without borrowing the job across asynchronous work.
++pub(super) struct StageGuard {
++    /// Shared state retained by the job and its result slot.
++    progress: Arc<Mutex<Progress>>,
++    /// Parent stage restored on drop, including error and cancellation paths.
++    previous: Option<&'static str>,
++}
++
++impl Drop for StageGuard {
++    /// Accounts for this interval and resumes its parent; poisoned advisory state is ignored.
++    fn drop(&mut self) {
++        if let Ok(mut progress) = self.progress.lock() {
++            progress.switch(self.previous);
++        }
++    }
++}
++
++/// Stage-journal contract checks using captured events and a controlled monotonic interval.
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Stage totals include the active interval, emit zeros for unused stages and expose slow
++    /// work to the default warning reader without source paths or a new logging backend.
++    #[test]
++    fn slow_stages_are_journaled_as_warnings() {
++        let mut progress = Progress {
++            active: Some(("check", Instant::now() - Duration::from_secs(9))),
++            requested: vec!["private/source.rs".into()],
++            ..Default::default()
++        };
++        crate::errorlog::capture_start();
++        progress.journal(
++            AssistanceTool::Edit,
++            "opaque-reference",
++            Some("opaque-request"),
++        );
++        let mut events = crate::errorlog::capture_take();
++        assert_eq!(events.len(), 6);
++        assert!(events.iter().all(|event| event.correlation.as_deref()
++            == Some("opaque-reference")
++            && !event.detail.as_deref().unwrap().contains("private")));
++        crate::errorlog::retain_warn_and_error(&mut events);
++        assert_eq!(events.len(), 1);
++        assert!(
++            events[0]
++                .detail
++                .as_deref()
++                .unwrap()
++                .contains("stage: check")
++        );
++        assert!(events[0].duration_ms.unwrap() >= 9000);
++        assert!(progress.active.is_none());
++    }
++}
+diff --git a/crates/agent-ide-core/src/assistance/reply.rs b/crates/agent-ide-core/src/assistance/reply.rs
+index bfed0333..9f4423e8 100644
+--- a/crates/agent-ide-core/src/assistance/reply.rs
++++ b/crates/agent-ide-core/src/assistance/reply.rs
+@@ -305,6 +305,8 @@ impl ExecutionProfileCause {
+ #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+ #[serde(rename_all = "snake_case")]
+ pub enum ResultKind {
++    /// Nonterminal edit progress, naming requested paths, confirmed commits and current stage.
++    EditProgress,
+     /// Durable Workspace activated and authorized the exact binding.
+     Activation,
+     /// Private legacy source context. Public positional/diagnostic queries use Symbol/Inspect.
+diff --git a/crates/agent-ide-core/src/assistance/symbols.rs b/crates/agent-ide-core/src/assistance/symbols.rs
+index 27883fcf..b069c243 100644
+--- a/crates/agent-ide-core/src/assistance/symbols.rs
++++ b/crates/agent-ide-core/src/assistance/symbols.rs
+@@ -1,8 +1,8 @@
+ //! Symbol-addressed worker jobs: `ide.outline`, `ide.read`, `ide.symbol` and `ide.graph` (v0.4).
+ //!
+-//! Every job observes the source through Workspace, asks the binding's live language server for
+-//! document symbols, normalizes them through the language module and renders the compact text the
+-//! contract specifies. Results are retained with the source observation; a later `ide.edit` is
++//! Every job observes the source through Workspace. Plain file/range reads return that text
++//! without provider outlines or semantic enrichment. Symbol requests normalize provider symbols
++//! through the language module. Results retain their source observation; a later `ide.edit` is
+ //! checked against the file's current bytes and needs no file-version reference (the deprecated,
+ //! unadvertised `source_ref` is still honoured when a caller supplies one).
+ 
+@@ -236,7 +236,9 @@ impl Worker<'_> {
+     /// `file has <n> lines; nothing at <range>`. The `symbol` form still needs an outline, so a file no
+     /// IDE language reads answers `unsupported_file`. File/range reads also retain the former
+     /// context related-links block for the requested lines; it follows numbered source, shares
+-    /// its continuation, and source/authority are rechecked after the index lookup.
++    /// its continuation, and source/authority are rechecked after the index lookup. Plain file
++    /// and range reads never start or await a provider; an index still building annotates its
++    /// availability without postponing source delivery.
+     pub(super) async fn read(
+         &mut self,
+         job: &mut Job,
+@@ -339,6 +341,9 @@ impl Worker<'_> {
+             return Ok((reply, Some(authority), Some(observed)));
+         }
+         let authority = self.authority(&binding).await?;
++        // Local name-index links require no language server. A still-building index may
++        // annotate its availability, but must not park delivery of plain source text.
++        let prior_park = job.park_until;
+         let links = self
+             .related_links(
+                 job,
+@@ -348,6 +353,9 @@ impl Worker<'_> {
+                 range.unwrap_or_else(|| LineRange::new(1, total.max(1))),
+             )
+             .await;
++        if requested.is_none() {
++            job.park_until = prior_park;
++        }
+         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
+         let mut text = match range {
+             Some(range) => render::read_text(
+@@ -643,10 +651,8 @@ impl Worker<'_> {
+                             &binding,
+                             &mut files,
+                             file.clone(),
+-                            // A range of a language file keeps the outline its ranges read always
+-                            // took, which registers it with the language session before any edit;
+-                            // a whole-file item needs none, like `ide.read {path}`.
+-                            range.is_some() && Lang::for_path(&file).is_some(),
++                            // Plain file/range content requires no provider outline.
++                            false,
+                         )
+                         .await
+                     {
+@@ -694,9 +700,11 @@ impl Worker<'_> {
+                 _ => LineRange::new(1, lang::line_count(source).max(1)),
+             };
+             let authority = self.authority(&binding).await?;
++            let prior_park = job.park_until;
+             let links = self
+                 .related_links(job, authority.worktree(), path, source.as_bytes(), range)
+                 .await;
++            job.park_until = prior_park;
+             self.finish_symbol_job(job, &binding, observed).await?;
+             if !links.is_empty() {
+                 text.push('\n');
+@@ -920,8 +928,8 @@ impl Worker<'_> {
+     /// Observes, outlines and finishes one file of a batch read once: every item of that file
+     /// shares the observation, the outline and the deadline/authority/source checks.
+     ///
+-    /// `outline` asks for the file's outline. It is false for a whole-file text item and for the
+-    /// ranges of a file no IDE language reads: neither needs one, so any readable file answers
++    /// `outline` asks for the file's outline. It is false for every plain file or range item:
++    /// neither needs one, so any readable file answers
+     /// them, and the file is retained with `None` for its outline. A later item of the same file
+     /// that asks for an outline gets it computed then, so item order never changes an answer; an
+     /// outline that cannot be computed fails like a first request would (`UnsupportedFile` for a
+@@ -1818,13 +1826,14 @@ impl Worker<'_> {
+     /// unavailable refusal. Returns the outline, the worktree root for path rendering, and why
+     /// the outline came from the text alone (replies then say so in one compact line; an
+     /// address it does not contain waits for the server while it loads — see
+-    /// [`missing_symbol`]).
++    /// [`missing_symbol`]). The job accumulates this interval as provider-wait timing.
+     pub(super) async fn outline_of(
+         &mut self,
+         job: &mut Job,
+         observed: &SourceObservation,
+         bytes: &[u8],
+     ) -> Result<(Outline, std::path::PathBuf, Option<Lexical>), FailureCode> {
++        let _timing = progress::Progress::enter(&job.progress, "provider_wait");
+         // A file no registered language reads (`Cargo.toml`, a script) has no outline at all: the
+         // caller asked the wrong tool, which a provider-unavailable answer would hide.
+         let language = Lang::for_path(observed.path()).ok_or_else(|| {
+@@ -3205,7 +3214,9 @@ impl Worker<'_> {
+                     return Err(FailureCode::EditRefused);
+                 }
+             };
+-        let formatted = self.format_candidate(&observed, &file, candidate).await;
++        let formatted = self
++            .format_candidate(job, &observed, &file, candidate)
++            .await;
+         // Pre-write structural gate, shared with batches and file creation: a candidate that
+         // does not parse is not written; a base that already failed is edited with a note.
+         let gated = self
+@@ -3638,7 +3649,7 @@ impl Worker<'_> {
+             }
+         };
+         let candidate = self
+-            .format_candidate(observed, &file, spliced.clone())
++            .format_candidate(job, observed, &file, spliced.clone())
+             .await;
+         // Pre-write structural gate: a candidate that does not parse is not written; a file that
+         // already failed the same check before the edit is still edited, with a note.
+@@ -3753,7 +3764,7 @@ impl Worker<'_> {
+         } else {
+             String::new()
+         };
+-        let candidate = self.format_candidate(&observed, &file, content).await;
++        let candidate = self.format_candidate(job, &observed, &file, content).await;
+         // The same pre-write structural gate as every edit: new content that does not parse is
+         // not written (an empty base can never have carried a pre-existing error).
+         let gated = self
+@@ -3799,14 +3810,17 @@ impl Worker<'_> {
+             .await
+     }
+ 
+-    /// Runs the project's stdin formatter over a candidate text; the candidate is returned
+-    /// unchanged when there is no formatter, it fails, or it takes longer than ten seconds.
++    /// Runs the project's stdin formatter over a candidate text, timing its exclusive interval
++    /// on `job`. Returns the candidate unchanged when no formatter exists, it fails, or it exceeds
++    /// ten seconds. The admitted observation supplies the worktree; formatting writes no source.
+     pub(super) async fn format_candidate(
+         &mut self,
++        job: &Job,
+         observed: &SourceObservation,
+         file: &Path,
+         candidate: String,
+     ) -> String {
++        let _timing = progress::Progress::enter(&job.progress, "format");
+         let Some(language) = Lang::for_path(file) else {
+             return candidate;
+         };
+@@ -3935,7 +3949,7 @@ impl Worker<'_> {
+     /// per-change attribution. `Ok(Some(note))` proceeds with that note line. One error-log
+     /// event records the gate's outcome for every edit — `gate: clean`, `gate: failed …`, or
+     /// `gate: unchecked: <reason>` — so a gate that silently cannot engage is diagnosable from
+-    /// `~/.agent-ide/logs`.
++    /// `~/.agent-ide/logs`. The job records the exclusive gate interval for its stage journal.
+     async fn gate_candidate(
+         &mut self,
+         job: &Job,
+@@ -3944,6 +3958,7 @@ impl Worker<'_> {
+         base: &str,
+         candidate: &str,
+     ) -> Result<Option<String>, (u32, String)> {
++        let _timing = progress::Progress::enter(&job.progress, "gate");
+         let (verdict, unchecked) = self.syntax_verdict_of(job, observed, file, candidate).await;
+         let record_gate = |outcome: crate::errorlog::Outcome, detail: String| {
+             crate::errorlog::record(
+diff --git a/crates/agent-ide-core/src/assistance/worker.rs b/crates/agent-ide-core/src/assistance/worker.rs
+index 33fde81f..3e059ffb 100644
+--- a/crates/agent-ide-core/src/assistance/worker.rs
++++ b/crates/agent-ide-core/src/assistance/worker.rs
+@@ -57,6 +57,8 @@ mod links;
+ mod navigation;
+ #[path = "worker/patch_edit.rs"]
+ mod patch_edit;
++#[path = "progress.rs"]
++mod progress;
+ #[path = "providers.rs"]
+ mod providers;
+ #[path = "snapshots.rs"]
+@@ -103,6 +105,8 @@ const TEST_INLINE_COMPLETION_WAIT: Duration = Duration::from_secs(6);
+ 
+ /// A bounded asynchronous operation whose identity never includes the transient MCP call ID.
+ struct Job {
++    /// Stage timing and confirmed commits shared with the retained result slot.
++    progress: Arc<Mutex<progress::Progress>>,
+     /// Same-binding opaque result key retained in the result ledger.
+     reference: String,
+     /// Validated host invocation for this exact operation.
+@@ -177,6 +181,8 @@ enum JobStage {
+ 
+ /// A retained outcome requiring exact binding ownership and fresh durable authorization on access.
+ pub(super) struct Detail {
++    /// Advisory stage timing and write progress; never replaces authority or source guards.
++    progress: Arc<Mutex<progress::Progress>>,
+     /// Immutable owner binding, checked separately from the opaque reference.
+     binding: BindingRef,
+     /// Current pending, error or owner-generated result.
+@@ -1956,8 +1962,9 @@ impl WorkerHandle {
+     }
+     /// Enqueues an exact query and waits up to [`INLINE_REPLY_WAIT`] for its completed reply.
+     ///
+-    /// A job still running at the limit returns its retained pending detail; callers can retrieve
+-    /// later completion with `ide.inspect`. The initial inspection permit is reserved before
++    /// A read/edit still running at the limit returns requested targets, confirmed commits and
++    /// its current stage; other tools retain their pending detail. Callers can retrieve later
++    /// completion with `ide.inspect`. The initial inspection permit is reserved before
+     /// enqueueing so timeout always has capacity to return the current detail. A completed reply
+     /// uses the worker's normal delivery path, preserving continuation and feedback semantics.
+     ///
+@@ -1974,9 +1981,10 @@ impl WorkerHandle {
+         let binding = invocation.binding_ref().clone();
+         let expected = Some((tool, selection(&parameters)));
+         if let Some(reference) = parameters.get("detail_ref").and_then(Value::as_str) {
+-            return self
++            let reply = self
+                 .inspect(binding, reference.to_owned(), attachment, expected)
+                 .await;
++            return self.progress_reply(invocation.binding_ref(), reference, reply);
+         }
+         if self.target(attachment).is_none() {
+             return PeerReply::Error {
+@@ -2030,14 +2038,14 @@ impl WorkerHandle {
+                 Ok(Ok(reply)) => reply,
+                 _ => {
+                     let reply = self
+-                        .inspect_reserved(binding, reference.clone(), expected, permit)
++                        .inspect_reserved(binding.clone(), reference.clone(), expected, permit)
+                         .await;
+                     // The caller leaves with `pending`: the final answer becomes a pushed
+                     // `job-ready` fact instead of something to ask for again (OUTBOX §3.2).
+                     if matches!(reply, PeerReply::Pending { .. }) {
+                         self.shared.defer_pending(&reference, tool, target);
+                     }
+-                    reply
++                    self.progress_reply(&binding, &reference, reply)
+                 }
+             },
+             Err(code) => PeerReply::Error {
+@@ -2047,6 +2055,75 @@ impl WorkerHandle {
+         }
+     }
+ 
++    /// Adds truthful stage and confirmed-write content to an unfinished read/edit response.
++    /// Internal inspection keeps its Pending variant so waiting and delivery semantics stay intact.
++    /// Each escaped label is capped at 256 bytes (with an ellipsis) to fit worst-case batches.
++    pub(super) fn progress_reply(
++        &self,
++        binding: &BindingRef,
++        reference: &str,
++        reply: PeerReply,
++    ) -> PeerReply {
++        if !matches!(reply, PeerReply::Pending { .. }) {
++            return reply;
++        }
++        let Some((tool, progress)) = self.shared.ledger.lock().ok().and_then(|ledger| {
++            let detail = ledger.details.get(reference)?;
++            (detail.binding == *binding
++                && matches!(
++                    detail.selection.0,
++                    AssistanceTool::Edit | AssistanceTool::Read
++                ))
++            .then(|| (detail.selection.0, detail.progress.clone()))
++        }) else {
++            return reply;
++        };
++        let Ok(progress) = progress.lock() else {
++            return reply;
++        };
++        let label = |path: &String| {
++            let text = content::display_safe(path);
++            if text.len() > 256 {
++                format!("{}…", super::reply::bounded_utf8_prefix(&text, 256))
++            } else {
++                text
++            }
++        };
++        let committed = if progress.committed.is_empty() {
++            "none".to_owned()
++        } else {
++            progress
++                .committed
++                .iter()
++                .map(label)
++                .collect::<Vec<_>>()
++                .join(", ")
++        };
++        let requested = progress
++            .requested
++            .iter()
++            .map(label)
++            .collect::<Vec<_>>()
++            .join(", ");
++        PeerReply::Complete {
++            kind: if tool == AssistanceTool::Edit {
++                ResultKind::EditProgress
++            } else {
++                ResultKind::Read
++            },
++            text: format!(
++                "{}: in progress; requested: {}; committed: {}; stage: {}; detail_ref: {reference}",
++                tool.mcp_name(),
++                requested,
++                committed,
++                progress.stage()
++            ),
++            detail_ref: Some(reference.to_owned()),
++            truncated: false,
++            continuation: false,
++        }
++    }
++
+     /// Signals revocation immediately and waits up to 800 ms for the exact stop result. A timeout
+     /// reports that cleanup may still be running; callers should check with `ide.start` before editing.
+     ///
+@@ -2472,10 +2549,34 @@ impl WorkerHandle {
+                 .or_insert_with(|| watch::channel(false).0)
+                 .subscribe()
+         };
++        let mut requested = Vec::new();
++        for field in ["path", "symbol"] {
++            if let Some(path) = parameters.get(field).and_then(Value::as_str) {
++                requested.push(path.to_owned());
++            }
++        }
++        for field in ["files", "items", "symbols"] {
++            if let Some(items) = parameters.get(field).and_then(Value::as_array) {
++                for item in items {
++                    if let Some(path) = item.as_str().or_else(|| {
++                        item.get("path")
++                            .or_else(|| item.get("symbol"))
++                            .and_then(Value::as_str)
++                    }) {
++                        requested.push(path.to_owned());
++                    }
++                }
++            }
++        }
++        let progress = Arc::new(Mutex::new(progress::Progress {
++            requested,
++            ..Default::default()
++        }));
+         if retain_detail {
+             ledger.details.insert(
+                 reference.clone(),
+                 Detail {
++                    progress: progress.clone(),
+                     binding: binding.clone(),
+                     reply: PeerReply::Pending {
+                         detail_ref: reference.clone(),
+@@ -2504,6 +2605,7 @@ impl WorkerHandle {
+             requests.insert(reference.clone(), request.to_owned());
+         }
+         let job = Job {
++            progress,
+             reference: reference.clone(),
+             invocation,
+             tool,
+@@ -3692,7 +3794,11 @@ impl<'a> Worker<'a> {
+         }
+     }
+     /// Rechecks queued liveness, executes only the selected owner operation, and fences every result.
++    /// Starts/resumes exclusive stage timing and journals read/edit totals only on settlement.
+     async fn perform(&mut self, job: &mut Job) {
++        if let Ok(mut progress) = job.progress.lock() {
++            progress.switch(Some(if job.stage.is_some() { "check" } else { "plan" }));
++        }
+         let binding = job.invocation.binding_ref().clone();
+         self.providers.begin_job();
+         let was_parked = job.park_until.take().is_some();
+@@ -3821,6 +3927,11 @@ impl<'a> Worker<'a> {
+             self.answer_while_loading(job).await;
+         }
+         if job.park_until.is_some() {
++            if job.stage.is_none()
++                && let Ok(mut progress) = job.progress.lock()
++            {
++                progress.switch(Some("provider_wait"));
++            }
+             return;
+         }
+         self.settle_session_health(job).await;
+@@ -3868,6 +3979,13 @@ impl<'a> Worker<'a> {
+             },
+             other => other,
+         };
++        if let Ok(mut progress) = job.progress.lock() {
++            progress.journal(
++                job.tool,
++                &job.reference,
++                self.shared.request_of(&job.reference).as_deref(),
++            );
++        }
+         self.journal_job_failure(job, &reply);
+         if let Some(authority) = &authority {
+             self.observe_head(&binding, authority);
+@@ -5970,6 +6088,9 @@ impl<'a> Worker<'a> {
+         source: SourceObservation,
+         await_check: bool,
+     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
++        if let Ok(mut progress) = job.progress.lock() {
++            progress.switch(Some("commit"));
++        }
+         let binding = job.invocation.binding_ref().clone();
+         let authority = match self.authority(&binding).await {
+             Ok(authority) => authority,
+@@ -6064,6 +6185,12 @@ impl<'a> Worker<'a> {
+             | crate::workspace::edit::EditOutcome::Unchanged(read) => Some(read),
+             _ => None,
+         };
++        if let Ok(mut progress) = job.progress.lock() {
++            if known {
++                progress.committed.push(request.path.clone());
++            }
++            progress.switch(Some("check"));
++        }
+         let (refreshed, diagnostics) = if known {
+             match self.observe(&binding, request.path.clone().into()).await {
+                 Ok((observed, bytes)) => {
+@@ -6841,6 +6968,7 @@ async fn reprove_disclosure(
+ /// reference path, so a newly denied secondary file invalidates its cached page.
+ /// Complete diff hunks on a delivered continuation join the binding's incremental memory;
+ /// an authorization, freshness or encoding refusal never records that page as delivered.
++/// A cancelled inspection retains its composed source page for the next retrieval.
+ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
+     if fault_seam("inspection") {
+         panic!("agent-ide test seam: deliberate inspection panic");
+@@ -7120,6 +7248,13 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
+         if carries_feedback {
+             shared.mark_feedback_inline_delivered(&request.binding, &request.reference, &reply);
+         }
++    } else if let Ok(mut ledger) = shared.ledger.lock()
++        && let Some(detail) = ledger.details.get_mut(&request.reference)
++        && detail.context_page.is_some()
++    {
++        // A bounded inspect can leave while authority is checked or a page is composed.
++        // Keep that undelivered page fresh rather than advancing past it on the next call.
++        detail.context_page_fresh = true;
+     }
+ }
+ 
+@@ -8827,6 +8962,7 @@ mod stop_retry_tests {
+             parameters["root"] = serde_json::json!(root);
+         }
+         let mut job = Job {
++            progress: Default::default(),
+             reference: format!("provider-{id}"),
+             invocation,
+             tool: AssistanceTool::Start,
+@@ -8863,6 +8999,7 @@ mod stop_retry_tests {
+         let (cancel_sender, cancel) = watch::channel(false);
+         let _keep = cancel_sender;
+         let mut job = Job {
++            progress: Default::default(),
+             reference: format!("provider-{call}"),
+             invocation,
+             tool: AssistanceTool::Symbol,
+@@ -8933,6 +9070,7 @@ mod stop_retry_tests {
+         let binding = invocation.binding_ref().clone();
+         let (_cancel_sender, cancel) = watch::channel(false);
+         let mut job = Job {
++            progress: Default::default(),
+             reference: format!("production-{id}"),
+             invocation,
+             tool: AssistanceTool::Start,
+@@ -9933,6 +10071,7 @@ mod stop_retry_tests {
+         let (observed, _) = worker.observe(&binding, file.clone()).await.unwrap();
+         let (_cancel_sender, cancel) = watch::channel(false);
+         let mut job = Job {
++            progress: Default::default(),
+             reference: "provider-sh-1".into(),
+             invocation,
+             tool: AssistanceTool::Symbol,
+@@ -10004,6 +10143,7 @@ mod stop_retry_tests {
+         let (cancel_sender, cancel) = watch::channel(false);
+         let _keep = cancel_sender;
+         let mut job = Job {
++            progress: Default::default(),
+             reference: format!("scripted-{call}"),
+             invocation,
+             tool,
+@@ -10684,6 +10824,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             reference.to_owned(),
+             Detail {
++                progress: Default::default(),
+                 binding: binding.clone(),
+                 reply,
+                 selection: (
+@@ -10790,6 +10931,7 @@ mod stop_retry_tests {
+         let invocation = production_call(worker, actor, call);
+         let (cancel_sender, cancel) = watch::channel(false);
+         let job = Job {
++            progress: Default::default(),
+             reference: format!("start-{call}"),
+             invocation,
+             tool: AssistanceTool::Start,
+@@ -11190,6 +11332,7 @@ mod stop_retry_tests {
+         let invocation = production_call(&worker, "edit-actor", "edit-context");
+         let (_cancel_sender, cancel) = watch::channel(false);
+         let mut context_job = Job {
++            progress: Default::default(),
+             reference: "context-source".into(),
+             invocation,
+             tool: AssistanceTool::Context,
+@@ -11210,6 +11353,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             context_job.reference.clone(),
+             Detail {
++                progress: Default::default(),
+                 binding: binding.clone(),
+                 reply: context_reply,
+                 selection: (AssistanceTool::Context, selection(&context_job.parameters)),
+@@ -11229,6 +11373,7 @@ mod stop_retry_tests {
+         let invocation = production_call(&worker, "edit-actor", "edit-call");
+         let (_cancel_sender, cancel) = watch::channel(false);
+         let mut edit_job = Job {
++            progress: Default::default(),
+             reference: "edit-result".into(),
+             invocation,
+             tool: AssistanceTool::Edit,
+@@ -11277,6 +11422,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             edit_job.reference.clone(),
+             Detail {
++                progress: Default::default(),
+                 binding: binding.clone(),
+                 reply: reply.clone(),
+                 selection: (AssistanceTool::Edit, selection(&edit_job.parameters)),
+@@ -11430,6 +11576,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             reference.to_owned(),
+             Detail {
++                progress: Default::default(),
+                 binding: binding.clone(),
+                 reply,
+                 selection: (AssistanceTool::Read, selection(&parameters)),
+@@ -11469,6 +11616,7 @@ mod stop_retry_tests {
+                     worker.shared.ledger.lock().unwrap().details.insert(
+                         reference.to_owned(),
+                         Detail {
++                            progress: Default::default(),
+                             binding,
+                             selection: (AssistanceTool::Edit, selection(&job.parameters)),
+                             line_movement: reply_line_movement(&reply),
+@@ -12444,6 +12592,7 @@ mod stop_retry_tests {
+                 .unwrap()
+                 .insert(reference.to_owned(), format!("req-for-{reference}"));
+             let job = Job {
++                progress: Default::default(),
+                 reference: reference.to_owned(),
+                 invocation,
+                 tool: AssistanceTool::Context,
+@@ -12488,7 +12637,8 @@ mod stop_retry_tests {
+     /// inspection hands a retained terminal result to its caller: a settled success and a cached
+     /// *failed* result are delivered; a reference this daemon never minted or no longer retains, a
+     /// result still `pending`, and a caller that already left are not — and no other inspection of
+-    /// the same reference can take or inherit the evidence.
++    /// the same reference can take or inherit the evidence. A cancelled source-page inspection
++    /// leaves its first or expanded page available for the next caller.
+     #[tokio::test]
+     async fn inspection_reports_typed_delivery_evidence() {
+         let fixture = Fixture::new();
+@@ -12498,6 +12648,7 @@ mod stop_retry_tests {
+         worker.observations.install_schema().await.unwrap();
+         let (binding, _) = production_start(&mut worker, "delivery-actor", "delivery-start").await;
+         let retained = |reply: PeerReply| Detail {
++            progress: Default::default(),
+             binding: binding.clone(),
+             reply,
+             selection: (AssistanceTool::Read, [0; 32]),
+@@ -12596,6 +12747,35 @@ mod stop_retry_tests {
+         // next inspection of the same reference starts from its own clean flag — here a refusal
+         // (another binding's view of the reference) must not inherit a stale true.
+         let (_, _) = inspect("ok-ref", false).await;
++        // Timeout/caller cancellation must preserve both the first and an expanded source page.
++        let (first, page) = ContextPageState::new(
++            "a retained row\n".repeat(20_000),
++            0,
++            false,
++            ResultKind::Read,
++        )
++        .next("paged-ref")
++        .unwrap();
++        assert!(page.is_some());
++        let mut detail = retained(first.clone());
++        detail.context_page = page;
++        detail.context_page_fresh = true;
++        worker
++            .shared
++            .ledger
++            .lock()
++            .unwrap()
++            .details
++            .insert("paged-ref".into(), detail);
++        inspect("paged-ref", false).await;
++        let (received, _) = inspect("paged-ref", true).await;
++        assert_eq!(received.unwrap().encode(), first.encode());
++        inspect("paged-ref", false).await;
++        let composed = worker.shared.ledger.lock().unwrap().details["paged-ref"]
++            .reply
++            .clone();
++        let (received, _) = inspect("paged-ref", true).await;
++        assert_eq!(received.unwrap().encode(), composed.encode());
+         let (other_reply, other_rx) = oneshot::channel();
+         let other_delivery = Arc::new(std::sync::atomic::AtomicBool::new(false));
+         serve_inspection(
+@@ -12900,6 +13080,7 @@ mod stop_retry_tests {
+         let invocation = production_call(worker, actor, id);
+         let (_cancel_sender, cancel) = watch::channel(false);
+         let mut job = Job {
++            progress: Default::default(),
+             reference: format!("problems-{id}"),
+             invocation,
+             tool: AssistanceTool::Context,
+@@ -13051,6 +13232,7 @@ mod stop_retry_tests {
+         let (cancel_sender, cancel) = watch::channel(false);
+         (
+             Job {
++                progress: Default::default(),
+                 reference: "continuation-detail".into(),
+                 invocation,
+                 tool: AssistanceTool::Context,
+@@ -13184,6 +13366,7 @@ mod stop_retry_tests {
+         handle.shared.ledger.lock().unwrap().details.insert(
+             reference.to_owned(),
+             Detail {
++                progress: Default::default(),
+                 binding: binding.clone(),
+                 reply,
+                 selection: (
+@@ -13204,6 +13387,112 @@ mod stop_retry_tests {
+         );
+     }
+ 
++    /// Queued and pre-commit edits never claim a write; the same retained slot later exposes
++    /// only confirmed paths and escapes labels without replacing its pending internal state.
++    /// Worst-case labels fit both carriers; a blocked authorization refuses at its wait deadline.
++    #[tokio::test]
++    async fn progress_preserves_no_commit_and_confirmed_subset() {
++        let fixture = Fixture::new();
++        let handle = detail_handle(&fixture.root, 8);
++        let invocation = validated_call(&handle.shared.bindings, "progress", "progress-call");
++        let binding = invocation.binding_ref().clone();
++        let reference = handle
++            .enqueue(
++                invocation,
++                AssistanceTool::Edit,
++                serde_json::json!({"files":[{"path":"first.rs"},{"path":"second.rs"}]}),
++                "stop-retry",
++                None,
++                None,
++            )
++            .unwrap();
++        let pending = PeerReply::Pending {
++            detail_ref: reference.clone(),
++        };
++        let progress = handle.shared.ledger.lock().unwrap().details[&reference]
++            .progress
++            .clone();
++        for stage in [None, Some("format")] {
++            progress.lock().unwrap().switch(stage);
++            let reply = handle.progress_reply(&binding, &reference, pending.clone());
++            let PeerReply::Complete {
++                kind: ResultKind::EditProgress,
++                text,
++                ..
++            } = reply
++            else {
++                panic!("{reply:?}")
++            };
++            assert!(
++                text.contains("committed: none") && text.contains(stage.unwrap_or("queued")),
++                "{text}"
++            );
++            assert!(
++                content::render_with_status(
++                    handle.progress_reply(&binding, &reference, pending.clone()),
++                    None,
++                    content::Envelope::WithStructured
++                )
++                .is_some()
++            );
++        }
++        progress
++            .lock()
++            .unwrap()
++            .committed
++            .push("first.rs\nforged".into());
++        let reply = handle.progress_reply(&binding, &reference, pending);
++        let PeerReply::Complete { text, .. } = reply else {
++            panic!("{reply:?}")
++        };
++        assert!(!text.contains('\n'), "{text}");
++        assert!(
++            text.contains("committed: first.rs") && !text.contains("committed: second.rs"),
++            "{text}"
++        );
++        assert!(matches!(
++            handle.shared.ledger.lock().unwrap().details[&reference].reply,
++            PeerReply::Pending { .. }
++        ));
++        // Worst-case batch labels still fit the actual structured carrier after escaping.
++        {
++            let mut progress = progress.lock().unwrap();
++            progress.requested = vec!["\u{202e}".repeat(512); 32];
++            progress.committed = progress.requested.clone();
++        }
++        let large = handle.progress_reply(
++            &binding,
++            &reference,
++            PeerReply::Pending {
++                detail_ref: reference.clone(),
++            },
++        );
++        assert!(content::fits(&large, content::Envelope::WithStructured));
++        assert!(content::fits(&large, content::Envelope::TextOnly));
++        // An inspection that cannot complete authorization must not reveal ledger progress.
++        let bounded = handle
++            .inspect_call(
++                binding,
++                &serde_json::json!({"detail_ref":reference, "wait_s":1}),
++                "stop-retry",
++                Arc::new(std::sync::atomic::AtomicBool::new(false)),
++            )
++            .await;
++        assert!(
++            matches!(
++                bounded,
++                PeerReply::Error {
++                    code: FailureCode::Deadline,
++                    ..
++                }
++            ),
++            "{bounded:?}"
++        );
++        let task = handle.task.lock().unwrap().take().unwrap();
++        task.abort();
++        assert!(task.await.unwrap_err().is_cancelled());
++    }
++
+     /// Concurrent start retries coalesce only when their environment selections are identical.
+     #[tokio::test]
+     async fn environment_start_coalescing_preserves_new_choices() {
+@@ -13742,6 +14031,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             job.reference.clone(),
+             Detail {
++                progress: Default::default(),
+                 binding: binding.clone(),
+                 reply: PeerReply::Pending {
+                     detail_ref: job.reference.clone(),
+@@ -13867,6 +14157,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             job.reference.clone(),
+             Detail {
++                progress: Default::default(),
+                 binding: binding.clone(),
+                 reply: PeerReply::Pending {
+                     detail_ref: job.reference.clone(),
+@@ -13962,6 +14253,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             job.reference.clone(),
+             Detail {
++                progress: Default::default(),
+                 binding,
+                 reply: PeerReply::Pending {
+                     detail_ref: job.reference.clone(),
+@@ -14033,6 +14325,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             "foreign-detail".into(),
+             Detail {
++                progress: Default::default(),
+                 binding: other_binding,
+                 reply: PeerReply::Complete {
+                     kind: ResultKind::Context,
+@@ -14630,6 +14923,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             "start-first".into(),
+             Detail {
++                progress: Default::default(),
+                 binding: binding.clone(),
+                 reply: PeerReply::Complete {
+                     kind: ResultKind::Activation,
+@@ -14690,6 +14984,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             job.reference.clone(),
+             Detail {
++                progress: Default::default(),
+                 binding,
+                 reply: PeerReply::Pending {
+                     detail_ref: job.reference.clone(),
+@@ -14777,6 +15072,7 @@ mod stop_retry_tests {
+         worker.shared.ledger.lock().unwrap().details.insert(
+             reference.to_owned(),
+             Detail {
++                progress: Default::default(),
+                 binding: binding.clone(),
+                 reply: PeerReply::Pending {
+                     detail_ref: reference.to_owned(),
+@@ -14805,6 +15101,7 @@ mod stop_retry_tests {
+         let (cancel_sender, cancel) = watch::channel(false);
+         (
+             Job {
++                progress: Default::default(),
+                 reference: reference.to_owned(),
+                 invocation,
+                 tool: AssistanceTool::Diff,
+@@ -15069,6 +15366,7 @@ mod stop_retry_tests {
+         let (cancel_sender, cancel) = watch::channel(false);
+         (
+             Job {
++                progress: Default::default(),
+                 reference: reference.into(),
+                 invocation,
+                 tool,
+@@ -15281,6 +15579,7 @@ mod stop_retry_tests {
+                 let (cancel_sender, cancel) = watch::channel(false);
+                 (
+                     Job {
++                        progress: Default::default(),
+                         reference: "stage-symbol".into(),
+                         invocation,
+                         tool: AssistanceTool::Symbol,
+diff --git a/crates/agent-ide-core/src/assistance/worker/stop_retry_tests/availability.rs b/crates/agent-ide-core/src/assistance/worker/stop_retry_tests/availability.rs
+index 7a17e364..272a1ed4 100644
+--- a/crates/agent-ide-core/src/assistance/worker/stop_retry_tests/availability.rs
++++ b/crates/agent-ide-core/src/assistance/worker/stop_retry_tests/availability.rs
+@@ -24,6 +24,7 @@ async fn scripted_symbol_attempt(
+     let (cancel_sender, cancel) = watch::channel(false);
+     let _keep = cancel_sender;
+     let mut job = Job {
++        progress: Default::default(),
+         reference: format!("attempt-{call}"),
+         invocation,
+         tool: AssistanceTool::Symbol,
+@@ -53,6 +54,7 @@ async fn provider_start_text(worker: &mut Worker<'_>, actor: &str, id: &str) ->
+     let invocation = production_call(worker, actor, id);
+     let (_cancel_sender, cancel) = watch::channel(false);
+     let mut job = Job {
++        progress: Default::default(),
+         reference: format!("provider-text-{id}"),
+         invocation,
+         tool: AssistanceTool::Start,
+@@ -447,6 +449,7 @@ fn waiting_job(
+     worker.shared.ledger.lock().unwrap().details.insert(
+         reference.clone(),
+         Detail {
++            progress: Default::default(),
+             binding: invocation.binding_ref().clone(),
+             reply: PeerReply::Pending {
+                 detail_ref: reference.clone(),
+@@ -467,6 +470,7 @@ fn waiting_job(
+     let (send, wait) = oneshot::channel();
+     let (cancel_sender, cancel) = watch::channel(false);
+     let job = Job {
++        progress: Default::default(),
+         reference,
+         invocation,
+         tool,
+diff --git a/docs/contracts/tools-v0.4.md b/docs/contracts/tools-v0.4.md
+index 7312950e..ea682de5 100644
+--- a/docs/contracts/tools-v0.4.md
++++ b/docs/contracts/tools-v0.4.md
+@@ -86,7 +86,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
+ 3. **Keep responses compact.** Responses contain no internal bookkeeping fields (`authority_epoch`, hashes, generations). Lists have ceilings and report “N more”; retrieve the complete list through `detail_ref`.
+ 4. Model refusals follow harness-reply-v1 r5: one head sentence (at most 160 UTF-8 bytes), exactly one Repair line (at most 120 bytes), and optional bounded current text. Internal reason/stage codes remain in operator journals and typed compatibility data, not model text.
+ 5. The language server runs as it would in a human's editor and remains alive for the session.
+-6. Every host returns an immediately available result directly. Long work stays retained under its reference; Bridge delivers it automatically when configured. The reference allows explicit retrieval of its body without polling or waiting.
++6. Every host returns an immediately available result directly. Long work stays retained under its reference; Bridge delivers it automatically when configured. Explicit retrieval may include one bounded `ide.inspect` wait; repeated polling instructions remain prohibited.
+ 
+ `ide.start` refusals name the actionable cause: an absent requested root includes the nearest existing ancestor under an allowed root; Git discovery failures include a short reason; unresolved worktrees and durable state failures have distinct stages. A worktree conflict says whether another actor owns it, this actor's other channel owns it, or this actor already owns another worktree, and names `ide.stop` or reuse as the remedy. An `ide.start` of another root by the actor that already holds an activation elsewhere hands that activation over without an `ide.stop` when nothing is pending on it (no queued or pending job, no edit that is unsettled or `outcome_unknown`, no running test): the old authority, provider ownership and leases are released as a stop would release them, the same session's grant moves to the new root in one durable step (a stopped session cannot start again), another session of the actor is revoked and stopped first, and the handover is journaled (`handover: released <path>`). Otherwise the `start:actor_owns_another_worktree` refusal stays, names the held worktree path and what keeps it (`; worktree <path>; kept: <reason>`), and releases nothing; another actor's activation is never touched by that handover. A writer start that meets another actor's writer takes it over only when that holder's session ended (its MCP front's lease closed and nothing arrived from it since) or when it has had no tool call and no IDE work in flight for 30 minutes; the reply names the displaced holder and the evidence, and the displaced actor's next call answers `taken_over` ([start-index-state](start-index-state-v1.md) §4). Provider cache namespace conflicts have their own stage and recovery. A successful repeat by the same actor and binding reports the existing activation idempotently. The start card explains which tools can answer from source while a language server starts. Its baseline says why coverage is partial: Git metadata and source bytes are captured separately, so an atomic window is not proven.
+ 
+@@ -369,6 +369,13 @@ graph: callees of src/Button.tsx#Button (depth 2, 2 nodes, 1 edges)
+ 
+ Input: `{symbol}`, `{path, lines: "120-180"}` or `{path}` (the whole file).
+ 
++Plain whole-file and line-range reads, including batch items and `ranges`, return authorized
++source text without starting or awaiting a language provider. Provider-based symbol enrichment
++is available separately through `ide.symbol`; no semantic completeness is implied by a lexical
++read. Source freshness, confinement and delivered-window edit guards still apply.
++Local name-index links may accompany the text; a building index cannot postpone plain source
++delivery and reports its availability separately.
++
+ Output is code with line numbers and the header included:
+ 
+ ```text
+@@ -400,6 +407,21 @@ Errors: `no_such_file` (the requested path does not exist in the worktree; fix t
+ 
+ ### 2.5 `ide.edit` — edit a symbol or range (implemented)
+ 
++When the eight-second inline reply window expires before settlement, the reply has
++`state: complete`, `kind: edit_progress`, and the retained `detail_ref`. Its text names requested
++paths, the confirmed committed subset (or `committed: none`), and the active stage (`queued`,
++`plan`, `format`, `gate`, `commit`, `check`, or `provider_wait`). This is nonterminal progress,
++never an applied outcome or a promise that a check environment is available. Inspect the same
++reference for the eventual outcome; do not repeat the edit to obtain its result. Before a check
++has produced an analysable snapshot, committed-file/stage progress replaces a pending-check
++promise. Unavailable checks keep their explicit classification in the settled result.
++Escaped path labels longer than 256 bytes end in an ellipsis to preserve the bounded carrier.
++
++Each read/edit request journals exclusive stage durations under its correlation/reference;
++edit stages are plan, format, gate, commit, check and provider_wait, while reads record plan and
++provider_wait. A stage exceeding the inline window is a warning visible in `agent-ide errors`.
++Stage records include duration_ms and no source text or file paths.
++
+ > E-003 (symbol-read-edit-v1 §3-§5): no form needs `source_ref` or `operation_id` (a missing id is generated); the current text is the base. New forms: a unit window (`file#Type/m:3-5` with `content`, guarded by the session's last read of the unit), `old`/`new` scoped to a unit, a window or the file (aliases `file_path`, `old_string`, `new_string`), `@` regions, `add_import`/`remove_import`, a whole-file `content` replacement, and Codex `patch` (Add File and Update File). Every success reply lists the changed lines by address (`  file#unit:N-M (L<a>-<b>)  <verb> (<k> lines → <m>)`), prints no `source_ref`, and arrives without waiting for the project check. Where the text below says otherwise, this note wins.
+ 
+ Input operations:
+@@ -568,6 +590,16 @@ Input: `{"kind":"problems","language"?:"rust","offset"?:0}` or
+ `{"kind":"diagnostics","path":"src/a.rs"}`. Language/offset apply only to problems;
+ path applies only to diagnostics. Retained pages use `detail_ref` separately.
+ 
++Retained references accept `wait_s`, an integer from 1 through 30 seconds, with `detail_ref` or
++`detail_refs`. Omission retrieves the current state immediately. A single bounded wait returns
++when a result settles or at the requested deadline, whichever comes first; expiry cancels no
++work and returns truthful progress. The bound covers the whole reference batch. It cannot be
++combined with private legacy `wait_ms` or the problems/diagnostics query modes. Guidance may
++teach this single bounded retrieval; instructions to poll, sleep and retry, or wait until idle
++remain prohibited. Automatic Bridge completion remains available when configured.
++If inspection itself cannot finish its authority/source checks within the bound, it returns a
++deadline refusal without revealing unverified progress; the retained job continues.
++
+ Problems use the existing project feed, capped at 20 entries per page with `next_offset`.
+ File diagnostics use the existing provider observation and generation/version checks;
+ unknown remains unknown, unversioned nonempty counts remain provisional lower bounds,
+diff --git a/schemas/tools-codex.json b/schemas/tools-codex.json
+index b0406550..3eda8251 100644
+--- a/schemas/tools-codex.json
++++ b/schemas/tools-codex.json
+@@ -164,6 +164,12 @@
+         "path": {
+           "description": "With diagnostics: worktree-relative file.",
+           "type": "string"
++        },
++        "wait_s": {
++          "description": "Completion seconds.",
++          "maximum": 30,
++          "minimum": 1,
++          "type": "integer"
+         }
+       },
+       "type": "object"
+diff --git a/schemas/tools.json b/schemas/tools.json
+index f243eed7..c36cab35 100644
+--- a/schemas/tools.json
++++ b/schemas/tools.json
+@@ -292,6 +292,12 @@
+         "path": {
+           "description": "With diagnostics: worktree-relative file.",
+           "type": "string"
++        },
++        "wait_s": {
++          "description": "Completion seconds.",
++          "maximum": 30,
++          "minimum": 1,
++          "type": "integer"
+         }
+       },
+       "type": "object"
+diff --git a/tests/batch_api/mod.rs b/tests/batch_api/mod.rs
+index c517f4ff..d76d0024 100644
+--- a/tests/batch_api/mod.rs
++++ b/tests/batch_api/mod.rs
+@@ -1193,22 +1193,15 @@ async fn slow_multi_file_edit_check_answers_at_once_with_pending_diagnostics() {
+     )
+     .await;
+     assert_eq!(
+-        edit["state"], "edit_batch",
+-        "the check never parks the reply: {edit} {text}"
++        edit["kind"], "edit_progress",
++        "an unproven check reports committed files and stage: {edit} {text}"
+     );
+     assert!(
+-        text.starts_with("edit: applied 2 of 2 files; diagnostics: pending"),
++        text.contains("committed: src/lib.rs, src/a.rs") && text.contains("stage: check"),
+         "{text}"
+     );
+     assert_no_source_ref(&text);
+-    assert!(
+-        text.contains("diagnostics: pending; project check retained under"),
+-        "{text}"
+-    );
+-    assert!(
+-        text.contains("Bridge delivers it automatically when configured"),
+-        "{text}"
+-    );
++    assert!(!text.contains("diagnostics: pending"), "{text}");
+     actor.call(&fixture, "ide.stop", json!({})).await;
+     actor.mcp.close().await;
+     daemon.kill().await.unwrap();
+diff --git a/tests/module_context_links.rs b/tests/module_context_links.rs
+index 70d967cc..ed2576b7 100644
+--- a/tests/module_context_links.rs
++++ b/tests/module_context_links.rs
+@@ -91,10 +91,9 @@ async fn settled(mode: &str, requests: &[Value]) -> Vec<String> {
+     let started = std::time::Instant::now();
+     let replies = loop {
+         let replies = context(&fixture, &mut session, requests).await;
+-        if replies
+-            .iter()
+-            .all(|reply| !reply.contains("unavailable for:"))
+-            || started.elapsed() > std::time::Duration::from_secs(40)
++        if replies.iter().all(|reply| {
++            !reply.contains("unavailable for:") && !reply.contains("related_links: unavailable")
++        }) || started.elapsed() > std::time::Duration::from_secs(40)
+         {
+             break replies;
+         }
+@@ -176,6 +175,7 @@ async fn the_related_links_block_is_identical_in_every_mixed_setting() {
+ /// Every usage row stays in the block, past the card's ceiling of 30: the rows that do not fit the
+ /// first reply page follow on the reply's own `detail_ref` pages. Read keeps its exact numbered
+ /// source before the links, and the fully delivered reference still authorizes the same bytes.
++/// Warm the advisory index explicitly: lexical source delivery no longer waits for it.
+ #[tokio::test]
+ async fn long_usage_lists_continue_on_the_replys_own_pages() {
+     const FILES: usize = 1200;
+@@ -202,11 +202,11 @@ async fn long_usage_lists_continue_on_the_replys_own_pages() {
+             .call(
+                 &fixture,
+                 source_query_tool(&json!({"path":"wide.css"})),
+-                json!({"path":"wide.css"}),
++                json!({"path":"wide.css", "force":true}),
+             )
+             .await;
+         let text = reply["text"].as_str().unwrap_or_default();
+-        if !text.contains("unavailable for:")
++        if (!text.contains("unavailable for:") && !text.contains("related_links: unavailable"))
+             || started.elapsed() > std::time::Duration::from_secs(40)
+         {
+             break reply;
+diff --git a/tests/product_mcp_contract.rs b/tests/product_mcp_contract.rs
+index 83e99e61..dd79597c 100644
+--- a/tests/product_mcp_contract.rs
++++ b/tests/product_mcp_contract.rs
+@@ -632,6 +632,7 @@ fn refusal_shape_holds(text: &str) -> bool {
+ /// may legitimately occur in the compact block, while the complete typed value remains separate.
+ /// A reply-delivered host's terminal reply may lead with the due status plate (T28B); the plate is
+ /// stripped from the text before the state comparison and must lead the structured copy's text too.
++/// Nonterminal edit progress carries confirmed paths and stage rather than an edit outcome.
+ fn assert_compact_envelope(reply: &Value) {
+     let result = reply["result"].as_object().expect("tool result object");
+     let content = result["content"].as_array().expect("content array");
+@@ -756,6 +757,12 @@ fn assert_compact_envelope(reply: &Value) {
+             }
+         }
+         // Unlabelled replies (harness-reply-v1 R2): the text is the delivery itself.
++        ("complete", Some("edit_progress")) => {
++            assert!(
++                text.contains("committed:") && text.contains("stage:"),
++                "{reply}"
++            );
++        }
+         ("complete", Some("activation" | "diff" | "stop")) => {
+             assert!(!body.is_empty(), "{reply}")
+         }
+@@ -6607,6 +6614,244 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
+     daemon.wait().await.unwrap();
+ }
+ 
++/// Replays cold matrix request shapes against actual configured providers and prints the
++/// exclusive journaled stages. Each fixture owns its provider cache and home; no warm semantic
++/// call precedes the measured request. Source/write assertions also protect the public result.
++#[tokio::test]
++#[ignore = "requires accepted Rust and TypeScript provider environment"]
++async fn cold_matrix_reply_shapes_journal_stage_timings() {
++    for edit in [false, true] {
++        let fixture = if edit {
++            ProductFixture::new(json!([accepted_typescript_provider()]))
++        } else {
++            symbol_test_fixture()
++        };
++        let count = if edit { 9 } else { 5 };
++        let mut items = Vec::new();
++        let mut files = Vec::new();
++        for index in 0..count {
++            let path = format!("src/cold_{index}.{}", if edit { "ts" } else { "rs" });
++            let content = if edit {
++                format!("export const value{index} = 1;\n")
++            } else {
++                format!("pub fn value{index}() -> i32 {{ 1 }}\n")
++            };
++            std::fs::write(fixture.root.join(&path), &content).unwrap();
++            items.push(json!({"path":path,"lines":"1-1"}));
++            files.push(json!({"path":path,"changes":[{"old":"= 1", "new":"= 2"}]}));
++        }
++        if edit {
++            std::fs::write(
++                fixture.root.join("tsconfig.json"),
++                "{\"compilerOptions\":{\"types\":[]},\"include\":[\"src/*.ts\"]}",
++            )
++            .unwrap();
++        }
++        let home = provider_home(&fixture);
++        let mut daemon = fixture.daemon_with_home(Some(&home)).await;
++        let mut actor = ProductActor::new(&fixture, "cold-matrix-shape").await;
++        let started = actor.call(&fixture, "ide.start", json!({})).await;
++        assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
++        let began = std::time::Instant::now();
++        let reply = if edit {
++            actor
++                .call(&fixture, "ide.edit", json!({"files":files}))
++                .await
++        } else {
++            actor
++                .call(&fixture, "ide.read", json!({"items":items}))
++                .await
++        };
++        assert_ne!(reply["state"], "pending", "bare inline handle: {reply}");
++        if !edit {
++            assert_eq!(reply["kind"], "read", "{reply}");
++            assert!(
++                reply["text"].as_str().unwrap().contains("value4"),
++                "{reply}"
++            );
++        }
++        eprintln!(
++            "cold matrix {} inline {:?}: {}",
++            if edit { "edit-9" } else { "read-5" },
++            began.elapsed(),
++            reply
++        );
++        let reference = reply["detail_ref"]
++            .as_str()
++            .or_else(|| reply["source_ref"].as_str())
++            .unwrap()
++            .to_owned();
++        let mut settled = actor.settle(&fixture, reply).await;
++        // Progress is a nonterminal complete envelope, so explicitly retrieve its final body.
++        for _ in 0..120 {
++            if settled["kind"] != "edit_progress" {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(250)).await;
++            settled = actor
++                .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
++                .await;
++        }
++        let events = std::fs::read_dir(home.join(".agent-ide/logs"))
++            .unwrap()
++            .flatten()
++            .flat_map(|entry| agent_ide::errorlog::read_events(&entry.path()))
++            .collect::<Vec<_>>();
++        let stages = events
++            .iter()
++            .filter(|event| {
++                event.correlation.as_deref() == Some(&reference)
++                    && event
++                        .detail
++                        .as_deref()
++                        .is_some_and(|detail| detail.starts_with("stage: "))
++            })
++            .collect::<Vec<_>>();
++        assert!(
++            !stages.is_empty(),
++            "missing stages for {reference}: {events:?}"
++        );
++        if !edit {
++            assert!(
++                stages.iter().any(|event| event
++                    .detail
++                    .as_deref()
++                    .is_some_and(|detail| detail.starts_with("stage: provider_wait;"))
++                    && event.duration_ms == Some(0)),
++                "plain reads awaited a provider: {stages:?}"
++            );
++            assert_eq!(settled["kind"], "read", "{settled}");
++        }
++        for event in stages {
++            eprintln!(
++                "cold matrix stage {} {}ms",
++                event.detail.as_deref().unwrap(),
++                event.duration_ms.unwrap()
++            );
++        }
++        if edit {
++            for index in 0..count {
++                assert!(
++                    std::fs::read_to_string(fixture.root.join(format!("src/cold_{index}.ts")))
++                        .unwrap()
++                        .contains("= 2"),
++                    "{settled}"
++                );
++            }
++        } else {
++            assert!(
++                settled["text"].as_str().unwrap().contains("value4"),
++                "{settled}"
++            );
++        }
++        actor.call(&fixture, "ide.stop", json!({})).await;
++        actor.mcp.close().await;
++        daemon.kill().await.unwrap();
++        daemon.wait().await.unwrap();
++    }
++}
++
++/// A first check held at an explicit gate cannot promise a working environment. After commit,
++/// inline expiry names the files and check stage; one bounded inspect expires without cancelling
++/// work, then a released check settles inside the next bound. The CLI exposes its slow stage.
++#[tokio::test]
++async fn edit_progress_and_bounded_inspect_preserve_committed_files() {
++    let fixture = ProductFixture::new(json!([]));
++    let home =
++        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
++    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
++    let mut actor = ProductActor::new(&fixture, "stage-progress").await;
++    let start = actor.call(&fixture, "ide.start", json!({})).await;
++    assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
++    let reply = actor
++        .call(
++            &fixture,
++            "ide.edit",
++            json!({"files":[
++        {"path":"src/lib.rs","changes":[{"old":"{ 7 }","new":"{ 8 }"}]}]}),
++        )
++        .await;
++    assert_eq!(reply["kind"], "edit_progress", "{reply}");
++    let text = reply["text"].as_str().unwrap();
++    assert!(
++        text.contains("committed: src/lib.rs") && text.contains("stage: check"),
++        "{reply}"
++    );
++    assert!(!text.contains("diagnostics: pending"), "{reply}");
++    assert!(
++        std::fs::read_to_string(fixture.root.join("src/lib.rs"))
++            .unwrap()
++            .contains("8")
++    );
++    let reference = reply["detail_ref"].as_str().unwrap();
++    let began = std::time::Instant::now();
++    let pending = actor
++        .call(
++            &fixture,
++            "ide.inspect",
++            json!({"detail_ref":reference,"wait_s":1}),
++        )
++        .await;
++    assert!(
++        began.elapsed() >= Duration::from_millis(900) && began.elapsed() < Duration::from_secs(2),
++        "{:?}: {pending}",
++        began.elapsed()
++    );
++    assert_eq!(pending["kind"], "edit_progress", "{pending}");
++    let began = std::time::Instant::now();
++    let pending_batch = actor
++        .call(
++            &fixture,
++            "ide.inspect",
++            json!({"detail_refs":[reference,reference],"wait_s":1}),
++        )
++        .await;
++    assert!(
++        began.elapsed() >= Duration::from_millis(900) && began.elapsed() < Duration::from_secs(2),
++        "{:?}: {pending_batch}",
++        began.elapsed()
++    );
++    assert_eq!(pending_batch["kind"], "inspect", "{pending_batch}");
++    assert!(
++        pending_batch["text"]
++            .as_str()
++            .unwrap()
++            .contains("committed: src/lib.rs"),
++        "{pending_batch}"
++    );
++    release_checks_gate(&fixture);
++    let began = std::time::Instant::now();
++    let settled = actor
++        .call(
++            &fixture,
++            "ide.inspect",
++            json!({"detail_ref":reference,"wait_s":30}),
++        )
++        .await;
++    assert!(began.elapsed() < Duration::from_secs(30), "{settled}");
++    assert_eq!(settled["state"], "edit_batch", "{settled}");
++    assert_eq!(settled["files"][0]["path"], "src/lib.rs", "{settled}");
++    assert_eq!(settled["files"][0]["state"], "replaced", "{settled}");
++    let errors = Command::new(product_binary())
++        .args(["errors", "--repo"])
++        .arg(&fixture.runtime)
++        .env(agent_ide::userhome::HOME_OVERRIDE_ENV, &home)
++        .output()
++        .await
++        .unwrap();
++    let errors_text = String::from_utf8_lossy(&errors.stdout);
++    assert!(
++        errors.status.success()
++            && errors_text.contains("stage: check")
++            && errors_text.contains("inline_wait_exceeded: true"),
++        "{errors:?}"
++    );
++    actor.call(&fixture, "ide.stop", json!({})).await;
++    actor.mcp.close().await;
++    daemon.kill().await.unwrap();
++    daemon.wait().await.unwrap();
++}
++
+ /// OUTBOX-r4 §8.6: when an edit's project check outlasts the inline wait, the edit answers with
+ /// its write and `diagnostics: pending` (never a whole-reply `pending`), and the edit's own
+ /// reference later returns the settled reply — never the silent `inspect:internal` a
+@@ -6736,11 +6981,11 @@ async fn pending_and_batch_replies_never_invite_polling() {
+                    "files":[{"path":"src/lib.rs","changes":[{"lines":"1-1","content":"pub fn value() -> i32 { 7 }"}]}]}),
+         )
+         .await;
++    assert_eq!(edit["kind"], "edit_progress", "{edit}");
+     assert!(
+-        edit["text"].as_str().is_some_and(|text| {
+-            text.contains("diagnostics: pending; project check retained under")
+-                && text.contains("Bridge delivers it automatically when configured")
+-        }),
++        edit["text"].as_str().is_some_and(
++            |text| text.contains("committed: src/lib.rs") && text.contains("stage: check")
++        ),
+         "{edit}"
+     );
+     seen.push(edit);
+@@ -11926,23 +12171,35 @@ async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existin
+     )
+     .await;
+     let (applied, applied_text) = batch_settle_with_text(&mut actor, &fixture, applied).await;
+-    assert_eq!(
+-        batch_without_status_plate(&applied_text),
+-        format!(
+-            "edit: replaced; path src/broken.rs; {}\n  src/broken.rs:2 (L2)  replaced \
+-             (1 lines → 1)\nnote: src/broken.rs already had a syntax error (line 5) before this \
+-             edit; edit applied",
+-            batch_diagnostics_segment(&applied)
+-        ),
++    let applied_text = batch_without_status_plate(&applied_text);
++    assert!(
++        applied_text.starts_with("edit: replaced; path src/broken.rs; diagnostics: "),
+         "{applied_text}"
+     );
++    assert!(applied_text.ends_with("  src/broken.rs:2 (L2)  replaced (1 lines → 1)\nnote: src/broken.rs already had a syntax error (line 5) before this edit; edit applied"), "{applied_text}");
+     assert!(
+         matches!(
+             applied["diagnostics"]["state"].as_str(),
+-            Some("not_analysed" | "unknown")
++            Some("not_analysed" | "unknown" | "current_reported")
+         ),
+         "an undeclared file is never claimed clean: {applied}"
+     );
++    if applied["diagnostics"]["state"] == "current_reported" {
++        assert!(
++            applied["diagnostics"]["delta"]
++                .as_str()
++                .unwrap()
++                .contains("project check did not analyse this file"),
++            "{applied}"
++        );
++        assert!(
++            !applied["diagnostics"]["messages"]
++                .as_array()
++                .unwrap()
++                .is_empty(),
++            "{applied}"
++        );
++    }
+     assert_eq!(
+         std::fs::read(fixture.root.join("src/broken.rs")).unwrap(),
+         b"pub fn helper() -> i32 {\n    2\n}\n\npub fn target( -> i32 {\n    helper()\n}\n"

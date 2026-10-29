@@ -292,6 +292,12 @@
         "path": {
           "description": "With diagnostics: worktree-relative file.",
           "type": "string"
+        },
+        "wait_s": {
+          "description": "Completion seconds.",
+          "maximum": 30,
+          "minimum": 1,
+          "type": "integer"
         }
       },
       "type": "object"
