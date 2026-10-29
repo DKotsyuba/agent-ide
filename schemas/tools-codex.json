@@ -46,7 +46,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Batch related production/tests edits into one atomic multi-file `patch` using apply_patch syntax: *** Begin Patch, *** Add File or *** Update File, *** End Patch. Send {patch:\"…\"}, optionally operation_id for safe retries. Deleting or moving files is not supported. Read affected code first; include related edits and tests in one patch. The reply confirms the write; its project check completes separately.",
+    "description": "Batch related production/tests edits into one atomic multi-file `patch` using apply_patch syntax: *** Begin Patch, *** Add File or *** Update File, *** End Patch. Send {patch:\"…\"}, optionally operation_id for safe retries. Deleting or moving files is not supported. Read affected code first; include related edits and tests in one patch. Absolute file headers inside the worktree are accepted; outside paths refuse with a worktree-relative repair hint. The reply confirms the write; its project check completes separately.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

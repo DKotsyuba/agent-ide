@@ -10,7 +10,8 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Value, json};
 
 use super::facade::{
-    AssistanceTool, FieldRule, ParameterError, invalid_field, parse_read_range, path_shape_rule,
+    AssistanceTool, FieldRule, ParameterError, edit_path_shape_rule, invalid_field,
+    parse_read_range, path_shape_rule,
 };
 use super::reply::{
     EditBatchFile, EditBatchFileState, EditBatchOutcome, EditBatchReason, PeerReply,
@@ -934,13 +935,9 @@ pub(crate) fn validate_edit_files(object: &Map<String, Value>) -> Result<(), Par
             .and_then(Value::as_str)
             .filter(|path| !path.is_empty() && path.len() <= 1024)
             .ok_or_else(shape)?;
-        // One leading `/` is an absolute location copied from `grep -n`; the worker makes it
-        // worktree-relative and refuses a file outside the worktree. Only the shape check and the
-        // per-entry validation see the path without that slash; entries are compared as written
-        // (`/repo/a.rs` and `repo/a.rs` are different files), and the worker refuses entries that
-        // name one file once they are worktree-relative.
-        let shape_path = path.strip_prefix('/').unwrap_or(path);
-        if let Some(rule) = path_shape_rule(shape_path) {
+        // Absolute spellings reach the worker's canonical containment guard unchanged. The
+        // worker also compares filesystem destinations after whole-batch path admission.
+        if let Some(rule) = edit_path_shape_rule(path) {
             return Err(invalid_field("files", rule));
         }
         if !paths.insert(path) {
@@ -963,7 +960,7 @@ pub(crate) fn validate_edit_files(object: &Map<String, Value>) -> Result<(), Par
             Some(Value::Bool(create)) => *create,
             Some(_) => return Err(invalid_field("create", FieldRule::Boolean)),
         };
-        let mut single = json!({"operation_id": operation_id, "path": shape_path});
+        let mut single = json!({"operation_id": operation_id, "path": path});
         match (entry.get("changes"), entry.get("content")) {
             (Some(changes), None) if !create => {
                 let list = changes.as_array().ok_or_else(shape)?;
@@ -1084,15 +1081,21 @@ pub(crate) fn edit_files_request(parameters: &Value) -> Option<(String, Vec<Edit
 }
 
 /// Digest of the caller's own multi-file edit arguments (`operation_id`, the batch
-/// `source_ref`, `files`) — never anything the worker derives — so an identical retry, even
+/// `source_ref`, `files`, or the original `patch`) — never derived patch candidates — so a retry, even
 /// after a daemon restart, matches its durable receipt and a changed request conflicts.
 pub(crate) fn edit_request_digest(parameters: &Value) -> [u8; 32] {
     // serde_json keeps object keys sorted, so equal requests serialize to equal bytes.
-    let canonical = json!({
-        "operation_id": parameters.get("operation_id"),
-        "source_ref": parameters.get("source_ref"),
-        "files": parameters.get("files"),
-    });
+    let canonical = if parameters.get("patch").is_some() {
+        // A replay derives different full-file candidates after earlier writes; the caller's
+        // original patch remains its stable input, while the receipt retains candidate digests.
+        json!({"operation_id": parameters.get("operation_id"), "patch": parameters.get("patch")})
+    } else {
+        json!({
+            "operation_id": parameters.get("operation_id"),
+            "source_ref": parameters.get("source_ref"),
+            "files": parameters.get("files"),
+        })
+    };
     let mut hash = blake3::Hasher::new();
     hash.update(b"changes-batch-edit-request-v1");
     hash.update(canonical.to_string().as_bytes());

@@ -169,6 +169,7 @@
           "type": "string"
         },
         "path": {
+          "description": "Relative or in-worktree absolute; normalizes to relative; outside refused.",
           "type": "string"
         },
         "remove_import": {

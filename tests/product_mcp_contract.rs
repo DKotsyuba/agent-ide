@@ -11422,6 +11422,729 @@ fn batch_diagnostics_segment(edit: &Value) -> String {
     }
 }
 
+/// Full-file, line, change, file-list and address edits share canonical containment for native
+/// absolute spellings; every outside/symlink escape refuses without changing source bytes.
+#[tokio::test]
+async fn configured_product_edit_native_absolute_shapes_share_containment() {
+    let content = "pub fn first() -> i32 {\n    1\n}\n";
+    let fixture = batch_edit_fixture(content);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "native-edit-shapes", "src/batch.rs").await;
+    let outside = fixture.base.join("shape-outside.rs");
+    std::fs::write(&outside, content).unwrap();
+    std::os::unix::fs::symlink(&fixture.base, fixture.root.join("src/shape-escape")).unwrap();
+    let paths = [
+        format!("{}/src/./batch.rs", fixture.root.display()),
+        format!("{}/src/../src/batch.rs", fixture.root.display()),
+        format!("{}//src//batch.rs", fixture.root.display()),
+        outside.display().to_string(),
+        format!(
+            "{}/src/shape-escape/../shape-denied.rs",
+            fixture.root.display()
+        ),
+    ];
+    for (index, path) in paths.into_iter().enumerate() {
+        let symbol = format!("{path}#first");
+        let calls = [
+            json!({"path":path,"content":content}),
+            json!({"path":path,"lines":"1-3","content":content}),
+            json!({"path":path,"changes":[{"old":"1","new":"1"}]}),
+            json!({"files":[{"path":path,"content":content}]}),
+            json!({"symbol":symbol,"content":content}),
+            json!({"path":path,"changes":[{"symbol":symbol,"content":content}]}),
+            json!({"path":path,"changes":[{"old":"1","new":"1","within":symbol}]}),
+        ];
+        for (form, mut parameters) in calls.into_iter().enumerate() {
+            parameters["operation_id"] = json!(format!("native-shape-{index}-{form}"));
+            let reply = batch_call_with_text(&mut actor, &fixture, "ide.edit", parameters).await;
+            let (reply, text) = batch_settle_with_text(&mut actor, &fixture, reply).await;
+            if index < 3 {
+                assert!(
+                    matches!(reply["state"].as_str(), Some("edit" | "edit_batch")),
+                    "{reply}: {text}"
+                );
+            } else {
+                assert_eq!(reply["code"], "edit_refused", "{reply}: {text}");
+                assert!(text.contains("outside the worktree"), "{reply}: {text}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/batch.rs")).unwrap(),
+                content
+            );
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), content);
+            assert!(!fixture.base.join("shape-denied.rs").exists());
+        }
+        if index < 3 {
+            let read = actor
+                .call(&fixture, "ide.read", json!({"path":"src/batch.rs"}))
+                .await;
+            let read = actor.settle(&fixture, read).await;
+            let reference = read["detail_ref"].as_str().expect("fresh source reference");
+            let reply = actor
+                .call(
+                    &fixture,
+                    "ide.edit",
+                    json!({
+                        "operation_id":format!("native-shape-source-{index}"),"path":path,
+                        "source_ref":reference,"content":content
+                    }),
+                )
+                .await;
+            let reply = actor.settle(&fixture, reply).await;
+            assert_eq!(reply["state"], "edit", "{reply}");
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/batch.rs")).unwrap(),
+                content
+            );
+        }
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A complete batch fences existing and future filesystem aliases (including parent aliases)
+/// before an otherwise valid first source changes; distinct future creates still succeed.
+#[tokio::test]
+async fn configured_product_edit_batch_native_aliases_refuse_before_source_writes() {
+    let content = "pub fn first() -> i32 {\n    1\n}\n";
+    let fixture = batch_edit_fixture(content);
+    std::fs::write(fixture.root.join("src/Existing.rs"), content).unwrap();
+    std::fs::write(fixture.root.join("src/é.rs"), content).unwrap();
+    let insensitive = std::fs::metadata(fixture.root.join("src/existing.rs")).is_ok();
+    let normalization_insensitive = std::fs::metadata(fixture.root.join("src/e\u{301}.rs")).is_ok();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "batch-native-aliases", "src/batch.rs").await;
+    for (case, pair, collides, reason) in [
+        (
+            "existing",
+            ["src/Existing.rs", "src/existing.rs"],
+            insensitive,
+            "repeated_file:",
+        ),
+        (
+            "future",
+            ["src/Planned/New.rs", "src/planned/new.rs"],
+            insensitive,
+            "repeated_file:",
+        ),
+        (
+            "parent",
+            ["src/Future", "src/future/child.rs"],
+            insensitive,
+            "future_file_parent:",
+        ),
+        (
+            "unicode",
+            ["src/new-é.rs", "src/new-e\u{301}.rs"],
+            normalization_insensitive,
+            "repeated_file:",
+        ),
+        (
+            "unicode-parent",
+            ["src/Parent-é", "src/Parent-e\u{301}/child.rs"],
+            normalization_insensitive,
+            "future_file_parent:",
+        ),
+    ] {
+        if !collides {
+            continue;
+        }
+        for reversed in [false, true] {
+            let mut aliases = pair.map(|path| json!({"path":path,"content":"pub fn alias() {}\n"}));
+            if reversed {
+                aliases.reverse();
+            }
+            let files = vec![
+                json!({"path":"src/batch.rs","content":"pub fn must_not_write() {}\n"}),
+                aliases[0].clone(),
+                aliases[1].clone(),
+            ];
+            let reply = batch_call_with_text(
+                &mut actor,
+                &fixture,
+                "ide.edit",
+                json!({
+                    "operation_id":format!("native-alias-{case}-{reversed}"),"files":files
+                }),
+            )
+            .await;
+            let (reply, text) = batch_settle_with_text(&mut actor, &fixture, reply).await;
+            assert_eq!(reply["code"], "edit_refused", "{reply}: {text}");
+            assert!(text.contains(reason), "{reply}: {text}");
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/batch.rs")).unwrap(),
+                content
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/Existing.rs")).unwrap(),
+                content
+            );
+            assert!(!fixture.root.join("src/Planned").exists());
+            assert!(!fixture.root.join("src/Future").exists());
+            assert!(!fixture.root.join("src/new-é.rs").exists());
+            assert!(!fixture.root.join("src/Parent-é").exists());
+        }
+    }
+    let reply = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"native-distinct-future","files":[
+                {"path":"src/distinct/one.rs","create":true,"content":"pub fn one() {}\n"},
+                {"path":"src/distinct/two.rs","create":true,"content":"pub fn two() {}\n"}
+            ]
+        }),
+    )
+    .await;
+    let (reply, text) = batch_settle_with_text(&mut actor, &fixture, reply).await;
+    assert_eq!(reply["state"], "edit_batch", "{reply}: {text}");
+    assert!(text.contains("applied 2 of 2 files"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/distinct/one.rs")).unwrap(),
+        "pub fn one() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/distinct/two.rs")).unwrap(),
+        "pub fn two() {}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Replays absolute apply_patch headers and create-parent failures through the product binary.
+///
+/// Canonical in-worktree absolute headers and nested creates must apply. An absolute outside path
+/// or a symlink escape returns the outside-root reason. For file-list edits, an unwritable parent
+/// or outside target refuses the entire batch before either of its other files is written.
+#[tokio::test]
+async fn configured_product_edit_normalizes_absolute_patch_paths_and_preflights_batches() {
+    let batch = "pub fn first() -> i32 {\n    1\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "edit-path-preflight", "src/batch.rs").await;
+    let absolute_update = fixture.root.join("src/batch.rs");
+    let absolute_nested = fixture.root.join("src/new/deeper/added.rs");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-    1\n+    2\n*** Add File: {}\n+pub fn nested() {{}}\n*** End Patch",
+        absolute_update.display(),
+        absolute_nested.display()
+    );
+    let patched = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"absolute-patch","patch":patch.clone()}),
+    )
+    .await;
+    let (patched, patched_text) = batch_settle_with_text(&mut actor, &fixture, patched).await;
+    assert_eq!(patched["state"], "edit_batch", "{patched}");
+    assert!(batch_without_status_plate(&patched_text).starts_with("edit: applied 2 of 2 files"));
+    assert_eq!(
+        std::fs::read_to_string(&absolute_nested).unwrap(),
+        "pub fn nested() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&absolute_update).unwrap(),
+        "pub fn first() -> i32 {\n    2\n}\n"
+    );
+
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&absolute_update).unwrap());
+    let replay = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"absolute-patch","patch":patch}),
+        )
+        .await;
+    let replay = actor.settle(&fixture, replay).await;
+    assert_eq!(replay["outcome"], "applied", "{replay}");
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&absolute_update).unwrap()),
+        inode,
+        "a same-id patch never replaces the file twice"
+    );
+    let conflict = actor.call(&fixture, "ide.edit", json!({"operation_id":"absolute-patch","patch":"*** Begin Patch\n*** Add File: src/conflict.rs\n+pub fn conflict() {}\n*** End Patch"})).await;
+    let conflict = actor.settle(&fixture, conflict).await;
+    assert_eq!(conflict["outcome"], "conflicting_duplicate", "{conflict}");
+    assert!(!fixture.root.join("src/conflict.rs").exists());
+
+    let alias = fixture.base.join("worktree-alias");
+    std::os::unix::fs::symlink(&fixture.root, &alias).unwrap();
+    let aliased_file = alias.join("src/batch.rs");
+    let alias_patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-    2\n+    3\n*** End Patch",
+        aliased_file.display()
+    );
+    let edited_alias = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"absolute-canonical-alias","patch":alias_patch}),
+    )
+    .await;
+    let (edited_alias, edited_alias_text) =
+        batch_settle_with_text(&mut actor, &fixture, edited_alias).await;
+    assert_eq!(edited_alias["state"], "edit_batch", "{edited_alias}");
+    assert!(
+        batch_without_status_plate(&edited_alias_text).starts_with("edit: applied 1 of 1 files"),
+        "{edited_alias_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&absolute_update).unwrap(),
+        "pub fn first() -> i32 {\n    3\n}\n"
+    );
+
+    let outside = fixture.base.join("symlink-outside.rs");
+    std::fs::write(&outside, "pub fn outside() {}\n").unwrap();
+    let escape = fixture.root.join("src/symlink-escape.rs");
+    std::os::unix::fs::symlink(&outside, &escape).unwrap();
+    let escape_patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n+pub fn injected() {{}}\n*** End Patch",
+        escape.display()
+    );
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"absolute-symlink-escape","patch":escape_patch}),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("use a worktree-relative path"),
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "pub fn outside() {}\n"
+    );
+
+    let outside = fixture.base.join("outside.rs");
+    let outside_patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n+pub fn outside() {{}}\n*** End Patch",
+        outside.display()
+    );
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"outside-patch","patch":outside_patch}),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("use a worktree-relative path"),
+        "{refused_text}; structured={refused}"
+    );
+    assert!(!outside.exists());
+
+    let locked = fixture.root.join("src/locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let first = fixture.root.join("src/first-must-not-write.rs");
+    let locked_file = locked.join("blocked.rs");
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"unwritable-batch",
+            "files":[
+                {"path":"src/first-must-not-write.rs","content":"pub fn first() {}\n"},
+                {"path":locked_file.display().to_string(),"content":"pub fn blocked() {}\n"}
+            ]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("src/locked/blocked.rs"),
+        "{refused}"
+    );
+    assert!(
+        !first.exists(),
+        "the batch must be refused before the first file write"
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let outside_file = fixture.base.join("outside-batch.rs");
+    let first = fixture.root.join("src/first-must-not-write-either.rs");
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"outside-batch",
+            "files":[
+                {"path":"src/first-must-not-write-either.rs","content":"pub fn first() {}\n"},
+                {"path":outside_file.display().to_string(),"content":"pub fn outside() {}\n"}
+            ]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("use a worktree-relative path"),
+        "{refused_text}; structured={refused}"
+    );
+    assert!(!first.exists());
+    assert!(!outside_file.exists());
+
+    // Every public path form reaches the same normalization, including whole-file content.
+    let absolute_content = "pub fn first() -> i32 {\n    4\n}\n";
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-whole-file", "path":absolute_update.display().to_string(),
+                "content":absolute_content
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let created = actor.call(&fixture, "ide.edit", json!({
+        "operation_id":"absolute-whole-create", "path":fixture.root.join("src/plain/deep/created.rs").display().to_string(),
+        "content":"pub fn created() {}\n"
+    })).await;
+    let created = actor.settle(&fixture, created).await;
+    assert_eq!(created["result"]["outcome"], "created", "{created}");
+    assert!(fixture.root.join("src/plain/deep/created.rs").is_file());
+
+    for (operation, path, old, new) in [
+        (
+            "absolute-files",
+            absolute_update.display().to_string(),
+            "4",
+            "5",
+        ),
+        ("relative-files", "src/batch.rs".to_owned(), "5", "6"),
+    ] {
+        let edited = actor.call(&fixture, "ide.edit", json!({"operation_id":operation,"files":[{"path":path,"changes":[{"old":old,"new":new}]}]})).await;
+        let edited = actor.settle(&fixture, edited).await;
+        assert_eq!(edited["state"], "edit_batch", "{edited}");
+    }
+    let location = format!("{}:2", absolute_update.display());
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"absolute-location","symbol":location,"old":"6","new":"7"}),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["state"], "edit", "{edited}");
+    assert!(
+        std::fs::read_to_string(&absolute_update)
+            .unwrap()
+            .contains("7")
+    );
+
+    let read = actor
+        .call(&fixture, "ide.read", json!({"path":"src/batch.rs"}))
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-with-source", "path":absolute_update.display().to_string(),
+                "source_ref":read["detail_ref"], "content":"pub fn first() -> i32 {\n    8\n}\n"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-lines", "path":absolute_update.display().to_string(),
+                "lines":"2-2", "content":"    9"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let symbol = format!("{}#first", absolute_update.display());
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-symbol", "symbol":symbol,
+                "content":"pub fn first() -> i32 { 10 }\n"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited = actor.call(&fixture, "ide.edit", json!({
+        "operation_id":"absolute-nested-symbol", "path":absolute_update.display().to_string(),
+        "changes":[{"symbol":symbol,"content":"pub fn first() -> i32 { 11 }\n"}]
+    })).await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-within", "path":absolute_update.display().to_string(),
+                "changes":[{"old":"11","new":"12","within":symbol}]
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let before_duplicate = std::fs::read(&absolute_update).unwrap();
+    let refused = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"absolute-relative-duplicate","files":[
+                {"path":absolute_update.display().to_string(),"content":"pub fn duplicate() {}\n"},
+                {"path":"src/batch.rs","content":"pub fn duplicate() {}\n"}
+            ]}),
+        )
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(std::fs::read(&absolute_update).unwrap(), before_duplicate);
+    for (index, path) in [
+        fixture
+            .root
+            .join("src/../src/batch.rs")
+            .display()
+            .to_string(),
+        format!("{}//src/batch.rs", fixture.root.display()),
+        fixture.root.join("src/./batch.rs").display().to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {path}\n@@\n-    12\n+    12\n*** End Patch"
+        );
+        let edited = actor
+            .call(
+                &fixture,
+                "ide.edit",
+                json!({"operation_id":format!("absolute-shape-{index}"),"patch":patch}),
+            )
+            .await;
+        let edited = actor.settle(&fixture, edited).await;
+        assert_eq!(edited["outcome"], "applied", "{edited}");
+    }
+
+    // The future file surface is checked in both orders before even a directory is created.
+    for reversed in [false, true] {
+        let mut files = vec![
+            json!({"path":"src/future-parent","create":true,"content":"parent\n"}),
+            json!({"path":"src/future-parent/child.rs","create":true,"content":"pub fn child() {}\n"}),
+        ];
+        if reversed {
+            files.reverse();
+        }
+        let refused = batch_call_with_text(
+            &mut actor,
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":format!("future-parent-{reversed}"),"files":files}),
+        )
+        .await;
+        let (refused, text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+        assert_eq!(refused["code"], "edit_refused", "{refused}");
+        assert!(text.contains("future_file_parent:"), "{text}");
+        assert!(!fixture.root.join("src/future-parent").exists());
+    }
+    let unsafe_parent = fixture.root.join("src/outside-parent");
+    std::os::unix::fs::symlink(&fixture.base, &unsafe_parent).unwrap();
+    // Resolving `..` before a symlink would incorrectly hide this actual canonical escape.
+    let escaped = unsafe_parent.join("../must-not-create.rs");
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: {}\n+pub fn denied() {{}}\n*** End Patch",
+        escaped.display()
+    );
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"symlink-before-parent-dotdot","patch":patch}),
+    )
+    .await;
+    let (refused, text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(text.contains("outside the worktree"), "{text}");
+    let escaped_symbol = format!(
+        "{}#outside",
+        fixture.root.join("src/symlink-escape.rs").display()
+    );
+    let refused = actor.call(&fixture, "ide.edit", json!({"operation_id":"absolute-symbol-symlink-escape","symbol":escaped_symbol,"content":"pub fn denied() {}\n"})).await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+
+    for (index, target, reason) in [
+        (
+            0,
+            "src/outside-parent/deeper/new.rs".to_owned(),
+            "unsafe_parent:",
+        ),
+        (1, "src/symlink-escape.rs".to_owned(), "unsafe_target:"),
+        (
+            2,
+            format!("src/missing/{}/new.rs", "x".repeat(256)),
+            "name_too_long:",
+        ),
+    ] {
+        let refused = batch_call_with_text(&mut actor, &fixture, "ide.edit", json!({"operation_id":format!("predictable-path-{index}"),"files":[
+            {"path":"src/no-parent-effects/deeper/new.rs","create":true,"content":"pub fn untouched() {}\n"},
+            {"path":target,"content":"pub fn denied() {}\n"}
+        ]})).await;
+        let (refused, text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+        assert_eq!(refused["code"], "edit_refused", "{refused}");
+        assert!(text.contains(reason), "{text}");
+        assert!(!fixture.root.join("src/no-parent-effects").exists());
+    }
+
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A real daemon crash after the first patch write reports unknown, keeps the batch receipt,
+/// and resumes from proven candidate/base digests without replacing the first file twice.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn configured_product_batch_patch_crash_recovers_from_receipt_digests() {
+    let fixture = batch_edit_fixture("pub fn first() -> i32 { 1 }\n");
+    std::fs::write(
+        fixture.root.join("src/second.rs"),
+        "pub fn second() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    let (fault, _) = fault_flag(&fixture, "batch_edit_after_write_1", true);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = batch_started_actor(&fixture, "batch-patch-crash", "src/batch.rs").await;
+    let arguments = json!({"operation_id":"patch-crash-recovery","patch":
+        "*** Begin Patch\n*** Update File: src/batch.rs\n@@\n-pub fn first() -> i32 { 1 }\n+pub fn first() -> i32 { 2 }\n*** Update File: src/second.rs\n@@\n-pub fn second() -> i32 { 1 }\n+pub fn second() -> i32 { 2 }\n*** End Patch"});
+    let lost = actor.call(&fixture, "ide.edit", arguments.clone()).await;
+    let lost = actor.settle(&fixture, lost).await;
+    assert_eq!(lost["outcome"], "outcome_unknown", "{lost}");
+    let first = fixture.root.join("src/batch.rs");
+    let second = fixture.root.join("src/second.rs");
+    let committed_first = std::fs::read_to_string(&first).unwrap();
+    let original_second = std::fs::read_to_string(&second).unwrap();
+    assert!(committed_first.contains('2'));
+    assert!(
+        original_second.contains('1'),
+        "the multi-file commit was interrupted after only its first write"
+    );
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap());
+    assert_crash_only_exit(&mut daemon, &fixture).await;
+    actor.mcp.close().await;
+
+    let mut replacement = fixture.daemon().await;
+    let mut again = batch_started_actor(&fixture, "batch-patch-recovery", "src/batch.rs").await;
+    let recovered = again.call(&fixture, "ide.edit", arguments.clone()).await;
+    let recovered = again.settle(&fixture, recovered).await;
+    assert_eq!(recovered["outcome"], "applied", "{recovered}");
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), committed_first);
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap()),
+        inode
+    );
+    assert!(std::fs::read_to_string(&second).unwrap().contains('2'));
+    // A settled replay also preserves subsequent native changes to an already-written file.
+    std::fs::write(&first, "// native after recovery\n").unwrap();
+    let replay = again.call(&fixture, "ide.edit", arguments).await;
+    let replay = again.settle(&fixture, replay).await;
+    assert_eq!(replay["outcome"], "applied", "{replay}");
+    assert_eq!(
+        std::fs::read_to_string(&first).unwrap(),
+        "// native after recovery\n"
+    );
+    again.call(&fixture, "ide.stop", json!({})).await;
+    again.mcp.close().await;
+    replacement.kill().await.unwrap();
+    replacement.wait().await.unwrap();
+}
+
+/// A native edit between validation and the second write produces an honest partial receipt.
+/// Repeating the patch preserves those newer bytes and never rewrites its first committed file.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn configured_product_batch_patch_stale_member_keeps_partial_and_native_bytes() {
+    let fixture = batch_edit_fixture("pub fn first() -> i32 { 1 }\n");
+    std::fs::write(
+        fixture.root.join("src/second.rs"),
+        "pub fn second() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    let (fault, _) = fault_flag(&fixture, "batch_edit_before_write_2", true);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = batch_started_actor(&fixture, "batch-patch-partial", "src/batch.rs").await;
+    let arguments = json!({"operation_id":"patch-stale-partial","patch":
+        "*** Begin Patch\n*** Update File: src/batch.rs\n@@\n-pub fn first() -> i32 { 1 }\n+pub fn first() -> i32 { 2 }\n*** Update File: src/second.rs\n@@\n-pub fn second() -> i32 { 1 }\n+pub fn second() -> i32 { 2 }\n*** End Patch"});
+    let partial = actor.call(&fixture, "ide.edit", arguments.clone()).await;
+    let partial = actor.settle(&fixture, partial).await;
+    assert_eq!(partial["outcome"], "partial", "{partial}");
+    assert_eq!(
+        partial["files"][1]["reason"], "changed_after_validation",
+        "{partial}"
+    );
+    let first = fixture.root.join("src/batch.rs");
+    let second = fixture.root.join("src/second.rs");
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap());
+    let native = std::fs::read_to_string(&second).unwrap();
+    assert!(native.ends_with("native\n"));
+    let replay = actor.call(&fixture, "ide.edit", arguments).await;
+    let replay = actor.settle(&fixture, replay).await;
+    assert_eq!(replay["outcome"], "partial", "{replay}");
+    assert_eq!(std::fs::read_to_string(&second).unwrap(), native);
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap()),
+        inode
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Case 1: `old` text that matches nothing refuses the whole batch naming the change and quoting
 /// the closest line, writes nothing, and the same `operation_id` retries once the text is fixed.
 #[tokio::test]

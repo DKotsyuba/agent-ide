@@ -5,7 +5,7 @@
 //! before anything is written; any parse error or miss refuses the whole call with nothing
 //! written. The resulting whole-file contents (`Add File` as creations, `Update File` as
 //! replacements) then run through [`Worker::edit_files`], so the patch inherits that
-//! pipeline's atomicity, receipts, immediate reply and single `edit-checked` fact.
+//! pipeline's batch preflight, partial recovery, receipts, immediate reply and single `edit-checked` fact.
 
 use super::*;
 use crate::assistance::patch::{PatchFile, apply_hunks, parse_patch};
@@ -19,10 +19,14 @@ impl Worker<'_> {
     /// Applies one `ide.edit {operation_id, patch}` call.
     ///
     /// Parse errors answer as invalid parameters with the parser's own sentence (including the
-    /// delete/move refusal). A missing file or an unmatched hunk is refused as `edit_refused`
-    /// with `patch refused, nothing written: …` plus the nearest text and one repair line. On
-    /// success the call is rewritten to the equivalent `files` request and delegated to
-    /// [`Self::edit_files`], so its reply, receipt and project check are that pipeline's.
+    /// delete/move refusal). Absolute file headers are normalized beneath the active worktree
+    /// before an `Update File` is observed; an outside path refuses with a worktree-relative
+    /// repair hint. A missing file or unmatched hunk is refused as `edit_refused` with
+    /// `patch refused, nothing written: …` plus the nearest text and one repair line. On success
+    /// the call is rewritten to the equivalent `files` request and delegated to
+    /// [`Self::edit_files`], so its reply, receipt and project check are that pipeline's. Existing
+    /// receipts compare the original patch first; written/candidate-equal files are not re-hunked,
+    /// while unresolved files still require the receipt's base/candidate digest proof.
     ///
     /// The file text is read in [`Self::patch_files`] and written by `edit_files`; every
     /// replacement carries the digest of the bytes its hunks were applied to, so a file that
@@ -48,8 +52,41 @@ impl Worker<'_> {
                 return Ok((PeerReply::InvalidParameters { message }, authority, None));
             }
         };
-        let files = self.patch_files(job, &binding, parsed).await?;
-        job.parameters = json!({"operation_id": operation_id, "files": files});
+        let existing = self.batch_receipt(job, &operation_id).await?;
+        if existing.as_ref().is_some_and(|receipt| {
+            receipt.request_digest != crate::assistance::batch::edit_request_digest(&job.parameters)
+        }) {
+            return Ok((
+                crate::assistance::batch::conflicting_duplicate_reply(&operation_id),
+                self.authority(&binding).await.ok(),
+                None,
+            ));
+        }
+        let authority = self.authority(&binding).await?;
+        let root = authority.worktree().worktree_path();
+        let normalized = parsed
+            .into_iter()
+            .map(|file| {
+                let (path, file) = match file {
+                    PatchFile::Add { path, content } => {
+                        let path = Self::relativize_edit_path(root, &path)?;
+                        (path.clone(), PatchFile::Add { path, content })
+                    }
+                    PatchFile::Update { path, hunks } => {
+                        let path = Self::relativize_edit_path(root, &path)?;
+                        (path.clone(), PatchFile::Update { path, hunks })
+                    }
+                };
+                crate::workspace::edit::preflight_edit_path(authority.worktree(), Path::new(&path))
+                    .map_err(|reason| format!("{path}: {reason}"))?;
+                Ok(file)
+            })
+            .collect::<Result<Vec<_>, String>>();
+        let parsed = normalized.map_err(|detail| refuse(job, detail))?;
+        let files = self
+            .patch_files(job, &binding, parsed, existing.as_ref())
+            .await?;
+        job.parameters = json!({"operation_id": operation_id, "patch": patch, "files": files});
         self.edit_files(job).await
     }
 
@@ -61,13 +98,15 @@ impl Worker<'_> {
     /// # Errors
     ///
     /// [`FailureCode::EditRefused`] (detail recorded on `job`) for a missing file or a hunk that
-    /// does not match, quoting the nearest text; observation failures propagate. Nothing is
+    /// does not match, quoting the nearest text; observation failures propagate. `existing` lets
+    /// a retry retain candidate-equal files without applying their hunks twice. Nothing is
     /// written either way.
     pub(super) async fn patch_files(
         &mut self,
         job: &mut Job,
         binding: &BindingRef,
         parsed: Vec<PatchFile>,
+        existing: Option<&crate::changes::batch::BatchReceipt>,
     ) -> Result<Vec<serde_json::Value>, FailureCode> {
         let mut files = Vec::with_capacity(parsed.len());
         for file in parsed {
@@ -76,6 +115,15 @@ impl Worker<'_> {
                     files.push(json!({"path": path, "create": true, "content": content}));
                 }
                 PatchFile::Update { path, hunks } => {
+                    if existing.is_some_and(|receipt| {
+                        receipt
+                            .files
+                            .iter()
+                            .any(|row| row.path == path && row.written)
+                    }) {
+                        files.push(json!({"path": path, "content": ""}));
+                        continue;
+                    }
                     let (observed, bytes) = self
                         .observe(binding, std::path::PathBuf::from(&path))
                         .await?;
@@ -83,6 +131,14 @@ impl Worker<'_> {
                         return Err(refuse(job, format!("{path} does not exist")));
                     }
                     let source = observed_text(&observed, &bytes)?.to_owned();
+                    if existing.is_some_and(|receipt| {
+                        receipt.files.iter().any(|row| {
+                            row.path == path && row.candidate == *blake3::hash(&bytes).as_bytes()
+                        })
+                    }) {
+                        files.push(json!({"path": path, "content": source}));
+                        continue;
+                    }
                     match apply_hunks(&source, &hunks) {
                         Ok(applied) => {
                             // The write is refused if the file no longer has the bytes the hunks

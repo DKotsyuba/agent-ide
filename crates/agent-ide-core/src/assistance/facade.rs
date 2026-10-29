@@ -315,7 +315,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "remove_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "With `path`: the import statement to remove, as written in the file."},
                     "where": {"type": "string", "enum": ["before", "after", "first", "last"], "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor."},
                     "new_name": {"type": "string", "minLength": 1, "maxLength": 128, "description": "For rename: the new identifier, applied project-wide."},
-                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Relative or in-worktree absolute; normalizes to relative; outside refused."},
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: file lines `a-b` to replace; for code prefer a `symbol` or a window."},
                     "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Deprecated; omit."},
                     "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."},
@@ -835,6 +835,19 @@ pub(super) fn path_shape_rule(path: &str) -> Option<FieldRule> {
     }
 }
 
+/// Validates one already-bounded edit path before the worker checks canonical containment.
+///
+/// Relative paths retain the strict no-empty, dot or parent-component rules. Absolute paths
+/// may contain those native spellings, but never NUL; the worker resolves them beneath the
+/// active worktree before source observation, parent preparation or writes. No I/O occurs here.
+pub(super) fn edit_path_shape_rule(path: &str) -> Option<FieldRule> {
+    if std::path::Path::new(path).is_absolute() {
+        path.as_bytes().contains(&0).then_some(FieldRule::NoNul)
+    } else {
+        path_shape_rule(path)
+    }
+}
+
 /// Holds one validated bounded method payload with no identity or authority fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidatedCall {
@@ -871,6 +884,8 @@ pub fn validate_call(
 /// Validates the trusted front's normalized daemon payload with the same bounded shapes.
 /// Preserves the front-derived diff flag across daemon revalidation; this entry is not used
 /// for public model arguments. Raw internal callers without a mode receive the usual default.
+/// Absolute edit paths keep their original spelling for canonical containment by the worker;
+/// validation here grants no filesystem authority and does not relax non-edit path rules.
 pub(crate) fn validate_normalized_call(
     tool: AssistanceTool,
     mut parameters: Value,
@@ -1503,9 +1518,7 @@ pub(crate) fn validate_normalized_call(
                 }
             }
             let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
-            // One leading `/` is an absolute location copied from `grep -n`; the worker makes it
-            // worktree-relative and refuses a file outside the worktree.
-            if let Some(rule) = path_shape_rule(path.strip_prefix('/').unwrap_or(path)) {
+            if let Some(rule) = edit_path_shape_rule(path) {
                 return Err(invalid_field("path", rule));
             }
             let changes = object["changes"]
@@ -1702,7 +1715,7 @@ pub(crate) fn validate_normalized_call(
                     return Err(ParameterError::EditTarget);
                 }
                 let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
-                if let Some(rule) = path_shape_rule(path) {
+                if let Some(rule) = edit_path_shape_rule(path) {
                     return Err(invalid_field("path", rule));
                 }
                 if parse_line_range(required_string(object, "lines", 32)?).is_none() {
@@ -1760,9 +1773,21 @@ pub(crate) fn validate_normalized_call(
                 .contains_key("source_ref")
                 .then(|| required_string(object, "source_ref", MAX_DETAIL_REF_BYTES))
                 .transpose()?;
+            if let Some(rule) = edit_path_shape_rule(path) {
+                return Err(invalid_field("path", rule));
+            }
+            let original_path = path.to_owned();
+            // Changes accepts only resolved relative paths. Its constructor checks the remaining
+            // fields here; an absolute target retains its exact spelling for the worker's shared
+            // canonical containment check before the real Changes request is constructed.
+            let validation_path = if std::path::Path::new(path).is_absolute() {
+                "edit-target"
+            } else {
+                path
+            };
             let request = crate::changes::edit::EditRequest::new(
                 operation_id,
-                path,
+                validation_path,
                 source_ref.unwrap_or("create"),
                 object
                     .get("content")
@@ -1784,6 +1809,7 @@ pub(crate) fn validate_normalized_call(
             let creates = source_ref.is_none();
             parameters =
                 serde_json::to_value(request).map_err(|_| ParameterError::InvalidObject)?;
+            parameters["path"] = Value::String(original_path);
             if creates {
                 parameters
                     .as_object_mut()
@@ -5378,7 +5404,7 @@ impl CatalogHost {
                     }
                     if self == Self::Codex && &*tool.name == "ide.edit" {
                         properties.retain(|key, _| matches!(key.as_str(), "operation_id" | "patch"));
-                        tool.description = Some("Batch related production/tests edits into one atomic multi-file `patch` using apply_patch syntax: *** Begin Patch, *** Add File or *** Update File, *** End Patch. Send {patch:\"…\"}, optionally operation_id for safe retries. Deleting or moving files is not supported. Read affected code first; include related edits and tests in one patch. The reply confirms the write; its project check completes separately.".into());
+                        tool.description = Some("Batch related production/tests edits into one atomic multi-file `patch` using apply_patch syntax: *** Begin Patch, *** Add File or *** Update File, *** End Patch. Send {patch:\"…\"}, optionally operation_id for safe retries. Deleting or moving files is not supported. Read affected code first; include related edits and tests in one patch. Absolute file headers inside the worktree are accepted; outside paths refuse with a worktree-relative repair hint. The reply confirms the write; its project check completes separately.".into());
                     }
                     if self == Self::Claude && &*tool.name == "ide.edit" {
                         properties.remove("patch");
@@ -5974,7 +6000,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
         (
             validate_call(
                 AssistanceTool::Edit,
-                json!({"operation_id":"o","path":"/abs/a.rs","source_ref":"s","content":""}),
+                json!({"operation_id":"o","path":"a//a.rs","source_ref":"s","content":""}),
             )
             .unwrap_err(),
             AssistanceTool::Edit,
@@ -6326,6 +6352,48 @@ fn start_root_must_be_absolute_and_normalized() {
             rule: FieldRule::Boolean,
         }
     );
+}
+
+/// Every edit form defers absolute dot/parent/repeated-slash spellings to the worker's shared
+/// containment guard while relative paths and NUL keep their strict boundary refusals.
+#[test]
+fn edit_absolute_native_shapes_reach_containment_in_every_form() {
+    for path in ["/repo/src/./a.rs", "/repo/src/../a.rs", "//repo//a.rs"] {
+        let calls = [
+            json!({"operation_id":"shape","path":path,"content":"new"}),
+            json!({"operation_id":"shape","path":path,"source_ref":"ref","content":"new"}),
+            json!({"operation_id":"shape","path":path,"lines":"1-1","content":"new"}),
+            json!({"operation_id":"shape","path":path,"changes":[{"old":"old","new":"new"}]}),
+            json!({"operation_id":"shape","files":[{"path":path,"content":"new"}]}),
+            json!({"operation_id":"shape","symbol":format!("{path}#first"),"content":"new"}),
+            json!({"operation_id":"shape","path":path,"changes":[{"symbol":format!("{path}#first"),"content":"new"}]}),
+            json!({"operation_id":"shape","path":path,"changes":[{"old":"old","new":"new","within":format!("{path}#first")}]}),
+        ];
+        for parameters in calls {
+            let call = validate_call(AssistanceTool::Edit, parameters.clone())
+                .unwrap_or_else(|error| panic!("{parameters}: {error:?}"));
+            assert_eq!(call.parameters(), &parameters);
+        }
+    }
+    for path in [
+        "src/./a.rs",
+        "src/../a.rs",
+        "src//a.rs",
+        "src/a\0.rs",
+        "/repo/a\0.rs",
+    ] {
+        for parameters in [
+            json!({"operation_id":"shape","path":path,"content":"new"}),
+            json!({"operation_id":"shape","path":path,"lines":"1-1","content":"new"}),
+            json!({"operation_id":"shape","path":path,"changes":[{"old":"old","new":"new"}]}),
+            json!({"operation_id":"shape","files":[{"path":path,"content":"new"}]}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, parameters).is_err(),
+                "{path:?}"
+            );
+        }
+    }
 }
 
 /// The quoted alternatives the `problems` language refusal lists: every registered checked

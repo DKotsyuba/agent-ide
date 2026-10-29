@@ -2,10 +2,14 @@
 //!
 //! Phase 1 observes and validates every file and builds every candidate without writing; any
 //! refusal answers `edit_refused` naming each failed file and change, with nothing written and no
-//! receipt kept. Phase 2 records a durable digest receipt ([`crate::changes::batch`]) and writes
-//! the files in request order through Workspace's stale-safe write, which re-checks each file's
-//! bytes against its base immediately before installing it; the first file that changed meanwhile
-//! or fails stops the commit, and the reply says exactly which files were written. After the last
+//! receipt kept. Before the receipt or first file write, every destination is descriptor-
+//! preflighted without worktree effects; native aliases, future-file/parent conflicts and unsafe or unwritable parents
+//! refuse the whole batch. Missing create parents are made beneath the worktree after admission.
+//! Phase 2 records a durable digest
+//! receipt ([`crate::changes::batch`]) and writes the files in request order through Workspace's
+//! stale-safe write, which re-checks each file's bytes against its base immediately before installing
+//! it; the first file that changes meanwhile or fails stops the commit, and the reply says exactly
+//! which files were written. After the last
 //! write of the call one project check runs per affected checked language, and the reply groups
 //! its diagnostics per file. A retry with the same `operation_id` and request resumes from the
 //! receipt: written files stay, unwritten files are written only while their bytes still equal the
@@ -167,10 +171,14 @@ fn settled_reply(
 impl Worker<'_> {
     /// `ide.edit {operation_id, files}`: one logical change across several files.
     ///
-    /// A new operation validates every file first and writes nothing on any refusal
-    /// (`edit_refused`, every failed file and change named, the `operation_id` left unused). It
-    /// then records the durable receipt and commits file by file; see the module documentation
-    /// for the stop, resume and check rules. The same `operation_id` with the same request
+    /// A new operation validates every file and preflights every destination before it writes
+    /// source bytes or creates destination parents. Private empty scratch probes qualify unresolved
+    /// names on the same filesystem; an unavailable oracle refuses the affected future group.
+    /// A refusal answers `edit_refused`, names every failed file and change, and leaves
+    /// the `operation_id` unused. Missing create parents are made safely inside the worktree; an
+    /// unsafe or unwritable target refuses the whole batch. It then records the durable receipt
+    /// and commits file by file; see the module documentation for the stop, resume and check
+    /// rules. The same `operation_id` with the same request
     /// resumes (or, when settled, answers with every file written earlier); with a different
     /// request it answers `edit: conflicting_duplicate` and writes nothing. The reply is a
     /// complete `edit_batch` result whose text opens with `edit: applied …` or `edit: partial …`;
@@ -181,6 +189,10 @@ impl Worker<'_> {
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
+        if let Some(detail) = repeated_file(&job.parameters) {
+            job.failure_detail = Some(detail);
+            return Err(FailureCode::EditRefused);
+        }
         let (operation_id, files) =
             batch::edit_files_request(&job.parameters).ok_or(FailureCode::Internal)?;
         let digest = batch::edit_request_digest(&job.parameters);
@@ -204,10 +216,55 @@ impl Worker<'_> {
         }
         let mut planned = Vec::with_capacity(files.len());
         let mut refusals = Vec::new();
-        for (index, file) in files.iter().enumerate() {
-            match self.plan_file(job, &binding, index, file, None).await? {
-                Ok(plan) => planned.push(plan),
-                Err(sentence) => refusals.push(sentence),
+        let authority = self.authority(&binding).await?;
+        let paths: Vec<_> = files.iter().map(|file| Path::new(&file.path)).collect();
+        for (index, reason) in
+            crate::workspace::edit::preflight_edit_paths(authority.worktree(), &paths)
+        {
+            refusals.push(format!(
+                "file {} {}: {reason}",
+                index + 1,
+                files[index].path
+            ));
+        }
+        if refusals.is_empty() {
+            for (index, file) in files.iter().enumerate() {
+                match self.plan_file(job, &binding, index, file, None).await? {
+                    Ok(plan) => planned.push(plan),
+                    Err(sentence) => refusals.push(sentence),
+                }
+            }
+        }
+        // Every path and candidate is admitted before creating parents. Resolve the whole
+        // admitted batch as well, so a real parent-creation or metadata failure precedes source writes.
+        if refusals.is_empty() {
+            let active = self.shared.active(&binding)?;
+            for (index, plan) in planned.iter().enumerate() {
+                let source =
+                    match crate::workspace::edit::EditSourceRef::from_observation(&plan.base) {
+                        Ok(source) => source,
+                        Err(outcome) => {
+                            refusals.push(format!(
+                                "file {} {}: stale_source ({outcome:?}); reread the file",
+                                index + 1,
+                                plan.path
+                            ));
+                            continue;
+                        }
+                    };
+                if let Err(outcome) = self
+                    .workspace
+                    .prepare_edit(
+                        &authority,
+                        &active,
+                        operation_id.clone(),
+                        plan.path.clone().into(),
+                        source,
+                    )
+                    .await
+                {
+                    refusals.push(format!("file {} {}: destination_preparation_failed ({outcome:?}); check current bytes, parent permissions and metadata", index + 1, plan.path));
+                }
             }
         }
         if !refusals.is_empty() {
@@ -941,7 +998,7 @@ impl Worker<'_> {
         operation_id: &str,
     ) -> Result<Option<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>)>, FailureCode>
     {
-        let receipt = self.rename_receipt(job, operation_id).await?;
+        let receipt = self.batch_receipt(job, operation_id).await?;
         let digest = batch::rename_request_digest(&job.parameters);
         match receipt {
             Some(existing) if existing.request_digest != digest => {
@@ -984,7 +1041,7 @@ impl Worker<'_> {
         note: String,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let digest = batch::rename_request_digest(&job.parameters);
-        let receipt = match self.rename_receipt(job, operation_id).await? {
+        let receipt = match self.batch_receipt(job, operation_id).await? {
             Some(existing) if existing.request_digest != digest => {
                 let authority = self.authority(binding).await.ok();
                 return Ok((
@@ -1124,8 +1181,8 @@ impl Worker<'_> {
         (reply, Some(authority), first)
     }
 
-    /// Loads the receipt of a rename's operation id after making sure its schema exists.
-    async fn rename_receipt(
+    /// Loads an edit or rename receipt by operation id after making sure its schema exists.
+    pub(super) async fn batch_receipt(
         &mut self,
         job: &mut Job,
         operation_id: &str,

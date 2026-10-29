@@ -2589,12 +2589,53 @@ fn edit_operation(parameters: &Value) -> Option<String> {
     }
 }
 
+/// Splits one edit target into its file spelling and unchanged address suffix without I/O.
+///
+/// Plain paths are returned verbatim with an empty suffix. Address text is trimmed once, as
+/// `Address::parse` requires, before deriving UTF-8 byte offsets. A `#` address or parsed
+/// `file:line[:column]` keeps its complete suffix; a file-less name lookup has no suffix.
+fn edit_target_parts(text: &str, address: bool) -> (&str, &str) {
+    if !address {
+        return (text, "");
+    }
+    let text = text.trim();
+    let split = text
+        .find('#')
+        .or_else(|| match crate::lang::address::Address::parse(text) {
+            Ok(crate::lang::address::Parsed::Location { file, .. }) => Some(file.as_os_str().len()),
+            _ => None,
+        });
+    split.map_or((text, ""), |index| text.split_at(index))
+}
+
+/// Address parser offsets and suffixes refer to the same trimmed UTF-8 spelling, so a leading
+/// space before a multibyte final file character cannot split that character or panic.
+#[cfg(test)]
+#[test]
+fn edit_target_parts_trim_utf8_addresses_once() {
+    for (text, expected) in [
+        (" a.é:1", ("a.é", ":1")),
+        ("\t a.é:1:2 ", ("a.é", ":1:2")),
+        (
+            " /repo/a.é#Owner/method:2 ",
+            ("/repo/a.é", "#Owner/method:2"),
+        ),
+        (" #é ", ("", "#é")),
+        (" method ", ("method", "")),
+    ] {
+        assert_eq!(edit_target_parts(text, true), expected);
+    }
+    assert_eq!(edit_target_parts(" a.é ", false), (" a.é ", ""));
+}
+
 /// Returns the `edit:refused` detail when two `files` entries of `parameters` name the same file.
 ///
 /// The facade only compares the paths as written, so an absolute and a relative spelling of one
 /// file pass it; once the worker made them worktree-relative they are the same file, which a
 /// multi-file edit refuses (batch-api-v1 section 3) before anything is planned or written.
-/// `None` when every path is distinct or the call has no `files`.
+/// This early spelling check does not prove native filesystem identity; the complete batch's
+/// descriptor/scratch admission detects case, Unicode and future-parent aliases before effects.
+/// `None` when every spelling is distinct or the call has no `files`.
 fn repeated_file(parameters: &Value) -> Option<String> {
     let files = parameters.get("files")?.as_array()?;
     let mut seen = BTreeSet::new();
@@ -5734,37 +5775,106 @@ impl<'a> Worker<'a> {
         ))
     }
 
-    /// Rewrites the absolute in-worktree files of an edit's targets to worktree-relative ones,
-    /// so a location copied from `grep -n` or a compiler (`/repo/src/a.rs:130`, symbol-read-edit-v1
-    /// section 1) edits like `src/a.rs:130`.
+    /// Converts an absolute edit path to a safe worktree-relative spelling.
     ///
-    /// The rewritten strings are `path`, `symbol` and each `changes` entry's `symbol` and
-    /// `within`, and for a multi-file `files` call each entry's `path` and the same fields of its
-    /// `changes`; a string that does not start with `/` is left as is. An absolute file outside
-    /// the binding's worktree refuses with `outside_allowed_roots` before anything is resolved or
-    /// written. Idempotent, so a resumed job sees the same relative targets.
+    /// Valid relative inputs are preserved; dot/parent components refuse. Absolute inputs resolve
+    /// their deepest existing prefix and
+    /// are accepted only when that canonical prefix and any missing suffix remain beneath the
+    /// canonical worktree root. The result is suitable for Workspace's no-follow relative-path
+    /// walk, which rechecks every component before observing or writing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a repair sentence when the absolute path is outside the worktree or does not name
+    /// a valid relative file path.
+    pub(super) fn relativize_edit_path(root: &Path, path: &str) -> Result<String, String> {
+        let absolute = Path::new(path);
+        if !absolute.is_absolute() {
+            return if crate::workspace::observation::valid_relative_path(absolute) {
+                Ok(path.to_owned())
+            } else {
+                Err(format!(
+                    "invalid path {path}; use a nonempty worktree-relative file path without dot or parent components"
+                ))
+            };
+        }
+        let outside = || {
+            format!("absolute path {path} is outside the worktree; use a worktree-relative path")
+        };
+        let canonical_root = std::fs::canonicalize(root)
+            .map_err(|_| "worktree root is unavailable; reactivate the worktree".to_owned())?;
+        let mut existing = absolute;
+        let mut missing = Vec::new();
+        let canonical_prefix = loop {
+            match std::fs::canonicalize(existing) {
+                Ok(canonical) => break canonical,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let name = existing.file_name().ok_or_else(outside)?;
+                    missing.push(name.to_os_string());
+                    existing = existing.parent().ok_or_else(outside)?;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "absolute path {path} cannot be resolved ({:?}); check its parent directories",
+                        error.kind()
+                    ));
+                }
+            }
+        };
+        let mut canonical_target = canonical_prefix;
+        for component in missing.iter().rev() {
+            canonical_target.push(component);
+        }
+        let relative = canonical_target
+            .strip_prefix(&canonical_root)
+            .map_err(|_| outside())?;
+        let normalized = relative.to_path_buf();
+        if !crate::workspace::observation::valid_relative_path(&normalized) {
+            return Err(format!(
+                "absolute path {path} does not name a worktree file; use a worktree-relative path"
+            ));
+        }
+        normalized
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("absolute path {path} is not valid UTF-8"))
+    }
+
+    /// Rewrites the absolute in-worktree files of an edit's targets to worktree-relative ones,
+    /// so locations copied from a native search or compiler can be used directly.
+    ///
+    /// The rewritten strings are `path`, `symbol`, each `changes` entry's `symbol` and
+    /// `within`, and each multi-file entry's `path` and nested changes. Relative inputs are
+    /// validated. Absolute paths are normalized beneath the active worktree; an escape refuses
+    /// as `edit_refused` with a relative-path repair hint before source resolution or writes.
+    /// Addresses are trimmed once before parsing and suffix splitting, preserving UTF-8 boundaries.
+    /// File portions are canonicalized separately from address suffixes. Known single-file paths
+    /// are read-only preflighted here; batches preflight their complete future-file surface next.
+    /// Rewriting is idempotent, including after a resumed job.
     async fn relativize_edit_targets(&mut self, job: &mut Job) -> Result<(), FailureCode> {
-        /// Collects the `symbol` and `within` strings of one `changes` array.
-        fn change_targets<'v>(changes: &'v mut Value, targets: &mut Vec<&'v mut Value>) {
+        /// Collects address values, marked so file canonicalization preserves their symbol/window suffix.
+        fn change_targets<'v>(changes: &'v mut Value, targets: &mut Vec<(&'v mut Value, bool)>) {
             for entry in changes.as_array_mut().into_iter().flatten() {
                 for (key, value) in entry.as_object_mut().into_iter().flatten() {
                     if matches!(key.as_str(), "symbol" | "within") {
-                        targets.push(value);
+                        targets.push((value, true));
                     }
                 }
             }
         }
-        let mut targets: Vec<&mut Value> = Vec::new();
+        let batch = job.parameters.get("files").is_some();
+        let mut targets: Vec<(&mut Value, bool)> = Vec::new();
         if let Some(object) = job.parameters.as_object_mut() {
             for (key, value) in object.iter_mut() {
                 match key.as_str() {
-                    "path" | "symbol" => targets.push(value),
+                    "path" => targets.push((value, false)),
+                    "symbol" => targets.push((value, true)),
                     "changes" => change_targets(value, &mut targets),
                     "files" => {
                         for file in value.as_array_mut().into_iter().flatten() {
                             for (key, value) in file.as_object_mut().into_iter().flatten() {
                                 match key.as_str() {
-                                    "path" => targets.push(value),
+                                    "path" => targets.push((value, false)),
                                     "changes" => change_targets(value, &mut targets),
                                     _ => {}
                                 }
@@ -5775,24 +5885,34 @@ impl<'a> Worker<'a> {
                 }
             }
         }
-        targets.retain(|target| target.as_str().is_some_and(|text| text.starts_with('/')));
+        targets.retain(|(target, _)| target.as_str().is_some());
         if targets.is_empty() {
             return Ok(());
         }
         let binding = job.invocation.binding_ref().clone();
-        let root = self
-            .authority(&binding)
-            .await?
-            .worktree()
-            .worktree_path()
-            .to_path_buf();
-        for target in targets {
-            let inside = Path::new(target.as_str().unwrap_or_default())
-                .strip_prefix(&root)
-                .map_err(|_| FailureCode::OutsideAllowedRoots)?
-                .to_string_lossy()
-                .into_owned();
-            *target = Value::String(inside);
+        let authority = self.authority(&binding).await?;
+        let root = authority.worktree().worktree_path();
+        for (target, address) in targets {
+            let text = target.as_str().ok_or(FailureCode::Internal)?;
+            let (file, suffix) = edit_target_parts(text, address);
+            if address && file.is_empty() {
+                continue;
+            }
+            let inside = Self::relativize_edit_path(root, file).map_err(|detail| {
+                job.failure_detail = Some(format!("edit:refused: {detail}"));
+                FailureCode::EditRefused
+            })?;
+            if !batch && (!address || !suffix.is_empty()) && !inside.is_empty() {
+                crate::workspace::edit::preflight_edit_path(
+                    authority.worktree(),
+                    Path::new(&inside),
+                )
+                .map_err(|reason| {
+                    job.failure_detail = Some(format!("edit:refused: {inside}: {reason}"));
+                    FailureCode::EditRefused
+                })?;
+            }
+            *target = Value::String(format!("{inside}{suffix}"));
         }
         Ok(())
     }
@@ -5873,23 +5993,17 @@ impl<'a> Worker<'a> {
                 source,
             ));
         }
+        self.relativize_edit_targets(job).await?;
         if job.parameters.get("patch").is_some() {
             return self.edit_patch(job).await;
         }
         if job.parameters.get("files").is_some() {
-            self.relativize_edit_targets(job).await?;
-            if let Some(detail) = repeated_file(&job.parameters) {
-                job.failure_detail = Some(detail);
-                return Err(FailureCode::EditRefused);
-            }
             return self.edit_files(job).await;
         }
         if job.parameters.get("changes").is_some() {
-            self.relativize_edit_targets(job).await?;
             return self.edit_changes(job).await;
         }
         if job.parameters.get("symbol").is_some() || job.parameters.get("lines").is_some() {
-            self.relativize_edit_targets(job).await?;
             return self.edit_by_symbol(job).await;
         }
         if job.parameters.get("source_ref").is_none() {
@@ -11592,7 +11706,7 @@ mod stop_retry_tests {
         )
         .unwrap();
         let files = worker
-            .patch_files(&mut job, &binding, parsed)
+            .patch_files(&mut job, &binding, parsed, None)
             .await
             .unwrap();
         // Another writer changes the file after the plan and before the write.
