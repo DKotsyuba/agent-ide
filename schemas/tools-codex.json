@@ -42,7 +42,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Atomic multi-file edit: batch production and test changes in one apply_patch `patch` (*** Begin Patch, *** Add File or *** Update File, *** End Patch); delete and move are unsupported. Absolute file headers inside the worktree are accepted; outside paths refuse. At the inline wait limit the reply is edit_progress: requested and committed files, stage and detail_ref; the project check reports separately.",
+    "description": "Atomic multi-file edit: batch files in one apply_patch `patch` (*** Begin Patch, *** Add File or *** Update File, *** End Patch); delete and move are unsupported. Absolute file headers inside the worktree are accepted; outside paths refuse. Inline wait may return edit_progress with stage; project checks report separately.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -67,7 +67,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Call trees for a batch of symbols: callers (impact), callees (dependencies) or both; depth 2\nusually suffices (1–3); tests:true expands test nodes.",
+    "description": "Call trees for a batch of symbols: callers (impact), callees (dependencies) or both; depth 2\nusually suffices; tests:true expands test nodes.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -196,7 +196,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Doc and body by address (`src/a.rs#Type/f`, window `…:3-5`, region `#@imports`,\n`path:line`) or file lines; batch items: {symbol} or {path, lines:\"1-80\"}. File lines answer\nat once from source. An unchanged item you already hold is acknowledged; force:true\nresends it.",
+    "description": "Doc and body by symbol/region or file lines; batch items: {symbol} or\n{path, lines:\"1-80\"}. File lines answer at once from source. Cached items may be unchanged.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -204,6 +204,7 @@
           "type": "string"
         },
         "force": {
+          "description": "Resend items you already hold.",
           "type": "boolean"
         },
         "items": {
@@ -236,7 +237,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Activate the IDE for this worktree once per task; replies with the project card and the\nbatch call forms.",
+    "description": "Activate once per worktree/task; returns the project card and batch call forms.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -336,7 +337,7 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Batch up to 8 targets ({symbol}, {path}, {pattern} or {command:[argv]}) in order at worktree\nroot with one budget_s. Read result:N/history:true, cancel:N, or restore retained logs\nwith output:\"<ref>/output/N\".",
+    "description": "Batch up to 8 targets ({symbol}, {path}, {pattern} or {command:[argv]}) in order at worktree\nroot with one budget_s. Read result:N/history:true, cancel:N.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

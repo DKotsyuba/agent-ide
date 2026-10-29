@@ -1872,7 +1872,8 @@ mod runner_tests {
         ));
     }
 
-    /// Reports an uncollected run with its command until the owner reads the settled result.
+    /// Reports an uncollected run with its replay environment and exact command until the owner
+    /// reads the settled result; only that owner's acknowledgement clears it.
     #[tokio::test]
     async fn uncollected_reports_runs_until_the_owner_reads_them() {
         let runs = TestRuns::default();
@@ -1890,10 +1891,27 @@ mod runner_tests {
             StartResult::Started(1)
         ));
         let binding = owner.fingerprint();
+        let uncollected = runs.uncollected(&binding);
+        assert_eq!(uncollected.len(), 1);
+        let (id, argv, running) = &uncollected[0];
+        assert_eq!(*id, 1);
+        assert!(*running);
+        assert_eq!(argv.first().map(String::as_str), Some("/usr/bin/env"));
+        assert!(argv.ends_with(&["/bin/echo".into(), "done".into()]));
+        let overrides = &argv[1..argv.len() - 2];
+        assert!(overrides.iter().all(|entry| {
+            entry
+                .split_once('=')
+                .is_some_and(|(key, value)| !key.is_empty() && !value.is_empty())
+        }));
         assert_eq!(
-            runs.uncollected(&binding),
-            vec![(1, vec!["/bin/echo".into(), "done".into()], true)]
+            overrides
+                .iter()
+                .filter(|entry| entry.starts_with("PATH="))
+                .count(),
+            1
         );
+        assert!(overrides.contains(&format!("PATH={}", std::env::var("PATH").unwrap())));
         for _ in 0..100 {
             if runs
                 .get(&root, 1, &owner)
@@ -1962,8 +1980,7 @@ mod runner_tests {
             .result
             .take();
         let pending = runs.stop_summaries(&owner.fingerprint()).join("\n");
-        assert!(pending.contains("running"), "{pending}");
-        assert!(!pending.contains("exit 7"), "{pending}");
+        assert!(pending.starts_with("tests #1: running — "), "{pending}");
         runs.0.lock().unwrap().jobs.get_mut(&id).unwrap().result = result;
 
         runs.observe_binding(&owner.fingerprint());

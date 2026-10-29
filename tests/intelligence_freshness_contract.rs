@@ -232,13 +232,14 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
     assert!(view.diagnostic_deltas().overflowed());
     // Retirement authority must be Workspace's own private-field closure receipt, so this section
     // commits two real durable closures instead of naming a publicly constructible reason.
-    // Native identity refuses symlinked components, so this real worktree lives under
-    // `/private/tmp` rather than behind Darwin's `/tmp` and `/var` aliases.
-    let tree_root = PathBuf::from(format!(
-        "/private/tmp/agent-ide-freshness-{}-{}-closable-worktree",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    // Native identity refuses symlinked components, so use canonical task TMPDIR.
+    let tree_root = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "agent-ide-freshness-{}-{}-closable-worktree",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
     fs::create_dir_all(tree_root.join(".git")).unwrap();
     let durable_database = temporary("durable").with_extension("sqlite");
     let durable_backups = temporary("durable-backups");
@@ -343,11 +344,13 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
     let foreign_store =
         Store::open_with_backup_root(&foreign_database, &foreign_backups, config()).unwrap();
     let foreign_owner = DurableWorkspace::open(&foreign_store).await.unwrap();
-    let foreign_root = PathBuf::from(format!(
-        "/private/tmp/agent-ide-freshness-{}-{}-foreign-worktree",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let foreign_root = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "agent-ide-freshness-{}-{}-foreign-worktree",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
     fs::create_dir_all(foreign_root.join(".git")).unwrap();
     let foreign_tree = foreign_owner
         .resolve_worktree(

@@ -1062,10 +1062,10 @@ mod faults {
     }
 }
 
-/// A project whose test runner is `runner` (a `devDependencies` entry), with a fake `npx` first
-/// on the daemon's `PATH` that prints the runner's own summary line for whatever it is asked to
-/// run, and the test replies of one daemon with `env`.
-async fn runner_transcript(runner: &str, summary: &str, env: &[(&str, &str)]) -> Vec<String> {
+/// Returns file, pattern, directory and non-test replies for a project declaring `runner` in
+/// `devDependencies`, with the hosting mode selected by `env`. A fake `npx` first on `PATH`
+/// records any invocation without preparing packages; its sentinel must remain absent.
+async fn runner_transcript(runner: &str, env: &[(&str, &str)]) -> Vec<String> {
     let fixture = Fixture::new(
         &[
             (
@@ -1082,11 +1082,7 @@ async fn runner_transcript(runner: &str, summary: &str, env: &[(&str, &str)]) ->
     let tools = fixture.base.join("fake-bin");
     std::fs::create_dir_all(&tools).unwrap();
     let script = tools.join("npx");
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\necho \"$@\"\necho '{summary}'\n"),
-    )
-    .unwrap();
+    std::fs::write(&script, "#!/bin/sh\n: > \"$0.ran\"\nexit 1\n").unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1111,33 +1107,33 @@ async fn runner_transcript(runner: &str, summary: &str, env: &[(&str, &str)]) ->
         replies.push(line_for(&fixture, "ide.test", &arguments, &reply));
     }
     session.close(&fixture).await;
+    assert!(
+        !tools.join("npx.ran").exists(),
+        "{runner}: npx must not run"
+    );
     replies
 }
 
-/// Vitest and Jest runs planned by the module become the declared test recipes and report exactly
-/// what the in-process runs report (file selection, named pattern, directory, a file with no
-/// tests), with the runner's own summary parsed.
+/// Both hosting modes refuse unbound `npx vitest`/`npx jest` for file, pattern and directory
+/// selections without invoking the runner; a non-test file still reports that it has no tests.
 #[tokio::test]
-async fn typescript_test_runners_match_in_process_answers() {
-    for (runner, summary, rerun) in [
-        (
-            "vitest",
-            "Tests  1 passed (1)",
-            "npx vitest run src/a.test.ts",
-        ),
-        (
-            "jest",
-            "Tests:       1 passed, 1 total",
-            "npx jest src/a.test.ts",
-        ),
-    ] {
-        let in_process = runner_transcript(runner, summary, &[IN_PROCESS]).await;
-        let moduled = runner_transcript(runner, summary, &[]).await;
+async fn typescript_test_runners_refuse_unbound_npx_in_both_modes() {
+    for runner in ["vitest", "jest"] {
+        let in_process = runner_transcript(runner, &[IN_PROCESS]).await;
+        let moduled = runner_transcript(runner, &[]).await;
         parity::assert_parity(&in_process, &moduled);
-        let all = moduled.join("\n");
-        assert!(all.contains("1 passed, 0 failed"), "{runner}:\n{all}");
-        assert!(all.contains(rerun), "{runner} reruns `{rerun}`:\n{all}");
-        assert!(all.contains("no tests in src/plain.ts"), "{runner}:\n{all}");
+        for reply in &moduled[..3] {
+            assert!(reply.contains("provider_unavailable"), "{runner}:\n{reply}");
+            assert!(
+                reply.contains("npx-based vitest/jest"),
+                "{runner}:\n{reply}"
+            );
+        }
+        assert!(
+            moduled[3].contains("no tests in src/plain.ts"),
+            "{runner}:\n{}",
+            moduled[3]
+        );
     }
 }
 
@@ -1151,7 +1147,7 @@ async fn typescript_test_runners_match_in_process_answers() {
 #[ignore = "requires accepted AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER"]
 #[tokio::test]
 async fn configured_node_wins_over_ambient_and_npx_refuses() {
-    let mut fixture = node_fixture(true);
+    let fixture = node_fixture(true);
     let sentinel = fixture.base.join("nodeB-ran");
     let ambient_bin = fixture.base.join("ambient-bin");
     std::fs::create_dir_all(&ambient_bin).unwrap();

@@ -1336,7 +1336,8 @@ async fn rename_stopped_midway_reports_each_file_and_the_same_operation_id_finis
 /// files, which cargo's admitted recipes run one per invocation, run one after another in the
 /// same run; and a target the runner cannot take is answered on its own line. While the run is live, another
 /// several-target start in the worktree answers exactly `tests #1: still running`; the settled
-/// result has one line per target and one rerun line, and that line reproduces the whole run.
+/// result has one line per target and one bounded rerun preview whose retained full replay
+/// reproduces every invocation with its admitted environment.
 #[tokio::test]
 async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
     let fixture = symbol_test_fixture();
@@ -1440,23 +1441,28 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
             && result.contains("\n  target 5 path README.md: not runnable: "),
         "{result}"
     );
-    let rerun = result
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix("rerun: "))
-        .unwrap_or_else(|| panic!("one rerun line: {result}"));
-    assert!(
-        rerun.starts_with("sh -c 'cargo test --workspace -- --exact ")
-            && rerun.ends_with(
-                "; cargo test --manifest-path Cargo.toml --test path_tests; cargo test \
-                 --manifest-path Cargo.toml --test more_tests'"
-            ),
-        "{rerun}"
-    );
-    let reproduced = std::process::Command::new("/bin/sh")
-        .args(["-c", rerun])
-        .current_dir(&fixture.root)
+    assert_eq!(result.matches("\n  rerun preview: ").count(), 1, "{result}");
+    let replay_link: Value = serde_json::from_str(
+        result
+            .lines()
+            .find_map(|line| line.strip_prefix("  full replay: ide.test "))
+            .expect("the bounded batch preview retains its complete replay"),
+    )
+    .unwrap();
+    let replay = actor.call(&fixture, "ide.test", replay_link).await;
+    assert_eq!(replay["continuation"], false, "{replay}");
+    let replay: Value = serde_json::from_str(replay["text"].as_str().unwrap()).unwrap();
+    let argv = replay["argv"].as_array().unwrap();
+    assert_eq!(argv.len(), 3, "{replay}");
+    assert_eq!(argv[0], "/bin/sh");
+    assert_eq!(argv[1], "-c");
+    let reproduced = std::process::Command::new(argv[0].as_str().unwrap())
+        .args(argv[1..].iter().map(|arg| arg.as_str().unwrap()))
+        .current_dir(fixture.root.join(replay["cwd"].as_str().unwrap()))
+        .env_clear()
         .output()
         .unwrap();
+    assert_eq!(reproduced.status.code(), Some(101));
     let reproduced = String::from_utf8_lossy(&reproduced.stdout);
     for line in [
         "test tests::doubles ... ok",
@@ -1465,7 +1471,7 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
         "test checks_is_file ... ok",
         "test more_is_file ... ok",
     ] {
-        assert!(reproduced.contains(line), "{line}: {reproduced}");
+        assert_eq!(reproduced.matches(line).count(), 1, "{line}: {reproduced}");
     }
 
     actor.call(&fixture, "ide.stop", json!({})).await;

@@ -351,7 +351,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "description": "Several line ranges of one source/text file in one reply."},
                     "detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES},
                     "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "offset":{"type":"integer","minimum":0,"description":"1-based first line."}, "limit":{"type":"integer","minimum":1,"description":"Line count; default 2000."}}}, "description": "Up to 32."},
-                    "force": {"type": "boolean", "default": false}
+                    "force": {"type": "boolean", "default": false, "description":"Resend items you already hold."}
                 }
             }),
         ),
@@ -5236,8 +5236,7 @@ impl StdioFacade {
 
 #[tool_router]
 impl StdioFacade {
-    /// Activate the IDE for this worktree once per task; replies with the project card and the
-    /// batch call forms.
+    /// Activate once per worktree/task; returns the project card and batch call forms.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn start(
@@ -5273,10 +5272,8 @@ impl StdioFacade {
             .await
     }
 
-    /// Doc and body by address (`src/a.rs#Type/f`, window `…:3-5`, region `#@imports`,
-    /// `path:line`) or file lines; batch items: {symbol} or {path, offset, limit}. File lines answer
-    /// at once from source. An unchanged item you already hold is acknowledged; force:true
-    /// resends it.
+    /// Doc and body by symbol/region or file lines; batch items: {symbol} or
+    /// {path, offset, limit}. File lines answer at once from source. Cached items may be unchanged.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn read(
@@ -5301,7 +5298,7 @@ impl StdioFacade {
     }
 
     /// Call trees for a batch of symbols: callers (impact), callees (dependencies) or both; depth 2
-    /// usually suffices (1–3); tests:true expands test nodes.
+    /// usually suffices; tests:true expands test nodes.
     #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn graph(
@@ -5313,8 +5310,7 @@ impl StdioFacade {
     }
 
     /// Batch up to 8 targets ({symbol}, {path}, {pattern} or {command:[argv]}) in order at worktree
-    /// root with one budget_s. Read result:N/history:true, cancel:N, or restore retained logs
-    /// with output:"<ref>/output/N".
+    /// root with one budget_s. Read result:N/history:true, cancel:N.
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false))]
     async fn test(
@@ -5350,12 +5346,11 @@ impl StdioFacade {
         self.call(AssistanceTool::Stop, parameters, context).await
     }
 
-    /// Atomic multi-file edit: batch production and test files ({path, changes}, {path, create:true,
-    /// content} or {path, content}); all apply or none. A change: {symbol, content} (op
-    /// insert/delete, where), exact {old, new} once (within scopes it), {lines, content},
-    /// add_import or remove_import. Rename: op rename, symbol, new_name. At the inline wait limit
-    /// the reply is edit_progress: requested and committed files, stage and detail_ref; the project
-    /// check reports separately.
+    /// Atomic multi-file edit: batch files ({path, changes}, {path, create:true,
+    /// content} or {path, content}); all apply or none. A change: {symbol, content} (op,
+    /// where), {old, new} once (within scopes it), {lines, content},
+    /// add_import or remove_import. Rename: op rename, symbol, new_name. Inline wait may return
+    /// edit_progress with stage; project checks report separately.
     #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
     async fn edit(
@@ -5454,7 +5449,7 @@ impl CatalogHost {
                     }
                     if self == Self::Codex && &*tool.name == "ide.edit" {
                         properties.retain(|key, _| matches!(key.as_str(), "operation_id" | "patch"));
-                        tool.description = Some("Atomic multi-file edit: batch production and test changes in one apply_patch `patch` (*** Begin Patch, *** Add File or *** Update File, *** End Patch); delete and move are unsupported. Absolute file headers inside the worktree are accepted; outside paths refuse. At the inline wait limit the reply is edit_progress: requested and committed files, stage and detail_ref; the project check reports separately.".into());
+                        tool.description = Some("Atomic multi-file edit: batch files in one apply_patch `patch` (*** Begin Patch, *** Add File or *** Update File, *** End Patch); delete and move are unsupported. Absolute file headers inside the worktree are accepted; outside paths refuse. Inline wait may return edit_progress with stage; project checks report separately.".into());
                     }
                     if self == Self::Claude && &*tool.name == "ide.edit" {
                         let change = properties.get("changes").and_then(|changes| changes.get("items")).cloned();
@@ -5989,7 +5984,7 @@ fn inspect_mode_restrictions_are_explicit_in_catalog_and_refusal() {
     }
     let error = validate_call(
         AssistanceTool::Inspect,
-        json!({"kind":"diagnostics","path":"a.rs","language":"rust"}),
+        json!({"kind":"diagnostics","path":"a.rs","language":"gamma"}),
     )
     .unwrap_err();
     assert_eq!(

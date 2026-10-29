@@ -1,12 +1,12 @@
-//! The `agent-ide doctor` command with no arguments: the read-only installation doctor.
+//! Installation findings for legacy `doctor` and explicit non-mutating `doctor --read-only`.
 //!
 //! Reports the launcher configuration, the toolchains it declares, the standalone install and
 //! launcher shim, the host plugin pinning, Codex/Claude host wiring, stale runtime entries under
 //! the temporary root, and the last day's error-journal volume as bounded JSON findings. It never
-//! creates state, never starts a daemon, and only ever names paths below the effective user's own
+//! starts a daemon, and only ever names paths below the effective user's own
 //! home (see [`crate::userhome`]). Its one mutation is retiring the product's own abandoned
 //! runtime directories (see `is_product_runtime_name`); no other temporary entry is counted,
-//! probed or removed.
+//! probed or removed. Explicit read-only mode also suppresses executable probes and cleanup.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -59,6 +59,9 @@ pub struct Finding {
 /// The complete installation doctor report.
 #[derive(Serialize)]
 pub struct Report {
+    /// Present and true only in the explicit mode that never prunes runtime state or probes tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
     /// The running binary's version.
     pub version: String,
     /// The effective home directory the checks were resolved against.
@@ -75,6 +78,17 @@ pub struct Report {
 /// older than a day and has no daemon listening is removed under its own exclusive lock (the
 /// lock file of a runtime that never had one is created first); see the daemons check.
 pub async fn report() -> Report {
+    report_with_mode(false).await
+}
+
+/// Reads installation findings without pruning runtimes, creating locks, or executing toolchains.
+/// The additive `read_only: true` marker lets consumers reject older, mutating CLI implementations.
+pub async fn report_read_only() -> Report {
+    report_with_mode(true).await
+}
+
+/// Shares installation discovery; `read_only` suppresses cleanup and executable version probes.
+async fn report_with_mode(read_only: bool) -> Report {
     let mut findings = Vec::new();
     let Some(effective) = userhome::user_home() else {
         push(
@@ -84,27 +98,38 @@ pub async fn report() -> Report {
             "install",
             "no home directory is available".to_owned(),
         );
-        return finish(findings, PathBuf::new());
+        return finish(findings, PathBuf::new(), read_only);
     };
     let home = effective.join(".agent-ide");
     let launcher = check_launcher(&mut findings, &effective);
-    check_toolchains(&mut findings, launcher.as_ref()).await;
+    if read_only {
+        push(
+            &mut findings,
+            "not_probed",
+            "info",
+            "toolchains",
+            "toolchain execution is unavailable in read-only mode".to_owned(),
+        );
+    } else {
+        check_toolchains(&mut findings, launcher.as_ref()).await;
+    }
     check_install(&mut findings, &effective);
     check_plugin(&mut findings, &effective);
     check_hosts(&mut findings, &effective);
     check_language_modes(&mut findings);
-    check_running_daemons(&mut findings).await;
+    check_running_daemons(&mut findings, read_only).await;
     check_error_journal(&mut findings, &home);
-    finish(findings, home)
+    finish(findings, home, read_only)
 }
 
-/// Renders the report with this binary's version and the current RFC 3339 moment.
-fn finish(findings: Vec<Finding>, home: PathBuf) -> Report {
+/// Renders findings and receipt time; read-only mode adds a true marker, legacy JSON stays unchanged.
+fn finish(findings: Vec<Finding>, home: PathBuf, read_only: bool) -> Report {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     Report {
+        read_only: read_only.then_some(true),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         home: home.to_string_lossy().into_owned(),
         checked_at: errorlog::format_rfc3339(now),
@@ -629,19 +654,13 @@ fn retire_abandoned_runtime(path: &Path, judged: &fs::Metadata) -> Retired {
 /// younger or answering candidate, or one whose lock is held (a daemon still starting), is never
 /// touched.
 ///
-/// The shared repository daemons a managed Claude session rendezvouses with live in
-/// `/private/tmp` under the `ai-r-` prefix rather than below the temp root, so those entries
+/// The shared repository daemons a managed Claude session rendezvouses with live in the public
+/// configured rendezvous parent (legacy `/private/tmp`) under `ai-r-`, so those entries
 /// are listed too — they are exactly the long-lived daemons an upgrade can leave outdated.
-async fn check_running_daemons(findings: &mut Vec<Finding>) {
-    let Ok(root) = fs::canonicalize(std::env::temp_dir()) else {
-        return;
-    };
+/// `read_only` retains abandoned directories without creating a lock or attempting removal.
+async fn check_running_daemons(findings: &mut Vec<Finding>, read_only: bool) {
+    let roots = daemon_scan_roots();
     let mut candidates = Vec::new();
-    let shared = Path::new("/private/tmp");
-    let mut roots = vec![root.as_path()];
-    if root.as_path() != shared {
-        roots.push(shared);
-    }
     for dir in roots {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
@@ -650,8 +669,7 @@ async fn check_running_daemons(findings: &mut Vec<Finding>) {
             if !is_product_runtime_name(&entry.file_name().to_string_lossy()) {
                 continue;
             }
-            // `DirEntry::metadata` does not follow a symlink, so a link named like a runtime is
-            // neither a directory nor a candidate.
+            // DirEntry metadata does not follow symlinks.
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
@@ -663,6 +681,51 @@ async fn check_running_daemons(findings: &mut Vec<Finding>) {
             }
         }
     }
+    check_runtime_candidates(findings, candidates, read_only).await;
+}
+
+/// Returns legacy production roots without scanning or writing them. The existing `test-seams`
+/// API admits one explicit private fixture root only in feature-enabled test builds; an invalid
+/// selector fails closed to no roots. Default/release builds never read or honor the selector.
+fn daemon_scan_roots() -> Vec<PathBuf> {
+    if let Some(selected) = crate::test_seams::var("AGENT_IDE_TEST_DOCTOR_SCAN_ROOT") {
+        let selected = Path::new(&selected);
+        if !selected.is_absolute() {
+            return Vec::new();
+        }
+        return fs::canonicalize(selected)
+            .ok()
+            .filter(|root| {
+                fs::symlink_metadata(root).is_ok_and(|metadata| {
+                    metadata.is_dir()
+                        && metadata.uid() == unsafe { libc::geteuid() }
+                        && metadata.mode() & 0o077 == 0
+                })
+            })
+            .into_iter()
+            .collect();
+    }
+    let Ok(root) = fs::canonicalize(std::env::temp_dir()) else {
+        return Vec::new();
+    };
+    let Ok(shared) = crate::hook_hints::effective_root() else {
+        return Vec::new();
+    };
+    let include_shared = root != shared;
+    let mut roots = vec![root];
+    if include_shared {
+        roots.push(shared);
+    }
+    roots
+}
+
+/// Projects prevalidated runtime candidates; read-only mode counts stale entries without cleanup.
+/// Candidate paths and metadata remain private and never enter findings.
+async fn check_runtime_candidates(
+    findings: &mut Vec<Finding>,
+    candidates: Vec<(PathBuf, fs::Metadata)>,
+    read_only: bool,
+) {
     let mut versions: BTreeMap<String, usize> = BTreeMap::new();
     let mut outdated = 0usize;
     let mut stale = 0usize;
@@ -674,7 +737,9 @@ async fn check_running_daemons(findings: &mut Vec<Finding>) {
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > STALE_RUNTIME_AGE);
         if !has_live_listener(&path).await {
-            if stale_age {
+            if stale_age && read_only {
+                stale += 1;
+            } else if stale_age {
                 match retire_abandoned_runtime(&path, &judged) {
                     Retired::Removed => pruned += 1,
                     Retired::Failed => stale += 1,
@@ -749,9 +814,15 @@ async fn check_running_daemons(findings: &mut Vec<Finding>) {
             "stale_runtime",
             "warn",
             "daemons",
-            format!(
-                "{stale} stale agent-ide runtime entries owned by this user under the temporary directory could not be removed"
-            ),
+            if read_only {
+                format!(
+                    "{stale} stale agent-ide runtime entries retained under the temporary directory"
+                )
+            } else {
+                format!(
+                    "{stale} stale agent-ide runtime entries owned by this user under the temporary directory could not be removed"
+                )
+            },
         );
     }
 }
@@ -828,4 +899,76 @@ fn check_error_journal(findings: &mut Vec<Finding>, home: &Path) {
         "errors",
         format!("{count} error-level journal lines in the last 24 hours"),
     );
+}
+
+#[cfg(test)]
+/// Isolated retention checks; never scans production runtime roots.
+mod observation_tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+
+    /// A default-build child inherits the selector but proves it cannot affect root selection.
+    /// This only computes paths; it never calls the mutating installation report or scans them.
+    #[cfg(not(feature = "test-seams"))]
+    #[test]
+    fn default_build_ignores_doctor_scan_root_selector() {
+        /// Existing feature-gated seam API selector exercised only in a disposable child.
+        const SELECTOR: &str = "AGENT_IDE_TEST_DOCTOR_SCAN_ROOT";
+        if let Some(selected) = std::env::var_os(SELECTOR) {
+            assert!(crate::test_seams::var(SELECTOR).is_none());
+            let selected = PathBuf::from(selected);
+            assert!(!daemon_scan_roots().contains(&selected));
+            assert_ne!(crate::hook_hints::effective_root().unwrap(), selected);
+            return;
+        }
+        let root = crate::scratch::ScratchDir::new("doctor-default");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "doctor_install::observation_tests::default_build_ignores_doctor_scan_root_selector", "--test-threads=1"])
+            .env(SELECTOR, &*root).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert_eq!(fs::read_dir(&*root).unwrap().count(), 0);
+    }
+
+    /// An old private runtime with no lock is retained byte-for-byte by the actual safe candidate
+    /// path; the legacy cleanup's exclusive lock creation is never reached.
+    #[tokio::test]
+    async fn read_only_doctor_retains_stale_runtime_without_creating_lock() {
+        let root = crate::scratch::ScratchDir::new("safe-doctor");
+        let runtime = root.join("ai-r-0000000000000000");
+        fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
+        fs::write(runtime.join("evidence"), b"retained evidence").unwrap();
+        let file = fs::File::open(&runtime).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(
+            std::time::SystemTime::now() - STALE_RUNTIME_AGE - Duration::from_secs(1),
+        ))
+        .unwrap();
+        let before = fs::metadata(&runtime).unwrap();
+        let mut findings = Vec::new();
+        check_runtime_candidates(&mut findings, vec![(runtime.clone(), before.clone())], true)
+            .await;
+        assert_eq!(
+            fs::read(runtime.join("evidence")).unwrap(),
+            b"retained evidence"
+        );
+        assert_eq!(fs::read_dir(&runtime).unwrap().count(), 1);
+        assert!(!runtime.join(crate::app::LOCK_NAME).exists());
+        assert_eq!(
+            fs::metadata(&runtime).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.code == "stale_runtime")
+        );
+        let safe = serde_json::to_value(finish(findings, root.to_path_buf(), true)).unwrap();
+        assert_eq!(safe["read_only"], true);
+        let legacy = serde_json::to_value(finish(Vec::new(), root.to_path_buf(), false)).unwrap();
+        assert!(legacy.get("read_only").is_none());
+    }
 }

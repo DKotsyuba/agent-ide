@@ -171,6 +171,15 @@ pub struct ProjectProblemFeed {
 }
 
 impl ProjectProblemFeed {
+    /// Reads retained scheduler summaries for a canonical Git common directory and row offset.
+    /// This does not consult or modify bindings, trigger checks, or consume delivered feed state.
+    pub(crate) fn observe(
+        &self,
+        common_dir: &str,
+        cursor: u64,
+    ) -> crate::app::observation::ChecksPage {
+        self.scheduler.observe(common_dir, cursor)
+    }
     /// Builds the feed around an already configured `scheduler`.
     ///
     /// `allowed_roots` must be nonempty for any worktree to be admitted; `languages` lists the

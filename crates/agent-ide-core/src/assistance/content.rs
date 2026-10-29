@@ -880,7 +880,7 @@ mod tests {
         assert_eq!(rendered.structured_content, Some(expected));
     }
 
-    /// Generic refusals obey r5 budgets through the production renderer, preserve isError and
+    /// Generic and configured-environment refusals obey r5 budgets through the production renderer, preserve isError and
     /// typed outcomes, and expose no internal inspect/start/diff reason labels in model text.
     #[test]
     fn generic_refusals_have_one_bounded_repair_and_preserve_outcomes() {
@@ -892,6 +892,10 @@ mod tests {
             ),
             (FailureCode::Capacity, "diff:too_large"),
             (FailureCode::Internal, "daemon:internal"),
+            (
+                FailureCode::ProviderUnavailable,
+                "environment: configured native tool is missing",
+            ),
             (
                 FailureCode::SourceTooLarge {
                     size: u64::MAX,

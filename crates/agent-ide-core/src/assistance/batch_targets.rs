@@ -221,7 +221,7 @@ impl Worker<'_> {
             single["symbol"] = serde_json::json!(entry.name);
             job.parameters = single;
             job.failure_detail = None;
-            // Boxed: the single forms route their own `symbols` form back here.
+            // Keep each large single-entry future off the batch owner's frame.
             let answer = match tool {
                 AssistanceTool::Graph => Box::pin(self.graph(job)).await,
                 _ => Box::pin(self.symbol(job)).await,

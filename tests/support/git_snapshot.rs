@@ -166,17 +166,19 @@ impl Drop for GitFixture {
     }
 }
 
-/// Returns a unique `/private/tmp` location without relying on test order or a global fixture path.
+/// Returns a unique canonical task-TMPDIR location without test order or a global fixture path.
 fn unique_temp_path(prefix: &str) -> PathBuf {
     let tick = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after epoch")
         .as_nanos();
-    PathBuf::from(format!(
-        "/private/tmp/{prefix}-{}-{tick}-{}",
-        std::process::id(),
-        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-    ))
+    fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "{prefix}-{}-{tick}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ))
 }
 
 /// Starts Git with the same cleared environment and literal worktree selection as the fixture needs.

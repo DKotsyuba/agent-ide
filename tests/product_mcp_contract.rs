@@ -3652,6 +3652,21 @@ fn toolchain_bin(tool: &str) -> String {
     format!("{root}/bin/{tool}")
 }
 
+/// Configures the operator-prepared Rust toolchain for fixture Cargo runs and Rust formatting.
+/// Enables real confined project checks without a semantic provider; no tool is installed.
+fn enable_prepared_rust_checks(fixture: &ProductFixture) {
+    let toolchain = PathBuf::from(toolchain_bin("cargo"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["project_checks"] = json!({"debounce_ms":100,"rust":{"toolchain_dir":toolchain}});
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+}
+
 /// A real MCP client plus host actor/call correlation owned by one configured test target.
 struct ProductActor {
     /// Actual shipping MCP process; its stdin is closed explicitly at test completion.
@@ -3866,13 +3881,49 @@ impl ProductActor {
         (reply, posts)
     }
     /// Runs exact Pre→MCP→Post with current host state separated from bounded model arguments.
+    /// Only an explicit first-page full-test-replay query permits the closed JSON replay body;
+    /// its canonical cwd must remain this fixture. Callers check the requested command's argv.
     async fn call(&mut self, fixture: &ProductFixture, name: &str, arguments: Value) -> Value {
         self.next += 1;
         let call = format!("call-{}", self.next);
         self.lifecycle(fixture, "PreToolUse", &call).await;
         let reply=self.mcp.exchange(json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":{"threadId":self.actor,"callId":call,"x-codex-turn-metadata":{},"codex/sandbox-state-meta":self.state}}})).await;
         self.lifecycle(fixture, "PostToolUse", &call).await;
-        assert_compact_envelope(&reply);
+        if name == "ide.test"
+            && arguments
+                .as_object()
+                .is_some_and(|object| object.len() == 1)
+            && arguments["output"]
+                .as_str()
+                .is_some_and(|reference| reference.ends_with("/replay/output/1"))
+        {
+            let result = &reply["result"];
+            let content = result["content"].as_array().unwrap();
+            assert_eq!(content.len(), 1, "{reply}");
+            let structured = &result["structuredContent"];
+            assert_eq!(structured["state"], "complete", "{reply}");
+            assert_eq!(structured["kind"], "test", "{reply}");
+            assert_eq!(structured["continuation"], false, "{reply}");
+            assert_eq!(structured["truncated"], false, "{reply}");
+            assert_eq!(structured["text"], content[0]["text"], "{reply}");
+            let replay: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(replay.as_object().unwrap().len(), 2, "{reply}");
+            assert!(
+                replay["argv"]
+                    .as_array()
+                    .is_some_and(|argv| !argv.is_empty() && argv.iter().all(Value::is_string)),
+                "{reply}"
+            );
+            let cwd = replay["cwd"].as_str().unwrap();
+            assert!(
+                std::fs::canonicalize(fixture.root.join(cwd))
+                    .unwrap()
+                    .starts_with(&fixture.root),
+                "{reply}"
+            );
+        } else {
+            assert_compact_envelope(&reply);
+        }
         reply["result"]["structuredContent"].clone()
     }
     /// Runs exact Pre→MCP→Post like [`Self::call`] but returns the whole raw MCP reply, for
@@ -6782,7 +6833,7 @@ async fn plain_source_does_not_wait_for_absent_cold_or_hung_providers() {
             )
             .unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-            fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"hung-plain-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"plain-provider-cache"}]));
+            fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"hung-plain-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"plain-provider-cache"}]));
         }
         let mut held_provider = None;
         let items = (0..5)
@@ -10339,12 +10390,17 @@ async fn configured_product_test_command_uses_cwd_env_and_parses_wrapped_pytest_
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let command = json!([
+        "/bin/sh",
+        "-c",
+        "test -f cwd-marker && test \"$PYTHONPATH\" = packages/a:packages/b || exit 9; printf '2 passed, 1 failed in 0.02s\\n'"
+    ]);
     let reply = actor
         .call(
             &fixture,
             "ide.test",
             json!({
-                "command":["/bin/sh","-c","test -f cwd-marker && test \"$PYTHONPATH\" = packages/a:packages/b || exit 9; printf '2 passed, 1 failed in 0.02s\\n'"],
+                "command":command,
                 "cwd":"packages/pkg",
                 "env":{"PYTHONPATH":"packages/a:packages/b"}
             }),
@@ -10354,7 +10410,15 @@ async fn configured_product_test_command_uses_cwd_env_and_parses_wrapped_pytest_
     assert_eq!(reply["kind"], "test", "{reply}");
     let text = reply["text"].as_str().unwrap();
     assert!(text.contains("2 passed, 1 failed"), "{text}");
-    assert!(text.contains("rerun:"), "{text}");
+    let replay = read_test_replay(&mut actor, &fixture, &reply).await;
+    assert_eq!(replay["cwd"], "packages/pkg");
+    let mut expected = vec![
+        json!("/usr/bin/env"),
+        json!(format!("PATH={}", std::env::var("PATH").unwrap())),
+        json!("PYTHONPATH=packages/a:packages/b"),
+    ];
+    expected.extend(command.as_array().unwrap().iter().cloned());
+    assert_eq!(replay["argv"], json!(expected));
     let outside = fixture.base.join("outside-package");
     std::fs::create_dir_all(&outside).unwrap();
     std::os::unix::fs::symlink(&outside, fixture.root.join("escape")).unwrap();
@@ -10491,6 +10555,7 @@ async fn configured_product_typescript_non_test_file_answers_no_tests() {
 #[tokio::test]
 async fn configured_product_test_runs_in_background_and_reports_failures() {
     let fixture = ProductFixture::new(json!([]));
+    enable_prepared_rust_checks(&fixture);
     std::fs::write(
         fixture.root.join("src/lib.rs"),
         r#"
@@ -11623,6 +11688,7 @@ printf '{"reason":"build-finished","success":true}\n'
 #[tokio::test]
 async fn configured_product_test_failures_carry_addresses() {
     let fixture = ProductFixture::new(json!([]));
+    enable_prepared_rust_checks(&fixture);
     std::fs::write(
         fixture.root.join("src/lib.rs"),
         "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fails() { assert_eq!(2 + 2, 5); }\n}\n",
@@ -11857,6 +11923,26 @@ async fn batch_call_with_text(
         .unwrap()
         .to_owned();
     (reply["result"]["structuredContent"].clone(), text)
+}
+
+/// Reads the full replay advertised by a completed test `result` through `actor`'s own fixture
+/// binding. Panics on missing/invalid replay JSON; it retrieves retained data and starts no run.
+async fn read_test_replay(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    result: &Value,
+) -> Value {
+    let link: Value = serde_json::from_str(
+        result["text"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("  full replay: ide.test "))
+            .expect("bounded rerun preview retains a complete replay"),
+    )
+    .unwrap();
+    let replay = actor.call(fixture, "ide.test", link).await;
+    serde_json::from_str(replay["text"].as_str().unwrap()).unwrap()
 }
 
 /// [`ProductActor::settle`] for calls whose compact text must be asserted too. A pending
@@ -12745,8 +12831,7 @@ async fn configured_product_batch_patch_stale_member_keeps_partial_and_native_by
 async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_operation_id() {
     let batch = "pub fn first() -> i32 {\n    1\n}\n\npub fn second() -> i32 {\n    2\n}\n";
     let fixture = batch_edit_fixture(batch);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
-    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut daemon = fixture.daemon().await;
     let mut actor = batch_started_actor(&fixture, "batch-old-miss", "src/batch.rs").await;
     let read = actor
         .call(
@@ -12832,8 +12917,8 @@ async fn configured_product_batch_old_ambiguous_lists_both_lines_and_within_retr
     let batch = "fn helper(value: i32) {\n    let _ = value;\n}\n\npub fn alpha() {\n    \
                  helper(0);\n}\n\npub fn beta() {\n    helper(0);\n}\n";
     let fixture = batch_edit_fixture(batch);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
-    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    // These semantic edit assertions need the accepted provider, not fake check counts.
+    let mut daemon = fixture.daemon().await;
     let mut actor = batch_started_actor(&fixture, "batch-old-two", "src/batch.rs").await;
     let read = actor
         .call(
@@ -13180,8 +13265,7 @@ async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existin
     std::fs::write(fixture.root.join("src/broken.rs"), broken).unwrap();
     fixture.git(&["add", "--", "src/broken.rs"]);
     fixture.git(&["commit", "--quiet", "-m", "pre-broken fixture"]);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
-    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut daemon = fixture.daemon().await;
     let mut actor = batch_started_actor(&fixture, "batch-syntax", "src/batch.rs").await;
     let read = actor
         .call(
@@ -13464,7 +13548,21 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
     )
     .await;
     let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
-    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    let gate_events = std::fs::read_to_string(
+        agent_ide::errorlog::log_root()
+            .unwrap()
+            .join(agent_ide::errorlog::repository_key(&fixture.runtime))
+            .join("events.jsonl"),
+    )
+    .unwrap_or_default();
+    let gate_events: Vec<_> = gate_events
+        .lines()
+        .filter(|line| line.contains("gate:"))
+        .collect();
+    assert_eq!(
+        refused["code"], "edit_refused",
+        "{refused}: {gate_events:?}"
+    );
     assert_eq!(
         batch_without_status_plate(&refused_text),
         "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
@@ -13784,8 +13882,7 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     let batch = "fn helper(value: i32) -> i32 {\n    value + 1\n}\n\npub fn alpha() -> i32 {\n    \
                  helper(1)\n}\n\npub fn beta() -> i32 {\n    helper(2)\n}\n";
     let fixture = batch_edit_fixture(batch);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
-    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut daemon = fixture.daemon().await;
     let mut actor = batch_started_actor(&fixture, "batch-ranges", "src/batch.rs").await;
     let read = batch_call_with_text(
         &mut actor,
@@ -13846,19 +13943,12 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
 /// while the other blocks still arrive.
 #[tokio::test]
 async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbol() {
-    let huge_body: String = (0..380)
-        .map(|index| {
-            format!(
-                "    let value_{index:03} = {index} + 0; // padding padding padding {index:03}\n"
-            )
-        })
-        .collect();
+    // Each unit fits the current source carrier on its own; together they exceed its budget.
+    // Keep the original line counts so the gutter, duplicate, missing-symbol and footer checks
+    // exercise exactly the same addresses without making the first unit itself paginated.
+    let huge_body = "let _a=0;\n".repeat(380);
     let other_body: String = (0..160)
-        .map(|index| {
-            format!(
-                "    let other_{index:03} = {index} + 0; // padding padding padding {index:03}\n"
-            )
-        })
+        .map(|index| format!("let other_{index:03}=0;\n"))
         .collect();
     let content = format!(
         "pub fn huge_a() -> i32 {{\n{huge_body}    0\n}}\n\npub fn huge_b() -> i32 {{\n\
@@ -13931,8 +14021,8 @@ async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbo
 async fn configured_product_batch_legacy_single_change_replies_stay_byte_identical() {
     let batch = "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n";
     let fixture = batch_edit_fixture(batch);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
-    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    // These semantic edit assertions need the accepted provider, not fake check counts.
+    let mut daemon = fixture.daemon().await;
     let mut actor = batch_started_actor(&fixture, "batch-legacy", "src/batch.rs").await;
 
     let insert = batch_call_with_text(
@@ -14112,8 +14202,7 @@ async fn configured_product_claude_edit_replies_name_their_operation() {
     std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
     fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
     fixture.git(&["commit", "--quiet", "-m", "claude edit operation fixture"]);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
-    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "claude-edit-ops").await;
     let started = actor
         .call_claude_with_post(
@@ -14316,6 +14405,7 @@ async fn product_directory_outline_lists_files_and_rejects_escaping_symlinks() {
 #[tokio::test]
 async fn product_outline_and_read_report_no_such_file() {
     let fixture = ProductFixture::new(json!([]));
+    enable_prepared_rust_checks(&fixture);
     std::fs::write(fixture.root.join("real.rs"), "pub fn present() {}\n").unwrap();
     std::os::unix::fs::symlink("/etc/passwd", fixture.root.join("escape.rs")).unwrap();
     let mut daemon = fixture.daemon().await;
@@ -14404,7 +14494,9 @@ async fn product_outline_and_read_report_no_such_file() {
     assert!(
         old_text_edit["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("edit: replaced; path real.rs")),
+            .is_some_and(
+                |text| batch_without_status_plate(text).starts_with("edit: replaced; path real.rs")
+            ),
         "{old_text_edit}"
     );
     daemon.kill().await.unwrap();
@@ -15145,9 +15237,16 @@ async fn configured_product_symbol_test_uses_the_live_symbol_session() {
             break status;
         }
     };
-    assert!(
-        result["text"].as_str().unwrap().contains("checks_is_file"),
-        "{result}"
+    let replay = read_test_replay(&mut actor, &fixture, &result).await;
+    assert_eq!(
+        replay["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|arg| arg.as_str() == Some("checks_is_file"))
+            .count(),
+        1,
+        "{replay}"
     );
     // A bare symbol name resolves through the same workspace-symbol path the symbol card uses
     // (T114 demo defect) instead of answering unknown_symbol for a missing `file#` prefix.
@@ -15179,9 +15278,16 @@ async fn configured_product_symbol_test_uses_the_live_symbol_session() {
             break status;
         }
     };
-    assert!(
-        result["text"].as_str().unwrap().contains("checks_is_file"),
-        "{result}"
+    let replay = read_test_replay(&mut actor, &fixture, &result).await;
+    assert_eq!(
+        replay["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|arg| arg.as_str() == Some("checks_is_file"))
+            .count(),
+        1,
+        "{replay}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
@@ -20116,7 +20222,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"slow-fixture-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"slow-fixture-cache"}]));
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"slow-fixture-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"slow-fixture-cache"}]));
     let mut daemon = fixture
         .daemon_with_home(Some(&provider_home(&fixture)))
         .await;
@@ -20182,6 +20288,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
             "HOME",
             "PATH",
             "RUSTC",
+            "RUSTUP_AUTO_INSTALL",
             "RUSTUP_TOOLCHAIN",
             "TMPDIR",
         ],
@@ -20252,7 +20359,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     fixture.write_config(
-        json!([{"executable":accepted_program(program.to_str().unwrap(),"exit-before-bind-fixture-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"exit-before-bind-fixture-cache"}]),
+        json!([{"executable":accepted_program(program.to_str().unwrap(),"exit-before-bind-fixture-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"exit-before-bind-fixture-cache"}]),
     );
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "exit-before-bind-root").await;
@@ -20360,7 +20467,7 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]));
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]));
     let mut daemon = fixture
         .daemon_with_home(Some(&provider_home(&fixture)))
         .await;
@@ -21607,6 +21714,7 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
     );
     let (number, last, from, mut end, total) = page_marker(&page1_text);
     assert_eq!((number, last, from, total), (1, false, 0, expected.len()));
+    assert!(end > 0 && end <= total, "{page1_text}");
     let mut collected = page1_text
         .split_once('\n')
         .expect("page marker precedes body")
@@ -21615,10 +21723,14 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
 
     let mut continuation = true;
     let mut expected_page = 1;
+    // Pages end at line boundaries and must advance by at least one complete source line.
+    // The 8 KiB carrier needs more than twenty pages here; the source line count bounds
+    // traversal independently of framing overhead or a future smaller page budget.
+    let max_pages = expected.lines().count();
     let mut last_page = String::new();
     while continuation {
         expected_page += 1;
-        assert!(expected_page < 20, "pagination did not terminate");
+        assert!(expected_page <= max_pages, "pagination did not terminate");
         let next = actor
             .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
             .await;
@@ -21630,6 +21742,12 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
             "the first continuation call must serve page two, never page one again: {text}"
         );
         assert_eq!((from, total), (end, expected.len()), "{text}");
+        assert!(to > from && to <= total, "each page advances: {text}");
+        assert_eq!(text.split_once('\n').unwrap().1.len(), to - from, "{text}");
+        assert!(
+            text.ends_with('\n'),
+            "pages retain complete source lines: {text}"
+        );
         end = to;
         continuation = next["continuation"].as_bool().unwrap();
         assert_eq!(last, !continuation, "{text}");
@@ -22547,7 +22665,9 @@ async fn completed_check_count(database: &Path) -> usize {
 }
 
 /// Same, with a shell command prepended to the fake `cargo` so a test can hold the first check
-/// in its running state long enough to observe a `checking (…)` plate (T22B).
+/// in its running state long enough to observe a `checking (…)` plate (T22B). Supplies an
+/// executable no-op `rustc` for the checks-only toolchain contract and the prepared real
+/// `rustfmt` for edit formatting; no real compiler is invoked.
 fn enable_fake_rust_checks_holding(
     fixture: &ProductFixture,
     allowed_root: &Path,
@@ -22557,6 +22677,8 @@ fn enable_fake_rust_checks_holding(
     let toolchain = home.join(".rustup/toolchains/fake");
     std::fs::create_dir_all(toolchain.join("bin")).unwrap();
     std::fs::create_dir_all(home.join(".cargo")).unwrap();
+    std::fs::copy("/usr/bin/true", toolchain.join("bin/rustc")).unwrap();
+    std::os::unix::fs::symlink(toolchain_bin("rustfmt"), toolchain.join("bin/rustfmt")).unwrap();
     let cargo = toolchain.join("bin/cargo");
     let mut script = String::new();
     if !hold.is_empty() {
@@ -24241,8 +24363,8 @@ async fn outbox_compaction_clears_the_unchanged_read_memory() {
 
 /// A test run that is still running adds nothing to any later reply or plate: no running line, no
 /// elapsed seconds, no instruction. Its outcome is then read explicitly through its handle as the
-/// terminal text of M024-M026-TEST-FACT (counts, the failing test, the rerun line and the output
-/// reference), and a call after it carries nothing about the run.
+/// terminal text of M024-M026-TEST-FACT (counts, the failing test, a runnable rerun or bounded
+/// preview with an exact full replay, and the output reference). A later call carries no run.
 #[tokio::test]
 async fn a_running_test_adds_no_plate_line_and_its_handle_reads_the_terminal_text() {
     let fixture = ProductFixture::new(json!([]));
@@ -24254,13 +24376,13 @@ async fn a_running_test_adds_no_plate_line_and_its_handle_reads_the_terminal_tex
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
     let text = |reply: &Value| reply["text"].as_str().unwrap_or_default().to_owned();
+    let command = json!([
+        "/bin/sh",
+        "-c",
+        "sleep 14; printf '%s\\n' 'running 1 test' 'test tests::fails ... FAILED' '' 'failures:' '' '---- tests::fails stdout ----' \"thread 'tests::fails' panicked at src/lib.rs:3:5:\" 'boom' '' 'failures:' '    tests::fails' '' 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"
+    ]);
     let run = actor
-        .call(
-            &fixture,
-            "ide.test",
-            json!({"command":["/bin/sh","-c",
-                "sleep 14; printf '%s\\n' 'running 1 test' 'test tests::fails ... FAILED' '' 'failures:' '' '---- tests::fails stdout ----' \"thread 'tests::fails' panicked at src/lib.rs:3:5:\" 'boom' '' 'failures:' '    tests::fails' '' 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"]}),
-        )
+        .call(&fixture, "ide.test", json!({"command":command}))
         .await;
     assert!(text(&run).starts_with("tests #1: started"), "{run}");
     assert!(!text(&run).contains("poll"), "{run}");
@@ -24294,7 +24416,26 @@ async fn a_running_test_adds_no_plate_line_and_its_handle_reads_the_terminal_tex
     };
     assert!(fact.starts_with("tests #1: "), "{fact}");
     assert!(fact.contains("\n  FAIL tests::fails"), "{fact}");
-    assert!(fact.contains("\n  rerun: "), "{fact}");
+    if fact.contains("\n  rerun preview: ") {
+        let replay_link: Value = serde_json::from_str(
+            fact.lines()
+                .find_map(|line| line.strip_prefix("  full replay: ide.test "))
+                .expect("a bounded preview retains its complete replay"),
+        )
+        .unwrap();
+        let replay = actor.call(&fixture, "ide.test", replay_link).await;
+        assert_eq!(replay["continuation"], false, "{replay}");
+        let replay: Value = serde_json::from_str(replay["text"].as_str().unwrap()).unwrap();
+        assert_eq!(replay["cwd"], ".");
+        let mut expected = vec![
+            json!("/usr/bin/env"),
+            json!(format!("PATH={}", std::env::var("PATH").unwrap())),
+        ];
+        expected.extend(command.as_array().unwrap().iter().cloned());
+        assert_eq!(replay["argv"], json!(expected));
+    } else {
+        assert!(fact.contains("\n  rerun: "), "{fact}");
+    }
     assert_eq!(fact.matches("full output: ide.test ").count(), 1, "{fact}");
     assert!(!fact.contains("poll"), "{fact}");
     let after = actor
@@ -24746,15 +24887,26 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
         .collect::<Vec<_>>();
     namespaces.sort();
     assert_eq!(namespaces.len(), 2);
-    let run = actor
-        .call(
-            &fixture,
-            "ide.test",
-            json!({"path":"tests/test_env.py","budget_s":5}),
-        )
-        .await;
+    let (run, run_text) = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.test",
+        json!({"path":"tests/test_env.py","budget_s":5}),
+    )
+    .await;
     let run = actor.settle(&fixture, run).await;
-    assert_eq!(run["kind"], "test", "{run}");
+    let module_events = std::fs::read_to_string(
+        provider_home(&fixture)
+            .join(".agent-ide/logs")
+            .join(agent_ide::errorlog::repository_key(&fixture.runtime))
+            .join("events.jsonl"),
+    )
+    .unwrap_or_default();
+    let module_events: Vec<_> = module_events
+        .lines()
+        .filter(|line| line.contains("module_unavailable"))
+        .collect();
+    assert_eq!(run["kind"], "test", "{run}: {run_text}: {module_events:?}");
     for selector in [".venv-py314", "auto"] {
         let next = actor
             .call(
@@ -25048,6 +25200,17 @@ fn add_worktrees(fixture: &ProductFixture, names: &[&str]) -> Vec<PathBuf> {
 #[tokio::test]
 async fn managed_claude_actors_in_three_worktrees_work_side_by_side() {
     let fixture = ProductFixture::new(json!([]));
+    // Routing needs prepared Rust tools, while check lifetimes are covered separately.
+    // Leave background checks out of this actor/worktree replacement contract.
+    fixture.write_config(json!([{
+        "executable":accepted_program(&toolchain_bin("rust-analyzer"),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap_or_else(|_| "1.98.1-aarch64-apple-darwin".into()),
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"managed-routing-tools"
+    }]));
     let worktrees = add_worktrees(&fixture, &["side-b", "side-c", "side-d"]);
     let (left, right, extra) = (&worktrees[0], &worktrees[1], &worktrees[2]);
     let runtime = managed_claude_runtime_path(&fixture.root);
@@ -25303,6 +25466,7 @@ async fn managed_claude_lost_reply_on_a_live_daemon_keeps_every_actor() {
 #[tokio::test]
 async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
     let fixture = ProductFixture::new(json!([]));
+    enable_prepared_rust_checks(&fixture);
     let runtime = managed_claude_runtime_path(&fixture.root);
     let _guard = SharedClaudeDaemonGuard(runtime);
     let mut mcp = Mcp::start_managed_claude_with_seam(

@@ -65,7 +65,15 @@ async fn main() -> ExitCode {
     // Claude's workspace identity is captured before argument parsing or asynchronous setup and is
     // never accepted from an MCP call, hook payload, or later environment read.
     let claude_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR");
+    let observation_requested = arguments.first().is_some_and(|mode| mode == "observe");
     let parsed = command(arguments.into_iter());
+    if observation_requested && parsed.is_err() {
+        return observation_failure(
+            "invalid_arguments",
+            "blocked",
+            "expected observe --repo ABS_PATH --json [--cursor N]",
+        );
+    }
     // Product test seam: only a daemon may simulate a slow (cold, loaded) start, before any
     // rendezvous-visible work runs; production never sets the variable.
     if matches!(parsed, Ok(Command::Daemon { .. })) {
@@ -194,15 +202,30 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        Ok(Command::Doctor { runtime_dir }) => match doctor_report(&runtime_dir).await {
+        Ok(Command::Observe { repo, cursor }) => observe_command(&repo, cursor).await,
+        Ok(Command::Doctor { runtime_dir, json }) => match doctor_report(&runtime_dir).await {
             Ok(report) => {
                 let healthy = matches!(report.status, DoctorStatus::Healthy { .. });
-                print_doctor_report(&report);
+                if json {
+                    println!("{}", doctor_json(&report));
+                } else {
+                    print_doctor_report(&report);
+                }
                 if healthy {
                     ExitCode::SUCCESS
                 } else {
                     ExitCode::FAILURE
                 }
+            }
+            Err(error) if json => {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"kind":"ide_daemon_diagnostic",
+                    "error":{"code":"diagnostic_unavailable","outcome":"unavailable",
+                        "detail":"daemon diagnostic could not be read"}})
+                );
+                let _ = error;
+                ExitCode::from(2)
             }
             Err(error) => fail(error),
         },
@@ -311,8 +334,12 @@ async fn main() -> ExitCode {
             }
         },
         Ok(Command::Cache { prune }) => run_cache(prune).await,
-        Ok(Command::DoctorInstall) => {
-            let report = agent_ide::doctor_install::report().await;
+        Ok(Command::DoctorInstall { read_only }) => {
+            let report = if read_only {
+                agent_ide::doctor_install::report_read_only().await
+            } else {
+                agent_ide::doctor_install::report().await
+            };
             match serde_json::to_string(&report) {
                 Ok(line) => {
                     println!("{line}");
@@ -371,6 +398,156 @@ fn evidence_executable(identity: &str, path: PathBuf) -> Result<String, AppError
 fn launcher_check(path: &std::path::Path) -> Result<(), AppError> {
     let config = LauncherConfig::read(path).map_err(|_| AppError::InvalidResponse)?;
     config.verify().map_err(|_| AppError::InvalidResponse)
+}
+
+/// Projects safe daemon diagnostics as one JSON envelope; version is reported only after health.
+/// Does not expose daemon generation, process details, launcher records, or native host metadata.
+fn doctor_json(report: &DoctorReport) -> serde_json::Value {
+    let (health, version) = match &report.status {
+        DoctorStatus::Healthy { daemon_generation } => {
+            ("healthy", reported_daemon_version(daemon_generation))
+        }
+        DoctorStatus::Unavailable => ("unavailable", None),
+    };
+    serde_json::json!({"schema_version":1,"kind":"ide_daemon_diagnostic","data":{
+        "product":"agent-ide","package_version":env!("CARGO_PKG_VERSION"),
+        "health":health,"daemon_version":version,
+        "runtime":format!("{:?}",report.runtime).to_ascii_lowercase(),
+        "endpoint":format!("{:?}",report.endpoint).to_ascii_lowercase(),
+        "lock":format!("{:?}",report.lock).to_ascii_lowercase()
+    }})
+}
+
+/// Emits one closed observation failure without raw stderr, source content, or OS error strings.
+/// `code`, `outcome`, and `detail` are static producer-owned vocabulary; failures exit 2.
+fn observation_failure(
+    code: &'static str,
+    outcome: &'static str,
+    detail: &'static str,
+) -> ExitCode {
+    println!(
+        "{}",
+        serde_json::json!({"schema_version":1,"kind":"ide_observation",
+        "error":{"code":code,"outcome":outcome,"detail":detail}})
+    );
+    ExitCode::from(2)
+}
+
+/// Resolves an absolute Git repository and prints at most one MiB of read-only JSON evidence.
+/// Repository failure never falls back to a workdir/name identity. Git lookup takes at most two
+/// seconds; endpoint reads have their own fixed budgets and never start a daemon or acquire a lease.
+async fn observe_command(repo: &Path, cursor: u64) -> ExitCode {
+    use agent_ide::app::observation::MAX_PATH_BYTES;
+    if !repo.is_absolute() || repo.as_os_str().len() > MAX_PATH_BYTES {
+        return observation_failure(
+            "invalid_repository",
+            "blocked",
+            "repository must be an absolute bounded path",
+        );
+    }
+    let Ok(source) = fs::canonicalize(repo) else {
+        return observation_failure(
+            "repository_unavailable",
+            "unavailable",
+            "repository path cannot be resolved",
+        );
+    };
+    let Some(common) = git_common_dir(&source)
+        .await
+        .and_then(|path| fs::canonicalize(path).ok())
+    else {
+        return observation_failure(
+            "repository_identity_unavailable",
+            "unavailable",
+            "canonical Git common directory cannot be resolved",
+        );
+    };
+    let (Some(source_text), Some(common_text)) = (source.to_str(), common.to_str()) else {
+        return observation_failure(
+            "unsupported_path",
+            "blocked",
+            "repository paths must be UTF-8",
+        );
+    };
+    if source_text.len() > MAX_PATH_BYTES || common_text.len() > MAX_PATH_BYTES {
+        return observation_failure(
+            "invalid_repository",
+            "blocked",
+            "repository identity exceeds the path budget",
+        );
+    }
+    let Ok(runtime) = claude_runtime_path(&common) else {
+        return observation_failure(
+            "runtime_lookup_unavailable",
+            "unavailable",
+            "repository rendezvous cannot be resolved",
+        );
+    };
+    let data = observe_repository(source_text, common_text, &runtime, cursor).await;
+    let line =
+        serde_json::json!({"schema_version":1,"kind":"ide_observation","data":data}).to_string();
+    if line.len() + 1 > 1024 * 1024 {
+        return observation_failure(
+            "observation_too_large",
+            "unavailable",
+            "observation exceeded the byte budget",
+        );
+    }
+    println!("{line}");
+    ExitCode::SUCCESS
+}
+
+/// Collects safe projections from an exact existing runtime for a previously canonicalized identity.
+/// The explicit path also permits isolated fixture verification without touching real rendezvous.
+/// `received_at_ms` is CLI receipt time; snapshot publication times are never overwritten by it.
+/// A completed malformed health reply keeps its proven runtime classifications; only an outer
+/// deadline loses that completed observation. Doctor's separate error/exit path is unchanged.
+async fn observe_repository(
+    source: &str,
+    common: &str,
+    runtime: &Path,
+    cursor: u64,
+) -> serde_json::Value {
+    let diagnostic = match tokio::time::timeout(
+        Duration::from_secs(2),
+        agent_ide::app::doctor_observation(runtime),
+    )
+    .await
+    {
+        Ok((report, _)) => Some(report),
+        _ => None,
+    };
+    let mut instance = diagnostic
+        .as_ref()
+        .map(doctor_json)
+        .map(|envelope| envelope["data"].clone())
+        .unwrap_or_else(|| {
+            serde_json::json!({"health":"unavailable","daemon_version":null,
+            "runtime":"unavailable","endpoint":"unavailable","lock":"unavailable"})
+        });
+    let generation = diagnostic.as_ref().and_then(|report| match &report.status {
+        DoctorStatus::Healthy { daemon_generation } => Some(daemon_generation.as_str()),
+        DoctorStatus::Unavailable => None,
+    });
+    instance["instance_id"] = serde_json::Value::String(
+        blake3::hash(
+            format!("{}\0{}", runtime.display(), generation.unwrap_or("unknown")).as_bytes(),
+        )
+        .to_hex()
+        .to_string(),
+    );
+    let evidence = agent_ide::app::observation::query(runtime, common, cursor).await;
+    let received_at_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    serde_json::json!({
+        "product":"agent-ide","package_version":env!("CARGO_PKG_VERSION"),"received_at_ms":received_at_ms,
+        "repository":{"identity":claude_rendezvous_identity(Path::new(common)),"common_dir":common,"source_path":source},
+        "instances":[instance],"checks":evidence.checks,"telemetry":evidence.telemetry,
+        "coverage":{"scope":"shared_repository_daemon","complete":false,
+            "reason":"private per-front runtimes and pruned evidence are not discoverable; retained state does not prove current files"}
+    })
 }
 
 /// Prints a fixed complete doctor report without creating runtime state or opening peer services.
@@ -475,7 +652,19 @@ enum Command {
         runtime_dir: PathBuf,
     },
     /// Queries an existing daemon without creating a directory or daemon process.
-    Doctor { runtime_dir: PathBuf },
+    Doctor {
+        /// Existing daemon directory; never created by diagnostics.
+        runtime_dir: PathBuf,
+        /// Selects the bounded JSON projection while retaining the original exit status.
+        json: bool,
+    },
+    /// Observes one canonical Git repository without activation, startup, or project checks.
+    Observe {
+        /// Absolute existing repository/worktree path selected by the caller.
+        repo: PathBuf,
+        /// Retained-check row offset; zero begins a bounded page.
+        cursor: u64,
+    },
     /// Emits one `{path, identity, blake3}` accepted-executable fragment for a measured file.
     ///
     /// Pure offline evidence-formatting; creates no runtime state and never launches `path`.
@@ -539,8 +728,11 @@ enum Command {
         /// Absolute allowed roots for the template; defaults to `~/projects` or the home itself.
         allowed_roots: Vec<PathBuf>,
     },
-    /// Reports installation health read-only as bounded JSON findings (no daemon is contacted).
-    DoctorInstall,
+    /// Reports installation findings; legacy mode prunes abandoned runtimes.
+    DoctorInstall {
+        /// Suppresses cleanup and toolchain execution; JSON carries an explicit true marker.
+        read_only: bool,
+    },
     /// Reports (`status`, a dry run) or applies now (`prune`) the cache retention policy.
     Cache {
         /// `true` for `prune`: remove what the policy selects; `false` for `status`.
@@ -686,7 +878,11 @@ commands:
   mcp --auto-launcher-template <file>     managed MCP server, host auto-detected
   daemon --runtime-dir <dir>              run the repository daemon
   doctor                                  report installation health as JSON findings
+  doctor --read-only                      report installation health without cleanup or tool probes
   doctor --runtime-dir <dir>              report daemon health
+  doctor --runtime-dir <dir> --json       report daemon health as JSON
+  observe --repo <absolute-path> --json [--cursor <n>]
+                                          observe retained repository evidence without startup
   codex-hook --runtime-dir <dir>          Codex native hook
   codex-hook --managed                    Codex native hook, managed route discovery
   codex-hooks print                       print the managed Codex hooks.json fragment
@@ -712,6 +908,7 @@ const SUBCOMMANDS: &[&str] = &[
     "mcp",
     "daemon",
     "doctor",
+    "observe",
     "codex-hook",
     "codex-hooks",
     "claude-hook",
@@ -750,6 +947,40 @@ fn usage_request(arguments: &[OsString]) -> Option<UsageRequest> {
 /// Rejects unknown, missing, and extra CLI arguments before any filesystem or daemon action.
 fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppError> {
     let arguments = arguments.collect::<Vec<_>>();
+    if let [mode, flag] = arguments.as_slice()
+        && mode == "doctor"
+        && flag == "--read-only"
+    {
+        return Ok(Command::DoctorInstall { read_only: true });
+    }
+    if let [mode, flag, value, format] = arguments.as_slice()
+        && mode == "doctor"
+        && flag == "--runtime-dir"
+        && format == "--json"
+    {
+        return Ok(Command::Doctor {
+            runtime_dir: value.into(),
+            json: true,
+        });
+    }
+    if let [mode, flag, repo, format, rest @ ..] = arguments.as_slice()
+        && mode == "observe"
+        && flag == "--repo"
+        && format == "--json"
+    {
+        let cursor = match rest {
+            [] => 0,
+            [flag, cursor] if flag == "--cursor" => cursor
+                .to_str()
+                .and_then(|cursor| cursor.parse().ok())
+                .ok_or(AppError::InvalidResponse)?,
+            _ => return Err(AppError::InvalidResponse),
+        };
+        return Ok(Command::Observe {
+            repo: repo.into(),
+            cursor,
+        });
+    }
     if arguments.as_slice() == [OsString::from("claude-hook")] {
         return Ok(Command::ManagedClaudeHook);
     }
@@ -787,7 +1018,7 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
     if let [mode] = arguments.as_slice()
         && mode == "doctor"
     {
-        return Ok(Command::DoctorInstall);
+        return Ok(Command::DoctorInstall { read_only: false });
     }
     if let [mode, action] = arguments.as_slice()
         && mode == "cache"
@@ -921,7 +1152,10 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
     let runtime_dir = PathBuf::from(value);
     match mode.to_str() {
         Some("daemon") => Ok(Command::Daemon { runtime_dir }),
-        Some("doctor") => Ok(Command::Doctor { runtime_dir }),
+        Some("doctor") => Ok(Command::Doctor {
+            runtime_dir,
+            json: false,
+        }),
         Some("mcp") => Ok(Command::Mcp {
             runtime_dir,
             host: CatalogHost::Claude,
@@ -1465,6 +1699,7 @@ async fn reroot_rendezvous_key(candidate: &Path) -> Option<PathBuf> {
 
 /// Runs one bounded `git rev-parse --git-common-dir` probe and returns its absolute output path.
 ///
+/// Ignores ambient Git repository overrides so the returned identity belongs to `candidate`.
 /// Never removes, creates, or writes anything; a killed, failed, or malformed probe returns `None`.
 async fn git_common_dir(candidate: &Path) -> Option<PathBuf> {
     let mut command = tokio::process::Command::new("/usr/bin/git");
@@ -1472,6 +1707,11 @@ async fn git_common_dir(candidate: &Path) -> Option<PathBuf> {
         .arg("-C")
         .arg(candidate)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -3765,6 +4005,57 @@ async fn terminate_owned_daemon(child: SharedChild) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The explicit safe installation flag cannot silently select legacy cleanup; observe JSON
+    /// and its continuation have one fixed argv contract, with malformed offsets rejected.
+    #[test]
+    fn observation_cli_forms_and_safe_doctor_are_explicit() {
+        assert!(matches!(
+            command(args(&["doctor"])),
+            Ok(Command::DoctorInstall { read_only: false })
+        ));
+        assert!(matches!(
+            command(args(&["doctor", "--read-only"])),
+            Ok(Command::DoctorInstall { read_only: true })
+        ));
+        assert!(command(args(&["doctor", "--read-only", "extra"])).is_err());
+        assert!(matches!(
+            command(args(&["observe", "--repo", "/fixture", "--json"])),
+            Ok(Command::Observe { cursor: 0, .. })
+        ));
+        assert!(matches!(
+            command(args(&[
+                "observe", "--repo", "/fixture", "--json", "--cursor", "16"
+            ])),
+            Ok(Command::Observe { cursor: 16, .. })
+        ));
+        assert!(
+            command(args(&[
+                "observe", "--repo", "/fixture", "--json", "--cursor", "-1"
+            ]))
+            .is_err()
+        );
+    }
+
+    /// JSON keeps this source package's identity separate from a positively observed daemon
+    /// version and does not expose raw daemon generations or configuration/host secrets.
+    #[test]
+    fn observation_daemon_diagnostic_separates_versions_and_redacts_generation() {
+        let report = DoctorReport {
+            status: DoctorStatus::Healthy {
+                daemon_generation: "0.1.2-private-executable-and-generation".into(),
+            },
+            runtime: agent_ide::app::DoctorRuntimeState::Private,
+            endpoint: agent_ide::app::DoctorEndpointState::Socket,
+            lock: DoctorLockState::Held,
+            config: EffectiveConfig::defaults(),
+        };
+        let json = doctor_json(&report);
+        assert_eq!(json["data"]["package_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["data"]["daemon_version"], "0.1.2");
+        assert!(!json.to_string().contains("private-executable"));
+        assert!(json.get("error").is_none());
+    }
 
     /// Builds the exact `OsString` argv `command` expects from plain string arguments.
     fn args(values: &[&str]) -> impl Iterator<Item = OsString> {

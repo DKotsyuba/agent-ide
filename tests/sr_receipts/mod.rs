@@ -105,8 +105,8 @@ while (my $header=<STDIN>) {
     std::fs::write(&program, script).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
-        "settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1",
-        "rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"held-diagnostics"}]));
+        "settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"held-diagnostics"}]));
 }
 
 /// Waits on the provider's actual post-write synchronization checkpoint; elapsed time is only
@@ -340,6 +340,7 @@ fn usable_events(home: &Path) -> Vec<agent_ide::errorlog::LoggedEvent> {
 #[tokio::test]
 async fn usable_journal_requires_actual_source_or_confirmed_receipt() {
     let fixture = ProductFixture::new(json!([]));
+    enable_prepared_rust_checks(&fixture);
     let home = provider_home(&fixture);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = ProductActor::new(&fixture, "usable-journal").await;

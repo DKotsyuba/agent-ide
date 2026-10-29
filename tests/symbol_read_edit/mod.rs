@@ -36,11 +36,11 @@ fn on_disk(fixture: &ProductFixture) -> String {
     std::fs::read_to_string(fixture.root.join(FILE)).unwrap()
 }
 
-/// Starts the daemon and an actor warmed on [`FILE`].
+/// Starts the accepted semantic provider and an actor warmed on [`FILE`], without unrelated
+/// fake checks whose toolchain would conflict with the provider's accepted compiler.
 async fn started(name: &'static str) -> (ProductFixture, OwnedDaemon, ProductActor) {
     let fixture = batch_edit_fixture(ORIGINAL);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
-    let daemon = fixture.daemon_with_home(Some(&home)).await;
+    let daemon = fixture.daemon().await;
     let actor = batch_started_actor(&fixture, name, FILE).await;
     (fixture, daemon, actor)
 }
@@ -429,10 +429,9 @@ async fn window_edits_are_guarded_by_the_last_read() {
     let fixture = batch_edit_fixture(ORIGINAL);
     let epoch = fixture.base.join("context-epoch");
     std::fs::write(&epoch, "1").unwrap();
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
     let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
     let daemon = fixture
-        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .spawn_configured_daemon_with_env(None, false, Duration::from_secs(30), None, &env)
         .await;
     let mut actor = batch_started_actor(&fixture, "sre-guard", FILE).await;
     let window = json!({"symbol":"src/batch.rs#utility:3-3","content":"    let a = x + 1;"});
@@ -523,16 +522,9 @@ async fn file_range_reads_guard_later_symbol_window_edits() {
         let fixture = batch_edit_fixture(ORIGINAL);
         let epoch = fixture.base.join("context-epoch");
         std::fs::write(&epoch, "1").unwrap();
-        let home = enable_fake_rust_checks(&fixture, &fixture.base);
         let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
         let daemon = fixture
-            .spawn_configured_daemon_with_env(
-                Some(&home),
-                false,
-                Duration::from_secs(30),
-                None,
-                &env,
-            )
+            .spawn_configured_daemon_with_env(None, false, Duration::from_secs(30), None, &env)
             .await;
         let mut actor = batch_started_actor(&fixture, "sre-file-range-guard", FILE).await;
         let (_, read) = call(&mut actor, &fixture, "ide.read", arguments).await;
@@ -586,10 +578,9 @@ async fn refused_batch_candidates_do_not_refresh_window_read_memory() {
     let fixture = batch_edit_fixture(ORIGINAL);
     let epoch = fixture.base.join("context-epoch");
     std::fs::write(&epoch, "1").unwrap();
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
     let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
     let daemon = fixture
-        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .spawn_configured_daemon_with_env(None, false, Duration::from_secs(30), None, &env)
         .await;
     let mut actor = batch_started_actor(&fixture, "sre-refused-batch-memory", FILE).await;
     let (_, read) = call(
@@ -653,10 +644,9 @@ async fn full_file_reads_guard_all_units_after_own_edits() {
     let fixture = batch_edit_fixture(&source);
     let epoch = fixture.base.join("context-epoch");
     std::fs::write(&epoch, "1").unwrap();
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
     let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
     let daemon = fixture
-        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .spawn_configured_daemon_with_env(None, false, Duration::from_secs(30), None, &env)
         .await;
     let mut actor = batch_started_actor(&fixture, "sre-many-units-guard", FILE).await;
     for own_edit in [false, true] {
@@ -730,16 +720,9 @@ async fn own_edits_do_not_adopt_external_changes_in_other_units() {
             let fixture = batch_edit_fixture(ORIGINAL);
             let epoch = fixture.base.join("context-epoch");
             std::fs::write(&epoch, "1").unwrap();
-            let home = enable_fake_rust_checks(&fixture, &fixture.base);
             let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
             let daemon = fixture
-                .spawn_configured_daemon_with_env(
-                    Some(&home),
-                    false,
-                    Duration::from_secs(30),
-                    None,
-                    &env,
-                )
+                .spawn_configured_daemon_with_env(None, false, Duration::from_secs(30), None, &env)
                 .await;
             let mut actor = batch_started_actor(&fixture, "sre-other-writer", FILE).await;
             call(&mut actor, &fixture, "ide.read", read.clone()).await;
@@ -789,10 +772,9 @@ async fn the_guard_covers_the_lines_read_and_follows_own_edits() {
     let fixture = batch_edit_fixture(ORIGINAL);
     let epoch = fixture.base.join("context-epoch");
     std::fs::write(&epoch, "1").unwrap();
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
     let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
     let daemon = fixture
-        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .spawn_configured_daemon_with_env(None, false, Duration::from_secs(30), None, &env)
         .await;
     let mut actor = batch_started_actor(&fixture, "sre-guard-span", FILE).await;
     // F4: only unit lines 1-3 were read; line 4 changes on disk; an edit of line 4 is unguarded
@@ -1110,8 +1092,7 @@ const WITH_IMPL: &str =
 #[tokio::test]
 async fn a_location_on_a_closing_container_line_reads_the_container() {
     let fixture = batch_edit_fixture(WITH_IMPL);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
-    let daemon = fixture.daemon_with_home(Some(&home)).await;
+    let daemon = fixture.daemon().await;
     let mut actor = batch_started_actor(&fixture, "sre-close", FILE).await;
     let (_, text) = call(
         &mut actor,
@@ -1146,16 +1127,15 @@ fn paged_source() -> String {
 }
 
 /// Starts a daemon with a known context epoch (the window guard remembers nothing without one)
-/// and an actor warmed on [`paged_source`].
+/// and an actor warmed on [`paged_source`]'s accepted semantic provider, without fake checks.
 #[cfg(feature = "test-seams")]
 async fn paged_started(name: &'static str) -> (ProductFixture, OwnedDaemon, ProductActor) {
     let fixture = batch_edit_fixture(&paged_source());
     let epoch = fixture.base.join("context-epoch");
     std::fs::write(&epoch, "1").unwrap();
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
     let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
     let daemon = fixture
-        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .spawn_configured_daemon_with_env(None, false, Duration::from_secs(30), None, &env)
         .await;
     let actor = batch_started_actor(&fixture, name, FILE).await;
     (fixture, daemon, actor)

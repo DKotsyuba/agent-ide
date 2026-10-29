@@ -1780,6 +1780,48 @@ impl WorkerHandle {
         self.shared.project_feed.as_ref()
     }
 
+    /// Counts at most 100 retained events through the existing Store owner, without new connections,
+    /// migrations, telemetry ingress, retention changes, actor registration, or job admission.
+    /// Missing/corrupt evidence is unavailable; row time is unknown because the schema has none.
+    pub(crate) async fn observe_telemetry(&self) -> crate::app::observation::TelemetrySummary {
+        use crate::app::observation::TelemetrySummary;
+        let telemetry = self
+            .telemetry
+            .try_lock()
+            .ok()
+            .and_then(|owner| owner.clone());
+        let Some(telemetry) = telemetry else {
+            return TelemetrySummary::unavailable();
+        };
+        match telemetry
+            .query(crate::telemetry::Filter::All, None, 100)
+            .await
+        {
+            Ok(page) => {
+                let mut counts = std::collections::BTreeMap::new();
+                for row in &page.rows {
+                    *counts.entry(row.event.tag().to_owned()).or_insert(0) += 1;
+                }
+                TelemetrySummary {
+                    availability: "available".into(),
+                    counts,
+                    coverage: if page.rows.is_empty() {
+                        "unknown"
+                    } else if page.truncated {
+                        "partial"
+                    } else {
+                        "complete"
+                    }
+                    .into(),
+                    next_cursor: page.next_cursor,
+                    dropped: page.dropped,
+                    observed_at_ms: None,
+                }
+            }
+            Err(_) => TelemetrySummary::unavailable(),
+        }
+    }
+
     /// Records that `binding`'s channel delivered a native hook, so compaction is observable.
     pub fn note_hook(&self, binding: &BindingRef) {
         self.shared.note_context_hook(binding);
@@ -3260,16 +3302,14 @@ impl<'a> Worker<'a> {
     /// Executes a test-domain operation under the current binding/worktree authority: start,
     /// actor-scoped retained result/history, or exact-generation cancellation. Unknown or foreign
     /// runs refuse; output continuation is intercepted in submit before any new job is queued.
-    /// Target batches share one ordered runner/budget. Bridge mode returns the started run
+    /// Handles single test requests; the batch owner has its own dispatch boundary and budget.
+    /// Bridge mode returns the started run
     /// without waiting for child completion; legacy deployments retain their finite inline wait.
     /// Results settle independently of turn completion; cancellation settles only after reaping.
     async fn test(
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
-        if job.parameters.get("targets").is_some() {
-            return self.batch_tests(job).await;
-        }
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
         self.shared.active(&binding)?;
@@ -4109,6 +4149,8 @@ impl<'a> Worker<'a> {
     }
     /// Rechecks queued liveness, executes only the selected owner operation, and fences every result.
     /// Starts/resumes exclusive stage timing and journals read/edit totals only on settlement.
+    /// Dispatches symbol/graph lists and test targets directly to their batch owner so a batch
+    /// never retains an outer single-entry future while awaiting its individual entries.
     async fn perform(&mut self, job: &mut Job) {
         if let Ok(mut progress) = job.progress.lock() {
             progress.switch(Some(if job.stage.is_some() { "check" } else { "plan" }));
@@ -4223,8 +4265,16 @@ impl<'a> Worker<'a> {
                     AssistanceTool::Symbol if job.parameters.get("path").is_some() => {
                         self.context(job).await
                     }
+                    AssistanceTool::Symbol | AssistanceTool::Graph
+                        if job.parameters.get("symbols").is_some() =>
+                    {
+                        self.batch_symbols(job).await
+                    }
                     AssistanceTool::Symbol => self.symbol(job).await,
                     AssistanceTool::Graph => self.graph(job).await,
+                    AssistanceTool::Test if job.parameters.get("targets").is_some() => {
+                        self.batch_tests(job).await
+                    }
                     AssistanceTool::Test => self.test(job).await,
                     _ => Err(FailureCode::Internal),
                 }
@@ -6334,7 +6384,8 @@ impl<'a> Worker<'a> {
     /// write is observed, with `diagnostics: pending` while the provider check is unknown; the
     /// check continues under the retained result and arrives as a fact, and a provider failure
     /// never changes a known filesystem outcome or implies cleanliness. The current host must
-    /// prove this path readable before Workspace opens it during preparation.
+    /// prove this path readable before Workspace opens it during preparation. Symbol/line edits
+    /// keep their large future on the heap so nested rename/post-write analysis fits default stacks.
     async fn edit(
         &mut self,
         job: &mut Job,
@@ -6425,7 +6476,7 @@ impl<'a> Worker<'a> {
             return self.edit_changes(job).await;
         }
         if job.parameters.get("symbol").is_some() || job.parameters.get("lines").is_some() {
-            return self.edit_by_symbol(job).await;
+            return Box::pin(self.edit_by_symbol(job)).await;
         }
         if job.parameters.get("source_ref").is_none() {
             return self.create_file(job).await;

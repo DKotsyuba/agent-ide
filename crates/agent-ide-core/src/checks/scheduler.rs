@@ -174,6 +174,8 @@ struct LanguageState {
     dirty: bool,
     /// Latest completed snapshot, absent until this pair's first check completes.
     latest_snapshot: Option<ProblemSnapshot>,
+    /// Original publication wall-clock milliseconds; never refreshed by observation or reuse.
+    snapshot_observed_at_ms: Option<u64>,
     /// Most recent policy-valid completed attempt, including transient failures suppressed from
     /// the usable problem feed; bounded to one snapshot for accepted-check settlement.
     latest_attempt: Option<ProblemSnapshot>,
@@ -506,6 +508,100 @@ impl Scheduler {
             .unwrap_or_default();
         snapshots.sort_by_key(|snapshot| snapshot.language);
         snapshots
+    }
+
+    /// Reads bounded retained state for an exact canonical Git common directory, without I/O.
+    /// `cursor` is an ordered row offset, never authority. Empty/oversized/missing evidence has
+    /// unknown coverage; currentness stays unknown unless a newer input generation proves staleness.
+    /// No checks, fingerprint refresh, feed delivery, telemetry, or lifecycle changes occur.
+    pub fn observe(&self, common_dir: &str, cursor: u64) -> crate::app::observation::ChecksPage {
+        use crate::app::observation::{
+            CheckSummary, ChecksPage, MAX_PATH_BYTES, PAGE_BYTES, PAGE_ROWS,
+        };
+        let Ok(state) = self.inner.state.try_lock() else {
+            return ChecksPage::unavailable();
+        };
+        let mut retained = Vec::new();
+        let mut omitted = state.worktrees.len() > 4096;
+        'scan: for (path, worktree) in state.worktrees.iter().take(4096) {
+            if worktree.repository_key != common_dir {
+                continue;
+            }
+            let Some(path) = path.to_str().filter(|path| path.len() <= MAX_PATH_BYTES) else {
+                omitted = true;
+                continue;
+            };
+            omitted |= worktree.languages.len() > 128;
+            for (language, item) in worktree.languages.iter().take(128) {
+                if language.as_str().len() > 128 {
+                    omitted = true;
+                    continue;
+                }
+                if let Some(snapshot) = &item.latest_snapshot {
+                    if retained.len() == 4096 {
+                        omitted = true;
+                        break 'scan;
+                    }
+                    retained.push((path, language, worktree, item, snapshot));
+                }
+            }
+        }
+        retained.sort_by_key(|(path, language, ..)| (*path, **language));
+        let start = usize::try_from(cursor)
+            .unwrap_or(usize::MAX)
+            .min(retained.len());
+        let mut end = start;
+        let mut snapshots = Vec::new();
+        let mut encoded_bytes = 2;
+        for (path, language, worktree, item, snapshot) in retained[start..].iter().take(PAGE_ROWS) {
+            let identity = format!(
+                "{path}\0{}\0{}\0{:?}",
+                language.as_str(),
+                snapshot.input_generation,
+                item.snapshot_observed_at_ms
+            );
+            let summary = CheckSummary {
+                snapshot_id: blake3::hash(identity.as_bytes()).to_hex().to_string(),
+                source_path: (*path).to_owned(),
+                language: language.as_str().to_owned(),
+                state: snapshot.state.clone(),
+                errors: snapshot.errors,
+                warnings: snapshot.warnings,
+                input_generation: snapshot.input_generation,
+                observed_at_ms: item.snapshot_observed_at_ms,
+                freshness: if snapshot.input_generation < worktree.input_generation
+                    || snapshot.input_generation < worktree.activation_generation
+                {
+                    "stale"
+                } else {
+                    "unknown"
+                }
+                .into(),
+                rechecking: item.running || item.timer_abort.is_some(),
+            };
+            let Ok(encoded) = serde_json::to_vec(&summary) else {
+                return ChecksPage::unavailable();
+            };
+            if encoded_bytes + encoded.len() + 1 > PAGE_BYTES {
+                break;
+            }
+            encoded_bytes += encoded.len() + 1;
+            snapshots.push(summary);
+            end += 1;
+        }
+        ChecksPage {
+            availability: "available".into(),
+            snapshots,
+            coverage: if omitted || retained.is_empty() {
+                "unknown"
+            } else if end < retained.len() {
+                "partial"
+            } else {
+                "complete"
+            }
+            .into(),
+            next_cursor: (end < retained.len()).then_some(end as u64),
+        }
     }
 
     /// Returns the newest policy-valid completed attempt of one configured worktree/language.
@@ -1086,6 +1182,10 @@ impl Inner {
             || snapshot.input_generation >= lang.last_stored_generation
         {
             lang.last_stored_generation = snapshot.input_generation;
+            lang.snapshot_observed_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
             lang.latest_snapshot = Some(snapshot);
         }
         true
@@ -1515,6 +1615,109 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod deny_tests {
     use super::*;
+
+    /// Retained partial/error evidence stays bounded and stale, with stable original publication
+    /// time, exact common-dir isolation, and no directory/cache/check creation on repeated reads.
+    #[test]
+    fn observation_reads_retained_pages_without_scheduling() {
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new("observe-scheduler");
+        let cache = root.join("absent-cache");
+        let scheduler = Scheduler::new(Vec::new(), Duration::from_secs(1), 1, cache.clone());
+        let common = root.join("common").to_string_lossy().to_string();
+        for index in 0..19 {
+            let path = root.join(format!("worktree-{index:02}"));
+            let mut worktree = WorktreeState::new(&common);
+            worktree.input_generation = 4;
+            worktree
+                .languages
+                .insert(crate::lang::testing::ALPHA, LanguageState::default());
+            scheduler
+                .inner
+                .lock_state()
+                .worktrees
+                .insert(path.clone(), worktree);
+            let snapshot = ProblemSnapshot::from_problems(
+                crate::lang::testing::ALPHA,
+                CheckState::Partial,
+                Vec::new(),
+                3,
+                17,
+            );
+            assert!(scheduler.inner.store_snapshot(&path, snapshot, 0));
+        }
+        let first = scheduler.observe(&common, 0);
+        assert_eq!(first.snapshots.len(), 16);
+        assert_eq!(first.next_cursor, Some(16));
+        assert_eq!(first.coverage, "partial");
+        assert!(first.snapshots.iter().all(|row| row.freshness == "stale"
+            && row.state == CheckState::Partial
+            && row.observed_at_ms.is_some()));
+        let again = scheduler.observe(&common, 0);
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&again).unwrap()
+        );
+        let last = scheduler.observe(&common, first.next_cursor.unwrap());
+        assert_eq!(last.snapshots.len(), 3);
+        assert_eq!(last.next_cursor, None);
+        assert_eq!(last.coverage, "complete");
+        assert!(serde_json::to_vec(&first).unwrap().len() < crate::app::MAX_V2_FRAME_BYTES);
+        assert_eq!(
+            scheduler.observe("/different/common", 0).coverage,
+            "unknown"
+        );
+        assert!(scheduler.observe(&common, u64::MAX).snapshots.is_empty());
+        assert!(!scheduler.is_busy());
+        assert!(!cache.exists());
+        assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
+    }
+
+    /// Escaped path bytes enforce a real encoded page ceiling and continuation, while a held
+    /// state owner stays unavailable instead of blocking or inventing healthy evidence.
+    #[test]
+    fn observation_pages_bound_encoded_bytes_and_refuse_busy_owner() {
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new("observe-bytes");
+        let scheduler = Scheduler::new(Vec::new(), Duration::from_secs(1), 1, root.join("absent"));
+        for index in 0..16 {
+            let path = PathBuf::from(format!("/{}-{index:02}", "\u{0001}".repeat(4000)));
+            let mut worktree = WorktreeState::new("/fixture/common");
+            worktree
+                .languages
+                .insert(crate::lang::testing::ALPHA, LanguageState::default());
+            scheduler
+                .inner
+                .lock_state()
+                .worktrees
+                .insert(path.clone(), worktree);
+            assert!(scheduler.inner.store_snapshot(
+                &path,
+                ProblemSnapshot::unavailable(
+                    crate::lang::testing::ALPHA,
+                    UnavailableReason::Fatal,
+                    0
+                ),
+                0
+            ));
+        }
+        let page = scheduler.observe("/fixture/common", 0);
+        assert!(!page.snapshots.is_empty());
+        assert!(page.snapshots.len() < crate::app::observation::PAGE_ROWS);
+        assert_eq!(page.coverage, "partial");
+        assert_eq!(page.next_cursor, Some(page.snapshots.len() as u64));
+        assert!(
+            serde_json::to_vec(&page.snapshots).unwrap().len()
+                <= crate::app::observation::PAGE_BYTES
+        );
+        let guard = scheduler.inner.lock_state();
+        assert_eq!(
+            scheduler.observe("/fixture/common", 0).availability,
+            "unavailable"
+        );
+        drop(guard);
+        assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
+    }
     use crate::checks::{FakeChecker, Problem, Severity};
     use crate::execution::seatbelt::CredentialGlob;
     use std::sync::Barrier;

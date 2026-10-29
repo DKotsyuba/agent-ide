@@ -597,8 +597,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Proves a path deny still narrows when its final component is a path alias (`/tmp`) or
-    /// an existing symlink: Seatbelt evaluates the resolved canonical path, so denying only
+    /// Proves a path deny still narrows through fixture directory aliases and an existing
+    /// symlink: Seatbelt evaluates the resolved canonical path, so denying only
     /// the spelled path would miss reads that resolve through it. A positive control read
     /// under the same grants proves allows work before the negative cases, and a deny of a
     /// plain non-symlinked directory must keep its existing behavior.
@@ -612,15 +612,17 @@ mod tests {
         std::fs::write(real.join("secret.txt"), "secret\n").unwrap();
         std::fs::write(real.join("plain.txt"), "plain\n").unwrap();
         std::os::unix::fs::symlink("real", inside.join("link")).unwrap();
-        let tmp_file = std::path::Path::new("/tmp")
-            .join(format!("aiv3-runner-alias-{}.txt", std::process::id()));
+        // Model the system temp alias inside the fixture, keeping every write under task TMPDIR.
+        let alias = root.join("tmp-alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let tmp_file = alias.join("alias-secret.txt");
         std::fs::write(&tmp_file, "secret\n").unwrap();
         let spec = |target: PathBuf, deny: PathBuf| RunSpec {
             program: PathBuf::from("/bin/cat"),
             args: vec![target.into_os_string()],
             cwd: inside.clone(),
             env: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-            read_roots: vec![inside.clone(), PathBuf::from("/tmp")],
+            read_roots: vec![inside.clone(), alias.clone()],
             write_roots: vec![],
             read_denies: vec![ReadDeny::Path(deny)],
             timeout: Duration::from_secs(10),
@@ -680,24 +682,24 @@ mod tests {
         assert_eq!(
             tmp_allowed.status,
             Some(0),
-            "positive control read of the /tmp file must succeed under the /tmp grant: {tmp_allowed:?}"
+            "positive control read through the alias must succeed under its grant: {tmp_allowed:?}"
         );
         assert_eq!(
             tmp_allowed.stdout, b"secret\n",
-            "positive control read of the /tmp file must capture stdout: {tmp_allowed:?}"
+            "positive control read through the alias must capture stdout: {tmp_allowed:?}"
         );
         let denied_alias = SeatbeltRunner
-            .run(spec(tmp_file.clone(), PathBuf::from("/tmp")))
+            .run(spec(tmp_file.clone(), alias.clone()))
             .await
             .unwrap();
         assert_ne!(
             denied_alias.status,
             Some(0),
-            "path deny spelled /tmp must deny the read resolving to /private/tmp: {denied_alias:?}"
+            "path deny spelled through the alias must deny the resolved read: {denied_alias:?}"
         );
         assert!(
             denied_alias.stdout.is_empty(),
-            "path deny spelled /tmp must leak no stdout: {denied_alias:?}"
+            "path deny spelled through the alias must leak no stdout: {denied_alias:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&tmp_file);

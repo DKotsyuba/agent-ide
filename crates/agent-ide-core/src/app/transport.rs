@@ -352,6 +352,19 @@ pub struct AssistanceDispatchUnavailable;
 
 /// Allows Assistance to receive exactly one bounded dispatch while retaining all host/tool semantics.
 pub trait AssistanceDispatcher: Send + Sync {
+    /// Projects retained checks for an exact canonical Git common directory and bounded row offset.
+    /// Must return promptly without starting jobs, refreshing files, recording telemetry, or
+    /// changing authority/lifecycle state. Default owners have no observable check evidence.
+    fn observe_checks(&self, _common_dir: &str, _cursor: u64) -> super::observation::ChecksPage {
+        super::observation::ChecksPage::unavailable()
+    }
+    /// Reads bounded closed telemetry counts from an already-open owner without recording events.
+    /// The default has no evidence; cancellation abandons only a read and never changes retention.
+    fn observe_telemetry(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = super::observation::TelemetrySummary> + Send + '_>> {
+        Box::pin(async { super::observation::TelemetrySummary::unavailable() })
+    }
     /// Notes that process `pid` opened a long-lived client lease on this daemon (an MCP front
     /// attaching). Liveness evidence only; the default dispatcher ignores it.
     fn carrier_opened(&self, _pid: u32) {}

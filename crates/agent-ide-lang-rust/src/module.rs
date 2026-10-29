@@ -777,21 +777,26 @@ fn support_server() -> agent_ide_core::modules::adapter::SupportServer {
 
 /// Plans only existing Cargo selection or formatter shapes using current accepted tools.
 /// Environment resolution and refusals precede recipe admission; no ambient planner fallback.
+/// Empty argv and programs other than literal `cargo`/`rustfmt` are unclaimed without resolving
+/// Rust inputs, so another language's command never requires a configured Rust environment.
 fn configured_effect(
     argv: &[String],
     config: &agent_ide_core::modules::contract::ModuleConfig,
     cwd: &Path,
 ) -> Result<Option<EffectRequest>, agent_ide_core::lang::LangError> {
     use agent_ide_core::lang::LangError;
+    let Some((program, words)) = argv.split_first() else {
+        return Ok(None);
+    };
+    if !matches!(program.as_str(), "cargo" | "rustfmt") {
+        return Ok(None);
+    }
     let root = config.worktree.as_deref().ok_or_else(|| {
         LangError::Environment("Rust request has no worktree; use native cargo".into())
     })?;
     let cwd = crate::environment::command_directory(cwd, argv).map_err(LangError::Environment)?;
     let (tools, _) =
         crate::environment::resolve_at(root, &cwd, config).map_err(LangError::Environment)?;
-    let Some((program, words)) = argv.split_first() else {
-        return Ok(None);
-    };
     if program == "cargo" {
         let Some((&(_, pinned, _), mut params)) = TEST_SHAPES
             .iter()
@@ -1490,6 +1495,29 @@ mod tests {
             let path = toolchain.join("bin").join(name);
             std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Unclaimed commands need no Rust configuration, while claimed Rust commands retain the
+    /// same missing-worktree refusal before recipe admission. No command is spawned.
+    #[test]
+    fn unclaimed_effects_do_not_require_rust_environment() {
+        let config = agent_ide_core::modules::contract::ModuleConfig::default();
+        let cwd = Path::new("/unused");
+        for argv in [
+            vec![],
+            vec!["python3".into(), "-c".into(), "pass".into()],
+            vec!["node".into(), "--test".into()],
+            vec!["/bin/sh".into(), "-c".into(), "true".into()],
+        ] {
+            assert!(configured_effect(&argv, &config, cwd).unwrap().is_none());
+        }
+        for program in ["cargo", "rustfmt"] {
+            assert!(matches!(
+                configured_effect(&[program.into()], &config, cwd),
+                Err(agent_ide_core::lang::LangError::Environment(cause))
+                    if cause == "Rust request has no worktree; use native cargo"
+            ));
         }
     }
 

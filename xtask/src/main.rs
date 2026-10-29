@@ -266,6 +266,22 @@ fn check(root: &Path) -> Result<()> {
         "cargo",
         &[workspace_tests, vec!["--test-threads=1"]].concat(),
     )?;
+    // Pure selection control: a default build ignores the doctor fixture seam without scanning.
+    run(
+        root,
+        "cargo",
+        &[
+            "test",
+            "--locked",
+            "-p",
+            "agent-ide-core",
+            "--lib",
+            "doctor_install::observation_tests::default_build_ignores_doctor_scan_root_selector",
+            "--",
+            "--exact",
+            "--test-threads=1",
+        ],
+    )?;
     // A release build (no `test-seams` feature) must ignore every environment seam: the version
     // seams and the job-panic seam.
     run(

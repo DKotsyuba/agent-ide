@@ -1027,15 +1027,12 @@ impl Worker<'_> {
         }
     }
 
-    /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: the symbol card; the
-    /// `{symbols}` form answers each entry through this same path (`batch_symbols`).
+    /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: one symbol card.
+    /// The batch owner also calls this path for each validated single-entry request.
     pub(super) async fn symbol(
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
-        if job.parameters.get("symbols").is_some() {
-            return self.batch_symbols(job).await;
-        }
         let binding = job.invocation.binding_ref().clone();
         let requested = job.parameters["symbol"]
             .as_str()
@@ -1437,8 +1434,8 @@ impl Worker<'_> {
         Ok((reply, Some(authority), Some(observed)))
     }
 
-    /// `ide.graph {symbol, direction, depth}`: bounded breadth-first call hierarchy; the
-    /// `{symbols}` form answers each root through this same path (`batch_symbols`).
+    /// `ide.graph {symbol, direction, depth}`: one bounded breadth-first call hierarchy.
+    /// The batch owner also calls this path for each validated single-root request.
     ///
     /// A call-hierarchy request that fails is recorded on the node it was made for and the reply
     /// says `unavailable (<cause>)` there (see [`render::call_graph_text`]); the session is marked
@@ -1448,9 +1445,6 @@ impl Worker<'_> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
-        if job.parameters.get("symbols").is_some() {
-            return self.batch_symbols(job).await;
-        }
         let binding = job.invocation.binding_ref().clone();
         let requested = job.parameters["symbol"]
             .as_str()

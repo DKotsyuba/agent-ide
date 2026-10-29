@@ -11,13 +11,15 @@ use agent_ide::userhome::HOME_OVERRIDE_ENV;
 
 static TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// A short unique scratch tree below `/private/tmp`.
+/// A short unique scratch tree below task TMPDIR.
 fn scratch(name: &str) -> PathBuf {
-    let path = PathBuf::from(format!(
-        "/private/tmp/aide-init-{}-{}-{name}",
-        std::process::id(),
-        TEST_ID.fetch_add(1, Ordering::Relaxed)
-    ));
+    let path = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "aide-init-{}-{}-{name}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).unwrap();
     path

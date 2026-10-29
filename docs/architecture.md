@@ -35,6 +35,8 @@ See [launcher configuration](assistance-launcher.md) and the active [tool contra
 - [Exact changes and verification](contracts/changes.md)
 - [Agent assistance and fail-open hooks](contracts/assistance.md)
 - [Local infrastructure](contracts/application.md)
+- [Read-only repository observation](contracts/observation-v1.md): bounded CLI evidence from existing
+  health, scheduler and telemetry owners, without activation, startup or project checks.
 
 ```mermaid
 flowchart LR

@@ -6,6 +6,8 @@ pub mod cache;
 pub mod config;
 /// Long-lived client lease admission and idle-timeout daemon shutdown.
 pub mod lease;
+/// Read-only retained check summaries on the existing private endpoint.
+pub mod observation;
 /// Dedicated SQLite owner-thread mechanics and durable operation receipts for domain SQL.
 pub mod store;
 /// Finite opaque Assistance hook and current-method transport values.
@@ -888,6 +890,19 @@ async fn doctor_socket(socket_path: PathBuf, deadline: Duration) -> Result<Docto
 
 /// Observes local startup compatibility without autostarting a daemon or opening peer services.
 pub async fn doctor_report(runtime_dir: &Path) -> Result<DoctorReport, AppError> {
+    let (report, error) = doctor_observation(runtime_dir).await;
+    match error {
+        Some(error) => Err(error),
+        None => Ok(report),
+    }
+}
+
+/// Observes one existing endpoint while retaining the classifications made before its health reply.
+/// Performs the same single inspection/exchange as [`doctor_report`], without creating state or
+/// acquiring a client lease. A malformed reply leaves health unavailable and returns its error
+/// separately, so observers retain proven directory/socket/lock facts while doctor keeps its
+/// existing error and exit semantics. Missing or unreachable endpoints have no protocol error.
+pub async fn doctor_observation(runtime_dir: &Path) -> (DoctorReport, Option<AppError>) {
     let config = config::EffectiveConfig::defaults();
     let (runtime, endpoint, lock) = inspect_runtime(runtime_dir);
     let status = match (runtime, endpoint) {
@@ -896,17 +911,24 @@ pub async fn doctor_report(runtime_dir: &Path) -> Result<DoctorReport, AppError>
                 runtime_dir.join(SOCKET_NAME),
                 config.ipc().connection_deadline,
             )
-            .await?
+            .await
         }
-        _ => DoctorStatus::Unavailable,
+        _ => Ok(DoctorStatus::Unavailable),
     };
-    Ok(DoctorReport {
-        status,
-        runtime,
-        endpoint,
-        lock,
-        config,
-    })
+    let (status, error) = match status {
+        Ok(status) => (status, None),
+        Err(error) => (DoctorStatus::Unavailable, Some(error)),
+    };
+    (
+        DoctorReport {
+            status,
+            runtime,
+            endpoint,
+            lock,
+            config,
+        },
+        error,
+    )
 }
 
 /// What one health probe of a daemon's control path found.
@@ -1240,7 +1262,11 @@ fn inspect_lock(path: &Path) -> DoctorLockState {
     {
         return DoctorLockState::Unavailable;
     }
-    let file = match OpenOptions::new().read(true).write(true).open(path) {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
         Ok(file) => file,
         Err(_) => return DoctorLockState::Unavailable,
     };
@@ -1290,6 +1316,14 @@ async fn serve_accepted_connection(
     let version = request.get("version").and_then(Value::as_u64);
     let identified = match version {
         Some(1) => {
+            if request.get("method").and_then(Value::as_str) == Some("observation") {
+                let _ = tokio::time::timeout_at(
+                    connection_deadline,
+                    observation::serve(&mut stream, &request, dispatcher.as_deref()),
+                )
+                .await;
+                return;
+            }
             let failed = dispatcher.as_deref().is_some_and(|owner| owner.is_failed());
             let _ = tokio::time::timeout_at(
                 connection_deadline,
@@ -2285,6 +2319,48 @@ mod tests {
     use crate::app::transport::AssistanceDispatchUnavailable;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The actual v1 route works with full job lanes and does not reset the idle countdown,
+    /// acquire a lease, record activity, or initialize a dispatcher.
+    #[tokio::test(start_paused = true)]
+    async fn observation_route_does_not_touch_lifecycle() {
+        let lease = lease::LeaseController::new(Duration::from_secs(5), || false);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let lanes = Lanes {
+            calls: Lane::new(0, "calls"),
+            hooks: Lane::new(0, "hooks"),
+        };
+        let served = serve_accepted_connection(
+            server,
+            "fixture-generation".into(),
+            None,
+            None,
+            Duration::from_secs(2),
+            lanes,
+            lease.clone(),
+        );
+        let read = async {
+            write_frame(
+                &mut client,
+                &json!({"version":1,"method":"observation",
+                "request_id":"fixture","common_dir":"/fixture/common","cursor":0}),
+                MAX_V2_FRAME_BYTES,
+            )
+            .await
+            .unwrap();
+            let reply: Value = read_frame(&mut client, MAX_V2_FRAME_BYTES).await.unwrap();
+            assert_eq!(reply["evidence"]["checks"]["availability"], "unavailable");
+            assert!(reply.to_string().find("fixture-generation").is_none());
+        };
+        tokio::join!(served, read);
+        assert!(lease.is_idle());
+        assert!(!lease.stop_requested());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::timeout(Duration::ZERO, lease.idle_expired())
+            .await
+            .expect("observation must not postpone the original idle deadline");
+    }
 
     /// Ensures the bridge can wait longer than the worker's inline reply window.
     #[test]

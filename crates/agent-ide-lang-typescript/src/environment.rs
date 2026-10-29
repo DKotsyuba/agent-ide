@@ -239,14 +239,15 @@ fn node_pin_conflict(
 }
 
 /// Why the configured consumers must not run for `worktree` under this request's denies, or
-/// `None` when they may: the compiler fact's refusal, then the Node pin's.
+/// `None` when they may: the compiler fact's explanatory refusal text, then the Node pin's.
 fn obstruction(worktree: &Path, tools: &ConfiguredTools, denies: &[ReadDeny]) -> Option<String> {
     // Without a configured TypeScript CLI (provider-only launch) the compiler fact cannot be
     // evaluated: no compiler obstruction, but the Node pin still applies.
     let compiler_cause = tools
         .tsc_cli
         .as_ref()
-        .and_then(|tsc_cli| compiler_fact(worktree, tsc_cli, denies).err());
+        .and_then(|tsc_cli| compiler_fact(worktree, tsc_cli, denies).err())
+        .map(|(_, cause)| cause);
     compiler_cause.or_else(|| node_pin_conflict(worktree, tools, denies))
 }
 

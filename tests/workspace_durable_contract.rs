@@ -48,13 +48,15 @@ struct Fixture {
     root: PathBuf,
 }
 impl Fixture {
-    /// Creates real directories beneath `/private/tmp`, avoiding Darwin's `/tmp` symlink alias.
+    /// Creates real directories beneath canonical task TMPDIR, avoiding symlink aliases.
     fn new() -> Self {
-        let base = PathBuf::from(format!(
-            "/private/tmp/workspace-durable-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let base = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "workspace-durable-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
         let root = base.join("worktree");
         fs::create_dir_all(root.join(".git")).unwrap();
         Self { base, root }

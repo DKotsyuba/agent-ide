@@ -47,12 +47,13 @@ fn bridge_publications(fixture: &ProductFixture) -> usize {
         .unwrap()
 }
 
-/// A missing configured cargo binary produces inline established unavailability and no wake;
+/// A missing configured Cargo tool refuses a Rust edit inline without writes or a wake;
 /// a working check still settles with its diagnostics and records a deferred check publication.
 #[tokio::test]
 async fn unavailable_checks_stay_inline_and_working_checks_still_publish() {
     for broken in [true, false] {
         let fixture = ProductFixture::new(json!([]));
+        let before = std::fs::read(fixture.root.join("src/lib.rs")).unwrap();
         std::fs::set_permissions(&fixture.base, std::fs::Permissions::from_mode(0o700)).unwrap();
         let gate = hold_checks_at_gate(&fixture);
         let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, &gate);
@@ -127,16 +128,15 @@ async fn unavailable_checks_stay_inline_and_working_checks_still_publish() {
             edit
         };
         if broken {
-            assert_eq!(edit["diagnostics"]["state"], "not_analysed", "{edit}");
-            let reason = edit["diagnostics"]["reason"].as_str().unwrap();
+            assert_eq!(edit["state"], "error", "{edit}");
+            assert_eq!(edit["code"], "provider_unavailable", "{edit}");
             assert!(
-                reason.contains("checks unavailable:") && reason.contains("tool not found"),
-                "{edit}"
+                rendered.contains("configured cargo is missing"),
+                "{rendered}"
             );
             assert_eq!(
-                rendered.matches("checks unavailable:").count(),
-                1,
-                "{rendered}"
+                std::fs::read(fixture.root.join("src/lib.rs")).unwrap(),
+                before
             );
             assert_eq!(
                 bridge_publications(&fixture),
@@ -347,6 +347,7 @@ printf '%s\n' '{{"reason":"compiler-message","package_id":"fixture","message":{{
 async fn cargo_2000_tests_keep_results_compact_and_log_pages_explicit() {
     for nocapture in [false, true] {
         let fixture = ProductFixture::new(json!([]));
+        enable_prepared_rust_checks(&fixture);
         let mut source = String::new();
         for index in 0..2000 {
             let body = if index == 1234 {
@@ -580,7 +581,7 @@ async fn explicit_output_body_recovery_is_readonly_through_the_assembled_mcp() {
             .split("  output (tail):\n")
             .nth(1)
             .unwrap()
-            .split("\n  rerun:")
+            .split("\n  rerun")
             .next()
             .unwrap()
             .lines()

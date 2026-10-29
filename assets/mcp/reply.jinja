@@ -186,7 +186,7 @@ Result retained under {{ detail_ref }}. Bridge delivers it automatically.
 {%- elif code == "provider_unavailable" and (resolution_detail is startingwith("outline:provider_unavailable ext=") or resolution_detail is startingwith("read:provider_unavailable ext=") or resolution_detail is startingwith("symbol:provider_unavailable ext=") or resolution_detail is startingwith("context:provider_unavailable ext=")) -%}
 {{ refusal("No language server is configured for ." ~ resolution_message ~ " files in this project.", "Continue this operation with native tools.") }}
 {%- elif code == "provider_unavailable" and resolution_detail is startingwith("environment:") -%}
-{{ refusal("The project's configured environment is unavailable.", "Use the project's prepared native command or align its launcher configuration.", refusal_excerpt) }}
+{{ refusal("The project's configured environment is unavailable.", "Use the project's prepared native command.", refusal_excerpt) }}
 {%- elif code == "provider_unavailable" -%}
 {{ refusal("No language-server result is available for this request.", "Continue this operation with native tools.") }}
 {%- elif code == "unsupported_git" -%}

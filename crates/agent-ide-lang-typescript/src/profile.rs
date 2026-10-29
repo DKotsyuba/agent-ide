@@ -288,7 +288,7 @@ impl ProjectResolutionInputsV1 {
 
     /// Observes the complete closed ancestor candidate set through Workspace's bounded reader.
     ///
-    /// This is the shared Codex/future-Claude construction path. It derives only the six supported
+    /// This is the shared Codex/future-Claude construction path. It derives only the ten supported
     /// exact basenames at the document directory and each ancestor through the worktree root; it
     /// never lists a directory or scans packages. It also checks the exact `node_modules` name at
     /// each document ancestor through the filesystem root: a real directory inside the worktree is
@@ -1070,6 +1070,10 @@ fn supported_resolution_file(path: &Path) -> bool {
             | "package-lock.json"
             | "yarn.lock"
             | "pnpm-lock.yaml"
+            | ".nvmrc"
+            | ".node-version"
+            | "bun.lock"
+            | "bun.lockb"
     ) || is_tsconfig_like(name)
 }
 
@@ -2195,6 +2199,57 @@ mod tests {
             bytes: 2,
         }];
         assert!(validate_resolution_files(document, &sibling).is_err());
+    }
+
+    /// Fingerprint-only Node pins and both bun lock formats are retained without JSON parsing;
+    /// changing any one's bytes retires the old resolution and produces a different identity.
+    #[test]
+    fn fingerprint_only_resolution_inputs_retire_without_being_parsed() {
+        let fixture = Fixture::new();
+        let bundle = fixture.bundle();
+        let (worktree, _) = fixture.worktree();
+        let document = fixture.root.join("src/file.ts");
+        std::fs::create_dir(fixture.root.join("src")).unwrap();
+        std::fs::write(fixture.root.join("tsconfig.json"), br#"{"compilerOptions":{"types":[],"moduleResolution":"node10"},"files":["src/file.ts"]}"#).unwrap();
+        for (name, bytes) in [
+            (".nvmrc", b"22.11.0\n".as_slice()),
+            (".node-version", b"22.11.0\n".as_slice()),
+            ("bun.lock", b"bun lock\n".as_slice()),
+            ("bun.lockb", [0u8, 1, 2, 3].as_slice()),
+        ] {
+            assert!(!parsed_input(Path::new(name)));
+            let path = fixture.root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let before = ProjectResolutionInputsV1::observe(
+                worktree.clone(),
+                document.clone(),
+                &bundle,
+                &|_| true,
+            )
+            .unwrap();
+            assert!(
+                before
+                    .files()
+                    .iter()
+                    .any(|file| file.path == Path::new(name))
+            );
+            let mut changed = bytes.to_vec();
+            changed.push(b'!');
+            std::fs::write(&path, changed).unwrap();
+            assert!(matches!(
+                before.verify(&|_| true),
+                Err(TypeScriptProfileError::InvalidResolution)
+            ));
+            let after = ProjectResolutionInputsV1::observe(
+                worktree.clone(),
+                document.clone(),
+                &bundle,
+                &|_| true,
+            )
+            .unwrap();
+            assert_ne!(before.identity, after.identity, "{name}");
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     /// Accepts all exact basenames, then rejects changed, missing, and unsupported inputs.

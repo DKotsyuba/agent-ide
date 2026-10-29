@@ -1070,13 +1070,19 @@ fn owns(bin: &Path, program: &str) -> bool {
 /// environment's interpreter, and a tool installed in its `bin` (`pytest`, `ruff`) runs with that
 /// `bin` first on `PATH` and `VIRTUAL_ENV` set. `None` for every other program (`cargo`, `make`),
 /// so another language's toolchain is never taken over, and when that root resolves nothing.
+/// An owned absolute tool names itself as its argv prefix, allowing recipe admission to attest
+/// that exact executable; a bare installed tool keeps its original name and activated PATH.
 pub(crate) fn command_env(worktree: &Path, cwd: &Path, program: &str) -> Option<CommandEnv> {
     let venv = for_path(worktree, cwd)?.env.chosen?.path;
     let bin = venv.join("bin");
     let argv_prefix = if matches!(program, "python" | "python3") {
         vec![python_of(&venv).into_os_string()]
     } else if owns(&bin, program) {
-        Vec::new()
+        if Path::new(program).is_absolute() {
+            vec![OsString::from(program)]
+        } else {
+            Vec::new()
+        }
     } else {
         return None;
     };
@@ -1573,7 +1579,8 @@ mod tests {
     /// Explicit commands run activated in the environment of the deepest root holding `cwd`,
     /// for the programs that environment owns only: `python` is replaced by the interpreter, an
     /// installed tool gets the environment's `bin` and `VIRTUAL_ENV`, and an uninstalled tool or
-    /// another language's program (`cargo`) is left alone.
+    /// another language's program (`cargo`) is left alone. Owned absolute tools attest their
+    /// exact executable for recipe admission; a different root's interpreter is unclaimed.
     #[test]
     fn command_env_activates_only_programs_the_environment_owns() {
         use std::os::unix::fs::PermissionsExt;
@@ -1618,8 +1625,29 @@ mod tests {
                 Path::new("packages/alpha"),
                 &pytest.display().to_string()
             ),
-            Some(activated),
+            Some(CommandEnv {
+                argv_prefix: vec![pytest.clone().into_os_string()],
+                ..activated.clone()
+            }),
             "the language's own absolute command runs activated"
+        );
+        let python = alpha.join("bin/python");
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            Python.command_env(&root, Path::new("packages/alpha"), python.to_str().unwrap()),
+            Some(CommandEnv {
+                argv_prefix: vec![python.into_os_string()],
+                ..activated
+            })
+        );
+        assert_eq!(
+            Python.command_env(
+                &root,
+                Path::new("packages/alpha"),
+                root.join(".venv/bin/python").to_str().unwrap()
+            ),
+            None,
+            "an absolute interpreter from another root is not taken over"
         );
         assert_eq!(
             Python.command_env(&root, Path::new("packages/alpha"), "ruff"),
