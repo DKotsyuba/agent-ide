@@ -250,8 +250,10 @@ fn collect_non_rust(dir: &Path, out: &mut Vec<String>) -> Result<()> {
 
 /// The full CI gate in one command: standard checks, fmt, the workspace tests (serialized, with
 /// `--no-fail-fast`, built with the `test-seams` feature the seam-driven
-/// product tests need), one default-build run proving a release build ignores those seams, the
+/// product tests need), default-build controls proving release builds ignore those seams, the
 /// four ignored provider tests, clippy, rustdoc, the release build and the contract snapshot check.
+/// Explicit fixture-root isolation refuses the genuinely default managed-runtime control before
+/// it can create canonical shared directories; the gate reports that boundary instead of skipping it.
 fn check(root: &Path) -> Result<()> {
     standard(root)?;
     run(root, "cargo", &["fmt", "--all", "--check"])?;
@@ -264,6 +266,25 @@ fn check(root: &Path) -> Result<()> {
         "cargo",
         &[workspace_tests, vec!["--test-threads=1"]].concat(),
     )?;
+    // Pure path selection only: never calls a mutating installation doctor against live roots.
+    run(
+        root,
+        "cargo",
+        &[
+            "test",
+            "--locked",
+            "-p",
+            "agent-ide-core",
+            "--lib",
+            "doctor_install::observation_tests::default_build_ignores_doctor_scan_root_selector",
+            "--",
+            "--exact",
+            "--test-threads=1",
+        ],
+    )?;
+    if std::env::var_os("AGENT_IDE_TEST_SHARED_RUNTIME_ROOT").is_some() {
+        return Err("blocked: service_lifecycle_contract::release_build_ignores_the_version_seams requires a default binary to create canonical /private/tmp shared runtime/key directories; it cannot honor the test-only root selector".into());
+    }
     // A release build (no `test-seams` feature) must ignore every environment seam: the version
     // seams and the job-panic seam.
     run(

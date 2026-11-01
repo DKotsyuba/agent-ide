@@ -1323,6 +1323,48 @@ impl WorkerHandle {
         self.shared.project_feed.as_ref()
     }
 
+    /// Counts at most 100 retained events through the existing Store owner, without new connections,
+    /// migrations, telemetry ingress, retention changes, actor registration, or job admission.
+    /// Missing/corrupt evidence is unavailable; row time is unknown because the schema has none.
+    pub(crate) async fn observe_telemetry(&self) -> crate::app::observation::TelemetrySummary {
+        use crate::app::observation::TelemetrySummary;
+        let telemetry = self
+            .telemetry
+            .try_lock()
+            .ok()
+            .and_then(|owner| owner.clone());
+        let Some(telemetry) = telemetry else {
+            return TelemetrySummary::unavailable();
+        };
+        match telemetry
+            .query(crate::telemetry::Filter::All, None, 100)
+            .await
+        {
+            Ok(page) => {
+                let mut counts = std::collections::BTreeMap::new();
+                for row in &page.rows {
+                    *counts.entry(row.event.tag().to_owned()).or_insert(0) += 1;
+                }
+                TelemetrySummary {
+                    availability: "available".into(),
+                    counts,
+                    coverage: if page.rows.is_empty() {
+                        "unknown"
+                    } else if page.truncated {
+                        "partial"
+                    } else {
+                        "complete"
+                    }
+                    .into(),
+                    next_cursor: page.next_cursor,
+                    dropped: page.dropped,
+                    observed_at_ms: None,
+                }
+            }
+            Err(_) => TelemetrySummary::unavailable(),
+        }
+    }
+
     /// Returns an undelivered test status line for the binding that started that job.
     pub fn test_status_line(&self, binding: &[u8; 32]) -> Option<String> {
         self.shared.test_runs.status_line_for_binding(binding)
@@ -7863,13 +7905,15 @@ mod stop_retry_tests {
         root: std::path::PathBuf,
     }
     impl Fixture {
-        /// Creates real directories beneath `/private/tmp`, avoiding Darwin's `/tmp` symlink alias.
+        /// Creates real directories beneath canonical task TMPDIR, avoiding symlink aliases.
         fn new() -> Self {
-            let base = std::path::PathBuf::from(format!(
-                "/private/tmp/worker-stop-retry-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let base = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "worker-stop-retry-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
             let root = base.join("worktree");
             std::fs::create_dir_all(&root).unwrap();
             assert!(

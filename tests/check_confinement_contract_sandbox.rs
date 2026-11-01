@@ -39,11 +39,13 @@ fn check_env() -> Vec<(String, String)> {
 /// replaced instead of reused.
 fn scratch(name: &str) -> Scratch {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let base = PathBuf::from(format!(
-        "/private/tmp/aiv3-t095-{}-{}",
-        process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed),
-    ));
+    let base = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "aiv3-t095-{}-{}",
+            process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
     let root = base.join(name);
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&root).expect("scratch root is created");

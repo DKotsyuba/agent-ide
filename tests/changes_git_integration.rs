@@ -410,10 +410,12 @@ fn snapshot_directory_follows_process_tmpdir() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is after epoch")
         .as_nanos();
-    let custom_temp = PathBuf::from(format!(
-        "/private/tmp/agent-ide-alt-scratch-{}-{tick}",
-        std::process::id()
-    ));
+    let custom_temp = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "agent-ide-alt-scratch-{}-{tick}",
+            std::process::id()
+        ));
     fs::create_dir_all(&custom_temp).expect("alternate temp root is creatable");
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([

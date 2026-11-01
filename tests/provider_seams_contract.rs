@@ -22,13 +22,15 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 /// Owns one temporary directory whose contents are all test-generated.
 struct Fixture(PathBuf);
 impl Fixture {
-    /// Creates a private absolute cwd for controlled shell/true commands.
+    /// Creates a private absolute cwd under canonical task TMPDIR for controlled shell/true commands.
     fn new() -> Self {
-        let path = PathBuf::from(format!(
-            "/private/tmp/provider-seam-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "provider-seam-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
         fs::create_dir(&path).unwrap();
         Self(path)
     }

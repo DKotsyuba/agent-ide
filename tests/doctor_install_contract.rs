@@ -2,10 +2,14 @@
 //! layout builder, then one test per contract point: healthy layout exits 0 with no error
 //! findings, missing config is an error exiting 2, plugin mismatch warns with the restart hint,
 //! and journal lines are counted.
+//! Cleanup fixtures require `test-seams` so their explicit scan-root selector cannot touch live
+//! runtime roots. The default-build selector control lives in core's `doctor_install` unit tests.
+
+#![cfg(feature = "test-seams")]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -15,26 +19,35 @@ use agent_ide::userhome::HOME_OVERRIDE_ENV;
 /// The version every healthy-layout fixture pins: the binary under test's own version.
 const BINVER: &str = env!("CARGO_PKG_VERSION");
 
+/// Distinguishes private fixture roots in this process.
 static TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// A short unique scratch tree below `/private/tmp`.
-fn scratch(name: &str) -> PathBuf {
-    let path = PathBuf::from(format!(
-        "/private/tmp/aide-doctor-{}-{}-{name}",
+/// Creates a short private root under task TMPDIR; the label does not lengthen socket paths.
+fn scratch(_name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "d-{}-{}",
         std::process::id(),
         TEST_ID.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).unwrap();
-    path
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    fs::canonicalize(path).unwrap()
 }
 
-fn agent_ide() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+/// Constructs this build's fixture child with all daemon scans confined by the test-seams API.
+/// Caller-supplied scan roots are private fixture directories; production roots are never scanned.
+fn agent_ide(scan_root: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    command
+        .env("AGENT_IDE_TEST_DOCTOR_SCAN_ROOT", scan_root)
+        .env("TMPDIR", scan_root)
+        .env("TMP", scan_root)
+        .env("TEMP", scan_root);
+    command
 }
 
 /// One fake per-user home: config written, everything else added per test.
 struct Layout {
+    /// Private fixture home below task TMPDIR; its `tmp` child is the sole daemon scan root.
     root: PathBuf,
 }
 
@@ -42,6 +55,10 @@ impl Layout {
     /// Creates the scratch tree and the launcher configuration inside it.
     fn new(name: &str) -> Self {
         let root = scratch(name);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.join("tmp"))
+            .unwrap();
         let config_dir = root.join(".config/agent-ide");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
@@ -136,7 +153,7 @@ impl Layout {
 
     /// Runs `doctor` against this layout and returns its full result.
     fn doctor(&self) -> std::process::Output {
-        agent_ide()
+        agent_ide(&self.root.join("tmp"))
             .arg("doctor")
             .env(HOME_OVERRIDE_ENV, &self.root)
             .output()
@@ -447,7 +464,7 @@ fn js_and_stderr_toolchains_report_versions_not_unresponsive() {
 #[cfg(feature = "test-seams")]
 fn spawn_health_daemon(runtime: &std::path::Path, version: Option<&str>) -> std::process::Child {
     use std::process::Stdio;
-    let mut command = agent_ide();
+    let mut command = agent_ide(runtime.parent().unwrap());
     command
         .args(["daemon", "--runtime-dir"])
         .arg(runtime)
@@ -495,19 +512,18 @@ fn live_daemons_are_listed_with_versions_and_outdated_ones_flagged() {
     layout.shim();
     layout.plugin(BINVER);
     layout.hosts();
-    // Shared repository daemons live in /private/tmp under the `ai-r-` prefix; a short path also
-    // keeps the socket under macOS's 104-byte limit on runners with a long temp root.
+    // Exact product names remain covered under the explicit private test-only scan root.
     let unique = TEST_ID.fetch_add(2, Ordering::Relaxed);
     // Doctor recognises only exact product runtime names: `ai-r-` plus sixteen lowercase hex
     // digits (here 12 for the process id, 3 for the test id and one for the daemon).
-    let current_runtime = PathBuf::from(format!(
-        "/private/tmp/ai-r-{:012x}{unique:03x}a",
-        std::process::id()
-    ));
-    let outdated_runtime = PathBuf::from(format!(
-        "/private/tmp/ai-r-{:012x}{unique:03x}b",
-        std::process::id()
-    ));
+    let current_runtime = layout
+        .root
+        .join("tmp")
+        .join(format!("ai-r-{:012x}{unique:03x}a", std::process::id()));
+    let outdated_runtime = layout
+        .root
+        .join("tmp")
+        .join(format!("ai-r-{:012x}{unique:03x}b", std::process::id()));
     let current = spawn_health_daemon(&current_runtime, None);
     let outdated = spawn_health_daemon(&outdated_runtime, Some("0.6.4"));
 
@@ -594,7 +610,7 @@ fn doctor_prunes_only_the_products_own_abandoned_runtimes() {
         make("ai-k-0123456789abcdef", 0o700, true),
         make("ai-aaaaaaaaaaaaaaaa", 0o755, true),
     ];
-    let output = agent_ide()
+    let output = agent_ide(&tmp)
         .arg("doctor")
         .env(HOME_OVERRIDE_ENV, &layout.root)
         .env("TMPDIR", &tmp)
@@ -696,7 +712,7 @@ fn doctor_keeps_runtimes_with_a_held_or_unsafe_lock() {
     // creates and holds the lock itself before it removes the tree.
     let missing = make("ai-4444444444444444");
     age(&missing);
-    let output = agent_ide()
+    let output = agent_ide(&tmp)
         .arg("doctor")
         .env(HOME_OVERRIDE_ENV, &layout.root)
         .env("TMPDIR", &tmp)
@@ -722,4 +738,41 @@ fn doctor_keeps_runtimes_with_a_held_or_unsafe_lock() {
     );
     drop(held_lock);
     let _ = fs::remove_dir_all(&layout.root);
+}
+
+/// The actual safe CLI reports its marker and retains old runtime bytes, times, and missing locks.
+#[test]
+fn read_only_doctor_never_prunes_its_explicit_private_scan_root() {
+    let layout = Layout::new("read-only");
+    let scan = layout.root.join("tmp");
+    let runtime = scan.join("ai-r-0000000000000000");
+    fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
+    fs::write(runtime.join("evidence"), b"retained snapshot").unwrap();
+    fs::File::open(&runtime)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600))
+        .unwrap();
+    let before = fs::metadata(&runtime).unwrap().modified().unwrap();
+    let output = agent_ide(&scan)
+        .args(["doctor", "--read-only"])
+        .env(HOME_OVERRIDE_ENV, &layout.root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["read_only"], true);
+    assert_eq!(report["version"], BINVER);
+    assert_eq!(
+        fs::read(runtime.join("evidence")).unwrap(),
+        b"retained snapshot"
+    );
+    assert_eq!(fs::read_dir(&scan).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&runtime).unwrap().count(), 1);
+    assert_eq!(fs::metadata(&runtime).unwrap().modified().unwrap(), before);
+    assert!(!runtime.join("agent-ide.lock").exists());
+    fs::remove_dir_all(layout.root).unwrap();
 }

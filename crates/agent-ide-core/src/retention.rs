@@ -1922,6 +1922,8 @@ impl Drop for SweepLock {
 /// Applies the policy in a long-lived daemon: first after `FIRST_SWEEP_DELAY`, then every
 /// `SWEEP_INTERVAL`, each on a blocking thread and only when no daemon swept within
 /// `SWEEP_SPACING`. Removals are recorded in this process's error log. Runs until dropped.
+/// Shared hint collection uses the same feature-gated fixture root as publishers; default
+/// builds retain canonical `/private/tmp`, and an invalid test selector never falls back there.
 pub async fn run_periodically() {
     let mut delay = FIRST_SWEEP_DELAY;
     loop {
@@ -1938,16 +1940,24 @@ pub async fn run_periodically() {
                 use crate::errorlog::{Fields, Method, Outcome, record};
                 let (outcome, detail) = match hint_publishers_unsafe(&process_snapshot) {
                     Some(unsafe_publishers) if unsafe_publishers.is_empty() => {
-                        let hints = crate::hook_hints::collect(
-                            Path::new(crate::hook_hints::TMP_ROOT),
-                            true,
-                            SystemTime::now(),
-                            &hint_publishers_safe(),
-                        );
-                        (
-                            Outcome::Completed,
-                            format!("hook_key_hints removed={}", hints.stale),
-                        )
+                        match crate::test_seams::shared_runtime_root() {
+                            Ok(root) => {
+                                let hints = crate::hook_hints::collect(
+                                    &root,
+                                    true,
+                                    SystemTime::now(),
+                                    &hint_publishers_safe(),
+                                );
+                                (
+                                    Outcome::Completed,
+                                    format!("hook_key_hints removed={}", hints.stale),
+                                )
+                            }
+                            Err(_) => (
+                                Outcome::Skipped,
+                                "hook_key_hints paused=unavailable".to_owned(),
+                            ),
+                        }
                     }
                     Some(unsafe_publishers) => (
                         Outcome::Skipped,

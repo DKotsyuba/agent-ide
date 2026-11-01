@@ -24,6 +24,7 @@ Do not equate an integration edge with an implementation dependency. A consumer 
 - [Exact changes and verification](contracts/changes.md)
 - [Agent assistance and fail-open hooks](contracts/assistance.md)
 - [Local infrastructure](contracts/application.md)
+- [Read-only repository observation](contracts/observation-v1.md)
 
 ```mermaid
 flowchart LR

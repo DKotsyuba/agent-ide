@@ -1247,16 +1247,18 @@ async fn named_hook(
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
 }
 
-/// Creates one fresh owner-only rendezvous test area directly below `/private/tmp`.
+/// Creates one fresh owner-only rendezvous test area below the configured task temp root.
 ///
-/// Kept short and outside `std::env::temp_dir()`: fixture Unix-socket paths must stay under
+/// Kept short under the task temp root: fixture Unix-socket paths must stay under
 /// `SUN_LEN`, and the area must never be a real production rendezvous root.
 fn rendezvous_area(tag: &str) -> PathBuf {
-    let base = PathBuf::from(format!(
-        "/private/tmp/.airvb-{tag}-{}-{}",
-        std::process::id(),
-        NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
-    ));
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            ".airvb-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
+        ));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir(&base).unwrap();
     std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -3314,7 +3316,7 @@ fn managed_claude_candidate_attachment(project: &Path) -> String {
             .as_os_str()
             .as_bytes(),
     );
-    let path = std::fs::canonicalize("/private/tmp")
+    let path = agent_ide::test_seams::shared_runtime_root()
         .unwrap()
         .join(format!("ai-k-{}", &identity.to_hex().as_str()[..16]))
         .join("candidate-attachment");
@@ -3341,7 +3343,7 @@ fn managed_claude_runtime_path(project: &Path) -> PathBuf {
         project
     };
     let hash = blake3::hash(key.as_os_str().as_bytes());
-    std::fs::canonicalize("/private/tmp")
+    agent_ide::test_seams::shared_runtime_root()
         .unwrap()
         .join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
 }
@@ -5137,10 +5139,12 @@ async fn managed_claude_first_worktree_start_pairs_before_mcp_call() {
     let runtime = managed_claude_runtime_path(&left);
     let _guard = SharedClaudeDaemonGuard(runtime.clone());
     assert!(!runtime.exists());
-    let cache = std::fs::canonicalize("/private/tmp").unwrap().join(format!(
-        "ai-k-{}",
-        &blake3::hash(left.as_os_str().as_bytes()).to_hex().as_str()[..16]
-    ));
+    let cache = agent_ide::test_seams::shared_runtime_root()
+        .unwrap()
+        .join(format!(
+            "ai-k-{}",
+            &blake3::hash(left.as_os_str().as_bytes()).to_hex().as_str()[..16]
+        ));
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&cache)
@@ -5835,7 +5839,7 @@ async fn a_pre_hook_on_a_dead_generations_attachment_fails_open_until_the_cache_
 
     let live = managed_claude_candidate_attachment(&fixture.root);
     assert_eq!(live.len(), 64, "a published attachment is 64 hex digits");
-    let cache = std::fs::canonicalize("/private/tmp")
+    let cache = agent_ide::test_seams::shared_runtime_root()
         .unwrap()
         .join(format!(
             "ai-k-{}",
