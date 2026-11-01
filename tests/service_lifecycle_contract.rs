@@ -105,7 +105,7 @@ fn expected_runtime_path(candidate: &Path) -> PathBuf {
         candidate
     };
     let hash = blake3::hash(key.as_os_str().as_bytes());
-    std::fs::canonicalize("/private/tmp")
+    agent_ide::test_seams::shared_runtime_root()
         .unwrap()
         .join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
 }

@@ -57,7 +57,7 @@ pub mod hook_hints;
 /// Implements the `init` command: per-user home tree and launcher template creation.
 pub mod init;
 
-/// Implements the argument-less `doctor` command: read-only installation health findings.
+/// Installation findings; explicit read-only mode suppresses legacy abandoned-runtime cleanup.
 pub mod doctor_install;
 /// Installs one sealed release bundle into the immutable standalone layout (`self-install`).
 pub mod selfinstall;

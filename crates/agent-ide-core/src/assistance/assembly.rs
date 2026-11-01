@@ -1389,6 +1389,26 @@ impl ProductDispatcher {
     }
 }
 impl AssistanceDispatcher for ProductDispatcher {
+    /// Projects only closed counts through the already-open telemetry owner, without new work.
+    fn observe_telemetry(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = crate::app::observation::TelemetrySummary> + Send + '_>> {
+        Box::pin(async move {
+            match &self.worker {
+                Some(worker) => worker.observe_telemetry().await,
+                None => crate::app::observation::TelemetrySummary::unavailable(),
+            }
+        })
+    }
+    /// Reads the existing scheduler owner only; never admits an actor, job, provider, or lease.
+    fn observe_checks(&self, common_dir: &str, cursor: u64) -> crate::app::observation::ChecksPage {
+        self.worker
+            .as_ref()
+            .and_then(WorkerHandle::project_feed)
+            .map_or_else(crate::app::observation::ChecksPage::unavailable, |feed| {
+                feed.observe(common_dir, cursor)
+            })
+    }
     /// Gives a managed Claude MCP its own target on this repository's shared daemon.
     fn register_claude_candidate(&self, candidate: &Path) -> Option<String> {
         if !self.managed_claude {

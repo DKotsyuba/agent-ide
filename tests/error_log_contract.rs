@@ -12,13 +12,15 @@ use agent_ide::userhome::{HOME_OVERRIDE_ENV, passwd_home};
 
 static TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// A short unique scratch tree below `/private/tmp` (Unix socket paths are length limited).
+/// A short unique scratch tree below task TMPDIR (Unix socket paths are length limited).
 fn scratch(name: &str) -> PathBuf {
-    let path = PathBuf::from(format!(
-        "/private/tmp/aide-elog-{}-{}-{name}",
-        std::process::id(),
-        TEST_ID.fetch_add(1, Ordering::Relaxed)
-    ));
+    let path = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "aide-elog-{}-{}-{name}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).unwrap();
     path

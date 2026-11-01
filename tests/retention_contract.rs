@@ -5,7 +5,7 @@
 //! which would briefly extend other tests' leases if they shared the process.
 
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
@@ -142,8 +142,10 @@ fn status_view_of_a_copied_build(name: &str, strip_proof: bool) -> (bool, bool) 
             .unwrap();
         assert!(signed.status.success(), "re-signing the edited copy");
     }
-    // A socket path must stay short, so the runtime directory is not below the long scratch home.
-    let runtime = PathBuf::from(format!("/private/tmp/ai-rc-{}-{name}", std::process::id()));
+    // A socket path stays short below task TMPDIR, outside the longer scratch home.
+    let runtime = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("ai-rc-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&runtime);
     std::fs::create_dir(&runtime).unwrap();
     std::fs::set_permissions(
