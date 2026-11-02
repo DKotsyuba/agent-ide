@@ -100,36 +100,6 @@ pub const PROBLEMS_PAGE_SIZE: u32 = 20;
 /// adversarial value, matching [`untrusted_line`]'s single-line, control-free guarantee.
 const MAX_CODE_CHARS: usize = 64;
 
-/// Appends one bounded explicit-test status line while preserving the feed's byte ceiling.
-fn append_test_status(block: &str, status: &str) -> String {
-    let line = status
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(160)
-        .collect::<String>();
-    let prefix = block
-        .strip_suffix("</agent-ide>")
-        .unwrap_or(block)
-        .trim_end();
-    let separator = if prefix.ends_with("<agent-ide>") {
-        ""
-    } else {
-        "\n"
-    };
-    let mut result = format!("{prefix}{separator}{line}\n</agent-ide>");
-    if result.len() > crate::feed::MAX_BLOCK_BYTES {
-        let excess = result.len() - crate::feed::MAX_BLOCK_BYTES;
-        let start = prefix.find('\n').unwrap_or(prefix.len());
-        let body = &prefix[start..];
-        let cut = body
-            .char_indices()
-            .find(|(index, _)| *index >= excess)
-            .map_or(body.len(), |(index, _)| index);
-        result = format!("<agent-ide>{}\n{line}\n</agent-ide>", &body[cut..]);
-    }
-    result
-}
-
 /// Supplies the latest completed project check snapshots for one authorized worktree.
 ///
 /// Implementers must be usable from the daemon worker concurrently (`Send + Sync`) and must
@@ -181,10 +151,6 @@ struct FeedWiring {
     pending_restricted: HashSet<[u8; 32]>,
     /// Delivered-block state per `(binding, worktree)`.
     feed: FeedState,
-    /// Daemon-owned test runner for appending explicit test status to the same plate.
-    test_runs: Option<super::tests::TestRuns>,
-    /// Last test status actually delivered for each binding/worktree.
-    test_delivered: HashMap<FeedKey, String>,
 }
 
 /// Daemon-owned project problem feed: trigger routing, admission, and block delivery state.
@@ -256,6 +222,7 @@ impl ProjectProblemFeed {
         let checkers: Vec<Arc<dyn Checker>> = checks
             .sections()
             .map(|(language, config)| {
+                let context = launcher.check_module_config(language);
                 checks
                     .raw_section(language)
                     .and_then(|section| {
@@ -264,9 +231,12 @@ impl ProjectProblemFeed {
                             section,
                             runner.clone(),
                             checks.check_timeout(),
+                            &context,
                         )
                     })
-                    .unwrap_or_else(|| config.checker(runner.clone(), checks.check_timeout()))
+                    .unwrap_or_else(|| {
+                        config.configured_checker(runner.clone(), checks.check_timeout(), context)
+                    })
             })
             .collect();
         if checkers.is_empty() {
@@ -517,6 +487,17 @@ impl ProjectProblemFeed {
         None
     }
 
+    /// Reads the last policy-valid attempt for an accepted check's exact language, including a
+    /// transient failure that leaves the ordinary problem feed's last usable report intact.
+    /// Returns `None` before completion or after environment/policy invalidation; never runs work.
+    pub(crate) fn latest_attempt(
+        &self,
+        worktree: &Path,
+        language: Language,
+    ) -> Option<ProblemSnapshot> {
+        self.scheduler.latest_attempt(worktree, language)
+    }
+
     /// Returns the `<agent-ide>` block due for `binding`, marking it delivered, or `None`.
     ///
     /// Reads only in-memory snapshots and never waits for a running check. `None` means the
@@ -534,19 +515,12 @@ impl ProjectProblemFeed {
     /// one wiring lock, so a block refused by `fits` is never recorded and stays due for the
     /// next call. This is the reply-carried delivery used by hosts without a hook stream: the
     /// plate may only be consumed by a reply that actually carries it whole.
+    ///
+    /// The plate carries check status only: a test run's outcome is one `test-finished` fact of
+    /// the session outbox, never a plate line (OUTBOX-r3 §4).
     pub fn next_block_when(
         &self,
         binding: &[u8; 32],
-        fits: impl FnOnce(&str) -> bool,
-    ) -> Option<String> {
-        self.next_block_when_with_test_status(binding, None, fits)
-    }
-
-    /// Like [`Self::next_block_when`], using a status snapshot already selected for this reply.
-    pub fn next_block_when_with_test_status(
-        &self,
-        binding: &[u8; 32],
-        test_status_snapshot: Option<&str>,
         fits: impl FnOnce(&str) -> bool,
     ) -> Option<String> {
         let mut guard = self.state.lock().ok()?;
@@ -566,44 +540,9 @@ impl ProjectProblemFeed {
         } else {
             self.rechecks_for(&bound.worktree)
         };
-        let test_status = test_status_snapshot.map(str::to_owned).or_else(|| {
-            state
-                .test_runs
-                .as_ref()
-                .and_then(|runs| runs.status_line_for_binding(binding))
-        });
-        let due_test = test_status
-            .as_ref()
-            .filter(|status| state.test_delivered.get(&key) != Some(*status));
-        let fits = std::cell::RefCell::new(Some(fits));
         let block = state
             .feed
-            .next_block_when(&key, &snapshots, &rechecks, |block| {
-                let combined = if let Some(status) = due_test {
-                    append_test_status(block, status)
-                } else {
-                    block.to_owned()
-                };
-                fits.borrow_mut().take().is_some_and(|fits| fits(&combined))
-            });
-        let block = match (block, due_test) {
-            (Some(block), Some(status)) => Some(append_test_status(&block, status)),
-            (Some(block), None) => Some(block),
-            (None, Some(status)) => {
-                let plate = append_test_status("<agent-ide>\n</agent-ide>", status);
-                fits.borrow_mut()
-                    .take()
-                    .is_some_and(|fits| fits(&plate))
-                    .then_some(plate)
-            }
-            (None, None) => None,
-        }?;
-        if let Some(status) = due_test {
-            state.test_delivered.insert(key.clone(), status.clone());
-            if let Some(runs) = &state.test_runs {
-                runs.mark_feed_status_delivered(&bound.worktree, status);
-            }
-        }
+            .next_block_when(&key, &snapshots, &rechecks, fits)?;
         let languages = snapshots
             .iter()
             .filter(|snapshot| {
@@ -634,20 +573,9 @@ impl ProjectProblemFeed {
             if let Some(bound) = state.bindings.remove(binding) {
                 state.feed.forget(&FeedKey {
                     binding: hex(binding),
-                    worktree: bound.worktree.clone(),
-                });
-                state.test_delivered.remove(&FeedKey {
-                    binding: hex(binding),
                     worktree: bound.worktree,
                 });
             }
-        }
-    }
-
-    /// Attaches the daemon's test status source before worker startup.
-    pub fn with_test_runs(&self, runs: super::tests::TestRuns) {
-        if let Ok(mut state) = self.state.lock() {
-            state.test_runs = Some(runs);
         }
     }
 
@@ -786,6 +714,47 @@ pub fn problems_text_with_rechecks(
     language: Option<Language>,
     offset: u32,
 ) -> String {
+    problems_text_addressed(
+        snapshots,
+        rechecks,
+        language,
+        offset,
+        &crate::lang::render::LocationAddresses::new(),
+    )
+}
+
+/// The `(file, line)` of every problem [`problems_text_addressed`] prints on the page at
+/// `offset`, in print order, so a caller can resolve their addresses first.
+pub fn page_locations(
+    snapshots: &[ProblemSnapshot],
+    language: Option<Language>,
+    offset: u32,
+) -> Vec<(String, u32)> {
+    snapshots
+        .iter()
+        .filter(|snapshot| language.is_none_or(|selected| snapshot.language == selected))
+        .filter(|snapshot| {
+            !matches!(
+                snapshot.state,
+                CheckState::Unavailable(UnavailableReason::Disabled)
+            )
+        })
+        .flat_map(|snapshot| &snapshot.problems)
+        .skip(offset as usize)
+        .take(PROBLEMS_PAGE_SIZE as usize)
+        .map(|problem| (problem.path.clone(), problem.line))
+        .collect()
+}
+
+/// [`problems_text_with_rechecks`] with position addresses: a problem whose `(path, line)` is in
+/// `addresses` prints `path:line:column <address (L123)> severity [code] message`.
+pub fn problems_text_addressed(
+    snapshots: &[ProblemSnapshot],
+    rechecks: &[(Language, Recheck)],
+    language: Option<Language>,
+    offset: u32,
+    addresses: &crate::lang::render::LocationAddresses,
+) -> String {
     let matched: Vec<&ProblemSnapshot> = snapshots
         .iter()
         .filter(|snapshot| language.is_none_or(|selected| snapshot.language == selected))
@@ -829,7 +798,7 @@ pub fn problems_text_with_rechecks(
                 skipped -= 1;
             } else if rendered < PROBLEMS_PAGE_SIZE {
                 rendered += 1;
-                lines.push(problem_line(problem));
+                lines.push(problem_line(problem, addresses));
             } else {
                 more = true;
             }
@@ -899,7 +868,7 @@ fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
 /// passes through [`sanitized_code`] rather than [`untrusted_line`] directly, so it also gets a
 /// length cap. All other textual fields pass through [`untrusted_line`]; the numeric fields come
 /// from the typed snapshot.
-fn problem_line(problem: &Problem) -> String {
+fn problem_line(problem: &Problem, addresses: &crate::lang::render::LocationAddresses) -> String {
     let severity = match problem.severity {
         Severity::Error => "error",
         Severity::Warning => "warning",
@@ -909,8 +878,12 @@ fn problem_line(problem: &Problem) -> String {
         .as_deref()
         .map(|code| format!(" [{}]", sanitized_code(code)))
         .unwrap_or_default();
+    let address = addresses
+        .get(&(problem.path.clone(), problem.line))
+        .map(|address| format!(" {address}"))
+        .unwrap_or_default();
     format!(
-        "{}:{}:{} {severity}{code} {}",
+        "{}:{}:{}{address} {severity}{code} {}",
         untrusted_line(&problem.path),
         problem.line,
         problem.column,
@@ -918,8 +891,8 @@ fn problem_line(problem: &Problem) -> String {
     )
 }
 
-/// Maps one unavailable reason to the same plain phrase shown in the status plate.
-fn unavailable_reason(reason: UnavailableReason) -> &'static str {
+/// Maps an unavailable check reason to the shared plain phrase used by plates and edit receipts.
+pub(super) fn unavailable_reason(reason: UnavailableReason) -> &'static str {
     match reason {
         UnavailableReason::Disabled => "checks disabled",
         UnavailableReason::ReadRestricted => "unavailable: read_restricted",
@@ -1455,14 +1428,20 @@ mod tests {
         }
     }
 
-    /// Builds a feed over a [`ScriptedChecker`] and returns it with its problem list and root.
+    /// Builds a scripted feed with a private state root so retention can admit its checks.
     fn scripted_feed(name: &str) -> (ProjectProblemFeed, Arc<Mutex<Vec<Problem>>>, PathBuf) {
+        use std::os::unix::fs::DirBuilderExt;
+
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
             .join(format!("agent-ide-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("wt")).unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root.join("wt"))
+            .unwrap();
         std::fs::write(root.join("wt/alpha.toml"), "").unwrap();
         let problems = Arc::new(Mutex::new(Vec::new()));
         let scheduler = Scheduler::new(

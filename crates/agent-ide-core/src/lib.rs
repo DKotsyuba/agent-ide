@@ -183,3 +183,12 @@ mod language_free {
         }
     }
 }
+
+/// Shared opt-in model transport policy, never loaded by model-disabled callers.
+#[cfg(feature = "jev-pilot")]
+mod model_io;
+
+/// Reused System One transport for the existing pilot and task-context selection.
+#[cfg(feature = "jev-pilot")]
+#[path = "assistance/support/client.rs"]
+pub(crate) mod jev;

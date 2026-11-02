@@ -234,7 +234,7 @@ mod tests {
     /// locks, leases, actors, stores, cache roots, or checks on repeated opens.
     #[tokio::test]
     async fn observation_missing_unsafe_and_corrupt_are_read_only() {
-        let root = crate::scratch::ScratchDir::new("observe-endpoint");
+        let root = crate::scratch::ScratchDir::new("o");
         let missing = root.join("missing");
         for _ in 0..2 {
             assert_eq!(
@@ -254,7 +254,7 @@ mod tests {
             "unavailable"
         );
         assert_eq!(fs::read_dir(&denied).unwrap().count(), 0);
-        let runtime = root.join("runtime");
+        let runtime = root.join("r");
         fs::create_dir(&runtime).unwrap();
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(runtime.join("sentinel"), b"retained").unwrap();

@@ -1,6 +1,29 @@
 # Delivery roadmap
 
-This is the current delivery boundary. It supersedes the earlier all-at-once implementation order in the design documents. The repository ships an installable IDE: release 0.6.9 installs through the [one-line installer](../README.md#install) on macOS arm64 (eleven MCP tools, host plugins, managed launcher), and all five macOS acceptance routes pass at the release revision recorded in [docs/evidence](evidence/). Linux remains explicitly `not_tested`. The older architecture and contract documents remain design input; they are not evidence that an interface is implemented or still agreed.
+The current development boundary is E-003: symbol-addressed reads/edits and compact replies,
+with the owner-directed ten-tool catalog for both hosts. Module work and formal acceptance
+are tracked in Agent Tasks; generated schemas and contracts describe the current source.
+Historical release evidence below qualifies its recorded revision, not this candidate.
+
+## Current completion order
+
+1. Finish the independent IDE domain: addressed reads and edits, guards for every delivered
+   read form, positional semantic lookup, file diagnostics, call-chain descriptions and
+   consistent source-backed replies. Preserve allowed roots, workspace ownership and freshness.
+2. Synchronize the ten-tool exports, per-host skills/plugin descriptions, byte-budget guards
+   and active documentation. Run one complete `cargo xtask check` on the final frozen source;
+   retain failed/interrupted runs separately. Focused passes do not replace this gate.
+3. Build and verify a local candidate bundle against that exact source. Installation,
+   publication and model comparison experiments remain separate delivery steps.
+4. Integrate Bridge only after its generic registration/assertion, scoped notification
+   lifetime and standalone client are implemented and qualified. Bridge owns native call
+   correlation and message transport; IDE owns activation generations, execution, source
+   validity and domain cancellation. The proposed API is not a runtime dependency yet.
+
+The previous delivery records follow. Release 0.6.9 installed through the
+[one-line installer](../README.md#install) on macOS arm64 (eleven tools at that revision)
+and its five acceptance routes are recorded in [docs/evidence](evidence/).
+Linux remains explicitly `not_tested`.
 
 ## v0.1: working coding companion
 

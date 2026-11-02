@@ -415,11 +415,14 @@ fn pause_seam() {
 /// Describes a live process executing from inside `release`, or `None` when none does.
 ///
 /// An unreadable process list or an uninspectable `agent-ide` process counts as a user: a
-/// release is never removed on an unproven absence.
+/// release is never removed on an unproven absence. Linux refuses because its namespace-local
+/// procfs cannot prove that a shared release is unused in every PID namespace.
+/// An `O_WRONLY`/`ETXTBSY` probe is not a substitute: it pins one executable inode but cannot
+/// exclude a noncooperating writer replacing that directory entry before tree removal.
 fn release_user(release: &Path) -> Result<Option<String>, String> {
     let release = fs::canonicalize(release).unwrap_or_else(|_| release.to_path_buf());
-    let processes = crate::retention::process_snapshot()
-        .ok_or("cannot list running processes to prove the release is unused")?;
+    let processes = crate::retention::global_process_snapshot()
+        .ok_or("complete process visibility is unavailable; cannot prove the release is unused")?;
     Ok(processes.into_iter().find_map(|(pid, exe)| match exe {
         Some(exe) if !exe.starts_with(&release) => None,
         Some(_) => Some(format!("pid {pid} runs from it")),
@@ -428,7 +431,8 @@ fn release_user(release: &Path) -> Result<Option<String>, String> {
 }
 
 /// Removes retired `.replaced-*` release copies that no live process uses; a copy still in use
-/// stays for a later install. Failures keep the copy.
+/// stays for a later install. Unknown global process visibility keeps every copy, including on
+/// Linux where namespace-local observations cannot prove absence.
 fn sweep_retired(releases: &Path) {
     let Ok(entries) = fs::read_dir(releases) else {
         return;
@@ -714,8 +718,8 @@ fn current_target(link: &Path) -> Option<String> {
     target.to_str().map(str::to_owned)
 }
 
-/// Writes the managed launcher shim: staged under a temporary name, mode 0755, fsynced, then
-/// renamed over the launcher path.
+/// Writes the managed launcher shim: staged under a temporary name with requested mode 0755,
+/// fsynced, then renamed over the launcher path. The process umask or ACL may restrict the mode.
 fn write_launcher(options: &Options) -> Result<PathBuf, String> {
     create_dir(&options.bin_dir)?;
     let launcher = options.bin_dir.join(BINARY_NAME);
@@ -763,8 +767,8 @@ fn parse_shim(contents: &[u8]) -> Option<(String, String)> {
 }
 
 /// Accepts an existing launcher path only when this product owns it: absent, a managed shim,
-/// a symlink into the prefix `current`, or a previously installed Mach-O binary — which moves
-/// aside exactly once as `agent-ide.bak-<old version>` when `migrate` is set. The preflight
+/// a symlink into the prefix `current`, a previously installed Mach-O binary, or a Linux ELF
+/// identical to a verified release. Binaries move aside once when `migrate` is set. The preflight
 /// passes `false`, so a refusal later in the install leaves the launcher where it was.
 fn ensure_launcher_owned(options: &Options, launcher: &Path, migrate: bool) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(launcher) {
@@ -811,11 +815,19 @@ fn ensure_launcher_owned(options: &Options, launcher: &Path, migrate: bool) -> R
     {
         return Ok(());
     }
-    if metadata.permissions().mode() & 0o111 != 0 && is_macho(&contents) {
+    let macho = is_macho(&contents);
+    let linux_version = known_linux_release(options, &contents);
+    if metadata.permissions().mode() & 0o111 != 0 && (macho || linux_version.is_some()) {
         if !migrate {
             return Ok(());
         }
-        let label = binary_version_label(launcher);
+        // Only the established Mach-O path runs its version command. Linux identity comes from
+        // sealed bytes, so a foreign executable is never run to decide whether it is ours.
+        let label = if macho {
+            binary_version_label(launcher)
+        } else {
+            format!("agent-ide-{}", linux_version.unwrap_or_default())
+        };
         let mut backup = launcher.with_file_name(format!("{BINARY_NAME}.bak-{label}"));
         if fs::symlink_metadata(&backup).is_ok() {
             // An earlier installer already kept a copy under that name; keep this one too
@@ -844,6 +856,42 @@ fn is_macho(contents: &[u8]) -> bool {
         contents.first_chunk::<4>(),
         Some([0xcf, 0xfa, 0xed, 0xfe] | [0xca, 0xfe, 0xba, 0xbe])
     )
+}
+
+/// Matches a Linux ELF executable only to byte-identical, sealed product releases. A marker
+/// within an arbitrary ELF is not enough evidence of ownership and is never executed.
+fn known_linux_release(options: &Options, contents: &[u8]) -> Option<String> {
+    if contents.len() < 20
+        || &contents[..7] != b"\x7fELF\x02\x01\x01"
+        || !matches!(contents[7], 0 | 3)
+        || contents[8] != 0
+        || !matches!(u16::from_le_bytes([contents[16], contents[17]]), 2 | 3)
+        || !matches!(u16::from_le_bytes([contents[18], contents[19]]), 62 | 183)
+    {
+        return None;
+    }
+    let matches_release = |dir: &Path, version: &str| {
+        verify_release(dir, version).is_ok()
+            && fs::read(dir.join(BINARY_NAME)).is_ok_and(|bytes| bytes == contents)
+    };
+    if matches_release(&options.release, &options.version) {
+        return Some(options.version.clone());
+    }
+    let releases = fs::read_dir(options.prefix.join(RELEASES_DIR)).ok()?;
+    for entry in releases.flatten() {
+        let Some(version) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !version.is_empty()
+            && version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            && matches_release(&entry.path(), &version)
+        {
+            return Some(version);
+        }
+    }
+    None
 }
 
 /// Names one backup from the binary's own first `--version` output line, else a UTC epoch
@@ -927,7 +975,7 @@ fn create_unique_dir(parent: &Path) -> Result<PathBuf, String> {
     Err("cannot create a unique staging directory".to_owned())
 }
 
-/// Writes owner-executable file bytes through a fresh 0755 file.
+/// Writes bytes through a fresh file with requested mode 0755, subject to umask and ACL.
 fn write_executable(path: &Path, contents: &[u8]) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -1073,6 +1121,91 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Linux cannot prove shared releases unused from namespace-local procfs: replacement
+    /// refuses and retired copies remain intact, entirely inside disposable fixture state.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unknown_global_visibility_keeps_installed_and_retired_releases() {
+        let root = crate::scratch::ScratchDir::new("linux-release-global-visibility");
+        let releases = root.join("releases");
+        let selected = releases.join("1.0.0");
+        let retired = releases.join(".replaced-1.0.0-123");
+        for path in [&selected, &retired] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join(BINARY_NAME), b"keep").unwrap();
+        }
+        let error = release_user(&selected).unwrap_err();
+        assert!(error.contains("complete process visibility is unavailable"));
+        sweep_retired(&releases);
+        for path in [&selected, &retired] {
+            assert_eq!(fs::read(path.join(BINARY_NAME)).unwrap(), b"keep");
+        }
+    }
+
+    /// A writable ELF handle excludes exec of that inode, but a noncooperating path replacement
+    /// can run another ELF under the same release name. Cleanup must retain the whole release.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_writable_inode_cannot_authorize_replaced_release_cleanup() {
+        use std::os::unix::fs::MetadataExt;
+        use std::process::{Child, Command, Stdio};
+
+        /// Owns only this test's sleeper and proves it reaped before fixture deletion.
+        struct Sleeper(Child);
+        impl Drop for Sleeper {
+            /// Stops the dedicated child on success and on assertion failure.
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = crate::scratch::ScratchDir::new("linux-release-inode-race");
+        let releases = root.join("releases");
+        let selected = releases.join("1.0.0");
+        let retired = releases.join(".replaced-1.0.0-123");
+        fs::create_dir_all(&selected).unwrap();
+        let program = selected.join(BINARY_NAME);
+        fs::copy("/bin/sleep", &program).unwrap();
+        let guarded = OpenOptions::new().write(true).open(&program).unwrap();
+        let old_inode = guarded.metadata().unwrap().ino();
+        let blocked = match Command::new(&program).arg("300").spawn() {
+            Ok(child) => {
+                let _child = Sleeper(child);
+                panic!("the guarded executable unexpectedly started");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(blocked.raw_os_error(), Some(libc::ETXTBSY));
+
+        // Atomic replacement changes the directory entry without touching the guarded inode.
+        // A pinned parent directory would not prevent this operation either.
+        let replacement = selected.join("replacement");
+        fs::copy("/bin/sleep", &replacement).unwrap();
+        fs::rename(&replacement, &program).unwrap();
+        assert_ne!(old_inode, fs::metadata(&program).unwrap().ino());
+        let _child = Sleeper(
+            Command::new(&program)
+                .arg("300")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        // spawn returns only after exec succeeds; no guessed startup delay is needed.
+        let busy = OpenOptions::new().write(true).open(&program).unwrap_err();
+        assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
+        assert_eq!(guarded.metadata().unwrap().ino(), old_inode);
+        assert!(release_user(&selected).is_err());
+
+        // Quarantine preserves both the stale inode guard and the running replacement.
+        fs::rename(&selected, &retired).unwrap();
+        sweep_retired(&releases);
+        assert!(retired.join(BINARY_NAME).is_file());
+        assert_eq!(guarded.metadata().unwrap().ino(), old_inode);
+    }
+
     /// FIPS 180-4 known-answer vectors pin the pure-std digest the whole seal relies on.
     #[test]
     fn sha256_matches_the_known_answer_vectors() {
@@ -1116,6 +1249,87 @@ mod tests {
         );
         assert_eq!(parse_shim(b"#!/bin/sh\nexit 0\n"), None);
         assert_eq!(parse_shim(b""), None);
+    }
+
+    /// A Linux launcher is owned only when its complete bytes match a valid sealed release;
+    /// mismatched files and forged proof strings cannot be migrated or executed.
+    #[test]
+    fn linux_launcher_requires_identical_sealed_release() {
+        let root = crate::scratch::ScratchDir::new("linux-launcher-identity");
+        let release = root.join("incoming");
+        let prefix = root.join("prefix");
+        let old_release = prefix.join("releases/1.0.0");
+        let launcher = root.join("agent-ide");
+        let options = Options {
+            release: release.clone(),
+            version: "2.0.0".into(),
+            home: root.join("home"),
+            prefix,
+            bin_dir: root.to_path_buf(),
+            share_dir: root.join("share"),
+            replace: false,
+        };
+        let mut elf = [0_u8; 20];
+        elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        elf[16] = 3;
+        elf[18] = 62;
+        let seal = |dir: &Path, version: &str, binary: &[u8]| {
+            fs::create_dir_all(dir).unwrap();
+            let metadata = format!("{{\"version\":\"{version}\",\"format\":1}}");
+            for (name, bytes) in [
+                (BINARY_NAME, binary),
+                (COMPLETE_FILE, SEAL_MARKER),
+                (METADATA_FILE, metadata.as_bytes()),
+            ] {
+                fs::write(dir.join(name), bytes).unwrap();
+            }
+            let sums = [BINARY_NAME, COMPLETE_FILE, METADATA_FILE]
+                .iter()
+                .map(|name| {
+                    format!(
+                        "{}  {name}\n",
+                        sha256_hex(&fs::read(dir.join(name)).unwrap())
+                    )
+                })
+                .collect::<String>();
+            fs::write(dir.join(CHECKSUMS_FILE), sums).unwrap();
+        };
+        let mut incoming = elf.to_vec();
+        incoming.push(1);
+        let mut old = elf.to_vec();
+        old.push(2);
+        seal(&release, "2.0.0", &incoming);
+        seal(&old_release, "1.0.0", &old);
+        fs::write(&launcher, &old).unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_launcher_owned(&options, &launcher, false).is_ok());
+        assert!(launcher.exists());
+        assert!(ensure_launcher_owned(&options, &launcher, true).is_ok());
+        assert_eq!(
+            fs::read(root.join("agent-ide.bak-agent-ide-1.0.0")).unwrap(),
+            old
+        );
+        let mut foreign = elf.to_vec();
+        foreign.extend_from_slice(b"agent-ide/worktree-lease-protocol/proof-1");
+        fs::write(&launcher, &foreign).unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_launcher_owned(&options, &launcher, true).is_err());
+        assert_eq!(fs::read(&launcher).unwrap(), foreign);
+        fs::write(old_release.join(BINARY_NAME), &old).unwrap();
+        fs::write(old_release.join(COMPLETE_FILE), b"tampered").unwrap();
+        assert!(known_linux_release(&options, &old).is_none());
+        assert_eq!(
+            known_linux_release(&options, &incoming).as_deref(),
+            Some("2.0.0")
+        );
+        incoming[18] = 183;
+        seal(&release, "2.0.0", &incoming);
+        assert_eq!(
+            known_linux_release(&options, &incoming).as_deref(),
+            Some("2.0.0")
+        );
+        incoming[18] = 40;
+        assert!(known_linux_release(&options, &incoming).is_none());
     }
 
     /// Only plain relative normal paths pass the SHA256SUMS path check.

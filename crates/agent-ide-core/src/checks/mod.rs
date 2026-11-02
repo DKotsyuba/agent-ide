@@ -94,6 +94,20 @@ pub trait CheckConfig: std::any::Any + Send + Sync {
         timeout: Duration,
     ) -> Arc<dyn Checker>;
 
+    /// Builds a checker with immutable accepted provider/check facts from this launcher.
+    /// The checker substitutes each request's actual worktree and applies its read policy before
+    /// resolving tools. Missing provider facts are unknown, never an ambient-version proof.
+    /// Unaffected languages retain their existing checker through this default.
+    fn configured_checker(
+        &self,
+        runner: Arc<dyn runner::ConfinedRunner>,
+        timeout: Duration,
+        config: crate::modules::contract::ModuleConfig,
+    ) -> Arc<dyn Checker> {
+        let _ = config;
+        self.checker(runner, timeout)
+    }
+
     /// Toolchain programs `doctor` probes, in declaration order, each with the interpreter that
     /// runs it when it is not directly executable.
     fn programs(&self) -> Vec<(PathBuf, Option<PathBuf>)>;

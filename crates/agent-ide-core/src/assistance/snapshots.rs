@@ -329,6 +329,9 @@ pub(super) struct DiffPageState {
     /// Whether the page that minted this cursor was rendered with `provenance: true`; a later
     /// `ide.inspect` page keeps the same rendering the caller originally asked for.
     provenance: bool,
+    /// Previously delivered hunks suppressed throughout this incremental capture, including
+    /// every continuation page. Empty for an explicitly requested full diff.
+    seen_hunks: BTreeSet<u64>,
 }
 
 /// Retained source used by the common inspector for snapshot or plain-patch pagination.
@@ -370,13 +373,15 @@ impl DiffPageState {
     /// Selection resumes the cursor's hunk and line offset under the original byte target.
     /// The fitter first reduces whole-hunk count, then cuts exact line parts or emits a read
     /// notice for a lone oversized line. No unseen hunk or line remainder is silently skipped.
+    /// Complete hunks delivered before this capture stay suppressed on every page; newly
+    /// delivered hunks are recorded separately when the inspector hands over a page.
     pub(super) fn expand_with_max_hunks(
         &self,
         expected_scope: &GitScope,
         max_hunks: usize,
     ) -> crate::changes::DiffResult {
         let budget = crate::changes::DiffSelectionBudget::bounded(max_hunks, self.budget.max_bytes);
-        match &self.evidence {
+        let result = match &self.evidence {
             DiffPageEvidence::Snapshot {
                 comparison,
                 snapshot,
@@ -425,7 +430,8 @@ impl DiffPageState {
                     .with_degraded(*degraded)
             })
             .unwrap_or_else(|| crate::changes::DiffResult::unavailable(expected_scope)),
-        }
+        };
+        result.without_seen_hunks(|fingerprint| self.seen_hunks.contains(&fingerprint))
     }
     /// Returns the byte/hunk budget originally captured for this comparison.
     pub(super) const fn budget(&self) -> crate::changes::DiffSelectionBudget {
@@ -439,7 +445,13 @@ impl DiffPageState {
     pub(super) const fn provenance(&self) -> bool {
         self.provenance
     }
-    /// Builds the next retained page state, or `None` once selection no longer overflows.
+    /// Returns the bounded pre-capture suppression set for preparation of the next actual
+    /// body delivery; preparing an inspected page does not itself consume its hunks.
+    pub(super) fn seen_hunks(&self) -> &BTreeSet<u64> {
+        &self.seen_hunks
+    }
+    /// Builds the next retained page state with the same pre-capture suppression set,
+    /// or `None` once selection no longer overflows; advancing never suppresses unseen hunks.
     pub(super) fn advance(&self, result: &crate::changes::DiffResult) -> Option<Self> {
         result.detail_cursor().map(|cursor| Self {
             scope: self.scope.clone(),
@@ -448,6 +460,7 @@ impl DiffPageState {
             cursor: cursor.clone(),
             mode: self.mode,
             provenance: self.provenance,
+            seen_hunks: self.seen_hunks.clone(),
         })
     }
     /// Re-verifies every retained tracked path's working-tree bytes against the current worktree
@@ -747,7 +760,7 @@ fn diff_page_fits(
             &diff_page_reply(
                 mode, epoch, reference, provenance, later, candidate, retained,
             ),
-            content::Envelope::WithStructured,
+            content::reply_envelope(),
         )
     })
 }
@@ -779,7 +792,7 @@ pub(super) fn diff_capacity_detail(
         &candidate.inventory_only(),
         false,
     );
-    if content::fits(&metadata, content::Envelope::WithStructured) {
+    if content::fits(&metadata, content::reply_envelope()) {
         candidate.line_capacity_detail()
     } else {
         "diff:reply_inventory".to_owned()
@@ -857,6 +870,9 @@ fn render_diff_provenance(
             text.push_str(&format!("file: {:?}\n", hunk.path()));
             current = Some(hunk.path());
         }
+        if let Some(address) = result.hunk_address(hunk) {
+            text.push_str(&format!("@ {address}\n"));
+        }
         text.push_str(&result.hunk_part_label(hunk, more_available));
         if let Some(notice) = hunk.line_notice() {
             text.push_str(notice);
@@ -893,6 +909,10 @@ const fn mode_label(mode: DiffMode) -> &'static str {
 /// Largest number of untracked/conflicted names shown inline before "+N more".
 const MAX_INLINE_DIFF_NAMES: usize = 5;
 
+/// Most hunk fingerprints one binding remembers for the default incremental `ide.diff`; past it
+/// the memory restarts, so the next diff is simply a full one.
+pub(super) const MAX_SEEN_DIFF_HUNKS: usize = 4096;
+
 /// Renders one bounded `label: name, name (+N more)` line, or an empty string for no paths.
 fn bounded_names_line(label: &str, paths: &[crate::workspace::git::PathStatus]) -> String {
     if paths.is_empty() {
@@ -914,6 +934,9 @@ fn bounded_names_line(label: &str, paths: &[crate::workspace::git::PathStatus]) 
 
 /// Separates capture inventory from delivered hunks and bounds names and omission notes.
 /// Quoted names preserve arbitrary Unix path labels without embedding control characters.
+///
+/// Only called for a coverage exception (a `name only` entry); a capture whose every changed file
+/// is simply delivered as hunks prints no inventory, so no path appears before its file rows.
 fn render_inventory(result: &crate::changes::DiffResult) -> String {
     let mut text = format!(
         "inventory: {} tracked, {} untracked, {} conflicted; hunks delivered: {}\n",
@@ -952,7 +975,7 @@ fn render_inventory(result: &crate::changes::DiffResult) -> String {
 }
 
 /// Renders the compact §2.7 default reply: one summary line, the untracked/conflicted names Git
-/// itself never diffs, per-file hunk text, and a bounded continuation marker — no hash-bearing or
+/// itself never diffs, the inventory only when some entry is name-only, per-file hunk text, and a bounded continuation marker — no hash-bearing or
 /// bookkeeping fields. `degraded`, when set, is appended in parentheses on the summary line, for
 /// the single-pass plain `git diff` fallback that never claims the two-pass capture's exactness.
 fn render_diff_compact(
@@ -972,14 +995,25 @@ fn render_diff_compact(
         text.push_str(&format!(" ({note})"));
     }
     text.push('\n');
+    if result.unchanged_hunks() > 0 {
+        text.push_str(&format!(
+            "unchanged since your last diff: {} hunks\n",
+            result.unchanged_hunks()
+        ));
+    }
     text.push_str(&bounded_names_line("untracked", result.untracked()));
     text.push_str(&bounded_names_line("conflicted", result.conflicts()));
-    text.push_str(&render_inventory(result));
+    if !result.name_only().is_empty() {
+        text.push_str(&render_inventory(result));
+    }
     let mut current: Option<&std::path::PathBuf> = None;
     for hunk in result.selected_hunks() {
         if current != Some(hunk.path()) {
             text.push_str(&format!("file: {:?}\n", hunk.path()));
             current = Some(hunk.path());
+        }
+        if let Some(address) = result.hunk_address(hunk) {
+            text.push_str(&format!("@ {address}\n"));
         }
         text.push_str(&result.hunk_part_label(
             hunk,
@@ -1133,6 +1167,8 @@ impl Worker<'_> {
     /// Pages a bounded plain Git capture for task mode or the degraded fallback.
     /// Captures selected untracked text and source fingerprints, retains one immutable cursor,
     /// reauthorizes delivery, and names source/patch/line limits. `degraded` is a fixed producer label.
+    /// Default calls use the same incremental fingerprint filter as exact captures; explicit
+    /// modes keep the whole comparison, including task-mode committed changes.
     async fn plain_diff_reply(
         &mut self,
         job: &mut Job,
@@ -1293,6 +1329,14 @@ impl Worker<'_> {
         .with_untracked_notes(notes.clone(), patch_paths)
         .with_degraded(degraded);
         drop(runner);
+        let previous = self.shared.previous_diff_hunks(&binding, &composed);
+        let incremental = job.parameters["since_last"].as_bool().unwrap_or(false);
+        let seen_before = if incremental {
+            previous.clone()
+        } else {
+            BTreeSet::new()
+        };
+        let hunk_lines = self.diff_hunk_addresses(job, &composed).await;
         let (result, reply) = fit_diff_page(
             mode,
             authority.epoch(),
@@ -1330,6 +1374,8 @@ impl Worker<'_> {
                         .with_untracked(untracked.clone())
                         .with_untracked_notes(notes.clone(), patch_paths)
                         .with_degraded(degraded)
+                        .with_hunk_addresses(&hunk_lines)
+                        .without_seen_hunks(|fingerprint| seen_before.contains(&fingerprint))
                 })
                 .unwrap_or_else(|| crate::changes::DiffResult::unavailable(&scope))
             },
@@ -1347,25 +1393,41 @@ impl Worker<'_> {
             }
             code
         })?;
+        let reply =
+            incremental_diff_reply(incremental, &seen_before, mode, &reference, &result, reply);
+        self.shared
+            .prepare_diff_delivery(&reference, &previous, &result, &reply);
         self.shared
             .set_diff_provenance(&reference, tracked_paths.into_iter().collect());
-        let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
-            scope: scope.clone(),
-            evidence: DiffPageEvidence::Plain {
-                stdout,
-                untracked,
-                notes,
-                patch_paths,
-                degraded,
-                worktree_sources,
-                operation: reference.clone(),
-                generation,
-            },
-            budget,
-            cursor: cursor.clone(),
-            mode,
-            provenance,
-        });
+        let diff_page = result
+            .detail_cursor()
+            .filter(|_| {
+                matches!(
+                    &reply,
+                    PeerReply::Complete {
+                        continuation: true,
+                        ..
+                    }
+                )
+            })
+            .map(|cursor| DiffPageState {
+                scope: scope.clone(),
+                evidence: DiffPageEvidence::Plain {
+                    stdout,
+                    untracked,
+                    notes,
+                    patch_paths,
+                    degraded,
+                    worktree_sources,
+                    operation: reference.clone(),
+                    generation,
+                },
+                budget,
+                cursor: cursor.clone(),
+                mode,
+                provenance,
+                seen_hunks: seen_before,
+            });
         let continues = diff_page.is_some();
         let retained = self.shared.set_diff_page(&reference, diff_page);
         let authority = self.authority(&binding).await?;
@@ -1456,6 +1518,9 @@ impl Worker<'_> {
             _ => return Err(FailureCode::Internal),
         };
         let provenance = job.parameters["provenance"].as_bool().unwrap_or(false);
+        // A call that named no `mode` answers only what changed since this activation's previous
+        // diff; naming `mode` (even `head`) always answers the whole diff.
+        let incremental = job.parameters["since_last"].as_bool().unwrap_or(false);
         let selected: Vec<PathBuf> = job.parameters["paths"]
             .as_array()
             .into_iter()
@@ -1577,6 +1642,19 @@ impl Worker<'_> {
         // The initial page goes through the same whole-page fitting path as every later expansion,
         // so it is proven to fit the serialized envelope here instead of being cut mid-hunk later
         // by the generic `PeerReply::encode` shrink.
+        let probe = crate::changes::compose_diff(
+            &scope,
+            &comparison,
+            evidence.clone(),
+            crate::changes::DiffSelectionBudget::bounded(budget.max_hunks, budget.max_bytes),
+        );
+        let previous = self.shared.previous_diff_hunks(&binding, &probe);
+        let seen_before = if incremental {
+            previous.clone()
+        } else {
+            BTreeSet::new()
+        };
+        let hunk_lines = self.diff_hunk_addresses(job, &probe).await;
         let (result, reply) = fit_diff_page(
             mode,
             authority.epoch(),
@@ -1591,6 +1669,8 @@ impl Worker<'_> {
                     evidence.clone(),
                     crate::changes::DiffSelectionBudget::bounded(max_hunks, budget.max_bytes),
                 )
+                .with_hunk_addresses(&hunk_lines)
+                .without_seen_hunks(|fingerprint| seen_before.contains(&fingerprint))
             },
         )
         .map_err(|code| {
@@ -1612,6 +1692,10 @@ impl Worker<'_> {
             }
             code
         })?;
+        let reply =
+            incremental_diff_reply(incremental, &seen_before, mode, &reference, &result, reply);
+        self.shared
+            .prepare_diff_delivery(&reference, &previous, &result, &reply);
         // T36B: retain the bounded provenance of every path this diff represents — each
         // delivered path plus its rename source — independently of the disposable pagination
         // state, so cached delivery must prove each under the live profile before it hands
@@ -1637,17 +1721,29 @@ impl Worker<'_> {
             .collect();
         self.shared
             .set_diff_provenance(&job.reference, represented_paths);
-        let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
-            scope: scope.clone(),
-            evidence: DiffPageEvidence::Snapshot {
-                comparison: Box::new(comparison.clone()),
-                snapshot: Box::new(evidence),
-            },
-            budget,
-            cursor: cursor.clone(),
-            mode,
-            provenance,
-        });
+        let diff_page = result
+            .detail_cursor()
+            .filter(|_| {
+                matches!(
+                    &reply,
+                    PeerReply::Complete {
+                        continuation: true,
+                        ..
+                    }
+                )
+            })
+            .map(|cursor| DiffPageState {
+                scope: scope.clone(),
+                evidence: DiffPageEvidence::Snapshot {
+                    comparison: Box::new(comparison.clone()),
+                    snapshot: Box::new(evidence),
+                },
+                budget,
+                cursor: cursor.clone(),
+                mode,
+                provenance,
+                seen_hunks: seen_before,
+            });
         // A page that reports further hunks must be resumable. If the aggregate retention ceiling
         // refuses to hold that continuation, the omitted hunks stay named but only recapture — not
         // `ide.inspect` — reaches them: an honest smaller answer beats erroring the whole call.
@@ -1668,6 +1764,46 @@ impl Worker<'_> {
             Some(authority),
             None,
         ))
+    }
+}
+
+/// Collapses a repeated incremental capture to one line only when every captured hunk,
+/// including later pages, was already delivered. Full calls and captures with unseen hunks
+/// retain their fitted reply; incomplete/name-only captures are never called unchanged and
+/// degraded captures keep their limitation. No continuation of unseen work is discarded.
+fn incremental_diff_reply(
+    incremental: bool,
+    seen: &BTreeSet<u64>,
+    mode: DiffMode,
+    reference: &str,
+    result: &crate::changes::DiffResult,
+    reply: PeerReply,
+) -> PeerReply {
+    if incremental
+        && result.coverage() != crate::changes::DiffCoverage::Unknown
+        && result.conflicts().is_empty()
+        && result.name_only().is_empty()
+        && !result.captured_fingerprints().is_empty()
+        && result.captured_fingerprints().is_subset(seen)
+    {
+        let mut text = format!(
+            "diff ({}): no changes since your last diff ({} hunks unchanged)\n",
+            mode_label(mode),
+            result.captured_fingerprints().len()
+        );
+        if let Some(note) = result.degraded() {
+            text.push_str(note);
+            text.push('\n');
+        }
+        PeerReply::Complete {
+            kind: ResultKind::Diff,
+            text,
+            detail_ref: Some(reference.to_owned()),
+            truncated: false,
+            continuation: false,
+        }
+    } else {
+        reply
     }
 }
 

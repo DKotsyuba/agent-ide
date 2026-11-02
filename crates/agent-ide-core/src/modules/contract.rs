@@ -280,10 +280,18 @@ pub struct HelloOffer {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleConfig {
+    /// Current computation's read exclusions, never additional read authority. Absent legacy
+    /// payloads carry no extra exclusions; check requests explicitly supply their own policy.
+    #[serde(default)]
+    pub read_denies: Vec<crate::execution::seatbelt::ReadDeny>,
+    /// IDE-selected test worker count; absent keeps the project runner defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_workers: Option<std::num::NonZeroU16>,
     /// The absolute canonical admitted root of this instance's scope.
     pub worktree: Option<std::path::PathBuf>,
-    /// The language's accepted provider declaration (executable, toolchain, trust, cache
-    /// namespace and its raw option fields), when one is configured.
+    /// In current computation requests, the accepted provider declaration (executable,
+    /// toolchain, trust, cache namespace and raw language options). A separately admitted hosted
+    /// analyzer hello instead wraps its grant/settings here; request data is never that grant.
     pub provider: Option<Value>,
     /// The language's `project_checks` launcher section, when configured.
     pub checks: Option<Value>,

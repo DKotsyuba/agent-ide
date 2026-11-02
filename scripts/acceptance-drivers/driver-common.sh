@@ -123,11 +123,11 @@ require_tool_result_text() {
 }
 
 # Requires the L2 stale probe: the model really called ide.edit (step 7 can be skipped) and that
-# call's own result carries the `stale_source` refusal. The oracle literal is unchanged; only
-# its source is pinned to the stale ide.edit result.
+# call's own result carries the stale refusal (`... does not match this file's current text;
+# nothing was written`, the answer to the probe's deprecated `source_ref`).
 require_stale_edit_result() {
     require_tool_use "$1" mcp__agent-ide__ide_edit A_L2_STEP7_SKIPPED || return 1
-    require_tool_result_text "$1" mcp__agent-ide__ide_edit "stale_source" A_L2_STALE_OUTCOME
+    require_tool_result_text "$1" mcp__agent-ide__ide_edit "does not match this file's current text" A_L2_STALE_OUTCOME
 }
 
 # Requires one literal to be absent from a captured stream-json transcript.

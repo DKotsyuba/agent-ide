@@ -349,6 +349,12 @@ impl<'a> EditReceiptStore<'a> {
         }
     }
 
+    /// The multi-file receipts kept in the same Application store; their schema is installed on
+    /// first use by the multi-file edit path ([`super::batch::BatchReceiptStore::install_schema`]).
+    pub const fn batches(&self) -> super::batch::BatchReceiptStore<'a> {
+        super::batch::BatchReceiptStore::new(self.application)
+    }
+
     /// Durably prepares a new exact request or reconciles an existing receipt without replay.
     pub async fn prepare(
         &self,

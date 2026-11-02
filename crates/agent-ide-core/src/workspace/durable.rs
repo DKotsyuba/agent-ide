@@ -16,10 +16,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::Read,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt},
-    },
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -1140,19 +1137,7 @@ pub(super) fn real_directory(path: &Path) -> Result<(PathBuf, [u8; 16]), Durable
 fn real_directory_with_root_identity(
     path: &Path,
 ) -> Result<(PathBuf, [u8; 16], [u8; 32], File), DurableError> {
-    if !path.is_absolute() {
-        return Err(identity_read());
-    }
-    let mut directory = File::open("/").map_err(|_| identity_read())?;
-    for component in path.components() {
-        if component == std::path::Component::RootDir {
-            continue;
-        }
-        let next = super::observation::open_directory(directory.as_raw_fd(), component.as_os_str())
-            .map_err(|_| identity_read())?;
-        // SAFETY: open_directory returned a new owned descriptor; File closes the previous one on assignment.
-        directory = unsafe { File::from_raw_fd(next) };
-    }
+    let directory = super::observation::open_directory_path(path).map_err(|_| identity_read())?;
     let root_identity =
         super::observation::native_directory_identity(&directory).map_err(|_| identity_read())?;
     let metadata = directory.metadata().map_err(|_| identity_read())?;

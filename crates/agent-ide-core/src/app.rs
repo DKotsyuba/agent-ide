@@ -45,8 +45,58 @@ const MAX_V1_FRAME_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_V2_FRAME_BYTES: usize = 160 * 1024;
 /// Cap for one Assistance JSON payload inside a frame.
 pub(crate) const MAX_ASSISTANCE_JSON_BYTES: usize = 144 * 1024;
+/// Largest frame the four-byte big-endian length prefix can describe. A Read, Prepare or Inspect
+/// reply ([`AssistanceMethod::delivers_source`]) is bounded by this wire format alone, never by
+/// [`MAX_V2_FRAME_BYTES`] or [`MAX_ASSISTANCE_JSON_BYTES`].
+pub(crate) const MAX_PREFIXED_FRAME_BYTES: usize = u32::MAX as usize;
+
+/// Returns the `(frame, payload)` bounds of one method reply.
+///
+/// Requested source of Read, Prepare and Inspect travels whole up to the wire format's own limit;
+/// every other method keeps `max_frame_bytes` and [`MAX_ASSISTANCE_JSON_BYTES`].
+pub(crate) fn method_reply_bounds(
+    method: AssistanceMethod,
+    max_frame_bytes: usize,
+) -> (usize, usize) {
+    if method.delivers_source() {
+        (MAX_PREFIXED_FRAME_BYTES, MAX_PREFIXED_FRAME_BYTES)
+    } else {
+        (max_frame_bytes, MAX_ASSISTANCE_JSON_BYTES)
+    }
+}
 /// Maximum time to wait for an Assistance method reply after its request is written.
 const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
+
+/// Returns the reply budget of one method dispatch: [`METHOD_DISPATCH_BUDGET`], plus the call's
+/// own `wait_s` (up to 30 s) or legacy `wait_ms` (up to 240 s) when `method` is `inspect`, so a
+/// bounded `ide.inspect` wait (OUTBOX-r3 §8.5) is never cut by the transport, and the extra
+/// one-call wait of `prepare` beyond the ordinary inline wait. `params` is the dispatch's
+/// `params_json` object; anything unreadable adds nothing.
+fn method_dispatch_budget(method: &str, params: &Value) -> Duration {
+    let wait = (method == "inspect")
+        .then(|| {
+            let parameters = params.get("parameters")?;
+            parameters
+                .get("wait_s")
+                .and_then(Value::as_u64)
+                .map(|seconds| Duration::from_secs(seconds.min(30)))
+                .or_else(|| {
+                    parameters.get("wait_ms").and_then(Value::as_u64).map(|ms| {
+                        Duration::from_millis(ms.min(crate::assistance::outbox::MAX_WAIT_MS))
+                    })
+                })
+        })
+        .flatten()
+        .unwrap_or_default();
+    // `ide.prepare` holds its call open longer than the ordinary inline wait (one-call packet).
+    let prepare = if method == "prepare" {
+        crate::assistance::worker::PREPARE_INLINE_WAIT
+            .saturating_sub(crate::assistance::worker::INLINE_REPLY_WAIT)
+    } else {
+        Duration::ZERO
+    };
+    METHOD_DISPATCH_BUDGET + wait + prepare
+}
 /// Total connect, request, and acknowledgement budget when a Codex MCP opens its client lease.
 const CLIENT_LEASE_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Concurrent hook submissions one daemon serves, a lane of its own apart from the tool-call
@@ -142,7 +192,7 @@ impl Lane {
     }
 }
 
-/// The two connection lanes of one daemon: tool calls (`max_connections`) and hooks.
+/// The connection lanes of one daemon: tool calls (`max_connections`) and hooks.
 #[derive(Clone)]
 struct Lanes {
     /// Tool-call connections.
@@ -747,6 +797,7 @@ pub async fn submit_hook_if_running(
 /// Connect and request write share the hook transport deadline; after the write, reply waiting gets
 /// the longer method budget. A short no-reply interval checks daemon health before keeping the
 /// request open, so a paused daemon fails fast while a live worker retains the full method budget.
+/// The original reply remains readable during that probe and takes priority over a health timeout.
 pub async fn dispatch_method_if_running(
     runtime_dir: &Path,
     request: MethodDispatch,
@@ -775,12 +826,15 @@ pub async fn dispatch_method_if_running(
         AssistanceMethod::Edit => "edit",
         AssistanceMethod::Outline => "outline",
         AssistanceMethod::Read => "read",
+        AssistanceMethod::Prepare => "prepare",
         AssistanceMethod::Symbol => "symbol",
         AssistanceMethod::Graph => "graph",
+        AssistanceMethod::Tree => "tree",
         AssistanceMethod::Test => "test",
         AssistanceMethod::HookSubmit => return MethodDispatchTransportResult::Unavailable,
     };
     let version = request.method().wire_version();
+    let reply_budget = method_dispatch_budget(method, &params);
     let wire = json!({
         "version": version,
         "request_id": request.request_id(),
@@ -801,8 +855,7 @@ pub async fn dispatch_method_if_running(
         Ok(Err(_)) => return MethodDispatchTransportResult::OutcomeUnknown,
         Err(_) => return MethodDispatchTransportResult::WrittenTimedOut,
     }
-    let Some(reply_deadline) = tokio::time::Instant::now().checked_add(METHOD_DISPATCH_BUDGET)
-    else {
+    let Some(reply_deadline) = tokio::time::Instant::now().checked_add(reply_budget) else {
         return MethodDispatchTransportResult::OutcomeUnknown;
     };
     let Some(first_reply_deadline) =
@@ -810,8 +863,9 @@ pub async fn dispatch_method_if_running(
     else {
         return MethodDispatchTransportResult::OutcomeUnknown;
     };
+    let (reply_frame_bytes, _) = method_reply_bounds(request.method(), limits.max_frame_bytes);
     let result = async {
-        let reply: Value = read_frame(&mut stream, limits.max_frame_bytes).await?;
+        let reply: Value = read_frame(&mut stream, reply_frame_bytes).await?;
         parse_method_dispatch_reply(&reply, &request)
     };
     tokio::pin!(result);
@@ -819,7 +873,15 @@ pub async fn dispatch_method_if_running(
         Ok(Ok(reply)) => reply,
         Ok(Err(_)) => MethodDispatchTransportResult::OutcomeUnknown,
         Err(_) => {
-            let responsive = tokio::time::timeout(limits.deadline, doctor(runtime_dir)).await;
+            let responsive = tokio::select! {
+                biased;
+                reply = tokio::time::timeout_at(reply_deadline, &mut result) => return match reply {
+                    Ok(Ok(reply)) => reply,
+                    Ok(Err(_)) => MethodDispatchTransportResult::OutcomeUnknown,
+                    Err(_) => MethodDispatchTransportResult::WrittenTimedOut,
+                },
+                responsive = tokio::time::timeout(limits.deadline, doctor(runtime_dir)) => responsive,
+            };
             if !matches!(responsive, Ok(Ok(DoctorStatus::Healthy { .. }))) {
                 return MethodDispatchTransportResult::WrittenTimedOut;
             }
@@ -1002,6 +1064,7 @@ pub const WEDGE_MIN_PROBES: u32 = 2;
 /// seconds (a load spike, a stopped process that resumes) keeps its daemon and its binding.
 pub const WEDGE_MIN_SPAN: Duration = Duration::from_secs(30);
 /// Executable file name a lock holder must have to be signalled; nothing else is ever signalled.
+#[cfg(target_os = "macos")]
 const DAEMON_EXECUTABLE_NAME: &[u8] = b"agent-ide";
 
 /// The closed result of one attempt to replace a wedged shared daemon.
@@ -1038,6 +1101,9 @@ struct LockHolder {
     device: u64,
     /// Inode of the lock file.
     inode: u64,
+    /// Linux process generation, to reject a reused PID during revalidation.
+    #[cfg(target_os = "linux")]
+    start_ticks: u64,
 }
 
 /// Re-reads and fully validates the current lock holder, or names why nothing may be signalled.
@@ -1061,13 +1127,22 @@ fn current_lock_holder(lock_path: &Path) -> Result<LockHolder, &'static str> {
     if pid as u32 == std::process::id() || unsafe { libc::kill(pid, 0) } != 0 {
         return Err("dead");
     }
+    #[cfg(target_os = "linux")]
+    let start_ticks =
+        crate::retention::linux::start_ticks(Path::new("/proc"), pid).ok_or("not_agent_ide")?;
     if !pid_is_agent_ide(pid) {
         return Err("not_agent_ide");
+    }
+    #[cfg(target_os = "linux")]
+    if crate::retention::linux::start_ticks(Path::new("/proc"), pid) != Some(start_ticks) {
+        return Err("changed");
     }
     Ok(LockHolder {
         pid,
         device: metadata.dev(),
         inode: metadata.ino(),
+        #[cfg(target_os = "linux")]
+        start_ticks,
     })
 }
 
@@ -1103,6 +1178,12 @@ pub async fn evict_wedged_daemon(
     if expected_pid.is_some_and(|pid| pid != holder.pid) {
         return EvictOutcome::Refused("changed");
     }
+    // A pidfd pins the Linux process generation even if the numeric PID is later reused.
+    #[cfg(target_os = "linux")]
+    let process = match open_process(holder.pid) {
+        Some(process) if current_lock_holder(&lock_path) == Ok(holder) => process,
+        _ => return EvictOutcome::Refused("changed"),
+    };
     if probe_health(runtime_dir).await != HealthProbe::Silent {
         return EvictOutcome::Refused("answering");
     }
@@ -1114,9 +1195,19 @@ pub async fn evict_wedged_daemon(
     if retain_runtime_store(runtime_dir).is_err() {
         return EvictOutcome::Refused("retain_failed");
     }
+    if current_lock_holder(&lock_path) != Ok(holder) {
+        return EvictOutcome::Refused("changed");
+    }
     // SAFETY: the pid was validated as the live lock holder running the agent-ide executable an
     // instant ago, and the lock file identity and pid record are unchanged.
-    unsafe { libc::kill(holder.pid, libc::SIGTERM) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::kill(holder.pid, libc::SIGTERM)
+    };
+    #[cfg(target_os = "linux")]
+    if !signal_process(&process, libc::SIGTERM) {
+        return EvictOutcome::Refused("changed");
+    }
     let mut killed = false;
     // Monotonic deadlines, not counted sleeps: a loaded host delays a sleep, never the grace.
     let mut deadline = tokio::time::Instant::now() + WEDGE_TERM_GRACE;
@@ -1136,7 +1227,14 @@ pub async fn evict_wedged_daemon(
             }
             killed = true;
             // SAFETY: as above, revalidated just now; SIGTERM did not release the lock.
-            unsafe { libc::kill(holder.pid, libc::SIGKILL) };
+            #[cfg(target_os = "macos")]
+            unsafe {
+                libc::kill(holder.pid, libc::SIGKILL)
+            };
+            #[cfg(target_os = "linux")]
+            if !signal_process(&process, libc::SIGKILL) {
+                return EvictOutcome::Refused("changed");
+            }
             deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1148,7 +1246,34 @@ pub async fn evict_wedged_daemon(
     }
 }
 
+/// Opens a Linux process handle; unsupported kernels and inaccessible processes refuse eviction.
+#[cfg(target_os = "linux")]
+fn open_process(pid: i32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: pidfd_open takes an integer PID and zero flags, and returns a new owned descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let fd = i32::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+    // SAFETY: successful pidfd_open returned a new descriptor owned by this function.
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Signals the pinned process generation; an exited process or syscall failure refuses eviction.
+#[cfg(target_os = "linux")]
+fn signal_process(process: &std::os::fd::OwnedFd, signal: libc::c_int) -> bool {
+    // SAFETY: `process` owns a valid pidfd, null info and zero flags follow the syscall contract.
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            process.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        ) == 0
+    }
+}
+
 /// Reports whether `pid` runs an executable whose file name is exactly `agent-ide`.
+#[cfg(target_os = "macos")]
 fn pid_is_agent_ide(pid: i32) -> bool {
     let mut path = vec![0_u8; 4096];
     // SAFETY: `path` is writable for its full length, which is passed as its size.
@@ -1159,6 +1284,14 @@ fn pid_is_agent_ide(pid: i32) -> bool {
     Path::new(std::ffi::OsStr::from_bytes(&path[..length as usize]))
         .file_name()
         .is_some_and(|name| name.as_bytes() == DAEMON_EXECUTABLE_NAME)
+}
+
+/// Refuses missing, inaccessible or deleted Linux process executables.
+#[cfg(target_os = "linux")]
+fn pid_is_agent_ide(pid: i32) -> bool {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .is_some_and(|path| path.file_name() == Some(std::ffi::OsStr::new("agent-ide")))
 }
 
 /// Writes the one typed journal line of a forced daemon replacement: the pid, the failed probes
@@ -1323,6 +1456,15 @@ async fn serve_accepted_connection(
             .ok()
             .and_then(Result::ok)
             .flatten()
+            .map(|guard| {
+                // The lease holder's process stays a live carrier until this lease reaches EOF.
+                let carrier = peer_pid(stream.as_raw_fd())
+                    .and_then(|pid| dispatcher.clone().map(|owner| (pid, owner)));
+                if let Some((pid, owner)) = &carrier {
+                    owner.carrier_opened(*pid);
+                }
+                (guard, carrier)
+            })
         }
         Some(2..=5) => {
             // Served Assistance calls prove a live client session and restart the idle countdown.
@@ -1343,7 +1485,13 @@ async fn serve_accepted_connection(
                     let method = request.get("method").and_then(Value::as_str)
                         == Some("assistance.method_dispatch");
                     let budget = if method {
-                        METHOD_DISPATCH_BUDGET
+                        method_dispatch_budget(
+                            request
+                                .get("dispatch_method")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            request.get("params_json").unwrap_or(&Value::Null),
+                        )
                     } else {
                         connection_deadline.duration_since(tokio::time::Instant::now())
                     };
@@ -1366,8 +1514,11 @@ async fn serve_accepted_connection(
         }
         _ => None,
     };
-    if let Some(guard) = identified {
+    if let Some((guard, carrier)) = identified {
         hold_lease_until_eof(stream).await;
+        if let Some((pid, owner)) = carrier {
+            owner.carrier_closed(pid);
+        }
         drop(guard);
     }
 }
@@ -1694,18 +1845,25 @@ async fn serve_assistance_request(
                 )
                 .ok_or_else(|| invalid_transport("invalid method parameters"))?,
             )
-            .ok_or_else(|| invalid_transport("invalid method correlation"))?;
+            .ok_or_else(|| invalid_transport("invalid method correlation"))?
+            .with_carrier(peer_pid(stream.as_raw_fd()));
+            let budget = method_dispatch_budget(
+                required_string(object, "dispatch_method")?,
+                required_value(object, "params_json")?,
+            );
             let reply = tokio::time::timeout(
-                METHOD_DISPATCH_BUDGET,
+                budget,
                 dispatcher.dispatch(AssistanceDispatch::MethodDispatch(dispatch.clone())),
             )
             .await;
             if drop_reply_for_test(dispatch.method()) {
                 return Ok(());
             }
+            let (reply_frame_bytes, reply_json_bytes) =
+                method_reply_bounds(dispatch.method(), limits.max_frame_bytes);
             let value = match reply {
                 Ok(Ok(AssistanceDispatchReply::MethodDispatch(payload)))
-                    if payload.as_str().len() <= MAX_ASSISTANCE_JSON_BYTES =>
+                    if payload.as_str().len() <= reply_json_bytes =>
                 {
                     json!({
                         "version": version,
@@ -1722,7 +1880,7 @@ async fn serve_assistance_request(
                     })
                 }
             };
-            write_frame(stream, &value, limits.max_frame_bytes).await
+            write_frame(stream, &value, reply_frame_bytes).await
         }
         _ => Err(invalid_transport("unsupported v2 transport method")),
     }
@@ -1755,6 +1913,9 @@ fn parse_hook_submit_reply(
 }
 
 /// Parses one closed method reply and maps transport unavailable or overflow states without semantics.
+///
+/// The payload bound is the method's own ([`method_reply_bounds`]): unbounded source for Read,
+/// Prepare and Inspect, [`MAX_ASSISTANCE_JSON_BYTES`] for every other method.
 fn parse_method_dispatch_reply(
     reply: &Value,
     request: &MethodDispatch,
@@ -1782,7 +1943,8 @@ fn parse_method_dispatch_reply(
     let Some(payload) = object.get("opaque_result_json") else {
         return Ok(MethodDispatchTransportResult::OutcomeUnknown);
     };
-    let payload = OpaqueJson::from_value(payload, MAX_ASSISTANCE_JSON_BYTES)
+    let (_, max_json_bytes) = method_reply_bounds(request.method(), MAX_V2_FRAME_BYTES);
+    let payload = OpaqueJson::from_value(payload, max_json_bytes)
         .ok_or_else(|| invalid_transport("invalid method reply payload"))?;
     Ok(MethodDispatchTransportResult::Dispatched {
         opaque_result_json: payload,
@@ -1847,6 +2009,9 @@ where
 }
 
 /// Serializes one JSON value as the fixed bounded length-prefixed IPC frame.
+///
+/// A value over `max_frame_bytes` or over the four-byte length prefix is refused before any byte
+/// is written, so an oversized frame never wraps its length.
 async fn write_frame<T>(
     stream: &mut UnixStream,
     value: &T,
@@ -1857,15 +2022,11 @@ where
 {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if bytes.len() > max_frame_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "oversized IPC frame",
-        ));
-    }
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await?;
+    let length = u32::try_from(bytes.len())
+        .ok()
+        .filter(|_| bytes.len() <= max_frame_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "oversized IPC frame"))?;
+    stream.write_all(&length.to_be_bytes()).await?;
     stream.write_all(&bytes).await?;
     stream.flush().await
 }
@@ -2007,8 +2168,10 @@ fn drop_reply_for_test(method: AssistanceMethod) -> bool {
         AssistanceMethod::Edit => "edit",
         AssistanceMethod::Outline => "outline",
         AssistanceMethod::Read => "read",
+        AssistanceMethod::Prepare => "prepare",
         AssistanceMethod::Symbol => "symbol",
         AssistanceMethod::Graph => "graph",
+        AssistanceMethod::Tree => "tree",
         AssistanceMethod::Test => "test",
         AssistanceMethod::HookSubmit => return false,
     };
@@ -2126,6 +2289,48 @@ fn peer_uid(fd: RawFd) -> io::Result<libc::uid_t> {
     Ok(unsafe { credentials.assume_init().uid })
 }
 
+/// Reads a connected Unix peer's process id (`SO_PEERCRED`): liveness evidence for a
+/// stale-writer takeover, never identity. `None` when the kernel does not report it.
+#[cfg(target_os = "linux")]
+fn peer_pid(fd: RawFd) -> Option<u32> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    (result == 0 && length as usize == std::mem::size_of::<libc::ucred>())
+        .then(|| unsafe { credentials.assume_init().pid })
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+}
+
+/// Reads a connected Unix peer's process id (`LOCAL_PEERPID`): liveness evidence for a
+/// stale-writer takeover, never identity. `None` when the kernel does not report it.
+#[cfg(target_os = "macos")]
+fn peer_pid(fd: RawFd) -> Option<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    (result == 0 && length as usize == std::mem::size_of::<libc::pid_t>())
+        .then_some(pid)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+}
+
 /// Reads a connected Unix peer's UID using macOS's `getpeereid` primitive.
 #[cfg(target_os = "macos")]
 fn peer_uid(fd: RawFd) -> io::Result<libc::uid_t> {
@@ -2233,6 +2438,26 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// A Linux process handle never starts referring to a new process after its child exits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_stays_bound_to_exited_process() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let process = open_process(child.id() as i32);
+        if let Some(process) = process.as_ref() {
+            assert!(signal_process(process, 0));
+        }
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        if let Some(process) = process.as_ref() {
+            assert!(!signal_process(process, 0));
+        }
+    }
+
     /// The actual v1 route works with full job lanes and does not reset the idle countdown,
     /// acquire a lease, record activity, or initialize a dispatcher.
     #[tokio::test(start_paused = true)]
@@ -2281,6 +2506,122 @@ mod tests {
         assert!(
             METHOD_DISPATCH_BUDGET > crate::assistance::worker::INLINE_REPLY_WAIT,
             "the bridge must preserve the original invocation through the inline wait"
+        );
+    }
+
+    /// An `ide.inspect` wait extends the dispatch budget by itself, clamped; nothing else does.
+    #[test]
+    fn inspect_waits_extend_the_dispatch_budget() {
+        let waiting = json!({"parameters":{"wait_ms":30000}});
+        assert_eq!(
+            method_dispatch_budget("inspect", &waiting),
+            METHOD_DISPATCH_BUDGET + Duration::from_secs(30)
+        );
+        assert_eq!(
+            method_dispatch_budget("inspect", &json!({"parameters":{"wait_ms":u64::MAX}})),
+            METHOD_DISPATCH_BUDGET + Duration::from_secs(240)
+        );
+        assert_eq!(
+            method_dispatch_budget("inspect", &json!({"parameters":{"wait_s":30}})),
+            METHOD_DISPATCH_BUDGET + Duration::from_secs(30)
+        );
+        assert_eq!(
+            method_dispatch_budget("inspect", &json!({"parameters":{"wait_s":u64::MAX}})),
+            METHOD_DISPATCH_BUDGET + Duration::from_secs(30)
+        );
+        assert_eq!(
+            method_dispatch_budget(
+                "inspect",
+                &json!({"parameters":{"wait_s":1,"wait_ms":240000}})
+            ),
+            METHOD_DISPATCH_BUDGET + Duration::from_secs(1)
+        );
+        assert_eq!(
+            method_dispatch_budget("read", &waiting),
+            METHOD_DISPATCH_BUDGET
+        );
+        assert_eq!(
+            method_dispatch_budget("inspect", &json!({})),
+            METHOD_DISPATCH_BUDGET
+        );
+    }
+
+    /// `prepare` keeps its one call open past the ordinary inline wait, and the transport waits
+    /// longer than the worker so the packet is never cut into a pending reply by the transport.
+    #[test]
+    fn prepare_dispatch_budget_outlasts_its_inline_wait() {
+        use crate::assistance::facade::AssistanceTool;
+        use crate::assistance::worker::{INLINE_REPLY_WAIT, PREPARE_INLINE_WAIT, inline_wait};
+        assert_eq!(inline_wait(AssistanceTool::Prepare), PREPARE_INLINE_WAIT);
+        assert_eq!(inline_wait(AssistanceTool::Read), INLINE_REPLY_WAIT);
+        assert!(method_dispatch_budget("prepare", &json!({})) > PREPARE_INLINE_WAIT);
+        assert_eq!(
+            method_dispatch_budget("read", &json!({})),
+            METHOD_DISPATCH_BUDGET
+        );
+    }
+
+    /// A confirmed method reply arriving during the health probe wins even when that separate
+    /// probe stays silent. The fake peer waits for the actual health request before answering the
+    /// original dispatch, so no sleep or scheduler timing decides which phase this exercises.
+    #[tokio::test]
+    async fn method_reply_during_silent_health_probe_is_not_lost() {
+        let scratch = ScratchRuntime(std::env::temp_dir().join(format!(
+            "agent-ide-method-health-race-{}",
+            std::process::id()
+        )));
+        let runtime = RuntimeDir::prepare_for_daemon(&scratch.0).unwrap();
+        let listener = UnixListener::bind(runtime.socket_path()).unwrap();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let peer = async {
+            let (mut method, _) = listener.accept().await.unwrap();
+            let request: Value = read_frame(&mut method, MAX_V2_FRAME_BYTES).await.unwrap();
+            let (mut health, _) = listener.accept().await.unwrap();
+            let health_request: Value = read_frame(&mut health, MAX_V1_FRAME_BYTES).await.unwrap();
+            assert_eq!(health_request["method"], "health");
+            write_frame(
+                &mut method,
+                &json!({
+                    "version": request["version"],
+                    "request_id": request["request_id"],
+                    "opaque_result_json": {"confirmed": true}
+                }),
+                MAX_V2_FRAME_BYTES,
+            )
+            .await
+            .unwrap();
+            // Keep both connections open until the caller decides: health never answers.
+            held.await.unwrap();
+        };
+        let caller = async {
+            let request = MethodDispatch::new(
+                "health-race",
+                "health-race",
+                "attachment",
+                AssistanceMethod::Start,
+                OpaqueJson::new("{}", 64).unwrap(),
+            )
+            .unwrap();
+            let limits = HookTransportLimits::new(
+                MAX_V2_FRAME_BYTES,
+                MAX_ASSISTANCE_JSON_BYTES,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+            let outcome = dispatch_method_if_running(&scratch.0, request, limits).await;
+            release.send(()).unwrap();
+            outcome
+        };
+        let (_, outcome) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(peer, caller) })
+                .await
+                .expect("the finite transport and fake peer must settle");
+        let MethodDispatchTransportResult::Dispatched { opaque_result_json } = outcome else {
+            panic!("a confirmed original reply must not become unknown: {outcome:?}");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(opaque_result_json.as_str()).unwrap(),
+            json!({"confirmed":true})
         );
     }
 
@@ -2647,6 +2988,98 @@ mod tests {
             .unwrap();
         let events = crate::errorlog::capture_take();
         assert_eq!(connection_panic_lines(&events), 1, "{events:?}");
+    }
+
+    /// Dispatcher answering every method with one fixed JSON payload.
+    struct FixedReplyDispatcher(String);
+
+    impl AssistanceDispatcher for FixedReplyDispatcher {
+        /// Returns the fixed payload for every dispatch, bounded only by the frame prefix.
+        fn dispatch(
+            &self,
+            _request: AssistanceDispatch,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<AssistanceDispatchReply, AssistanceDispatchUnavailable>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let payload = OpaqueJson::new(self.0.clone(), MAX_PREFIXED_FRAME_BYTES);
+            Box::pin(async move {
+                payload
+                    .map(AssistanceDispatchReply::MethodDispatch)
+                    .ok_or(AssistanceDispatchUnavailable)
+            })
+        }
+    }
+
+    /// Read and Prepare replies cross the real daemon socket byte for byte past the former
+    /// 144 KiB payload and 160 KiB frame caps, Unicode and JSON escapes included; every other
+    /// method keeps its cap, so the same payload answers an explicit unavailable that the caller
+    /// maps to an unknown outcome, never to a cut reply.
+    #[tokio::test]
+    async fn source_replies_cross_the_daemon_socket_whole() {
+        let text = "é🦀\"\\\n".repeat(400_000);
+        let payload = serde_json::to_string(&json!({ "text": text })).unwrap();
+        assert!(payload.len() > 16 * MAX_V2_FRAME_BYTES);
+        let scratch = ScratchRuntime(
+            std::env::temp_dir().join(format!("agent-ide-source-whole-{}", std::process::id())),
+        );
+        let runtime = RuntimeDir::prepare_for_daemon(&scratch.0).unwrap();
+        let daemon = tokio::spawn(run_daemon_with_assistance(
+            runtime,
+            Arc::new(FixedReplyDispatcher(payload.clone())),
+            config::EffectiveConfig::defaults(),
+            Duration::from_millis(1500),
+        ));
+        for _ in 0..200 {
+            if UnixStream::connect(scratch.0.join(SOCKET_NAME))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let limits = HookTransportLimits::new(
+            MAX_V2_FRAME_BYTES,
+            MAX_ASSISTANCE_JSON_BYTES,
+            Duration::from_secs(5),
+        )
+        .expect("fixed limits are valid");
+        for method in [
+            AssistanceMethod::Read,
+            AssistanceMethod::Prepare,
+            AssistanceMethod::Context,
+        ] {
+            let request = MethodDispatch::new(
+                "whole",
+                "whole",
+                "attachment",
+                method,
+                OpaqueJson::new("{}", 64).unwrap(),
+            )
+            .unwrap();
+            match dispatch_method_if_running(&scratch.0, request, limits).await {
+                MethodDispatchTransportResult::Dispatched { opaque_result_json }
+                    if method.delivers_source() =>
+                {
+                    assert_eq!(opaque_result_json.as_str().len(), payload.len());
+                    assert_eq!(
+                        blake3::hash(opaque_result_json.as_str().as_bytes()),
+                        blake3::hash(payload.as_bytes())
+                    );
+                }
+                MethodDispatchTransportResult::OutcomeUnknown if !method.delivers_source() => {}
+                other => panic!("{method:?}: {other:?}"),
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("the idle daemon exits")
+            .unwrap()
+            .unwrap();
     }
 
     /// A connection task that panicked before shutdown's abort-and-join is journaled by the drain

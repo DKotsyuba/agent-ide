@@ -9,11 +9,89 @@
 use std::{
     collections::HashMap,
     ffi::OsString,
+    fs,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
 
 use super::Language;
+
+/// Maximum UTF-8 bytes returned by `read_input`; larger text must be handled by a language's
+/// explicit unsupported path rather than parsed from a prefix. Hashing has no prefix ceiling.
+pub const MAX_INPUT_TEXT_BYTES: usize = 64 * 1024;
+
+/// Size of one chunk a native input streams through while being hashed: hashing costs this
+/// much memory per file, never the file's size.
+const INPUT_CHUNK: usize = 64 * 1024;
+
+/// Opens `path` under the environment-input gate, or `None` when the file says nothing:
+/// missing, host-denied, or a link that refuses to be followed. Without denies a regular file
+/// is read plainly; under denies a denied or symlinked input is refused without being followed
+/// (`O_NOFOLLOW`). The one gate every environment input read goes through.
+fn open_input(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> Option<fs::File> {
+    if denies.is_empty() {
+        if !path.is_file() {
+            return None;
+        }
+        return fs::File::open(path).ok();
+    }
+    if denies.iter().any(|deny| deny.matches(path)) {
+        return None;
+    }
+    // A final link is not proved readable: refuse without following.
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return None;
+    }
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()
+}
+
+/// The guarded text of a native environment input, or `None` when it says nothing (see
+/// `open_input`). At most `MAX_INPUT_TEXT_BYTES` UTF-8 bytes are returned. An oversized,
+/// invalid-UTF-8 or unreadable file returns `None`, never a parsed prefix; a language deciding
+/// authoritative presence must distinguish that refusal from absence before calling this.
+pub fn read_input(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> Option<String> {
+    let mut bytes = Vec::new();
+    open_input(path, denies)?
+        .take(MAX_INPUT_TEXT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= MAX_INPUT_TEXT_BYTES)
+        .then(|| String::from_utf8(bytes).ok())
+        .flatten()
+}
+
+/// Whether `path` is readable under the environment-input gate (`open_input`): a language
+/// checks this before a content-dependent decision, so a denied input never influences one.
+pub fn readable(path: &Path, denies: &[crate::execution::seatbelt::ReadDeny]) -> bool {
+    open_input(path, denies).is_some()
+}
+
+/// Whole-content BLAKE3 of a native environment input, hashed with bounded memory, or `None`
+/// when the file says nothing (see `open_input`). The file is streamed in `INPUT_CHUNK`
+/// chunks straight into the hasher, so no input is ever held in memory whole, and any content
+/// — UTF-8 or not — is hashed as the bytes it is. A language's resolver calls this for every
+/// fingerprinted project file so all of them hash identically.
+pub fn hash_input(
+    path: &Path,
+    denies: &[crate::execution::seatbelt::ReadDeny],
+) -> Option<blake3::Hash> {
+    let mut file = open_input(path, denies)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = vec![0u8; INPUT_CHUNK];
+    loop {
+        let read = file.read(&mut chunk).ok()?;
+        if read == 0 {
+            return Some(hasher.finalize());
+        }
+        hasher.update(&chunk[..read]);
+    }
+}
 
 /// One stored environment choice for one project root of a worktree.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -33,7 +111,8 @@ pub struct EnvCandidate {
     pub label: String,
     /// Absolute environment directory (or toolchain directory).
     pub path: PathBuf,
-    /// Version read from files (`3.14.0`), or `None` when the files do not say.
+    /// Installed version established by native metadata or accepted executable facts, never a
+    /// manifest constraint or directory-name guess; `None` when the version is unknown.
     pub version: Option<String>,
     /// The environment exists but cannot run (for example its base interpreter is gone).
     pub broken: bool,
@@ -129,6 +208,24 @@ pub fn replace_selections(worktree: &Path, language: Language, selections: Vec<E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Oversized text never parses a prefix while binary/tail changes still hash completely;
+    /// denied input returns no data through either read route.
+    #[test]
+    fn guarded_input_bounds_and_full_hashes() {
+        let root = crate::scratch::ScratchDir::new("environment-input");
+        let path = root.join("input");
+        let mut bytes = vec![b'x'; MAX_INPUT_TEXT_BYTES + 2];
+        fs::write(&path, &bytes).unwrap();
+        assert!(read_input(&path, &[]).is_none());
+        let before = hash_input(&path, &[]).unwrap();
+        *bytes.last_mut().unwrap() = 0xff;
+        fs::write(&path, &bytes).unwrap();
+        assert_ne!(hash_input(&path, &[]).unwrap(), before);
+        let denies = [crate::execution::seatbelt::ReadDeny::Path(path.clone())];
+        assert!(!readable(&path, &denies));
+        assert!(read_input(&path, &denies).is_none() && hash_input(&path, &denies).is_none());
+    }
 
     /// A holder that panicked with the process-wide selection map locked does not make every later
     /// read or write of the (rebuildable) cache panic.

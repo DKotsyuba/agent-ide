@@ -123,8 +123,9 @@ with the existing launcher configuration error.
   `"retry":"daemon restarted; repeat this call once"` fact for `ide.start`. For another method,
   the hint tells the agent to call `ide.start` first and then repeat with fresh references: the
   replacement has no actor binding, so repeating Context directly cannot recover. The hint is a
-  `structuredContent` field and compact text on Codex, and compact text alone on Claude
-  (agent-content-v0.2 §"Host-specific projection", T14B). Every other reply,
+  compact text on every host; only a `test-seams` build with
+  `AGENT_IDE_TEST_STRUCTURED_REPLIES=1` also keeps the typed copy in `structuredContent` for a
+  non-Claude host (harness-reply-v1 R1, agent-content-v0.2 §"Host-specific projection"). Every other reply,
   including a still-unavailable retry, is unchanged.
 - Daemon version currency (0.6.7): the daemon's health reply reports its product version and the
   hash of its executable path inside the opaque generation identifier
@@ -511,6 +512,11 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
   against the same byte bound the reply renderer applies, shrinking only owner text; the plate is
   marked delivered only when it was attached whole — a plate that cannot fit stays due for the
   next terminal reply, exactly like the hook-carried case.
+
+Delivery notes since [OUTBOX-r4](session-outbox-v1.md): the plate is the only content of the
+`<agent-ide>` block. Requested results (`test-finished`, `edit-checked`, `job-ready`,
+`lost-after-restart`) never ride it, a native `PostToolUse` hook, a `Stop` hold or a reply: Bridge
+delivers them. Test runs add no plate line on any carrier.
 
 ## 7. `ide.context` with `kind: "problems"`
 

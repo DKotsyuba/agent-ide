@@ -199,7 +199,7 @@ environment: typescript node 22.11.0 (.nvmrc) ≠ volta.node 20.18.0 · server n
 
 **Plate / feed**
 - `EnvMissing` carries a detail, as `Fatal` already does (`unavailable_with_detail`): `python: environment .venv-py314 missing (selected) — recreate it or ide.start environment {"python":"auto"}`.
-- One-shot change line, in the style of the `git: HEAD moved` line: `python: environment now .venv-py314 (was .venv; selected) — semantic session restarted`.
+- One-shot change line, in the style of the `git: HEAD moved` line: `python: environment now .venv-py314 (was .venv; selected) — project checks invalidated` (the change itself invalidates the language's project checks; a live semantic session retires at its next use when the resolver identity no longer matches).
 
 **ide.test.** The summary adds ` · env .venv-py314` only when the language has more than one candidate or a selection is in force.
 
@@ -343,7 +343,7 @@ environment: typescript node 22.11.0 (.nvmrc) ≠ volta.node 20.18.0 · server n
 ## 6. What the agent sees, end to end
 1. The `ide.start` card shows: `environment: python .venv (3.12.7, discovered) · also .venv-py314 (3.14.0) — choose: ide.start environment {"python": ".venv-py314"}`.
 2. The agent repeats `ide.start` with that choice, and the card now says `(selected)`.
-3. The plate reports: `python: environment now .venv-py314 (was .venv; selected) — semantic session restarted`.
+3. The plate reports: `python: environment now .venv-py314 (was .venv; selected) — project checks invalidated`.
 4. The next check uses the new env, and `ide.test` runs `.venv-py314/bin/python -m pytest`.
 5. If the directory is later deleted, the plate says: `python: environment .venv-py314 missing (selected) — recreate it or ide.start environment {"python":"auto"}`.
 
@@ -359,6 +359,30 @@ environment: typescript node 22.11.0 (.nvmrc) ≠ volta.node 20.18.0 · server n
 2. Consider an MCP only if a host without Agent IDE must list and select environments interactively. Even then it would read the same files, honor `allowed_roots`, and keep no trust store of its own.
 
 ## 8. Not verified / open
+
+The current Rust implementation uses the accepted request's provider/check configuration,
+not process `AGENT_IDE_*` variables as tool evidence. A stable release pin requires matching
+accepted rustc evidence; a directory name, Cargo version, unknown version, alias, prerelease,
+or unsupported pin requirements cannot establish compatibility. A refusal has no chosen
+candidate and names native recovery before an IDE child starts. Automatic installation remains
+disabled. Selection of another Rust environment and rustup-manager discovery are unsupported.
+Formatter planning retains the target file's Cargo project, edition and actual child directory
+before native/module admission; worktree authority remains unchanged. Both native and module
+Cargo test activation force offline mode and disable automatic toolchain installation.
+
+Rust native identity includes full-byte manifest/lock/pin/config inputs inside the worktree,
+including nested members, and actual configured tool bytes/stamps. Semantic leases include this
+identity. Text parsing is limited to 64 KiB. Discovery reads only the effective root,
+literal/whole-component `*` workspace members (respecting excludes), double-quoted local dependency
+paths and their relevant configuration ancestors, up to 1,024 projects. Root commands ignore
+unrelated/excluded projects; an explicit cwd or Cargo manifest selector resolves that project's
+pin separately. Other member glob syntax, escaped/multiline dependency paths, foreign members
+and symlinked native input paths are unsupported. Relevant paths are checked before content
+reads; unrelated assets and their links do not participate. Unsupported or exhausted scope
+refuses rather than certify a partial identity. With extra read exclusions, the legacy CI/task project-fact detector is
+unavailable; guarded environment/check resolution remains separate. These are implementation
+scope limits, not evidence that the integrated mandatory gate or owner acceptance has passed.
+
 These are not relied on: the location of poetry's `envs.toml`; the semantics of `uv python find`; where VS Code persists its Python selection; whether rust-analyzer reloads on a toolchain-file edit (the design restarts instead); the fnm and volta install layouts (verify in P3); the `pyvenv.cfg` keys written by virtualenv/poetry (the design shows `version unknown`).
 
 The researcher read Pyright's precedence from source with medium-high confidence. A P1 real-provider test confirms it (§5.6).

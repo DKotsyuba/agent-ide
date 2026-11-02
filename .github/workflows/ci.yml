@@ -44,6 +44,26 @@ jobs:
         # clippy -D warnings, rustdoc -D warnings, the release build — with --no-fail-fast,
         # plus the family standard and contract-snapshot checks.
         run: cargo xtask check
+  linux-package-contract:
+    runs-on: ubuntu-24.04
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check workspace targets with test seams and Jev
+        run: cargo check --locked --workspace --all-targets --features test-seams,jev-pilot
+      - name: Check Linux TypeScript declarations and byte remeasurement
+        run: cargo test --locked -p agent-ide-lang-typescript --lib backend::linux_tests:: -- --test-threads=1
+      - name: Check Linux TypeScript evidence command refusals
+        run: cargo test --locked -p agent-ide --bin agent-ide --features test-seams,jev-pilot typescript_evidence_rejects_invalid_argv_and_unpinned_files -- --test-threads=1
+      - name: Check Linux runtime parent selection
+        run: cargo test --locked -p agent-ide-core --lib --features test-seams,jev-pilot linux_runtime_parent_prefers_private_runtime_and_validates_xdg -- --test-threads=1
+      - run: cargo test --locked -p xtask linux_elf_target_rejects_wrong_abi_and_machine
+      - run: sh -n install.sh scripts/package-release.sh scripts/release-smoke.sh
   dependencies:
     runs-on: ubuntu-24.04
     steps:

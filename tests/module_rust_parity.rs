@@ -7,10 +7,15 @@
 //! `AGENT_IDE_RUST_TOOLCHAIN`) and a binary built with `--features test-seams`.
 #![cfg(feature = "test-seams")]
 
+use parity::{source_query, source_query_tool};
+
 #[path = "support/parity.rs"]
 mod parity;
 
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use parity::{Daemon, Fixture, ProcessIdentity, ProcessTree, Session};
 use serde_json::{Value, json};
@@ -31,11 +36,45 @@ fn accepted(path: &str, identity: &str) -> Value {
         "blake3":blake3::hash(&std::fs::read(path).unwrap()).to_hex().to_string()})
 }
 
+/// Measures the prepared Linux analyzer's reported identity; macOS retains the accepted fixture.
+fn real_rust_analyzer_identity() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let analyzer =
+            std::env::var("AGENT_IDE_RUST_ANALYZER").expect("prepared rust-analyzer path");
+        let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").expect("prepared Rust toolchain");
+        let toolchain_dir = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+            .expect("prepared Rust toolchain directory");
+        assert!(std::path::Path::new(&analyzer).is_absolute());
+        assert!(std::path::Path::new(&toolchain_dir).is_absolute());
+        let output = std::process::Command::new(&analyzer)
+            .arg("--version")
+            .env("RUSTUP_TOOLCHAIN", &toolchain)
+            .output()
+            .expect("measure prepared rust-analyzer version");
+        assert!(
+            output.status.success(),
+            "prepared rust-analyzer --version failed"
+        );
+        let identity = String::from_utf8(output.stdout).expect("rust-analyzer version is UTF-8");
+        let identity = identity.trim_end();
+        assert!(
+            identity.starts_with("rust-analyzer 1.98.1 ") && !identity.contains('\n'),
+            "unexpected rust-analyzer version: {identity}"
+        );
+        identity.to_owned()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".to_owned()
+    }
+}
+
 /// The launcher `providers` entry for the accepted rust-analyzer in `cache_namespace`.
 fn providers(cache_namespace: &str) -> Value {
     let dir = input("AGENT_IDE_RUST_TOOLCHAIN_DIR");
     json!([{
-        "executable":accepted(&input("AGENT_IDE_RUST_ANALYZER"),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "executable":accepted(&input("AGENT_IDE_RUST_ANALYZER"), &real_rust_analyzer_identity()),
         "settings":"rust_cache_priming_disabled_v1",
         "toolchain":input("AGENT_IDE_RUST_TOOLCHAIN"),
         "cargo":accepted(&format!("{dir}/bin/cargo"),"cargo 1.98.1"),
@@ -130,10 +169,7 @@ fn semantic() -> Vec<(&'static str, Value)> {
             "ide.graph",
             json!({"symbol":"src/lib.rs#user","direction":"both","depth":2}),
         ),
-        (
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":HELPER_CALL_OFFSET}),
-        ),
+        source_query(json!({"path":"src/lib.rs","byte_offset":HELPER_CALL_OFFSET})),
         edit(
             json!({"operation_id":"p-container","op":"insert","symbol":"src/lib.rs#tests",
             "where":"last","content":"#[test]\nfn added_test() {\n    assert!(user());\n}"}),
@@ -205,9 +241,15 @@ fn test_runs() -> Vec<Value> {
     ]
 }
 
-/// One `ide.test` run: its start reply (the selected command) and, polled with `{"status": N}`
-/// until it is no longer running (180 s), its settled result.
-async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) -> Vec<String> {
+/// One `ide.test` run: its start reply and status polled for up to 180 s. The terminal status and
+/// full replay recipe are validated against the requested test and hosting route before only its
+/// recipe footer is canonicalized for transcript parity.
+async fn test_run(
+    session: &mut Session,
+    fixture: &Fixture,
+    arguments: Value,
+    module: bool,
+) -> Vec<String> {
     let started = session.call(fixture, "ide.test", arguments.clone()).await;
     let text = started["text"].as_str().unwrap_or_default().to_owned();
     let mut lines = vec![record(fixture, "ide.test", &arguments, &started)];
@@ -224,7 +266,22 @@ async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) ->
         let reply = session.call(fixture, "ide.test", status.clone()).await;
         let text = reply["text"].as_str().unwrap_or_default();
         if !text.contains(": running") && !text.contains(": started") {
-            lines.push(record(fixture, "ide.test", &status, &reply));
+            assert_rust_test_recipe(session, fixture, &arguments, &reply, text, module).await;
+            let entry = record(fixture, "ide.test", &status, &reply);
+            lines.push(
+                entry
+                    .lines()
+                    .filter(|row| !row.starts_with("  full replay:"))
+                    .map(|row| {
+                        if row.starts_with("  rerun") {
+                            "  rerun: <route-verified recipe>"
+                        } else {
+                            row
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
             return lines;
         }
         assert!(
@@ -235,14 +292,152 @@ async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) ->
     }
 }
 
-/// Polls `ide.context` on `src/lib.rs` until rust-analyzer answers semantically (60 s).
+/// Checks one Rust test result's status and complete replay receipt against its requested target
+/// and route. Module receipts must contain the exact env-i allowlist; native receipts must contain
+/// only the configured command overrides plus the effective inherited PATH. `cwd` must remain
+/// the fixture root, and the settled counts and exit stay unmasked for transcript comparison.
+async fn assert_rust_test_recipe(
+    session: &mut Session,
+    fixture: &Fixture,
+    selection: &Value,
+    reply: &Value,
+    text: &str,
+    module: bool,
+) {
+    assert_eq!(reply["state"], "complete", "{reply}");
+    assert_eq!(reply["kind"], "test", "{reply}");
+    let (cargo_args, counts, exit): (Vec<&str>, &str, &str) =
+        if selection["symbol"] == "src/lib.rs#user" {
+            (
+                vec!["test", "--workspace"],
+                "2 passed, 1 failed",
+                "(exit 101)",
+            )
+        } else if selection["path"] == "tests/service.rs" {
+            (
+                vec!["test", "--manifest-path", "Cargo.toml", "--test", "service"],
+                "1 passed, 0 failed",
+                "(exit 0)",
+            )
+        } else if selection["path"] == "tests/broken.rs" {
+            (
+                vec!["test", "--manifest-path", "Cargo.toml", "--test", "broken"],
+                "0 passed, 1 failed",
+                "(exit 101)",
+            )
+        } else if selection["pattern"] == "added_test" {
+            (
+                vec!["test", "--workspace", "added_test"],
+                "1 passed, 0 failed",
+                "(exit 0)",
+            )
+        } else {
+            panic!("unexpected Rust test target: {selection}");
+        };
+    assert!(text.contains(counts) && text.contains(exit), "{text}");
+    let rerun = text
+        .lines()
+        .find(|line| line.starts_with("  rerun preview:"))
+        .expect("the long Rust recipe has an explicit preview");
+    assert!(
+        rerun.starts_with("  rerun preview: /usr/bin/env "),
+        "{rerun}"
+    );
+    assert!(rerun.ends_with('…'), "{rerun}");
+    let replay: Value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("  full replay: ide.test "))
+        .map(|line| serde_json::from_str(line).expect("preview has a replay query"))
+        .expect("a preview has an owner-only full replay");
+    let first_reference = replay["output"].as_str().unwrap();
+    let replay = parity::recover_test_replay(session, fixture, first_reference).await;
+    assert_eq!(
+        replay["cwd"], ".",
+        "Rust tests run at the project root: {replay}"
+    );
+
+    let toolchain = PathBuf::from(input("AGENT_IDE_RUST_TOOLCHAIN_DIR"));
+    let bin = toolchain.join("bin");
+    let cargo = bin.join("cargo").display().to_string();
+    let rustc = bin.join("rustc").display().to_string();
+    let mut expected = vec!["/usr/bin/env".to_owned()];
+    if module {
+        expected.push("-i".to_owned());
+        expected.push("CARGO_NET_OFFLINE=true".to_owned());
+        expected.push(format!("RUSTC={rustc}"));
+        let mut bins = vec![bin.clone()];
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+        if let (Some(home), Some(cargo_home)) = (agent_ide::userhome::user_home(), cargo_home) {
+            let cargo_bin = cargo_home.join("bin");
+            if cargo_bin.starts_with(&home) && cargo_bin.is_dir() {
+                bins.push(cargo_bin);
+            }
+        }
+        let path = bins
+            .iter()
+            .map(|path| path.display().to_string())
+            .chain(
+                ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .collect::<Vec<_>>()
+            .join(":");
+        expected.push(format!("PATH={path}"));
+        for name in [
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "DEVELOPER_DIR",
+            "HOME",
+            "RUSTFLAGS",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "TMPDIR",
+        ] {
+            let value = match name {
+                "CARGO_TARGET_DIR" => Some(fixture.base.join("cargo-target").display().to_string()),
+                "RUSTUP_TOOLCHAIN" => Some(toolchain.display().to_string()),
+                _ => std::env::var(name).ok(),
+            };
+            if let Some(value) = value {
+                expected.push(format!("{name}={value}"));
+            }
+        }
+        expected.push("RUSTUP_AUTO_INSTALL=0".to_owned());
+    } else {
+        expected.extend([
+            "CARGO_NET_OFFLINE=true".to_owned(),
+            format!(
+                "PATH={}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+            format!("RUSTC={rustc}"),
+            "RUSTUP_AUTO_INSTALL=0".to_owned(),
+            format!("RUSTUP_TOOLCHAIN={}", toolchain.display()),
+        ]);
+    }
+    expected.push(cargo);
+    expected.extend(cargo_args.into_iter().map(str::to_owned));
+    let actual = replay["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "complete Rust replay recipe: {replay}");
+}
+
+/// Polls the positional Symbol query until rust-analyzer answers semantically (60 s).
 async fn ready(session: &mut Session, fixture: &Fixture) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let reply = session
             .call(
                 fixture,
-                "ide.context",
+                source_query_tool(&json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET})),
                 json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET}),
             )
             .await;
@@ -279,7 +474,7 @@ async fn problems(
         let reply = session
             .call(
                 fixture,
-                "ide.context",
+                source_query_tool(&json!({"kind":"problems","language":"rust"})),
                 json!({"kind":"problems","language":"rust"}),
             )
             .await;
@@ -313,8 +508,8 @@ fn analyzer(tree: &ProcessTree) -> Option<(parity::Node, ProcessIdentity)> {
         })
 }
 
-/// The transcript of one daemon run with `env`: source-first answers, the semantic and editing
-/// rows, the landed project check, then an edit of a file the crate never compiles.
+/// The transcript of one daemon run with `env`: source-first answers, semantic and editing rows,
+/// the landed project check, then an exact read/edit check of a file the crate never compiles.
 async fn run(fixture: &Fixture, env: &[(&str, &str)]) -> (Vec<String>, ProcessTree, Daemon) {
     let mut daemon = Daemon::start(fixture, env).await;
     let mut session = Session::start(fixture).await;
@@ -328,8 +523,9 @@ async fn run(fixture: &Fixture, env: &[(&str, &str)]) -> (Vec<String>, ProcessTr
         let reply = session.call(fixture, tool, arguments.clone()).await;
         replies.push(record(fixture, tool, &arguments, &reply));
     }
+    let module = env.contains(&MODULE);
     for arguments in test_runs() {
-        replies.extend(test_run(&mut session, fixture, arguments).await);
+        replies.extend(test_run(&mut session, fixture, arguments, module).await);
     }
     replies.push(
         problems(&mut session, fixture, Duration::from_secs(120), |text| {
@@ -339,10 +535,23 @@ async fn run(fixture: &Fixture, env: &[(&str, &str)]) -> (Vec<String>, ProcessTr
     );
     let read = json!({"path":"src/orphan.rs","lines":"1-3"});
     let observed = session.call(fixture, "ide.read", read.clone()).await;
+    let orphan_path = fixture.root.join("src/orphan.rs");
+    assert_eq!(
+        std::fs::read(&orphan_path).unwrap(),
+        b"pub fn orphan() -> u8 {\n    1\n}\n"
+    );
     replies.push(record(fixture, "ide.read", &read, &observed));
     let orphan = json!({"operation_id":"p-orphan","op":"replace","path":"src/orphan.rs",
         "lines":"2-2","content":"    2","source_ref":observed["detail_ref"]});
     let reply = session.call(fixture, "ide.edit", orphan.clone()).await;
+    assert_eq!(reply["state"], "edit", "{reply}");
+    assert_eq!(reply["result"]["outcome"], "replaced", "{reply}");
+    assert_eq!(reply["result"]["path"], "src/orphan.rs", "{reply}");
+    assert_eq!(
+        std::fs::read(&orphan_path).unwrap(),
+        b"pub fn orphan() -> u8 {\n    2\n}\n",
+        "the source-only edit lands without claiming compile coverage"
+    );
     replies.push(record(fixture, "ide.edit", &orphan, &reply));
     let tree = daemon.tree();
     session.close(fixture).await;
@@ -391,10 +600,14 @@ async fn rust_module_and_in_process_transcripts_are_equal() {
             ("expected failure", "libtest failure message parsed"),
             ("rust: ready", "the check landed"),
             ("unused", "the check reported the warning"),
-            ("not_analysed", "module-graph noncoverage"),
         ] {
             assert!(all.contains(needle), "{row}: {needle:?} missing in\n{all}");
         }
+        assert!(
+            all.contains("graph: callers and callees of src/lib.rs#user")
+                && all.contains("\n  +3 tests"),
+            "the graph reports its bounded call chain and omitted test count:\n{all}"
+        );
     }
     let masked = |replies: &[String]| {
         replies
@@ -466,10 +679,10 @@ async fn a_check_report_over_two_mib_lands_equally() {
     parity::assert_parity(&pages[..1], &pages[1..]);
 }
 
-/// Killing the Rust module while rust-analyzer indexes settles the waiting semantic call with a
-/// typed `module_unavailable (bundled.rust:…)` refusal; the daemon is the same process and still
-/// healthy, an unrelated language answers on it, rust-analyzer dies with its module, the next
-/// Rust call starts a fresh module, and nothing survives the daemon.
+/// Killing the Rust module while rust-analyzer indexes settles the semantic job still waiting
+/// for the analyzer with a typed `module_unavailable (bundled.rust:…)` refusal; the daemon is the
+/// same process and still healthy, an unrelated language answers on it, rust-analyzer dies with
+/// its module, the next Rust call starts a fresh module, and nothing survives the daemon.
 #[tokio::test]
 #[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
 async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_orphan() {
@@ -478,11 +691,20 @@ async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_o
     let mut daemon = Daemon::start(&fixture, &[MODULE]).await;
     let daemon_pid = daemon.pid();
     let mut session = Session::start(&fixture).await;
+    // The semantic call starts the module and rust-analyzer. Its job cannot answer precisely
+    // before the analyzer has loaded the workspace, so it may answer early (labelled approximate,
+    // symbol-graph-item r2 §4, or pending) and keeps waiting; its final outcome then replaces the
+    // early one under the same `detail_ref`. The module is killed as soon as the analyzer runs,
+    // whatever the call has answered by then.
+    let unsettled = |reply: &Value| {
+        reply["state"] == "pending"
+            || reply["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("approximate: "))
+    };
     let call = json!({"symbol":"src/lib.rs#Service/work"});
-    // The semantic call starts the module and rust-analyzer; it cannot answer before the
-    // analyzer has loaded the workspace.
-    let (fixture, outcome) = {
-        let pending = tokio::spawn(async move {
+    let (fixture, answered) = {
+        let asked = tokio::spawn(async move {
             let reply = session.call(&fixture, "ide.symbol", call).await;
             (session, fixture, reply)
         });
@@ -494,20 +716,15 @@ async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_o
             assert!(Instant::now() < deadline, "rust-analyzer never started");
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        // Indexing: rust-analyzer runs, loading the workspace, and the call is still waiting.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Indexing: rust-analyzer has just started loading the workspace.
         assert!(server.exists(), "rust-analyzer is loading");
-        assert!(
-            !pending.is_finished(),
-            "the semantic call waits for indexing"
-        );
         let loading: Vec<ProcessIdentity> = descendants(module.id.pid)
             .into_iter()
             .map(|(id, _)| id)
             .collect();
         // SAFETY: `module` is the exact identity captured as this test's daemon child just now.
         unsafe { libc::kill(module.id.pid, libc::SIGKILL) };
-        let (returned, fixture, reply) = pending.await.unwrap();
+        let (returned, fixture, reply) = asked.await.unwrap();
         session = returned;
         assert!(module.id.gone().await, "the killed module is reaped");
         for id in loading {
@@ -515,16 +732,28 @@ async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_o
         }
         (fixture, reply)
     };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut outcome = answered;
+    while unsettled(&outcome) {
+        assert!(
+            Instant::now() < deadline,
+            "the job never settled: {outcome}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let reference = json!({"detail_ref":outcome["detail_ref"].as_str().unwrap()});
+        outcome = session.call(&fixture, "ide.inspect", reference).await;
+    }
     let text = outcome["text"].as_str().unwrap_or_default();
-    // The symbol card keeps its definition and names why usages are missing, or the call fails
-    // whole; either way its own text names the analyzer module's typed fault.
+    // The symbol card keeps its definition and names why usages are missing, or the job fails
+    // whole; either way its own text names the analyzer module's typed fault (a job that had
+    // finished before the kill would carry no fault: it was still waiting for indexing).
     assert!(
         outcome["code"] == "provider_unavailable" || text.contains("usages: unavailable"),
-        "the original call fails its semantic part: {outcome}"
+        "the semantic job fails its semantic part: {outcome}"
     );
     assert!(
         text.contains("module_unavailable (bundled.rust:"),
-        "the original call names the module fault: {outcome}"
+        "the semantic job names the module fault: {outcome}"
     );
     assert_eq!(daemon.pid(), daemon_pid, "the daemon is the same process");
     assert!(
@@ -586,7 +815,7 @@ async fn a_stalled_cargo_check_times_out_and_leaves_no_orphan() {
     let checking = session
         .call(
             &fixture,
-            "ide.context",
+            source_query_tool(&json!({"kind":"problems","language":"rust"})),
             json!({"kind":"problems","language":"rust"}),
         )
         .await;
@@ -766,6 +995,285 @@ const FAULT_SEAM: &str = "AGENT_IDE_TEST_MODULE_FAULT";
 /// The module request budget seam (`agent_ide_core::modules::router::BUDGET_SEAM`).
 const BUDGET_SEAM: &str = "AGENT_IDE_TEST_MODULE_BUDGET_MS";
 
+/// Qualifies the identity fixture with the original accepted analyzer before interpreting any
+/// copied-tool failure as a product regression. Both hosting modes must reach the unchanged
+/// semantic readiness barrier and release every captured child; no executable is copied here.
+#[tokio::test]
+#[ignore = "requires the accepted Rust inputs; diagnostic control for the identity fixture"]
+async fn original_rust_analyzer_identity_fixture_is_ready() {
+    for (label, mode) in [("native", IN_PROCESS), ("module", MODULE)] {
+        let fixture = rust_fixture(PARITY_FILES, &format!("identity-control-{label}"), 300);
+        let mut daemon = Daemon::start(&fixture, &[mode]).await;
+        let mut session = Session::start(&fixture).await;
+        ready(&mut session, &fixture).await;
+        let owned = daemon.tree().all();
+        session.close(&fixture).await;
+        drop(daemon);
+        for process in owned {
+            assert!(
+                process.gone().await,
+                "{label}: control child survived cleanup"
+            );
+        }
+    }
+}
+
+/// Native input changes retire healthy native/module sessions, and a
+/// fresh semantic answer comes from a different owned analyzer. Cleanup proves all captured
+/// processes gone; an unchanged query preserves its healthy process before either mutation.
+#[tokio::test]
+#[ignore = "requires accepted Rust inputs; run explicitly for native environment retirement"]
+async fn changed_rust_native_inputs_retire_the_live_session() {
+    for (label, mode) in [("native", IN_PROCESS), ("module", MODULE)] {
+        let fixture = rust_fixture(PARITY_FILES, &format!("native-inputs-{label}"), 300);
+        let mut daemon = Daemon::start(&fixture, &[mode]).await;
+        let mut session = Session::start(&fixture).await;
+        ready(&mut session, &fixture).await;
+        let analyzer_path = input("AGENT_IDE_RUST_ANALYZER");
+        let current = |tree: ProcessTree| {
+            tree.all()
+                .into_iter()
+                .filter(|process| process.command().contains(&analyzer_path))
+                .collect::<Vec<_>>()
+        };
+        let before = current(daemon.tree());
+        assert_eq!(before.len(), 1, "{label}: initial analyzer");
+        ready(&mut session, &fixture).await;
+        assert_eq!(
+            current(daemon.tree()),
+            before,
+            "{label}: unchanged native inputs reuse the live process"
+        );
+        for (relative, body) in [
+            (
+                "Cargo.lock",
+                format!(
+                    "{}\n# changed input\n",
+                    std::fs::read_to_string(fixture.root.join("Cargo.lock")).unwrap()
+                ),
+            ),
+            (".cargo/config.toml", "[build]\njobs=1\n".into()),
+        ] {
+            let old = current(daemon.tree());
+            assert_eq!(old.len(), 1);
+            let path = fixture.root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+            ready(&mut session, &fixture).await;
+            let fresh = current(daemon.tree());
+            assert_eq!(fresh.len(), 1, "{label}: fresh analyzer for {relative}");
+            assert_ne!(
+                fresh, old,
+                "{label}: changed {relative} must partition native/module reuse"
+            );
+            for process in old {
+                assert!(
+                    process.gone().await,
+                    "{label}: prior {relative} analyzer survived"
+                );
+            }
+        }
+        let owned = daemon.tree().all();
+        session.close(&fixture).await;
+        drop(daemon);
+        for process in owned {
+            assert!(
+                process.gone().await,
+                "{label}: child survived environment test cleanup"
+            );
+        }
+    }
+}
+
+/// The actual edit/format consumers in both hosting modes use the target member's environment
+/// and rustfmt config. A stable root edit returns an edit-state replacement; its nightly member
+/// refuses without writing, then a compatible member formats with its own hard-tab configuration.
+/// All owned provider children are reaped; only existing accepted tools run, with no manager/install.
+#[tokio::test]
+#[ignore = "requires the accepted Rust inputs, including prepared bin/rustfmt; explicit formatter scope regression"]
+async fn nested_formatter_scope_is_current_in_native_and_module_consumers() {
+    let mut files = PARITY_FILES.to_vec();
+    files.retain(|(path, _)| !matches!(*path, "Cargo.toml" | "Cargo.lock"));
+    files.extend([
+        ("Cargo.toml","[workspace]\nmembers=[\"legacy\"]\n[package]\nname=\"paritycrate\"\nversion=\"0.1.0\"\nedition=\"2024\"\n"),
+        ("Cargo.lock","version=4\n[[package]]\nname=\"paritycrate\"\nversion=\"0.1.0\"\n[[package]]\nname=\"legacy\"\nversion=\"0.1.0\"\n"),
+        ("rust-toolchain.toml","[toolchain]\nchannel=\"1.98.1\"\n"),
+        ("legacy/Cargo.toml","[package]\nname=\"legacy\"\nversion=\"0.1.0\"\nedition=\"2021\"\n"),
+        ("legacy/rust-toolchain.toml","[toolchain]\nchannel=\"nightly\"\n"),
+        ("legacy/rustfmt.toml","hard_tabs = true\n"),
+        ("legacy/src/lib.rs","pub fn value() -> i32 {\n    1\n}\n"),
+    ]);
+    for (label, mode) in [("native", IN_PROCESS), ("module", MODULE)] {
+        let fixture = rust_fixture(&files, &format!("formatter-scope-{label}"), 300);
+        let mut daemon = Daemon::start(&fixture, &[mode]).await;
+        let mut session = Session::start(&fixture).await;
+        ready(&mut session, &fixture).await;
+        let _ = session
+            .call(&fixture, "ide.read", json!({"symbol":"src/lib.rs#user"}))
+            .await;
+        let root_edit=session.call(&fixture,"ide.edit",json!({"operation_id":"root-format","op":"replace","symbol":"src/lib.rs#user","content":"pub   fn user()->bool{true}"})).await;
+        assert_eq!(root_edit["state"], "edit", "{label}: {root_edit}");
+        assert_eq!(root_edit["result"]["outcome"], "replaced", "{root_edit}");
+        assert_eq!(root_edit["result"]["path"], "src/lib.rs", "{root_edit}");
+        assert!(
+            std::fs::read_to_string(fixture.root.join("src/lib.rs"))
+                .unwrap()
+                .contains("pub fn user() -> bool {")
+        );
+        let before = std::fs::read(fixture.root.join("legacy/src/lib.rs")).unwrap();
+        let read = session
+            .call(
+                &fixture,
+                "ide.read",
+                json!({"symbol":"legacy/src/lib.rs#value"}),
+            )
+            .await;
+        assert!(
+            read["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pub fn value() -> i32"),
+            "{label}: source delivery: {read}"
+        );
+        let failed=session.call(&fixture,"ide.edit",json!({"operation_id":"member-nightly","op":"replace","symbol":"legacy/src/lib.rs#value","content":"pub   fn value()->i32{2}"})).await;
+        assert_eq!(failed["code"], "provider_unavailable", "{label}: {failed}");
+        let text = failed["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("nightly") && text.contains("native"),
+            "{label}: {failed}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join("legacy/src/lib.rs")).unwrap(),
+            before,
+            "{label}: refused formatter must write nothing"
+        );
+        std::fs::write(
+            fixture.root.join("legacy/rust-toolchain.toml"),
+            "[toolchain]\nchannel=\"1.98.1\"\n",
+        )
+        .unwrap();
+        let _ = session
+            .call(
+                &fixture,
+                "ide.read",
+                json!({"symbol":"legacy/src/lib.rs#value"}),
+            )
+            .await;
+        let edited=session.call(&fixture,"ide.edit",json!({"operation_id":"member-stable","op":"replace","symbol":"legacy/src/lib.rs#value","content":"pub   fn value()->i32{2}"})).await;
+        assert_eq!(edited["state"], "edit", "{label}: {edited}");
+        assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+        assert_eq!(edited["result"]["path"], "legacy/src/lib.rs", "{edited}");
+        let after = std::fs::read_to_string(fixture.root.join("legacy/src/lib.rs")).unwrap();
+        assert!(
+            after.contains("\n\t2\n"),
+            "{label}: member rustfmt.toml was not consumed: {after:?}"
+        );
+        let owned = daemon.tree().all();
+        session.close(&fixture).await;
+        drop(daemon);
+        for process in owned {
+            assert!(
+                process.gone().await,
+                "{label}: formatter test child survived cleanup"
+            );
+        }
+    }
+}
+
+/// A live Rust session never answers after its declared analyzer executable is replaced at the
+/// same path. Both native and module hosting retire the original process before refusing the
+/// now-unqualified replacement; no declaration is silently reaccepted and the daemon survives.
+#[tokio::test]
+#[ignore = "requires the accepted Rust inputs; run explicitly with the corrective provider checks"]
+async fn changed_rust_analyzer_bytes_retire_the_live_session() {
+    for (label, mode) in [("native", IN_PROCESS), ("module", MODULE)] {
+        let fixture = rust_fixture(PARITY_FILES, &format!("identity-{label}"), 300);
+        // Preserve the installed tool's basename and sibling asset layout: rust-analyzer may
+        // locate sysroot/proc-macro resources relative to its own executable. Only its bytes
+        // are copied; library/tool siblings remain links to the already prepared toolchain.
+        let prefix = fixture.base.join("toolchain-copy");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let original = std::path::PathBuf::from(input("AGENT_IDE_RUST_ANALYZER"));
+        let original_prefix = original.parent().unwrap().parent().unwrap();
+        for name in ["lib", "libexec", "share"] {
+            let resource = original_prefix.join(name);
+            if resource.exists() {
+                std::os::unix::fs::symlink(resource, prefix.join(name)).unwrap();
+            }
+        }
+        for name in ["cargo", "rustc", "rustfmt", "rust-analyzer-proc-macro-srv"] {
+            let resource = original.parent().unwrap().join(name);
+            if resource.exists() {
+                std::os::unix::fs::symlink(resource, prefix.join("bin").join(name)).unwrap();
+            }
+        }
+        let analyzer_path = prefix.join("bin/rust-analyzer");
+        std::fs::copy(input("AGENT_IDE_RUST_ANALYZER"), &analyzer_path).unwrap();
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+        config["targets"][0]["providers"][0]["executable"] = accepted(
+            analyzer_path.to_str().unwrap(),
+            &real_rust_analyzer_identity(),
+        );
+        std::fs::write(&fixture.config, config.to_string()).unwrap();
+        let mut daemon = Daemon::start(&fixture, &[mode]).await;
+        let mut session = Session::start(&fixture).await;
+        ready(&mut session, &fixture).await;
+        let tree = daemon.tree();
+        let original: Vec<_> = tree
+            .all()
+            .into_iter()
+            .filter(|id| id.command().contains(analyzer_path.to_str().unwrap()))
+            .collect();
+        assert_eq!(original.len(), 1, "{label}: expected one live analyzer");
+        let replacement = fixture.base.join("replacement");
+        std::fs::copy("/usr/bin/false", &replacement).unwrap();
+        std::fs::rename(replacement, &analyzer_path).unwrap();
+        let reply = session
+            .call(
+                &fixture,
+                source_query_tool(&json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET})),
+                json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET}),
+            )
+            .await;
+        let text = reply["text"].as_str().unwrap_or_default();
+        assert!(
+            !text.contains("mode: semantic"),
+            "{label}: stale semantic answer: {reply}"
+        );
+        assert!(
+            text.contains("mode: lexical") && text.contains("unavailable"),
+            "{label}: missing semantic refusal: {reply}"
+        );
+        for process in original {
+            assert!(
+                process.gone().await,
+                "{label}: old analyzer survived identity change"
+            );
+        }
+        let active = session
+            .call(
+                &fixture,
+                "ide.start",
+                json!({"activation_id":"parity-start"}),
+            )
+            .await;
+        assert_eq!(
+            active["kind"], "activation",
+            "{label}: daemon did not answer activation: {active}"
+        );
+        let owned = daemon.tree().all();
+        session.close(&fixture).await;
+        drop(daemon);
+        for process in owned {
+            assert!(
+                process.gone().await,
+                "{label}: owned child survived cleanup"
+            );
+        }
+    }
+}
+
 /// The M-A conformance cases on the Rust analyzer module with the real rust-analyzer: once the
 /// analyzer is ready, a stall past the module budget and a malformed reply each settle the next
 /// semantic call with a typed `module_unavailable (bundled.rust:…)` (timeout, malformed) on the
@@ -915,7 +1423,7 @@ async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
     // Deaths are noticed through the backend's own path (context) and through the core's
     // semantic paths (symbol, graph); each counts once against the same budget.
     let demands = [
-        ("ide.context", context.clone()),
+        source_query(context.clone()),
         ("ide.symbol", json!({"symbol":"src/lib.rs#Service/work"})),
         ("ide.graph", json!({"symbol":"src/lib.rs#user"})),
         ("ide.symbol", json!({"symbol":"src/lib.rs#user"})),
@@ -1073,8 +1581,10 @@ async fn the_module_process_starts_rust_analyzer_within_hello() {
         std::fs::create_dir_all(namespace.join(sub)).unwrap();
     }
     let settings = agent_ide_lang_rust::module::RustProviderSettings {
+        project_root: None,
+        configuration: Default::default(),
         binary: input("AGENT_IDE_RUST_ANALYZER").into(),
-        version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),
+        version: real_rust_analyzer_identity(),
         cargo: dir.join("bin/cargo"),
         cargo_home: None,
         cargo_version: "cargo 1.98.1".into(),
@@ -1108,6 +1618,8 @@ async fn the_module_process_starts_rust_analyzer_within_hello() {
         .unwrap();
     let offer = agent_ide_core::modules::contract::HelloOffer {
         config: agent_ide_core::modules::contract::ModuleConfig {
+            test_workers: None,
+            read_denies: Vec::new(),
             worktree: Some(fixture.root.clone()),
             provider: Some(json!({
                 "grant": ProviderGrant {
@@ -1256,8 +1768,10 @@ async fn the_daemon_open_path_reaches_a_ready_rust_analyzer() {
         std::fs::create_dir_all(namespace.join(sub)).unwrap();
     }
     let settings = agent_ide_lang_rust::module::RustProviderSettings {
+        project_root: None,
+        configuration: Default::default(),
         binary: input("AGENT_IDE_RUST_ANALYZER").into(),
-        version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),
+        version: real_rust_analyzer_identity(),
         cargo: dir.join("bin/cargo"),
         cargo_home: None,
         cargo_version: "cargo 1.98.1".into(),

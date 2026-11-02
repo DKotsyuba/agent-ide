@@ -67,7 +67,13 @@ async fn typed_failures_and_check_starts_are_logged_without_telemetry() {
         .canonicalize()
         .unwrap()
         .join(format!("agent-ide-elog-check-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+    }
     let worktree = root.join("wt");
     std::fs::create_dir_all(&worktree).unwrap();
     std::fs::write(worktree.join("Cargo.toml"), "[package]\n").unwrap();

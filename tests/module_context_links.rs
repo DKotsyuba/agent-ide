@@ -1,8 +1,9 @@
-//! The `related_links:` block of `ide.context`: the cross-language names of the file (or of the
+//! The related-links block of Read and positional Symbol: cross-language names of the file or
 //! requested position) with the same rows, uncertainty labels and notes as a symbol card, the
 //! same answer whether HTML and CSS compute in their modules or in process, and no block at all
 //! for a file without name facts.
 
+use parity::source_query_tool;
 #[path = "support/parity.rs"]
 mod parity;
 
@@ -46,22 +47,19 @@ fn page() -> String {
     )
 }
 
-/// `ide.context` of `arguments` on a fresh daemon with the mode `env` value.
-async fn context(mode: &str, requests: &[Value]) -> Vec<String> {
-    let fixture = fixture();
-    let env: Vec<(&str, &str)> = if mode.is_empty() {
-        Vec::new()
-    } else {
-        vec![(LANGUAGE_MODE, mode)]
-    };
-    let _daemon = Daemon::start(&fixture, &env).await;
-    let mut session = Session::start(&fixture).await;
+/// Reads a complete comparison sweep on the same warmed fixture/session. Forced source reads
+/// measure actual related-link parity instead of an unchanged-body acknowledgement.
+async fn context(fixture: &Fixture, session: &mut Session, requests: &[Value]) -> Vec<String> {
     let mut replies = Vec::new();
     for request in requests {
-        let reply = session.call(&fixture, "ide.context", request.clone()).await;
-        replies.push(line_for(&fixture, "ide.context", request, &reply));
+        let tool = source_query_tool(request);
+        let mut query = request.clone();
+        if tool == "ide.read" {
+            query["force"] = json!(true);
+        }
+        let reply = session.call(fixture, tool, query).await;
+        replies.push(line_for(fixture, tool, request, &reply));
     }
-    session.close(&fixture).await;
     replies
 }
 
@@ -79,20 +77,30 @@ fn requests(page: &str) -> Vec<Value> {
     ]
 }
 
-/// A module still starting reads `unavailable for:`; the next sweep asks again, so the block of
-/// the settled index is what is compared.
+/// Warms one real daemon/session until its related-link index settles or the existing forty
+/// second limit expires. Retries retain the warming work rather than repeatedly restarting it.
 async fn settled(mode: &str, requests: &[Value]) -> Vec<String> {
+    let fixture = fixture();
+    let env = if mode.is_empty() {
+        vec![]
+    } else {
+        vec![(LANGUAGE_MODE, mode)]
+    };
+    let _daemon = Daemon::start(&fixture, &env).await;
+    let mut session = Session::start(&fixture).await;
     let started = std::time::Instant::now();
-    loop {
-        let replies = context(mode, requests).await;
-        if replies
-            .iter()
-            .all(|reply| !reply.contains("unavailable for:"))
-            || started.elapsed() > std::time::Duration::from_secs(40)
+    let replies = loop {
+        let replies = context(&fixture, &mut session, requests).await;
+        if replies.iter().all(|reply| {
+            !reply.contains("unavailable for:") && !reply.contains("related_links: unavailable")
+        }) || started.elapsed() > std::time::Duration::from_secs(40)
         {
-            return replies;
+            break replies;
         }
-    }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    session.close(&fixture).await;
+    replies
 }
 
 /// The block lists what the file defines and links with the card's rows and labels, is the same
@@ -164,11 +172,12 @@ async fn the_related_links_block_is_identical_in_every_mixed_setting() {
     }
 }
 
-/// Every usage row stays in the block, past the card's ceiling of 30: the rows that do not fit the
-/// first reply page follow on the reply's own `detail_ref` pages, and the source stays the last
-/// part, byte for byte, with the `source_ref` of the exact core-read bytes.
+/// Every usage row stays in the block, past the card's ceiling of 30, and the Read reply carries
+/// them all in one reply with no page: Read output has no size ceiling. Read keeps its exact
+/// numbered source before the links, and the delivered reference still authorizes the same bytes.
+/// Warm the advisory index explicitly: lexical source delivery no longer waits for it.
 #[tokio::test]
-async fn long_usage_lists_continue_on_the_replys_own_pages() {
+async fn long_usage_lists_arrive_whole_in_one_read_reply() {
     const FILES: usize = 1200;
     let mut files: Vec<(String, String)> = (0..FILES)
         .map(|n| {
@@ -190,35 +199,27 @@ async fn long_usage_lists_continue_on_the_replys_own_pages() {
     let started = std::time::Instant::now();
     let first = loop {
         let reply = session
-            .call(&fixture, "ide.context", json!({"path":"wide.css"}))
+            .call(
+                &fixture,
+                source_query_tool(&json!({"path":"wide.css"})),
+                json!({"path":"wide.css", "force":true}),
+            )
             .await;
         let text = reply["text"].as_str().unwrap_or_default();
-        if !text.contains("unavailable for:")
+        if (!text.contains("unavailable for:") && !text.contains("related_links: unavailable"))
             || started.elapsed() > std::time::Duration::from_secs(40)
         {
             break reply;
         }
     };
-    let mut text = first["text"].as_str().unwrap().to_owned();
+    let text = first["text"].as_str().unwrap().to_owned();
     assert!(
         text.contains(&format!("usages: {FILES} indexed in {FILES} files")),
         "{text}"
     );
     assert!(!text.contains("… "), "no cut row: {text}");
-    // The rows exceed one page: the reply says so and `ide.inspect` serves the rest.
-    assert_eq!(first["continuation"], true, "{first}");
-    let mut reply = first.clone();
-    let mut pages = 1;
-    while reply["continuation"] == true {
-        let reference = reply["detail_ref"].as_str().unwrap().to_owned();
-        reply = session
-            .call(&fixture, "ide.inspect", json!({"detail_ref": reference}))
-            .await;
-        text.push_str(reply["text"].as_str().unwrap());
-        pages += 1;
-        assert!(pages < 20, "{reply}");
-    }
-    assert!(pages > 1);
+    // The rows far exceed the former reply page, yet arrive in this one reply.
+    assert_ne!(first["continuation"], true, "{first}");
     for n in [0, 29, 30, FILES - 1] {
         assert!(text.contains(&format!("pages/p{n:04}.html:1")), "p{n}");
     }
@@ -227,10 +228,12 @@ async fn long_usage_lists_continue_on_the_replys_own_pages() {
         FILES,
         "every row once"
     );
-    // The source follows the block untouched.
-    assert!(text.trim_end().ends_with(source.trim_end()), "{text}");
-    // The context's `source_ref` still binds the exact bytes the core read: an edit through it
-    // applies, whatever the block above them held.
+    // Read preserves its numbered source before the links, without losing any source byte.
+    let numbered = format!("wide.css  (lines 1)\n1\t{source}");
+    let source_at = text.find(&numbered).expect("complete numbered source");
+    let links_at = text.find("related_links:").expect("retained link rows");
+    assert!(source_at < links_at, "{text}");
+    // The actual delivered read reference still binds the file.
     let reference = first["detail_ref"].as_str().unwrap();
     let edited = ".wide { margin: 1px; }\n";
     let edit = session
@@ -248,19 +251,26 @@ async fn long_usage_lists_continue_on_the_replys_own_pages() {
     session.close(&fixture).await;
 }
 
-/// A killed HTML module never reads as "no links": the style sheet's own names keep answering,
-/// any reply produced while the module is down names `html` as unavailable, and the block of the
-/// restarted module lists the page's usage again.
+/// A killed HTML module never reads as "no links": source remains readable while an index rebuild
+/// explicitly reports ProviderLoading. An answering index retains the style sheet's own names,
+/// names an unavailable HTML module, and eventually lists the edited page's usage. A new demand
+/// reaps the exited idle instance before replacement; forced reads observe the evolving links.
 #[tokio::test]
 async fn a_downed_html_module_is_disclosed_and_the_block_recovers() {
     let fixture = fixture();
     let mut daemon = Daemon::start(&fixture, &[]).await;
     let mut session = Session::start(&fixture).await;
-    let request = json!({"path":"styles.css"});
+    let request = json!({"path":"styles.css", "force":true});
     let usage = "index.html:";
     let started = std::time::Instant::now();
     let warm = loop {
-        let reply = session.call(&fixture, "ide.context", request.clone()).await;
+        let reply = session
+            .call(
+                &fixture,
+                source_query_tool(&request.clone()),
+                request.clone(),
+            )
+            .await;
         let text = reply["text"].as_str().unwrap_or_default().to_owned();
         if text.contains(usage) || started.elapsed() > std::time::Duration::from_secs(40) {
             break text;
@@ -274,7 +284,7 @@ async fn a_downed_html_module_is_disclosed_and_the_block_recovers() {
         .expect("the HTML module runs");
     // SAFETY: `module.id` is the exact module identity captured as a child of this test's daemon.
     unsafe { libc::kill(module.id.pid, libc::SIGKILL) };
-    assert!(module.id.gone().await, "the killed module is reaped");
+    assert!(module.id.exited().await, "the killed module exited");
     std::fs::write(
         fixture.root.join("index.html"),
         "<main id=\"main\"><p class=\"btn\">x</p></main>\n",
@@ -282,14 +292,26 @@ async fn a_downed_html_module_is_disclosed_and_the_block_recovers() {
     .unwrap();
     let started = std::time::Instant::now();
     loop {
-        let reply = session.call(&fixture, "ide.context", request.clone()).await;
+        let reply = session
+            .call(
+                &fixture,
+                source_query_tool(&request.clone()),
+                request.clone(),
+            )
+            .await;
         let text = reply["text"].as_str().unwrap_or_default().to_owned();
-        assert_eq!(reply["kind"], "context", "{reply}");
-        assert!(text.contains("defines: class name btn"), "{text}");
-        if text.contains("unavailable for:") {
-            assert!(text.contains("unavailable for: html"), "{text}");
-        } else if text.contains("index.html:1") {
-            break;
+        assert_eq!(reply["kind"], "read", "{reply}");
+        assert!(
+            text.contains(".btn"),
+            "the CSS source stays readable: {text}"
+        );
+        if !text.contains("related_links: unavailable (ProviderLoading)") {
+            assert!(text.contains("defines: class name btn"), "{text}");
+            if text.contains("unavailable for:") {
+                assert!(text.contains("unavailable for: html"), "{text}");
+            } else if text.contains("index.html:1") {
+                break;
+            }
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(40),
@@ -297,6 +319,7 @@ async fn a_downed_html_module_is_disclosed_and_the_block_recovers() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+    assert!(module.id.gone().await, "recovery reaped the killed module");
     session.close(&fixture).await;
 }
 
@@ -325,7 +348,11 @@ async fn a_snippet_that_looks_like_the_cut_marker_stays_intact() {
     let started = std::time::Instant::now();
     let text = loop {
         let reply = session
-            .call(&fixture, "ide.context", json!({"path":"wide.css"}))
+            .call(
+                &fixture,
+                source_query_tool(&json!({"path":"wide.css"})),
+                json!({"path":"wide.css"}),
+            )
             .await;
         let text = reply["text"].as_str().unwrap_or_default().to_owned();
         if !text.contains("unavailable for:")

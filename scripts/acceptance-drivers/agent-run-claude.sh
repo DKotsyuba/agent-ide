@@ -320,7 +320,7 @@ reset_none() {
 
 # Requires the agent's stored transcript (tool results included) to contain one
 # literal token. The scripts force a fixed final reply, so tool outcomes such as
-# stale_source or the semantic mode line only ever appear in tool results, as on
+# the stale-edit refusal or the semantic mode line only ever appear in tool results, as on
 # the direct Claude route. Markers checked here never occur in the task prompts.
 require_record_text() {
     if /usr/bin/grep -qF -- "$2" "$DIAG_DIR/transcript-$1.json"; then
@@ -383,7 +383,7 @@ fi
 # class can retry, and the precondition is l1's post state, so no reset.
 verify_l2() {
     require_answer_text l2 "LEFT_FALLBACK_OK" A_L2_FINAL
-    require_record_text l2 "stale_source" A_L2_STALE_OUTCOME
+    require_record_text l2 "does not match this file's current text" A_L2_STALE_OUTCOME
 }
 run_scenario l2 "$LEFT" l2.txt verify_l2 reset_none
 # A byte-exact compare against a fixed expectation is too strict: a native tool (for

@@ -204,7 +204,8 @@ fn record_module_failure(
 /// The identity of the module's environment resolutions of `worktree` (every project root's),
 /// computed in the module; `unavailable` when the module could not answer.
 async fn module_environment(worktree: &std::path::Path) -> String {
-    match agent_ide_core::modules::calls::environments(crate::LANGUAGE, worktree).await {
+    let config = agent_ide_core::modules::calls::module_config(crate::LANGUAGE, worktree);
+    match agent_ide_core::modules::calls::environments(crate::LANGUAGE, worktree, &config).await {
         Ok(environments) => environments
             .iter()
             .map(|environment| environment.identity.as_str())

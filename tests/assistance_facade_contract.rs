@@ -48,11 +48,14 @@ fn pre_hook() -> agent_ide::assistance::host_binding::HookEvent {
     .unwrap()
 }
 
+/// The private backend schema keeps stable operation-slot indexes, including its internal Context
+/// operation and the retired Prepare route; public eleven-tool discovery is proved by the shipping
+/// MCP catalog tests.
 #[test]
-fn discovery_is_static_and_contains_exactly_eleven_current_methods() {
+fn backend_schemas_keep_the_stable_operation_slots() {
     agent_ide::languages::install();
     let schemas = tool_schemas();
-    assert_eq!(schemas.len(), 11);
+    assert_eq!(schemas.len(), 13);
     assert!(schemas.iter().map(|schema| schema.name).eq([
         "ide.start",
         "ide.context",
@@ -64,7 +67,9 @@ fn discovery_is_static_and_contains_exactly_eleven_current_methods() {
         "ide.read",
         "ide.symbol",
         "ide.graph",
-        "ide.test"
+        "ide.test",
+        "ide.prepare",
+        "ide.tree"
     ]));
     assert!(
         schemas
@@ -162,7 +167,32 @@ fn validation_rejects_unknown_identity_and_requires_stable_operation_and_detail_
     assert!(validate_call(AssistanceTool::Inspect, json!({"detail_ref":"detail-1"})).is_ok());
     assert!(validate_call(AssistanceTool::Start, json!({"actor_id":"forged"})).is_err());
     assert!(validate_call(AssistanceTool::Stop, json!({"authority":"forged"})).is_err());
+    // OUTBOX-r3 §8.5: a reference is required (no session fact list is read); references and
+    // waits stay bounded.
     assert!(validate_call(AssistanceTool::Inspect, json!({})).is_err());
+    assert!(validate_call(AssistanceTool::Inspect, json!({"wait_ms":5})).is_err());
+    assert!(
+        validate_call(
+            AssistanceTool::Inspect,
+            json!({"detail_ref":"detail-1","wait_ms":240000})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Inspect,
+            json!({"detail_ref":"detail-1","wait_ms":240001})
+        )
+        .is_err()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Inspect,
+            json!({"detail_refs":["a","b","c","d","e","f","g","h","i"]})
+        )
+        .is_err()
+    );
+    assert!(validate_call(AssistanceTool::Inspect, json!({"actor_id":"forged"})).is_err());
 }
 
 #[tokio::test]
@@ -251,7 +281,7 @@ fn feedback_deduplicates_rechecks_and_suppresses_after_stop() {
     .unwrap();
     assert_eq!(
         delta.render(),
-        "Fact: one new fact\nNext: inspect detail\nFreshness: current\nDetail: detail-1"
+        "one new fact inspect detail (current)\nide.inspect {\"detail_ref\":\"detail-1\"}"
     );
     assert!(!delta.render().contains("Evidence:"));
     let mut feedback = FeedbackLedger::default();
@@ -486,13 +516,17 @@ fn edit_arguments_are_closed_and_bounded() {
     let mut extra = valid.clone();
     extra["patch"] = json!("@@");
     assert!(validate_call(AssistanceTool::Edit, extra).is_err());
-    for field in ["operation_id", "path", "content"] {
+    // `operation_id` is optional since symbol-read-edit-v1: a missing one gets a fresh id.
+    let mut anonymous = valid.clone();
+    anonymous.as_object_mut().unwrap().remove("operation_id");
+    assert!(validate_call(AssistanceTool::Edit, anonymous).is_ok());
+    for field in ["path", "content"] {
         let mut missing = valid.clone();
         missing.as_object_mut().unwrap().remove(field);
         assert!(validate_call(AssistanceTool::Edit, missing).is_err());
     }
-    // Without `source_ref` the full-file form is a creation request: the daemon observes the
-    // path itself and refuses it when the file already exists.
+    // `source_ref` is optional: the daemon observes the current file itself, replacing an
+    // existing file or creating an absent one under the same atomic freshness checks.
     let mut create = valid.clone();
     create.as_object_mut().unwrap().remove("source_ref");
     assert!(validate_call(AssistanceTool::Edit, create).is_ok());

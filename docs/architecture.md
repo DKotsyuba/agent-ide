@@ -15,6 +15,33 @@ One application: a language-independent core crate, one crate per language and t
 
 Do not equate an integration edge with an implementation dependency. A consumer may use an agreed small substitute until the real provider is ready. Actual host authentication, delivery, durability, concurrency and LSP sharing need their own real integration evidence.
 
+Project tree and context indexing resolve Git's global excludes using the effective
+`userhome::user_home()` (including an explicit `AGENT_IDE_HOME`), not inherited `HOME` or
+`XDG_CONFIG_HOME`. Configure `core.excludesFile` there, or use its default
+`~/.config/git/ignore`; repository-local Git configuration takes precedence.
+
+## Bridge-only delivery
+
+The direct-address consumer is selected by explicit Bridge native-store configuration.
+Bridge owns transport, queueing, retry, carrier selection and native wake. IDE owns workspace
+and binding authority, source/cancellation fences, retained results and immutable handoff intent.
+Graph/test results arrive asynchronously, including warm graph results; IDE runs no fallback
+carrier, native `PostToolUse` delivery of results, `Stop` hold or idle wake. Both live passive-wake
+proofs (Codex and Claude) passed, so the superseded IDE-run delivery code was removed. Without a
+Bridge route a result stays retained under its `detail_ref` and is read with `ide.inspect`.
+See [launcher configuration](assistance-launcher.md) and the active [tool contract](contracts/tools-v0.4.md).
+
+TypeScript test planning binds prepared project-local Vitest/Jest package bins to the
+launcher's configured Node in both native and module execution, with that Node's directory
+leading child `PATH`. Contained pnpm package aliases are supported; missing, malformed,
+read-denied or escaping runners are unavailable. No package manager or download is used;
+unbound `npx vitest`/`npx jest` commands remain refused. Jev candidates use this same
+test-selection and admitted `TestRuns` path.
+Declared Node ranges are checked by a fixed prelude on that same admitted Node before the
+runner loads. It shares the qualified TypeScript `VersionRange` predicate with project checks;
+incompatible or unprovable requirements retain an environment-unavailable result, exit and
+stderr, with no inferred test counts.
+
 ## Component contracts
 
 - [Shared vocabulary and failure semantics](contracts/common.md)
@@ -58,13 +85,55 @@ A panic inside one accepted-connection task is contained to that connection and 
 check service. `crates/agent-ide-core/src/checks/` schedules confined background checks and owns
 one bounded problem snapshot per `(worktree, language)`; each language crate's `checks` module runs
 its checker (`cargo check`, Pyright, `tsc`); Assistance
-renders the compact `<agent-ide>` block through Claude post hooks and answers `ide.context` with
-`{"kind":"problems"}`; Application hosts the per-repository rendezvous (`/private/tmp/ai-r-…`,
-hook key cache `/private/tmp/ai-k-…`) and the persistent check caches under
+renders the compact `<agent-ide>` block through Claude post hooks and answers `ide.inspect` with
+`{"kind":"problems"}`; Application hosts the per-repository rendezvous (`<parent>/ai-r-…`,
+hook key cache `<parent>/ai-k-…`) and the persistent check caches under
 `$HOME/.agent-ide/checks`. Admission is restart-only launcher configuration (`allowed_roots`,
-`project_checks`); every failure is fail-open and never vetoes native agent work. The MVP targets
-macOS and Claude; phase 2 adds warm LSP, a launchd per-user service, subagent attach, TypeScript
-checks, and the Codex active block.
+`project_checks`); every failure is fail-open and never vetoes native agent work. TypeScript
+checks and the Codex active block are present; Linux support remains a candidate, not release
+qualification. Retained cache directories do not establish a warm provider index.
+
+For an isolated Claude runtime, `AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT` selects an existing absolute,
+normalized temporary parent for both `ai-r-…` runtimes and `ai-k-…` hints. MCP servers, hooks and
+daemons must inherit the same value. On macOS the default is `/private/tmp`. On Linux it is the
+private `/run/user/<euid>`, then a validated nonempty `XDG_RUNTIME_DIR`, then the effective user
+home when XDG is unset or empty. A supplied invalid XDG root, or a relative, traversing or
+unresolvable operator override, fails without falling back. Manual hint collection uses the
+same parent, and automatic collection skips an invalid parent. Choose a short parent for Unix
+socket paths; private child ownership, no-follow validation and locking remain unchanged.
+
+Linux checks require `/usr/bin/bwrap` with `--bind-fd`, `--ro-bind-fd`, `--disable-userns` and
+`--assert-userns-disabled`, user/mount/network namespaces, seccomp, `openat2` and `close_range`
+with `CLOSE_RANGE_CLOEXEC` (Linux 5.11 or a backport). A policy with read-deny exclusions is
+refused because the Linux adapter cannot enforce it; unavailable confinement also refuses the
+check, without an unconfined retry. macOS retains its existing nested-profile fallback under the
+host confinement.
+
+Linux Git change snapshots require the launcher-selected Git to support `--no-lazy-fetch`
+(Git 2.45 or later). Unsupported Git fails closed rather than attempting a snapshot that could
+lazily fetch missing objects from a promisor remote.
+
+Codex has its separate `AGENT_IDE_CODEX_RENDEZVOUS_ROOT` override. Fixture and toolchain scratch
+uses `TMPDIR`, `TMP` and `TEMP`, and the persistent product home can be isolated with
+`AGENT_IDE_HOME`.
+
+## Completion facts (OUTBOX-r4)
+
+[OUTBOX-r4](contracts/session-outbox-v1.md) describes the facts long work produces so no agent
+polls. Results stay retained under their references; Bridge delivers them when configured. All of
+it lives in Assistance (`crates/agent-ide-core/src/assistance/`):
+
+- `outbox.rs` is the producer seam: `SessionOutbox` (`push`, `defer`, `forget`, `context_epoch`),
+  the `FactDraft` kinds and budgets, and a test-only `RecordingOutbox` that peer modules test
+  against.
+- `session_outbox.rs` is the in-memory session ledger: change counters for fencing against edits
+  and native writes, and in-flight work. It queues no fact and dies with the daemon.
+- `worker/delivery.rs` turns settled jobs, test runs and slow edit checks into facts and hands each
+  one to Bridge (`bridge.rs`) after a source-access re-proof.
+- `unresolved.rs` is the MCP front's memory of what each actor was owed. After a daemon
+  replacement it clears those subjects only after Bridge accepts the one `lost-after-restart`
+  publication or reports an uncertain outcome; no route or definite no-effect retains them for a
+  later re-activation.
 
 ## Crates (v0.5)
 

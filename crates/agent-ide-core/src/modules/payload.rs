@@ -95,10 +95,20 @@ pub enum Field<T> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProjectQuery {
-    /// `LanguageSupport::detect`; answers `Option<LanguageProject>`.
+    /// `LanguageSupport::detect` with the core's stored `selections` applied first, so the
+    /// detected environment (the demanded interpreter a test or format plan reads back) is the
+    /// current choice, never the module instance's last-seen one; answers `Option<LanguageProject>`.
     Detect {
         /// Project root.
         root: PathBuf,
+        /// The core's stored selections for this root's worktree and language. Missing or
+        /// empty resets the instance's selections before detection; current callers send them
+        /// explicitly, and older recorded payloads deserialize to the same empty reset.
+        #[serde(default)]
+        selections: Vec<EnvSelection>,
+        /// Current accepted request facts; absent recorded data is unconfigured, not authority.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
     },
     /// `LanguageSupport::environments` honouring the core's stored `selections`; answers
     /// `Vec<ResolvedEnv>`.
@@ -107,6 +117,9 @@ pub enum ProjectQuery {
         worktree: PathBuf,
         /// The core's stored selections for this worktree and language.
         selections: Vec<EnvSelection>,
+        /// Current accepted request facts; implementations must not infer missing tool evidence.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
     },
     /// `LanguageSupport::check_selection`; answers `Result<(), String>`.
     CheckSelection {
@@ -118,8 +131,12 @@ pub enum ProjectQuery {
         selector: String,
     },
     /// `LanguageSupport::command_env` with the core's stored `selections`; answers
-    /// `Option<CommandEnv>`.
+    /// `CommandEnvAnswer`, including a typed pre-admission environment refusal.
     CommandEnv {
+        /// Actual arguments after the program; historical program-only requests default empty.
+        /// Languages may interpret project selectors before constructing an admitted command.
+        #[serde(default)]
+        args: Vec<String>,
         /// Worktree.
         worktree: PathBuf,
         /// Command working directory.
@@ -128,6 +145,9 @@ pub enum ProjectQuery {
         program: String,
         /// The core's stored selections for this worktree and language.
         selections: Vec<EnvSelection>,
+        /// Immutable accepted facts for this exact command request, before effect admission.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
     },
     /// `LanguageSupport::test_toolchain`; answers `Option<(PathBuf, PathBuf)>`.
     TestToolchain {
@@ -143,7 +163,7 @@ pub type EnvironmentsAnswer = Vec<ResolvedEnv>;
 /// Answer of [`ProjectQuery::CheckSelection`].
 pub type CheckSelectionAnswer = Result<(), String>;
 /// Answer of [`ProjectQuery::CommandEnv`].
-pub type CommandEnvAnswer = Option<CommandEnv>;
+pub type CommandEnvAnswer = Result<Option<CommandEnv>, LangError>;
 /// Answer of [`ProjectQuery::TestToolchain`].
 pub type TestToolchainAnswer = Option<(PathBuf, PathBuf)>;
 
@@ -245,9 +265,12 @@ pub enum SyntaxQuery {
         /// The candidate text.
         source: SourceRef,
     },
-    /// `syntax_probe_command` as a stdin probe recipe; answers `Option<EffectRequest>` (the core
+    /// `syntax_probe_command` as a stdin probe recipe; answers `Result<Option<EffectRequest>, LangError>` (the core
     /// feeds the candidate, [`Stdin::Candidate`]).
     ProbePlan {
+        /// Current accepted request facts; absence supplies no launcher/tool proof.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
         /// The project.
         project: Box<LanguageProject>,
         /// Absolute project root.
@@ -256,6 +279,39 @@ pub enum SyntaxQuery {
         file: PathBuf,
         /// Externally configured probe programs.
         configured: Option<ProbePrograms>,
+    },
+    /// Plans a stdin-only syntax outline, using the same closed recipe admission as `ProbePlan`.
+    OutlineProbePlan {
+        /// Current accepted launcher and filesystem facts.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
+        /// Detected project and its admitted toolchain, not permission to resolve its imports.
+        project: Box<LanguageProject>,
+        /// Admitted working directory.
+        root: PathBuf,
+        /// Root-relative source name.
+        file: PathBuf,
+        /// Accepted programs, if configured.
+        configured: Option<ProbePrograms>,
+        /// Empty for outline; otherwise 1-based public source anchors.
+        #[serde(default)]
+        anchors: Vec<u32>,
+    },
+    /// Validates bounded probe output against exact supplied source; answers `Option<Outline>`.
+    OutlineProbeResult {
+        /// The original source and its attachment identity.
+        source: SourceRef,
+        /// UTF-8 stdout, capped by the core before transport.
+        output: String,
+    },
+    /// Validates selected context lines from the same admitted source-only probe.
+    ContextProbeResult {
+        /// Exact source bytes supplied to the probe.
+        source: SourceRef,
+        /// Bounded stdout.
+        output: String,
+        /// Public failure lines, 1-based.
+        anchors: Vec<u32>,
     },
 }
 
@@ -572,6 +628,9 @@ impl EditProposal {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FormatPlanRequest {
+    /// Current immutable request configuration, applied before constructing an effect.
+    #[serde(default)]
+    pub config: super::contract::ModuleConfig,
     /// The project.
     pub project: LanguageProject,
     /// Root-relative file.
@@ -579,7 +638,7 @@ pub struct FormatPlanRequest {
 }
 
 /// Answer of [`FormatPlanRequest`].
-pub type FormatPlanAnswer = Option<EffectRequest>;
+pub type FormatPlanAnswer = Result<Option<EffectRequest>, LangError>;
 
 /// `test_plan`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -587,6 +646,9 @@ pub type FormatPlanAnswer = Option<EffectRequest>;
 pub enum TestPlanQuery {
     /// `test_selection`; answers `Result<TestSelection, LangError>`.
     Selection {
+        /// Current immutable request configuration; absent facts remain unknown.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
         /// The project.
         project: Box<LanguageProject>,
         /// The target.
@@ -595,6 +657,9 @@ pub enum TestPlanQuery {
     /// The run of `test_selection` as a recipe request; answers [`RunAnswer`]. The core runs
     /// module-planned tests only this way (an explicit `ide.test` command keeps its own path).
     Run {
+        /// Current immutable request configuration, resolved before recipe admission.
+        #[serde(default)]
+        config: super::contract::ModuleConfig,
         /// The project.
         project: Box<LanguageProject>,
         /// The target.
@@ -644,12 +709,21 @@ pub struct TestParseRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckPlanRequest {
+    /// Accepted provider/check facts for this request; raw `config` below remains the language
+    /// check section. Missing historical context conveys no accepted provider or tool identity.
+    #[serde(default)]
+    pub module_config: super::contract::ModuleConfig,
     /// The core's check invocation.
     pub request: CheckRequest,
     /// The language's `project_checks` launcher section, decoded by the module.
     pub config: Value,
     /// Total wall-clock ceiling of the check.
     pub timeout_ms: u64,
+    /// The core's stored environment selections for this worktree and language, applied before
+    /// the module plans, so a planned check runs in the current environment. Absent in recorded
+    /// payloads deserialize to empty and reset the instance's selections before planning.
+    #[serde(default)]
+    pub selections: Vec<EnvSelection>,
 }
 
 /// `check_parse`: interpret one completed run the core performed; stdout and stderr follow as
@@ -754,6 +828,8 @@ pub enum Arg {
     Each(&'static str),
     /// `--flag=<value>`-style concatenation of a literal prefix and a named parameter.
     Joined(&'static str, &'static str),
+    /// Joined option omitted when its parameter is absent.
+    OptionalJoined(&'static str, &'static str),
 }
 
 /// Where an admitted path may be. The core checks the path as given against its own resolution
@@ -780,6 +856,8 @@ pub enum PathRole {
     },
     /// Exactly one of these absolute paths.
     Fixed(&'static [&'static str]),
+    /// The canonical target of one fixed, core-recognized Linux system tool.
+    SystemTool(&'static str),
     /// Under a developer directory the core resolves itself (its platform tools selection,
     /// standard install locations, or the launcher's override).
     DeveloperDir,
@@ -1549,6 +1627,8 @@ mod tests {
         };
         assert_eq!(decode::<DescribeQuery>(encode(&query)), Ok(query));
         let config = crate::modules::contract::ModuleConfig {
+            read_denies: Vec::new(),
+            test_workers: None,
             worktree: Some("/w".into()),
             provider: None,
             checks: Some(serde_json::json!({})),

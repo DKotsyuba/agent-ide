@@ -98,14 +98,15 @@ Feature-enabled fixtures use the existing `test_seams::var` API with
 `AGENT_IDE_TEST_DOCTOR_SCAN_ROOT` to select exactly one private fixture directory.
 An invalid selector scans nothing. Default/release builds ignore this selector;
 the gate verifies pure path selection in a default-build child without calling
-the mutating report. Production temp/shared roots and cleanup semantics remain
-unchanged. Doctor cleanup integration tests explicitly require `test-seams`.
+the mutating report. Doctor cleanup integration tests explicitly require `test-seams`.
 
 Shared runtime/key fixture constructors and hint collection use one further
 selector through that same API: `AGENT_IDE_TEST_SHARED_RUNTIME_ROOT`. It accepts
 only a private existing absolute fixture root and never creates one. Default
-builds ignore it and retain canonical `/private/tmp`. The pure default-build
-control proves both selectors are ignored without scanning or creating live
+builds ignore it and use the configured operator parent or platform default: canonical
+`/private/tmp` on macOS; on Linux, private `/run/user/<euid>`, then validated nonempty
+`XDG_RUNTIME_DIR`, then effective user home. An invalid supplied XDG root fails closed when
+selected. The pure default-build control proves both selectors are ignored without scanning or creating live
 runtime state. When this isolation selector is set, `xtask check` refuses its
 genuinely default managed-MCP version-seam fixture before it can create canonical
 shared directories; this is an explicit blocked gate, not a skipped/passing test.

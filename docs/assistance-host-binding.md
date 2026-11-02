@@ -225,9 +225,9 @@ native hooks can find the same daemon without any operator-configured runtime or
   working: the oldest settled records of a full scope are evicted, never a live session's.
 
 `agent-ide codex-hook --managed` is the managed hook command: it ignores every credential and
-runtime environment override, reads stdin once (at most 8 MiB plus an overflow byte; a payload
-over 64 KiB is projected down to its identity fields, and only a projection still over that
-transport bound is dropped as oversize) inside one
+runtime environment override, reads stdin once (a payload over 64 KiB, of any size, is streamed
+and projected down to its identity fields without buffering its tool bodies, and only a
+projection still over that transport bound is dropped as oversize) inside one
 250 ms total deadline, discovers exactly one live route, submits once, and renders only a
 successful `PostToolUse` feedback result. Missing, ambiguous, stale, or contended routes,
 malformed or oversized payloads, unsupported phases, and deadline expiry all exit 0 with empty
@@ -236,8 +236,9 @@ installed path shell-quoted) — the placeholder-only example is
 [`docs/examples/codex-hooks.json`](examples/codex-hooks.json). The owner merges the two handlers
 into the existing `PreToolUse`/`PostToolUse` arrays of `~/.codex/hooks.json` preserving existing
 entries, then reviews and trusts both definitions through Codex's normal UI; the product never
-writes `hooks.json` or any host configuration, and duplicate agent-ide handlers must not be
-registered (duplicate pre-events are rejected as replays).
+writes `hooks.json` or any host configuration. A handler registered twice (for example the
+user's `hooks.json` beside a harness's own entries) delivers every event twice; the daemon
+treats the identical second pre as the same pending pre, so every call keeps working (T-010).
 
 Claude Code 2.1.280 is the tested target. Its example config includes exact `PreToolUse`,
 `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` commands; older Claude versions
@@ -250,8 +251,9 @@ optional `agent_id`, and optional `agent_type` fields. The placeholder-only exam
 implemented; `permission_mode` is never mapped to OS authority, and the same `allowed_roots`
 policy applies as on Codex.
 
-The hook command reads at most 8 MiB plus one overflow byte (a larger payload's tool bodies are
-projected away before submission) and uses a separate **250 ms
+The hook command keeps a payload up to 64 KiB exact and streams a larger one, keeping only the
+projected identity fields (and the routing `cwd`) while skipping its tool bodies unbuffered; it
+uses a separate **250 ms
 total deadline** for stdin, parsing, connect, dispatch and reply. An open stdin pipe cannot
 hold up process exit. Missing/invalid attachment, absent daemon, invalid or oversized
 JSON, malformed or ambiguous identity, transport loss and timeout all exit successfully
@@ -275,10 +277,13 @@ then fail, and for real ingress failures (`hook_input_*`, `hook_no_cwd`): the da
 hook it refuses on a channel that already holds a binding per call (`hook_refused:<cause>`), and
 the client journals a submission that outlived its 250 ms budget per call (`hook_submit_timeout`,
 a lost pre). Large host payloads
-no longer drop their event: the hook reads up to 8 MiB on the same deadline and projects the
-payload down to the identity fields the daemon consumes, so a multi-megabyte Read/Write tool
-body is discarded rather than the lifecycle; only a projection that itself exceeds the 64 KiB
-transport bound is refused as `hook_input_oversize`.
+no longer drop their event, whatever their size: the hook streams the payload on the same
+deadline and keeps only the identity fields the daemon consumes (Claude's `agent_type` and its
+writer-tool `file_path`/`notebook_path` included), so a multi-megabyte Read/Write tool body or
+`tool_response` is skipped rather than the lifecycle; a repeated projected field is malformed,
+and only a projection that itself exceeds the 64 KiB transport bound is refused as
+`hook_input_oversize`. Memory stays proportional to the longest single string token the
+parser must decode (a kept field or an object key), never to the skipped bodies.
 
 ### Restart recovery (T15B follow-up)
 
@@ -292,7 +297,8 @@ mechanisms keep the session usable without the agent being told to re-activate:
 - **Transparent re-activation.** The managed Claude MCP watches its held lease stream: EOF
   means the generation ended, and it re-attaches at once (re-registering its sibling worktrees)
   so the host's next pre-hook already finds a healthy rendezvous. A current daemon names the
-  actor of every start it resolved with a private actor tag (BLAKE3 of the actor id, carried only
+  actor of every start it resolved (and, since OUTBOX-r3, of every call) with a private actor tag
+  (BLAKE3 of the actor id, carried only
   over daemon IPC beside the reply, never rendered, granting nothing), and the MCP remembers each
   admitted start's exact parameters — root, `read_only`, environment, activation id — under that
   tag (at most 32 actors). After a replacement every managed Claude call announces the remembered
@@ -334,6 +340,56 @@ mechanisms keep the session usable without the agent being told to re-activate:
   invalid `detail_ref` after a replacement appends "issued before the IDE restarted; re-read",
   and `ide.stop` of a known activation that a replacement already revoked answers success-shaped
   ("stopped (the IDE had already restarted)").
+- **Results a restart may have lost (OUTBOX-r4 §10).** A current daemon tags every reply to a
+  current managed Claude front with the calling actor's tag (not only starts), so the front
+  remembers, per actor, up to 16 requests it relayed without their answer (`pending`, `tests #N:
+  started`, `diagnostics: pending`); a read of the reference or a settled run resolves one. The re-activation start carries the remaining subjects as `claudecode/lost` (inert
+  on older daemons); the new daemon hands Bridge one `lost-after-restart` fact for that actor, runs
+  labelled "before restart".
+  Untagged daemons and Codex keep one anonymous memory.
+
+### Compaction (OUTBOX-r4 §9.1)
+
+One more hook phase pairs with no tool call and finds the actor's active binding: `compaction`
+(Claude `PreCompact` and `SessionStart` with source `compact` or `clear`, Codex `PreCompact`). A
+compaction raises the context epoch of every session on the channel; a probe on Claude 2.1.294
+and codex-cli 0.160.1 saw one `PreCompact` per compaction, naming the session only.
+
+`Stop` and `SubagentStop` are not supported phases: IDE neither holds a turn end nor wakes an idle
+session (Bridge owns both), so a stale installed `Stop` entry exits silently without effect and
+the shipped configurations carry none.
+
+### Stale writer takeover
+
+The shared Claude daemon outlives every session, so a session that ends without `ide.stop` (a
+finished or crashed agent) used to keep its writer activation until the daemon itself stopped,
+and every later writer start on that worktree was refused `worktree_held_by_another_actor`. A
+writer start that collides with another actor's writer now weighs the holder's liveness
+(`assistance/carriers.rs`, `assistance/takeover.rs`; contract
+[start-index-state](contracts/start-index-state-v1.md) §4):
+
+- **Evidence.** The daemon reads the kernel's peer process id of every call connection
+  (`LOCAL_PEERPID` on macOS, `SO_PEERCRED` on Linux) and of every long-lived client lease, and
+  notes when a lease reaches EOF. The process that carried a binding's latest validated call is
+  its *carrier*: the session's MCP front, a child of the host session. The guard also keeps when
+  each bound actor last sent a hook and whether a tool call is in flight (a pre-hook without its
+  post, a call still settling). A process id is liveness evidence only, never identity or
+  authority; a reused id can only make a gone holder look alive.
+- **Session ended.** The carrier's last lease closed and nothing arrived from the holder later
+  than 5 s after that: the start takes the writer over at once. Queued work of the gone session
+  is cancelled exactly as `ide.stop` cancels it.
+- **Inactive.** The holder has no tool call and no IDE work in flight (queued or pending job,
+  running test, unsettled edit, uncertain cleanup) and sent nothing for 30 minutes.
+- **Anything else is a live holder** and keeps its writer; the refusal names the holder and says
+  that the slot frees when that session ends or after 30 minutes without activity.
+
+A takeover runs the existing handover machinery: the holder is fenced against new work, revoked
+durably, its sessions and retained results are released, and the start re-runs. The reply says
+`took over the writer from actor <actor> (activation <id>, last activity <time>; its session
+ended | inactive for <m> min)`, and the journal records `takeover: actor <actor>
+(session_ended|inactive)`. The displaced actor's next call is refused with the closed cause
+`(taken_over)` and the reason; a fresh `ide.start` (read-only while the other actor writes)
+works again. Managed Codex is unaffected: each Codex front owns a private daemon and store.
 
 ### Lost replies (0.10.3)
 
@@ -382,8 +438,9 @@ commands: actor/call/phase are sufficient triggers; command text, paths and tool
 are never trusted as effects. `take_native_change_hint` consumes that bounded hint after
 a fresh liveness check. The worker invalidates old detail immediately, then reconciles only
 registered paths on the next MCP invocation. A binding keeps at most 256 distinct registered paths (a budget of its own, independent of the retained results limit); when the set is full, the least recently read path is evicted to make room, so a read is never refused for it. An evicted path is only no longer refreshed on native hints: an edit built on its retained read is judged by the file's bytes as always — still matching, it applies; changed, it meets the ordinary `stale_source` answer, which asks for a re-read.
-Duplicate pre-hooks, premature post-hooks and MCP-before-pre ordering reject that
-invocation for subsequent MCP validation in the remaining daemon lifetime; late hooks cannot repair it. Explicit stop revokes the
+Premature post-hooks and MCP-before-pre ordering reject that
+invocation for subsequent MCP validation in the remaining daemon lifetime; late hooks cannot repair it. The
+same pre delivered twice (one handler registered twice) counts as one pre. Explicit stop revokes the
 exact binding and rejects its pending pre-hooks before any Workspace handoff could occur.
 Post settlement for already validated calls can still complete. A fresh explicit start
 is required after stop; another actor's binding is unaffected.
@@ -394,7 +451,7 @@ Closed daemon outcomes are:
 
 | Outcome | Meaning |
 | --- | --- |
-| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(invalid_metadata)`, `(missing_field)`, `(invalid_field)`, `(invalid_attachment)`, `(unsupported_hook_phase)`, `(missing_invocation)`, `(outside_allowed_roots)`, `(hooks_not_delivered)`, `(missing_pre)`, `(replay)`, `(mismatch)`, `(inactive_binding)`, `(never_activated)`, `(recovery_needed)`, `(capacity_exceeded)`, `(host_unrecognized)`, or `(project_moved: bound to <path>, asked <path>)`; the refusal follows with the cause and next step. The same tag is the journal `detail`. The structured reply keeps its historical fields. |
+| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(invalid_metadata)`, `(missing_field)`, `(invalid_field)`, `(invalid_attachment)`, `(unsupported_hook_phase)`, `(missing_invocation)`, `(outside_allowed_roots)`, `(hooks_not_delivered)`, `(missing_pre)`, `(replay)`, `(mismatch)`, `(inactive_binding)`, `(taken_over)`, `(never_activated)`, `(recovery_needed)`, `(capacity_exceeded)`, `(host_unrecognized)`, or `(project_moved: bound to <path>, asked <path>)`; the refusal follows with the cause and next step. The same tag is the journal `detail`. The structured reply keeps its historical fields. |
 | `{"state":"unavailable","reason":"workspace_activation"}` | Host invocation and current binding are proven; Workspace activation is not connected. |
 | `{"state":"hook_observed"}` | One pre-hook was retained; no authority or delivery claim. |
 | `{"state":"hook_settled"}` | One exact post-hook settled a validated invocation. |

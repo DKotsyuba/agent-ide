@@ -176,6 +176,9 @@ struct LanguageState {
     latest_snapshot: Option<ProblemSnapshot>,
     /// Original publication wall-clock milliseconds; never refreshed by observation or reuse.
     snapshot_observed_at_ms: Option<u64>,
+    /// Most recent policy-valid completed attempt, including transient failures suppressed from
+    /// the usable problem feed; bounded to one snapshot for accepted-check settlement.
+    latest_attempt: Option<ProblemSnapshot>,
     /// `input_generation` of [`LanguageState::latest_snapshot`], used to discard stale completions.
     last_stored_generation: u64,
     /// Wall-clock instant the most recent run completed, for the EYES-r2 cooldown.
@@ -237,6 +240,7 @@ impl Scheduler {
                 }
                 lang.running = false;
                 lang.latest_snapshot = None;
+                lang.latest_attempt = None;
                 lang.completed_fingerprint = None;
                 lang.skip_eligible = false;
             }
@@ -278,6 +282,7 @@ impl Scheduler {
         lang.running = false;
         lang.dirty = false;
         lang.latest_snapshot = None;
+        lang.latest_attempt = None;
         lang.completed_fingerprint = None;
         lang.skip_eligible = false;
         lang.urgent = restart;
@@ -597,6 +602,20 @@ impl Scheduler {
             .into(),
             next_cursor: (end < retained.len()).then_some(end as u64),
         }
+    }
+
+    /// Returns the newest policy-valid completed attempt of one configured worktree/language.
+    /// Unlike `latest`, this includes transient Fatal/Timeout failures so an accepted waiter
+    /// observes its actual outcome. Environment or policy invalidation clears it; no I/O occurs.
+    pub fn latest_attempt(&self, worktree: &Path, language: Language) -> Option<ProblemSnapshot> {
+        self.inner
+            .lock_state()
+            .worktrees
+            .get(&canonical_worktree(worktree))?
+            .languages
+            .get(&language)?
+            .latest_attempt
+            .clone()
     }
 
     /// Returns the languages whose stored snapshot for `worktree` predates the latest
@@ -1142,6 +1161,13 @@ impl Inner {
         else {
             return false;
         };
+        if lang
+            .latest_attempt
+            .as_ref()
+            .is_none_or(|previous| snapshot.input_generation >= previous.input_generation)
+        {
+            lang.latest_attempt = Some(snapshot.clone());
+        }
         if is_transient_failure(&snapshot.state)
             && matches!(
                 lang.latest_snapshot
@@ -1508,7 +1534,7 @@ fn canonical_worktree(worktree: &Path) -> PathBuf {
 
 /// Reports whether `state` is a transient failure (EYES-r2 §5: `Fatal` or `Timeout`) that must
 /// not overwrite an existing usable result, as opposed to a durable `Unavailable` condition.
-fn is_transient_failure(state: &CheckState) -> bool {
+pub(crate) fn is_transient_failure(state: &CheckState) -> bool {
     matches!(
         state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -1589,6 +1615,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod deny_tests {
     use super::*;
+    use std::os::unix::fs::DirBuilderExt;
 
     /// Retained partial/error evidence stays bounded and stale, with stable original publication
     /// time, exact common-dir isolation, and no directory/cache/check creation on repeated reads.
@@ -1741,7 +1768,11 @@ mod deny_tests {
                 old_problem.is_some()
             ));
             let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
             let root = std::fs::canonicalize(root).unwrap();
             std::fs::write(root.join("beta.toml"), "").unwrap();
             let old = ProblemSnapshot::from_problems(
@@ -1861,7 +1892,11 @@ mod deny_tests {
             "gated"
         ));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
         let root = std::fs::canonicalize(root).unwrap();
         std::fs::write(root.join("alpha.toml"), "").unwrap();
         std::fs::write(root.join("beta.toml"), "").unwrap();
@@ -1993,7 +2028,11 @@ mod deny_tests {
                 reason
             ));
             let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
             let root = std::fs::canonicalize(&root).unwrap();
             std::fs::write(root.join("beta.toml"), "").unwrap();
             assert!(crate::lang::testing::BETA.is_present(&root));
@@ -2168,7 +2207,11 @@ mod deny_tests {
     async fn deny_glob_skips_worktree_fingerprint() {
         let root =
             std::env::temp_dir().join(format!("agent-ide-deny-fingerprint-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
         let root = std::fs::canonicalize(root).unwrap();
         let scheduler = Scheduler::new(Vec::new(), Duration::from_millis(1), 1, root.join("cache"))
             .with_fingerprint(Arc::new(|_| panic!("denied worktree was fingerprinted")));
@@ -2188,7 +2231,11 @@ mod deny_tests {
     async fn policy_change_drops_completion_waiting_at_publication() {
         let root =
             std::env::temp_dir().join(format!("agent-ide-policy-barrier-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
         let root = std::fs::canonicalize(root).unwrap();
         std::fs::write(root.join("beta.toml"), "").unwrap();
         let entered = Arc::new(Barrier::new(2));
@@ -2228,6 +2275,45 @@ mod deny_tests {
         scheduler.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
+    /// A transient failed attempt remains observable to accepted check waiters while the
+    /// ordinary problem feed preserves its prior usable report; invalidation clears both.
+    #[test]
+    fn latest_attempt_preserves_fatal_timeout_without_replacing_ready() {
+        crate::lang::testing::install();
+        let scratch = crate::scratch::ScratchDir::new("check-attempt");
+        let root = scratch.canonicalize().unwrap();
+        let language = crate::lang::testing::ALPHA;
+        let scheduler = Scheduler::new(Vec::new(), Duration::from_millis(1), 1, root.join("cache"));
+        let mut wt = WorktreeState::new("repo");
+        wt.languages.insert(language, LanguageState::default());
+        scheduler
+            .inner
+            .lock_state()
+            .worktrees
+            .insert(root.clone(), wt);
+        let ready = ProblemSnapshot::from_problems(language, CheckState::Ready, Vec::new(), 1, 0);
+        assert!(scheduler.inner.store_snapshot(&root, ready.clone(), 0));
+        for (generation, reason) in [
+            (2, UnavailableReason::Fatal),
+            (3, UnavailableReason::Timeout),
+        ] {
+            let mut attempt = ProblemSnapshot::from_problems(
+                language,
+                CheckState::Unavailable(reason),
+                Vec::new(),
+                generation,
+                0,
+            );
+            attempt.detail = Some(format!("attempt {generation} actual cause"));
+            assert!(scheduler.inner.store_snapshot(&root, attempt.clone(), 0));
+            assert_eq!(scheduler.latest(&root), vec![ready.clone()]);
+            assert_eq!(scheduler.latest_attempt(&root, language), Some(attempt));
+        }
+        scheduler.discard_environment(&root, language);
+        assert!(scheduler.latest_attempt(&root, language).is_none());
+        assert!(scheduler.latest(&root).is_empty());
+    }
+
     /// Environment changes discard the stale snapshot and bypass an unchanged fingerprint.
     #[tokio::test]
     async fn environment_change_forces_unchanged_fingerprint_and_drops_snapshot() {
@@ -2235,7 +2321,11 @@ mod deny_tests {
         let language = crate::lang::testing::ALPHA;
         let root =
             std::env::temp_dir().join(format!("environment-scheduler-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
         let root = root.canonicalize().unwrap();
         std::fs::write(root.join("alpha.toml"), "").unwrap();
         let ready = ProblemSnapshot::from_problems(language, CheckState::Ready, Vec::new(), 1, 0);

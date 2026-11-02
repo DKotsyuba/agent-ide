@@ -23,7 +23,7 @@ use std::{
     process::{Command, ExitStatus},
     time::Duration,
 };
-use support::{GIT, GitFixture};
+use support::{GitFixture, git_program};
 
 /// Mutable test data for malformed-input scenarios; conversion still passes Execution's checked constructor.
 #[derive(Clone)]
@@ -89,7 +89,7 @@ fn discovered(root: &Path) -> (DiscoveryOperationRef, Vec<DiscoveryFixture>) {
             vec!["worktree", "list", "--porcelain", "-z"],
         ),
     ] {
-        let output = Command::new(GIT)
+        let output = Command::new(git_program())
             .env_clear()
             .arg("-C")
             .arg(root)

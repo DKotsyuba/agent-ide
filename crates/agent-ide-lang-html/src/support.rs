@@ -83,6 +83,18 @@ impl LanguageSupport for HtmlSupport {
         ))
     }
 
+    /// HTML regions: `<!doctype>` and `<!-- -->` header, no imports, blocks are runs of
+    /// non-blank lines between outlined elements.
+    fn region_rules(&self) -> &'static agent_ide_core::lang::regions::RegionRules {
+        &agent_ide_core::lang::regions::RegionRules {
+            line_comments: &[],
+            block_comment: Some(("<!--", "-->")),
+            header_prefixes: &["<!doctype"],
+            blank_line_blocks: true,
+            ..agent_ide_core::lang::regions::GENERIC_RULES
+        }
+    }
+
     /// Documents are never tests.
     fn is_test_file(&self, _file: &Path) -> bool {
         false

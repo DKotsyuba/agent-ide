@@ -136,6 +136,37 @@ impl BindingRef {
         }
     }
 
+    /// Returns whether `other` rides the same host contract and trusted channel, whatever its
+    /// actor or generation: the sessions of one host session (a Claude main thread and its
+    /// subagents) share a channel, so a host-session-wide event such as a context compaction
+    /// reaches all of them.
+    pub(crate) fn same_channel(&self, other: &BindingRef) -> bool {
+        self.host == other.host && self.channel == other.channel
+    }
+
+    /// Returns the host contract this binding was established under.
+    pub(crate) fn host(&self) -> HostKind {
+        self.host
+    }
+
+    /// Returns whether this binding's actor is the host session itself (a Claude main thread or a
+    /// Codex thread) rather than a subagent: `session_id` is the host's own session identifier.
+    pub(crate) fn actor_is(&self, session_id: &str) -> bool {
+        self.actor_id == session_id
+    }
+
+    /// Returns the native actor already established by protected local correlation. Only trusted
+    /// delivery code may combine it with explicit operator store configuration; it is not proof
+    /// on its own and must never be accepted from model arguments or used to mint authority.
+    pub(crate) fn native_actor_id(&self) -> &str {
+        &self.actor_id
+    }
+
+    /// Returns the private actor tag of this binding's actor (see [`actor_tag`]).
+    pub(crate) fn actor_tag(&self) -> String {
+        actor_tag(&self.actor_id)
+    }
+
     /// Returns a stable opaque persistence key without exposing actor/channel fields or minting proof.
     /// The domain and length framing preserve distinct actor, channel, and generation identities.
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
@@ -184,6 +215,17 @@ pub enum HookPhase {
     PermissionDenied,
     /// The native host has completed a batch without supplying one synthetic tool-call identity.
     PostBatch,
+    /// The host compacted or cleared the session's context (`PreCompact`, or Claude's
+    /// `SessionStart` with source `compact` or `clear`); it raises the session compaction counter.
+    Compaction,
+}
+
+impl HookPhase {
+    /// Whether this phase is a turn-level event that names no tool call: it pairs with no pre and
+    /// only looks up the actor's active binding.
+    pub fn is_turn_event(self) -> bool {
+        matches!(self, HookPhase::Compaction)
+    }
 }
 
 /// Names the host contract that supplied one native event; it is never inferred from process state.
@@ -324,6 +366,42 @@ impl HookEvent {
     }
 }
 
+/// Why a stale writer's activation was taken over by another actor's `ide.start`
+/// (start-index-state r2 §4). It is the evidence the successor's reply names and what the
+/// displaced actor's next call is told.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum TakeoverReason {
+    /// The MCP process that carried the holder's calls ended and nothing arrived from the holder
+    /// afterwards: its host session is gone.
+    SessionEnded,
+    /// The holder had no tool call and no IDE work in flight and sent nothing for `minutes`
+    /// whole minutes (at least the 30-minute threshold).
+    Inactive {
+        /// Whole minutes since the holder's last hook or call.
+        minutes: u64,
+    },
+}
+
+impl TakeoverReason {
+    /// The evidence as the successor's start reply names it: `its session ended` or
+    /// `inactive for <m> min`.
+    pub fn evidence(self) -> String {
+        match self {
+            Self::SessionEnded => "its session ended".to_owned(),
+            Self::Inactive { minutes } => format!("inactive for {minutes} min"),
+        }
+    }
+
+    /// The reason as the displaced actor's next call is told: `after this session's IDE
+    /// connection closed` or `after <m> min without activity`.
+    pub fn displaced(self) -> String {
+        match self {
+            Self::SessionEnded => "after this session's IDE connection closed".to_owned(),
+            Self::Inactive { minutes } => format!("after {minutes} min without activity"),
+        }
+    }
+}
+
 /// Describes why host binding is unavailable without retaining or reporting raw host data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BindingUnavailable {
@@ -353,6 +431,9 @@ pub enum BindingUnavailable {
     Replay,
     /// Bounded pending, binding, channel, scope, or replay storage is full.
     CapacityExceeded,
+    /// This scope's activation was taken over by another actor's `ide.start` as a stale writer;
+    /// the remedy is a fresh `ide.start` (read-only while the other actor writes).
+    TakenOver(TakeoverReason),
 }
 
 /// Reports the lifecycle strength available to a Workspace or Execution consumer.
@@ -371,6 +452,9 @@ pub enum BindingStatus {
     /// A complete native hook lifecycle marks this active binding for registered-path recheck.
     /// It proves neither an MCP invocation nor a source effect or successful native command.
     NativeObserved(BindingRef),
+    /// A turn-level event (a compaction) named this active binding's actor
+    /// on its channel. It pairs with no call and proves no tool effect.
+    TurnObserved(BindingRef),
     /// Required host data was absent, malformed, mismatched, replayed, or unavailable.
     Unavailable(BindingUnavailable),
 }
@@ -470,9 +554,132 @@ pub struct HostBindingGuard {
     replays: BTreeMap<ChannelSessionRef, ChannelReplayScopes>,
     /// Monotonic replay insertion order; the oldest settled records are evicted first.
     next_replay_sequence: u64,
+    /// When each bound scope last sent a hook or established its start: the holder-silence
+    /// evidence of a stale-writer takeover. Kept only while the scope holds a binding.
+    last_seen: BTreeMap<(HostKind, String, ChannelSessionRef), std::time::Instant>,
+    /// Scopes whose activation a stale-writer takeover revoked, with why, so their next call is
+    /// told `taken_over` instead of a bare `inactive_binding`, and when. Cleared by the scope's
+    /// next start; past the binding-table ceiling the oldest record goes first.
+    displaced:
+        BTreeMap<(HostKind, String, ChannelSessionRef), (TakeoverReason, std::time::Instant)>,
+    /// Which process carried each binding's calls and when front leases ended (takeover
+    /// evidence); kept under this guard's lock with the bindings it describes.
+    carriers: super::carriers::Carriers,
 }
 
 impl HostBindingGuard {
+    /// Records that a bound scope was just heard from (a hook or its start). Unbound scopes are
+    /// not recorded, so the table never outgrows the binding table.
+    fn note_seen(&mut self, host: HostKind, actor_id: &str, channel: &ChannelSessionRef) {
+        let key = (host, actor_id.to_owned(), channel.clone());
+        if self.bindings.contains_key(&key) {
+            self.last_seen.insert(key, std::time::Instant::now());
+        }
+    }
+
+    /// When `binding`'s scope last sent a hook or started; `None` when it is not the scope's
+    /// current generation or nothing was recorded.
+    pub fn last_seen(&self, binding: &BindingRef) -> Option<std::time::Instant> {
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
+        (self.bindings.get(&key) == Some(binding))
+            .then(|| self.last_seen.get(&key).copied())
+            .flatten()
+    }
+
+    /// Whether `binding`'s actor has a tool call in flight on its channel: a pre-hook that is
+    /// still waiting for its call or its post, or a validated call still settling. A host that
+    /// lost a post leaves this true for good, which only ever keeps a holder from being taken
+    /// over for inactivity.
+    pub fn call_in_flight(&self, binding: &BindingRef) -> bool {
+        let owned = |invocation: &(CandidateInvocation, ChannelSessionRef)| {
+            invocation.0.host == binding.host
+                && invocation.0.actor_id == binding.actor_id
+                && invocation.1 == binding.channel
+        };
+        self.pre_observed.iter().any(owned) || self.settling.keys().any(owned)
+    }
+
+    /// Revokes `binding` as displaced by a stale-writer takeover: exactly [`Self::stop_binding`],
+    /// plus a record that the scope's next call is refused `TakenOver(reason)` rather than
+    /// `InactiveBinding`. The record lasts until the scope starts again and is bounded by the
+    /// binding-table ceiling (the oldest record goes first).
+    pub fn displace(
+        &mut self,
+        binding: &BindingRef,
+        reason: TakeoverReason,
+    ) -> Result<(), BindingUnavailable> {
+        let stopped = self.stop_binding(binding);
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
+        if !self.bindings.contains_key(&key) {
+            if self.displaced.len() >= MAX_BINDINGS
+                && let Some(oldest) = self
+                    .displaced
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(scope, _)| scope.clone())
+            {
+                self.displaced.remove(&oldest);
+            }
+            self.displaced
+                .insert(key, (reason, std::time::Instant::now()));
+        }
+        stopped
+    }
+
+    /// Records that process `pid` opened a client lease on this daemon: it is a live carrier
+    /// until its last open lease reaches EOF.
+    pub fn carrier_opened(&mut self, pid: u32) {
+        self.carriers.opened(pid);
+    }
+
+    /// Records that a client lease of process `pid` reached EOF now.
+    pub fn carrier_closed(&mut self, pid: u32) {
+        self.carriers.closed(pid, std::time::Instant::now());
+    }
+
+    /// Records that process `pid` carried a validated call of `binding` while it is the scope's
+    /// current generation; a stale generation is ignored.
+    pub fn note_carrier(&mut self, binding: &BindingRef, pid: u32) {
+        if self.check_active(binding).is_ok() {
+            self.carriers.note(binding, pid);
+        }
+    }
+
+    /// The liveness evidence of `binding`'s holder, without its IDE work (the worker adds that):
+    /// when its carrier ended, when it was last heard from, and whether a tool call is in flight.
+    pub(crate) fn holder_evidence(&self, binding: &BindingRef) -> super::carriers::HolderEvidence {
+        super::carriers::HolderEvidence {
+            carrier_ended: self.carriers.ended_at(binding),
+            last_seen: self.last_seen(binding),
+            call_in_flight: self.call_in_flight(binding),
+            pending_work: None,
+        }
+    }
+
+    /// Moves `binding`'s last-seen record `by` into the past, so a test can stand for a long
+    /// silence without waiting.
+    #[cfg(test)]
+    pub(crate) fn backdate_seen(&mut self, binding: &BindingRef, by: std::time::Duration) {
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
+        if let Some(seen) = self.last_seen.get_mut(&key)
+            && let Some(earlier) = seen.checked_sub(by)
+        {
+            *seen = earlier;
+        }
+    }
+
     /// Remembers an established scope without exceeding the binding table's history ceiling.
     fn record_ever_bound(&mut self, key: (HostKind, String, ChannelSessionRef)) {
         if self.ever_bound.contains(&key) {
@@ -592,18 +799,19 @@ impl HostBindingGuard {
         BindingStatus::Validated(validated(candidate, binding, created_binding))
     }
 
-    /// Names the refusal for a scope whose generation is absent: `NeverActivated` while this
-    /// daemon boot never held a binding for it, else `InactiveBinding` for a stopped one.
+    /// Names the refusal for a scope whose generation is absent: `TakenOver` when a stale-writer
+    /// takeover displaced it, else `NeverActivated` while this daemon boot never held a binding
+    /// for it, else `InactiveBinding` for a stopped one.
     fn inactive_or_never(
         &self,
         host: HostKind,
         actor_id: &str,
         channel: &ChannelSessionRef,
     ) -> BindingUnavailable {
-        if self
-            .ever_bound
-            .contains(&(host, actor_id.to_owned(), channel.clone()))
-        {
+        let key = (host, actor_id.to_owned(), channel.clone());
+        if let Some((reason, _)) = self.displaced.get(&key) {
+            BindingUnavailable::TakenOver(*reason)
+        } else if self.ever_bound.contains(&key) {
             BindingUnavailable::InactiveBinding
         } else {
             BindingUnavailable::NeverActivated
@@ -789,9 +997,11 @@ impl HostBindingGuard {
                 generation,
             };
             self.record_ever_bound(binding_key.clone());
+            self.displaced.remove(&binding_key);
             self.bindings.insert(binding_key, binding.clone());
             (binding, true)
         };
+        self.note_seen(candidate.host, &candidate.actor_id, &binding.channel);
         self.pre_observed.remove(&invocation);
         self.settling.insert(invocation, binding.clone());
         BindingStatus::Validated(validated(candidate, binding, created_binding))
@@ -875,13 +1085,29 @@ impl HostBindingGuard {
 
     /// Buffers a native pre-hook or records a per-tool/batch post for a channel-bound invocation.
     ///
-    /// Duplicate pre-hooks and post-before-MCP lifecycles prevent later MCP validation.
+    /// Post-before-MCP lifecycles prevent later MCP validation. The same pre delivered twice (one
+    /// handler registered twice) is idempotent and never rejects its call.
     /// For an already active binding, a complete Pre/Post without MCP also coalesces one
     /// native-change hint. Failed commands and edit/delete/rename lifecycles use the same hint;
     /// tool payloads are never interpreted as proof of effects.
     /// A pre-hook is not an authority claim. A post-hook never gates MCP result acceptance: it
     /// only settles a call that was already validated by `establish_start` or `validate_active`.
     pub fn observe_hook(&mut self, event: HookEvent, channel: ChannelSessionRef) -> BindingStatus {
+        // Any hook of a bound actor proves its session is alive (takeover evidence), a compaction
+        // and a pre delivered twice included: each stands for a real host event.
+        self.note_seen(event.host, &event.actor_id, &channel);
+        if event.phase.is_turn_event() {
+            let (host, actor_id) = (event.host, event.actor_id.clone());
+            return match self
+                .bindings
+                .get(&(host, actor_id.clone(), channel.clone()))
+            {
+                Some(binding) => BindingStatus::TurnObserved(binding.clone()),
+                None => {
+                    BindingStatus::Unavailable(self.inactive_or_never(host, &actor_id, &channel))
+                }
+            };
+        }
         if event.phase == HookPhase::PostBatch {
             // Claude's PostToolUse already fires once per exact tool call; its uncorrelated batch
             // boundary must never coalesce a native-change hint that Claude never actually proved.
@@ -921,14 +1147,13 @@ impl HostBindingGuard {
             return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
         match event.phase {
-            HookPhase::Pre
-                if self.pre_observed.contains(&invocation)
-                    || self.settling.contains_key(&invocation) =>
-            {
-                self.pre_observed.remove(&invocation);
-                self.settling.remove(&invocation);
-                self.record_replay(&invocation, ReplayDisposition::Rejected)
-                    .expect("the checked rejection scope has capacity");
+            // A handler registered twice (a plugin beside a hand-merged hooks.json, or a harness
+            // beside the user's hooks.json) delivers every pre twice with the same identity. The
+            // pending pre stays pending, and a pre whose call was already validated is a silent
+            // replay; neither rejects the call (T-010), and a true replay of a settled or
+            // rejected call is still refused above.
+            HookPhase::Pre if self.pre_observed.contains(&invocation) => BindingStatus::PreObserved,
+            HookPhase::Pre if self.settling.contains_key(&invocation) => {
                 BindingStatus::Unavailable(BindingUnavailable::Replay)
             }
             HookPhase::Pre => {
@@ -990,7 +1215,9 @@ impl HostBindingGuard {
                     .expect("the checked rejection scope has capacity");
                 BindingStatus::Unavailable(BindingUnavailable::Mismatch)
             }
-            HookPhase::PostBatch => unreachable!("batch hooks return before invocation matching"),
+            HookPhase::PostBatch | HookPhase::Compaction => {
+                unreachable!("batch and turn hooks return before invocation matching")
+            }
         }
     }
 
@@ -1306,6 +1533,8 @@ impl HostBindingGuard {
         self.bindings.remove(&key);
         self.stopping.remove(binding);
         self.native_hints.remove(binding);
+        self.last_seen.remove(&key);
+        self.carriers.forget(binding);
         self.settling.retain(|_, owner| owner != binding);
         Ok(())
     }
@@ -1323,6 +1552,8 @@ impl HostBindingGuard {
         self.bindings.remove(&key);
         self.stopping.remove(binding);
         self.native_hints.remove(binding);
+        self.last_seen.remove(&key);
+        self.carriers.forget(binding);
         let pending: Vec<_> = self
             .pre_observed
             .iter()
@@ -1354,6 +1585,7 @@ impl HostBindingGuard {
         self.bindings.clear();
         self.stopping.clear();
         self.native_hints.clear();
+        self.last_seen.clear();
     }
 
     /// Reports whether one exact call identity already delivered its pre-hook on this channel.
@@ -1517,6 +1749,7 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
         "PostToolUseFailure" => HookPhase::PostFailure,
         "PermissionDenied" => HookPhase::PermissionDenied,
         "PostToolBatch" => HookPhase::PostBatch,
+        "PreCompact" => HookPhase::Compaction,
         _ => return Err(BindingUnavailable::UnsupportedHookPhase),
     };
     let session_id = payload
@@ -1546,6 +1779,7 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
         actor_id,
         call_id: match (phase, payload.tool_use_id) {
             (HookPhase::PostBatch, None) => None,
+            (phase, _) if phase.is_turn_event() => None,
             (_, Some(value)) => Some(checked_identifier(value, "tool_use_id")?),
             _ => return Err(BindingUnavailable::MissingField("tool_use_id")),
         },
@@ -1578,6 +1812,10 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
         "PostToolUseFailure" => HookPhase::PostFailure,
         "PermissionDenied" => HookPhase::PermissionDenied,
         "PostToolBatch" => HookPhase::PostBatch,
+        "PreCompact" => HookPhase::Compaction,
+        "SessionStart" if matches!(payload.source.as_deref(), Some("compact" | "clear")) => {
+            HookPhase::Compaction
+        }
         _ => return Err(BindingUnavailable::UnsupportedHookPhase),
     };
     let session_id = checked_identifier(payload.session_id, "session_id")?;
@@ -1591,6 +1829,7 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
         .transpose()?;
     let call_id = match (phase, payload.tool_use_id) {
         (HookPhase::PostBatch, None) => None,
+        (phase, _) if phase.is_turn_event() => None,
         (_, Some(value)) => Some(checked_identifier(value, "tool_use_id")?),
         _ => return Err(BindingUnavailable::MissingField("tool_use_id")),
     };
@@ -1671,6 +1910,8 @@ struct ClaudeHookPayload {
     /// Whole native tool input; only its bounded `file_path`/`notebook_path` string is ever
     /// retained.
     tool_input: Option<serde_json::Value>,
+    /// `SessionStart` source; only `compact` and `clear` make it a compaction event.
+    source: Option<String>,
 }
 
 /// Reads a required bounded string field without reporting its raw value.
@@ -2133,9 +2374,125 @@ mod tests {
         }
     }
 
+    /// T-010 × takeover evidence: a pre delivered twice refreshes the holder's last-seen time
+    /// like any hook (both copies stand for one real tool call), keeps that call in flight until
+    /// its post instead of hiding it, and a late copy after the call settled puts nothing in
+    /// flight.
+    #[test]
+    fn a_pre_delivered_twice_keeps_takeover_evidence_truthful() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("evidence-channel");
+        assert!(matches!(
+            guard.observe_hook(claude_pre("session", None, "start"), channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        let BindingStatus::Validated(start) =
+            guard.establish_start_claude("start", channel.clone())
+        else {
+            panic!("the start binds")
+        };
+        let binding = start.binding_ref().clone();
+        assert!(matches!(
+            guard.observe_hook(claude_post("session", None, "start"), channel.clone()),
+            BindingStatus::Settled(_)
+        ));
+        assert!(!guard.call_in_flight(&binding));
+        guard.backdate_seen(&binding, std::time::Duration::from_secs(3600));
+        let silent = guard.last_seen(&binding).expect("a bound scope is seen");
+        for _ in 0..2 {
+            assert!(matches!(
+                guard.observe_hook(claude_pre("session", None, "read"), channel.clone()),
+                BindingStatus::PreObserved
+            ));
+            assert!(guard.call_in_flight(&binding));
+        }
+        assert!(guard.last_seen(&binding).is_some_and(|seen| seen > silent));
+        assert!(matches!(
+            guard.validate_active_claude("read", channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(matches!(
+            guard.observe_hook(claude_pre("session", None, "read"), channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        assert!(
+            guard.call_in_flight(&binding),
+            "the validated call still settles"
+        );
+        assert!(matches!(
+            guard.observe_hook(claude_post("session", None, "read"), channel.clone()),
+            BindingStatus::Settled(_)
+        ));
+        assert!(!guard.call_in_flight(&binding));
+        assert!(matches!(
+            guard.observe_hook(claude_pre("session", None, "read"), channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        assert!(
+            !guard.call_in_flight(&binding),
+            "a late copy puts nothing in flight"
+        );
+    }
+
+    /// T-010 regression: with one agent-ide handler registered twice (Codex loads the user's
+    /// hooks.json beside a harness's or plugin's own entries), every hook arrives twice. Every
+    /// managed call is still admitted, a native lifecycle yields exactly one observation, and a
+    /// consumed call id stays a refused replay.
+    #[test]
+    fn a_handler_registered_twice_keeps_every_call_working() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("doubled-handlers");
+        assert!(matches!(
+            guard.establish_managed_codex_start(codex_candidate("actor", "start"), channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        for call in ["read-1", "read-2", "read-3"] {
+            for _ in 0..2 {
+                assert!(matches!(
+                    guard.observe_hook(codex_hook("PreToolUse", "actor", call), channel.clone()),
+                    BindingStatus::PreObserved
+                ));
+            }
+            assert!(
+                matches!(
+                    guard.validate_managed_codex_active(
+                        codex_candidate("actor", call),
+                        channel.clone()
+                    ),
+                    BindingStatus::Validated(_)
+                ),
+                "{call}"
+            );
+            for _ in 0..2 {
+                assert!(matches!(
+                    guard.observe_hook(codex_hook("PostToolUse", "actor", call), channel.clone()),
+                    BindingStatus::Unavailable(BindingUnavailable::Replay)
+                ));
+            }
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                guard.observe_hook(codex_hook("PreToolUse", "actor", "bash"), channel.clone()),
+                BindingStatus::PreObserved
+            ));
+        }
+        assert!(matches!(
+            guard.observe_hook(codex_hook("PostToolUse", "actor", "bash"), channel.clone()),
+            BindingStatus::NativeObserved(_)
+        ));
+        assert!(!matches!(
+            guard.observe_hook(codex_hook("PostToolUse", "actor", "bash"), channel.clone()),
+            BindingStatus::NativeObserved(_)
+        ));
+        assert!(matches!(
+            guard.validate_managed_codex_active(codex_candidate("actor", "read-1"), channel),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+    }
+
     /// Pins the managed pairing state machine (T29B §4): managed MCP admission consumes its
-    /// paired exact pre-observation and silences its own post, while duplicate pres, completed
-    /// call IDs, conflicting settling state and pre-less native posts stay rejected.
+    /// paired exact pre-observation (delivered once or twice) and silences its own post, while
+    /// completed call IDs, conflicting settling state and pre-less native posts stay rejected.
     #[test]
     fn managed_codex_admission_consumes_a_paired_pre_and_keeps_rejections() {
         let mut guard = HostBindingGuard::default();
@@ -2169,21 +2526,34 @@ mod tests {
             ),
             BindingStatus::Unavailable(BindingUnavailable::Replay)
         ));
-        // A duplicated pre-event poisons the invocation permanently, for hooks and admission alike.
+        // A pre delivered twice (one handler registered twice, T-010) stays one pending pre:
+        // admission still validates the call, its posts are silent, and the consumed call id
+        // is then refused as a replay.
+        for _ in 0..2 {
+            assert!(matches!(
+                guard.observe_hook(
+                    codex_hook("PreToolUse", "actor-a", "call-2"),
+                    channel.clone()
+                ),
+                BindingStatus::PreObserved
+            ));
+        }
         assert!(matches!(
-            guard.observe_hook(
-                codex_hook("PreToolUse", "actor-a", "call-2"),
+            guard.validate_managed_codex_active(
+                codex_candidate("actor-a", "call-2"),
                 channel.clone()
             ),
-            BindingStatus::PreObserved
+            BindingStatus::Validated(_)
         ));
-        assert!(matches!(
-            guard.observe_hook(
-                codex_hook("PreToolUse", "actor-a", "call-2"),
-                channel.clone()
-            ),
-            BindingStatus::Unavailable(BindingUnavailable::Replay)
-        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                guard.observe_hook(
+                    codex_hook("PostToolUse", "actor-a", "call-2"),
+                    channel.clone()
+                ),
+                BindingStatus::Unavailable(BindingUnavailable::Replay)
+            ));
+        }
         assert!(matches!(
             guard.validate_managed_codex_active(
                 codex_candidate("actor-a", "call-2"),
@@ -2617,13 +2987,25 @@ mod tests {
             BindingStatus::PreObserved
         ));
         assert!(matches!(
+            duplicate.observe_hook(event.clone(), duplicate_channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        // The same pre delivered twice (one handler registered twice, T-010) is one pre: the
+        // start binds, a third copy after validation is a silent replay, and the post settles.
+        assert!(matches!(
+            duplicate.establish_start_claude("duplicate-call", duplicate_channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(matches!(
             duplicate.observe_hook(event, duplicate_channel.clone()),
             BindingStatus::Unavailable(BindingUnavailable::Replay)
         ));
-        // The duplicated pre was rejected as replay evidence, so the call names that cause.
         assert!(matches!(
-            duplicate.establish_start_claude("duplicate-call", duplicate_channel),
-            BindingStatus::Unavailable(BindingUnavailable::Replay)
+            duplicate.observe_hook(
+                claude_post("session", Some("child"), "duplicate-call"),
+                duplicate_channel
+            ),
+            BindingStatus::Settled(_)
         ));
     }
 
@@ -2796,6 +3178,40 @@ mod tests {
             BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
         ));
         // Nothing but live sessions is never evicted.
+    }
+
+    /// Past the binding-table ceiling, the displacement record that goes first is the oldest one,
+    /// not the smallest scope: the first displaced scope sorts last here and is still evicted.
+    #[test]
+    fn displacement_records_evict_the_oldest_first() {
+        let mut guard = HostBindingGuard::default();
+        let names: Vec<String> = std::iter::once("z-first".to_owned())
+            .chain((0..MAX_BINDINGS).map(|index| format!("a-{index:02}")))
+            .collect();
+        for name in &names {
+            let scope = channel(name);
+            let event = parse_hook_event(
+                json!({"hook_event_name":"PreToolUse","session_id":"actor","tool_use_id":name})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .expect("test hook is valid");
+            guard.observe_hook(event, scope.clone());
+            let BindingStatus::Validated(call) =
+                guard.establish_start(codex_candidate("actor", name), scope)
+            else {
+                panic!("{name} binds");
+            };
+            let _ = guard.displace(&call.binding, TakeoverReason::SessionEnded);
+        }
+        let displaced = |name: &str| {
+            guard
+                .displaced
+                .contains_key(&(HostKind::Codex, "actor".to_owned(), channel(name)))
+        };
+        assert_eq!(guard.displaced.len(), MAX_BINDINGS);
+        assert!(!displaced("z-first"), "the oldest record went first");
+        assert!(displaced("a-00") && displaced("a-63"));
     }
 
     /// Keeps total channel, scope, and record counts within their explicit product bounds.

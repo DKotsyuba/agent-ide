@@ -1,7 +1,7 @@
 //! Collection and publication-exclusion tests for [`super`], on private temporary roots.
 
 use super::*;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 
 /// Two days: past [`STALE_AFTER`].
 const OLD: Duration = Duration::from_secs(2 * 86_400);
@@ -10,6 +10,51 @@ const OLD: Duration = Duration::from_secs(2 * 86_400);
 /// it, when dropped. `name` only labels it.
 fn scratch(name: &str) -> crate::scratch::ScratchDir {
     crate::scratch::ScratchDir::new(&format!("hints-{name}"))
+}
+
+/// Linux chooses a stable private runtime parent and rejects an unsafe explicit XDG directory.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_runtime_parent_prefers_private_runtime_and_validates_xdg() {
+    let root = scratch("linux-runtime-parent");
+    let conventional = root.join("runtime");
+    let xdg = root.join("xdg");
+    let home = root.join("home");
+    for path in [&conventional, &xdg, &home] {
+        fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    }
+    assert_eq!(
+        linux_platform_root(
+            &conventional,
+            Some(xdg.clone().into_os_string()),
+            Some(home.clone()),
+        )
+        .unwrap(),
+        fs::canonicalize(&conventional).unwrap()
+    );
+    fs::remove_dir(&conventional).unwrap();
+    assert_eq!(
+        linux_platform_root(
+            &conventional,
+            Some(xdg.clone().into_os_string()),
+            Some(home.clone()),
+        )
+        .unwrap(),
+        fs::canonicalize(&xdg).unwrap()
+    );
+    fs::set_permissions(&xdg, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        linux_platform_root(
+            &conventional,
+            Some(xdg.into_os_string()),
+            Some(home.clone()),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        linux_platform_root(&conventional, None, Some(home.clone())).unwrap(),
+        fs::canonicalize(home).unwrap()
+    );
 }
 
 /// Builds the hint directory of `slot` (16 hex digits) below `root`, holding a `key` file naming
@@ -223,4 +268,41 @@ fn an_unsafe_publisher_appearing_mid_pass_keeps_the_remaining_hints() {
         })
         .count();
     assert_eq!(left, 2);
+}
+
+/// An explicit parent confines stale collection to that root; malformed overrides never select
+/// the legacy parent. Both the selected and untouched sentinel roots are private test scratch.
+#[test]
+fn redirected_parent_confines_collection_and_rejects_malformed_overrides() {
+    let selected = scratch("redirected-root");
+    let untouched = scratch("unselected-root");
+    let selected_hint = hint(&selected, "0000000000000001", None, OLD);
+    let untouched_hint = hint(&untouched, "0000000000000002", None, OLD);
+    let root = resolve_root(Some(selected.as_os_str().to_owned())).unwrap();
+    assert_eq!(root, fs::canonicalize(&*selected).unwrap());
+    let report = collect(&root, true, SystemTime::now(), &|| true);
+    assert_eq!(report.stale, 1);
+    assert!(!selected_hint.exists());
+    assert!(untouched_hint.exists());
+    assert!(resolve_root(Some("relative".into())).is_err());
+    assert!(resolve_root(Some(selected.join("../escape").into_os_string())).is_err());
+    assert!(resolve_root(Some(selected.join("missing").into_os_string())).is_err());
+}
+
+/// An existing regular file, including a symlink to it, is not a rendezvous parent; rejecting
+/// it before collection prevents callers from sweeping state under an invalid operator value.
+#[test]
+fn nondirectory_parent_is_rejected_before_collection() {
+    let root = scratch("nondirectory-parent");
+    let file = root.join("parent-file");
+    fs::write(&file, "not a directory").unwrap();
+    let link = root.join("parent-link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    for parent in [file, link] {
+        assert!(
+            resolve_root(Some(parent.clone().into_os_string())).is_err(),
+            "an existing file cannot be a rendezvous parent: {}",
+            parent.display()
+        );
+    }
 }

@@ -5,7 +5,7 @@ use tokio::io::AsyncBufReadExt;
 
 /// Creates one synthetic request with a bounded local execution policy.
 fn request(kind: CommandKind, program: &str, args: &[&str]) -> ValidatedExecutionRequest {
-    let root = PathBuf::from("/private/tmp");
+    let root = std::env::temp_dir();
     ValidatedExecutionRequest::validate(
         ValidatedHostInvocation::from_verified_binding("linear-contract").unwrap(),
         WorkspaceAuthority::from_workspace("tree", "1", root.clone(), 1).unwrap(),

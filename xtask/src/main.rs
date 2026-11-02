@@ -34,10 +34,14 @@ const PROVIDER_TESTS: [&str; 4] = [
     "configured_product_claude_returns_real_pyright_semantic_context_diff_and_stop",
 ];
 /// Non-Rust tooling source is prohibited outside these declared product assets: the embedded
-/// TypeScript adapter ships inside the binary via `include_str!`, and `record.mjs` is the
-/// rust-analyzer outline-corpus regeneration utility (both LANG-03 exceptions).
-const ALLOWED_NON_RUST: [&str; 2] = [
+/// TypeScript checker, syntax outline/context selector, version predicate and runner prelude ship via
+/// `include_str!`; `record.mjs` is the Rust outline-corpus utility (LANG-03 exceptions).
+const ALLOWED_NON_RUST: [&str; 6] = [
+    "crates/agent-ide-lang-typescript/src/class_context.js",
+    "crates/agent-ide-lang-typescript/src/outline_probe.js",
     "crates/agent-ide-lang-typescript/src/typescript_adapter.js",
+    "crates/agent-ide-lang-typescript/src/version_range.js",
+    "crates/agent-ide-lang-typescript/src/runner_guard.js",
     "crates/agent-ide-lang-rust/tests/fixtures/lexical/record.mjs",
 ];
 
@@ -186,6 +190,7 @@ fn standard(root: &Path) -> Result<()> {
         "family.toml",
         ".family/origin.json",
         "schemas/tools.json",
+        "schemas/tools-codex.json",
         "docs/MCP_RESPONSE_STANDARD.md",
         "docs/FAMILY_CONTRACT.md",
         "docs/qualification.md",
@@ -251,7 +256,8 @@ fn collect_non_rust(dir: &Path, out: &mut Vec<String>) -> Result<()> {
 /// The full CI gate in one command: standard checks, fmt, the workspace tests (serialized, with
 /// `--no-fail-fast`, built with the `test-seams` feature the seam-driven
 /// product tests need), default-build controls proving release builds ignore those seams, the
-/// four ignored provider tests, clippy, rustdoc, the release build and the contract snapshot check.
+/// four ignored provider tests with their test-seams oracle, clippy, rustdoc, the release build and
+/// the contract snapshot check.
 /// Explicit fixture-root isolation refuses the genuinely default managed-runtime control before
 /// it can create canonical shared directories; the gate reports that boundary instead of skipping it.
 fn check(root: &Path) -> Result<()> {
@@ -310,7 +316,8 @@ fn check(root: &Path) -> Result<()> {
         ],
     )?;
     // The provider tests read their toolchains from the AGENT_IDE_* environment exactly as CI
-    // prepares it; nothing here defaults to a developer's local interpreter paths.
+    // prepares it; their independent typed oracle also requires test-seams. Nothing here defaults
+    // to a developer's local interpreter paths.
     for name in PROVIDER_TESTS {
         run(
             root,
@@ -318,6 +325,8 @@ fn check(root: &Path) -> Result<()> {
             &[
                 "test",
                 "--locked",
+                "--features",
+                "test-seams",
                 "--test",
                 "product_mcp_contract",
                 name,
@@ -356,7 +365,7 @@ fn check(root: &Path) -> Result<()> {
 }
 
 /// Builds the binary, performs the MCP handshake and returns the raw `tools/list` response line.
-fn tools_list_line(root: &Path) -> Result<String> {
+fn tools_list_line(root: &Path, host: &str) -> Result<String> {
     run(root, "cargo", &["build", "--locked", "--bin", "agent-ide"])?;
     let binary = target_dir(root).join("debug/agent-ide");
     let runtime =
@@ -365,6 +374,7 @@ fn tools_list_line(root: &Path) -> Result<String> {
     command
         .args(["mcp", "--runtime-dir"])
         .arg(&runtime)
+        .args(["--host", host])
         .env("TOKIO_WORKER_THREADS", "1")
         .env_remove("AGENT_IDE_HOST_ATTACHMENT")
         .stdin(Stdio::piped())
@@ -437,36 +447,53 @@ fn reap(mut child: Child) {
 /// `tools/list` result. The snapshot is rendered with `serde_json::to_string_pretty`; `check`
 /// compares parsed values, so formatting alone is never drift.
 fn contract(root: &Path, update: bool) -> Result<()> {
-    let reply = tools_list_line(root)?;
+    for (host, snapshot) in CONTRACT_SNAPSHOTS {
+        contract_host(root, update, host, snapshot)?;
+    }
+    Ok(())
+}
+
+/// The per-host catalog snapshots: the `--host` value the binary exports and the file holding it.
+const CONTRACT_SNAPSHOTS: [(&str, &str); 2] = [
+    ("claude", "schemas/tools.json"),
+    ("codex", "schemas/tools-codex.json"),
+];
+
+/// Compares (or writes) one host's snapshot against `mcp --host <host>`'s `tools/list` result.
+fn contract_host(root: &Path, update: bool, host: &str, snapshot: &str) -> Result<()> {
+    let reply = tools_list_line(root, host)?;
     let response: Value = serde_json::from_str(&reply)?;
     let tools = response
         .get("result")
         .and_then(|result| result.get("tools"))
         .cloned()
         .ok_or("tools/list reply has no result.tools")?;
-    let path = root.join("schemas/tools.json");
+    let path = root.join(snapshot);
     if update {
         fs::create_dir_all(path.parent().ok_or("snapshot parent missing")?)?;
         fs::write(
             &path,
             format!("{}\n", serde_json::to_string_pretty(&tools)?),
         )?;
-        println!("contract: schemas/tools.json updated");
+        println!("contract: {snapshot} updated");
         Ok(())
     } else {
-        let text = fs::read_to_string(&path).map_err(
-            |_| "contract snapshot absent: run `cargo xtask contract update` and commit it",
-        )?;
-        let snapshot: Value = serde_json::from_str(&text)
-            .map_err(|_| "schemas/tools.json is not valid JSON; regenerate it with `cargo xtask contract update`")?;
-        if tools != snapshot {
-            return Err(
-                "contract drift: the binary's tools/list differs from schemas/tools.json; \
+        let text = fs::read_to_string(&path).map_err(|_| {
+            format!("contract snapshot {snapshot} absent: run `cargo xtask contract update` and commit it")
+        })?;
+        let expected: Value = serde_json::from_str(&text).map_err(|_| {
+            format!(
+                "{snapshot} is not valid JSON; regenerate it with `cargo xtask contract update`"
+            )
+        })?;
+        if tools != expected {
+            return Err(format!(
+                "contract drift: the binary's {host} tools/list differs from {snapshot}; \
                  run `cargo xtask contract update` and review the diff"
-                    .into(),
-            );
+            )
+            .into());
         }
-        println!("contract: schemas/tools.json matches the binary");
+        println!("contract: {snapshot} matches the binary");
         Ok(())
     }
 }
@@ -545,16 +572,22 @@ mod tests {
         assert_eq!(table_value(text, "s", "missing"), None);
     }
 
+    /// Checks the exact asset set independently of filesystem enumeration order.
     #[test]
     fn non_rust_inventory_flags_only_declared_files() -> Result<()> {
         let root = root()?;
         let mut found = Vec::new();
         collect_non_rust(&root.join("crates"), &mut found)?;
+        found.sort();
         assert_eq!(
             found,
             vec![
                 "crates/agent-ide-lang-rust/tests/fixtures/lexical/record.mjs".to_owned(),
+                "crates/agent-ide-lang-typescript/src/class_context.js".to_owned(),
+                "crates/agent-ide-lang-typescript/src/outline_probe.js".to_owned(),
+                "crates/agent-ide-lang-typescript/src/runner_guard.js".to_owned(),
                 "crates/agent-ide-lang-typescript/src/typescript_adapter.js".to_owned(),
+                "crates/agent-ide-lang-typescript/src/version_range.js".to_owned(),
             ]
         );
         Ok(())

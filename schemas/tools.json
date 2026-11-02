@@ -4,73 +4,15 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Bounded source with current diagnostics for one `path`, or with `kind: \"problems\"` the\nproject's latest check results (errors and warnings by file, paged). Use `problems` to\nsee what is broken right now instead of running the build yourself; use `path` before or\nafter editing a file natively.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "byte_offset": {
-          "description": "Continue a truncated source reply from this byte offset.",
-          "maximum": 1048576,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "detail_ref": {
-          "description": "Reference from an earlier reply: continue that result.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "kind": {
-          "description": "`problems`: the project check results instead of a file.",
-          "enum": [
-            "problems"
-          ],
-          "type": "string"
-        },
-        "language": {
-          "description": "With `problems`: limit to one language.",
-          "enum": [
-            "rust",
-            "python",
-            "typescript"
-          ],
-          "type": "string"
-        },
-        "offset": {
-          "description": "With `problems`: continue from this problem index (see `next_offset`).",
-          "maximum": 4294967295,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "path": {
-          "description": "File relative to the project root; returns its source with diagnostics.",
-          "maxLength": 1024,
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "ide.context"
-  },
-  {
-    "annotations": {
-      "openWorldHint": false,
-      "readOnlyHint": true
-    },
-    "description": "Diff of what this task changed in the working tree (`head`, `staged`, `unstaged` or `task`),\npaged. Review it before finishing or handing off, instead of running `git diff` in a\nshell.",
+    "description": "Batch paths; paged changes since last diff. mode: whole comparison; provenance:true adds identity.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "detail_ref": {
-          "description": "Reference from an earlier reply: continue that result.",
-          "maxLength": 128,
-          "minLength": 1,
           "type": "string"
         },
         "mode": {
-          "default": "head",
-          "description": "`head`: everything not yet committed; `staged` / `unstaged`: only that part; `task`: everything changed since activation, including commits.",
+          "description": "Whole comparison: uncommitted, staged, unstaged or since activation.",
           "enum": [
             "head",
             "staged",
@@ -80,19 +22,12 @@
           "type": "string"
         },
         "paths": {
-          "description": "Limit capture and hunk budgets to these worktree-relative files or directories; literal paths only, no absolute paths or .. segments.",
           "items": {
-            "maxLength": 1024,
-            "minLength": 1,
             "type": "string"
           },
-          "maxItems": 16,
-          "minItems": 1,
           "type": "array"
         },
         "provenance": {
-          "default": false,
-          "description": "Return the exact worktree/comparison identity header instead of the compact default; no hashes appear otherwise.",
           "type": "boolean"
         }
       },
@@ -107,82 +42,85 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is\nproject-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a\n`source_ref`. Formats the result with the project formatter, runs the project check\n(cargo check, pyright or tsc) and returns this file's errors and warnings in the reply.\nPrefer it over native edit/write for source: no line matching, no separate check step.",
+    "description": "Atomic `files` batches (all-or-none), symbol/line/text/import edits, rename or host patch.\nLong edits return `edit_progress` with stage, requested/committed paths, and `detail_ref`;\nchecks report separately.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
-        "changes": {
+        "files": {
+          "description": "Up to 16 files; up to 32 changes each.",
           "items": {
-            "additionalProperties": false,
-            "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once (add `within` to scope it) and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match).",
             "properties": {
+              "changes": {
+                "items": {
+                  "properties": {
+                    "add_import": {
+                      "type": "string"
+                    },
+                    "content": {
+                      "type": "string"
+                    },
+                    "lines": {
+                      "type": "string"
+                    },
+                    "new": {
+                      "type": "string"
+                    },
+                    "old": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "enum": [
+                        "replace",
+                        "insert",
+                        "delete"
+                      ],
+                      "type": "string"
+                    },
+                    "remove_import": {
+                      "type": "string"
+                    },
+                    "symbol": {
+                      "type": "string"
+                    },
+                    "where": {
+                      "enum": [
+                        "before",
+                        "after",
+                        "first",
+                        "last"
+                      ],
+                      "type": "string"
+                    },
+                    "within": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
               "content": {
                 "type": "string"
               },
-              "lines": {
-                "pattern": "^[0-9]+-[0-9]+$",
-                "type": "string"
+              "create": {
+                "type": "boolean"
               },
-              "new": {
-                "type": "string"
-              },
-              "old": {
-                "minLength": 1,
-                "type": "string"
-              },
-              "op": {
-                "enum": [
-                  "replace",
-                  "insert",
-                  "delete"
-                ],
-                "type": "string"
-              },
-              "symbol": {
-                "maxLength": 1024,
-                "minLength": 1,
-                "type": "string"
-              },
-              "where": {
-                "enum": [
-                  "before",
-                  "after",
-                  "first",
-                  "last"
-                ],
-                "type": "string"
-              },
-              "within": {
-                "maxLength": 1024,
-                "minLength": 1,
+              "path": {
                 "type": "string"
               }
             },
+            "required": [
+              "path"
+            ],
             "type": "object"
           },
-          "maxItems": 32,
-          "minItems": 1,
           "type": "array"
         },
-        "content": {
-          "description": "Replacement or inserted code, including the symbol's doc comment and attributes.",
-          "maxLength": 131072,
-          "type": "string"
-        },
-        "lines": {
-          "description": "With `path`: inclusive 1-based line range to replace.",
-          "pattern": "^[0-9]+-[0-9]+$",
-          "type": "string"
-        },
         "new_name": {
-          "description": "For rename: the new identifier, applied project-wide.",
-          "maxLength": 128,
-          "minLength": 1,
           "type": "string"
         },
         "op": {
           "default": "replace",
-          "description": "Symbol operation. replace: new body for `symbol` (or for `path`+`lines`); insert: new symbol placed `where` relative to `symbol`; delete: remove `symbol` with its header; rename: rename `symbol` project-wide to `new_name`.",
           "enum": [
             "replace",
             "insert",
@@ -192,42 +130,13 @@
           "type": "string"
         },
         "operation_id": {
-          "description": "Any unique id for this edit; repeating it never applies the edit twice.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "path": {
-          "maxLength": 1024,
-          "minLength": 1,
-          "type": "string"
-        },
-        "source_ref": {
-          "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines` and to replace an existing file with `path`+`content`, optional (but validated) with `symbol`. Omit it with `path`+`content` to create a new file.",
-          "maxLength": 128,
-          "minLength": 1,
+          "description": "Retry key; never applied twice.",
           "type": "string"
         },
         "symbol": {
-          "description": "Symbol path `file#Owner/name`.",
-          "maxLength": 1024,
-          "minLength": 1,
-          "type": "string"
-        },
-        "where": {
-          "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor.",
-          "enum": [
-            "before",
-            "after",
-            "first",
-            "last"
-          ],
           "type": "string"
         }
       },
-      "required": [
-        "operation_id"
-      ],
       "type": "object"
     },
     "name": "ide.edit"
@@ -237,20 +146,19 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Bounded call graph around one symbol: callers, callees or both, depth 1–3, at most 60\nnodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into `+N tests` per parent (set `tests: true` to list them). Use\nit to see the blast radius before changing a function or to trace how a call reaches a\nsymbol, instead of chained greps.",
+    "description": "Call trees for a batch of symbols: callers (impact), callees (dependencies) or both; depth 2\nusually suffices (1–3); tests:true expands test nodes.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "depth": {
           "default": 2,
-          "description": "Levels to expand; 2 is usually enough.",
-          "maximum": 3,
-          "minimum": 1,
           "type": "integer"
+        },
+        "detail_ref": {
+          "type": "string"
         },
         "direction": {
           "default": "callers",
-          "description": "`callers`: who calls it (blast radius); `callees`: what it calls; `both`.",
           "enum": [
             "callers",
             "callees",
@@ -259,43 +167,75 @@
           "type": "string"
         },
         "symbol": {
-          "description": "Symbol path `file#Owner/name`, or a bare name to search the project.",
-          "maxLength": 1024,
-          "minLength": 1,
+          "description": "Address or bare name.",
           "type": "string"
         },
+        "symbols": {
+          "description": "Up to 8.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "tests": {
-          "default": false,
-          "description": "Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent.",
           "type": "boolean"
         }
       },
-      "required": [
-        "symbol"
-      ],
       "type": "object"
     },
     "name": "ide.graph"
   },
   {
+    "_meta": {
+      "anthropic/maxResultSizeChars": 500000
+    },
     "annotations": {
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or\nthe next page of a long result (outline, symbol, graph, diff, test output). Poll every\nfew seconds while it stays pending.",
+    "description": "Batch detail_refs or one detail_ref; kind:diagnostics+path or kind:problems. No check run; unknown is not clean.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "detail_ref": {
-          "description": "Reference from an earlier reply: continue that result.",
-          "maxLength": 128,
-          "minLength": 1,
           "type": "string"
+        },
+        "detail_refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "description": "Exclusive query mode; omit for retained references.",
+          "enum": [
+            "problems",
+            "diagnostics"
+          ],
+          "type": "string"
+        },
+        "language": {
+          "description": "Only with kind:problems; omit for diagnostics.",
+          "enum": [
+            "rust",
+            "python",
+            "typescript"
+          ],
+          "type": "string"
+        },
+        "offset": {
+          "description": "Only with kind:problems; continue from next_offset.",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Only with kind:diagnostics.",
+          "type": "string"
+        },
+        "wait_s": {
+          "description": "Only with detail_ref(s): completion seconds.",
+          "type": "integer"
         }
       },
-      "required": [
-        "detail_ref"
-      ],
       "type": "object"
     },
     "name": "ide.inspect"
@@ -305,76 +245,73 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Skeleton of a file (every symbol with signature, doc line and line numbers, members\nindented, tests collapsed) or of a directory (files with line counts and first doc line).\nA fraction of the cost of reading the file — use it before any native read of a source\nfile longer than a screen. Answers inline on a warm language server; a cold one answers\n`pending` — poll ide.inspect.",
+    "description": "Batch paths/glob: symbol and region addresses, signatures and docs, no bodies.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "glob": {
+          "description": "`*`, `?`, `**`; up to 24 files.",
+          "type": "string"
+        },
         "kinds": {
-          "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows.",
-          "maxLength": 256,
-          "minLength": 1,
-          "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol))*$",
+          "description": "Comma list of kinds to keep; `region` adds @header, @imports.",
           "type": "string"
         },
         "path": {
-          "description": "File relative to the project root.",
-          "maxLength": 1024,
-          "minLength": 1,
+          "description": "One file, or a directory listing.",
           "type": "string"
+        },
+        "paths": {
+          "description": "Up to 24 files.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
-      "required": [
-        "path"
-      ],
       "type": "object"
     },
     "name": "ide.outline"
   },
   {
+    "_meta": {
+      "anthropic/maxResultSizeChars": 500000
+    },
     "annotations": {
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Body of one symbol (`file#Owner/name`) or an explicit line range, numbered, with its doc\nheader. The precise replacement for reading a whole file when you already know what you\nneed; its `source_ref` is what a full-file ide.edit is based on.",
+    "description": "Batch items: {symbol} or {path, offset, limit}. Addresses: file#Type/f, #@imports, path:line, …:3-5. Current source, every item whole; unchanged acknowledged, force:true resends.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
-        "lines": {
-          "description": "Inclusive 1-based line range such as `120-180`.",
-          "pattern": "^[0-9]+-[0-9]+$",
+        "detail_ref": {
           "type": "string"
         },
-        "path": {
-          "description": "File relative to the project root; alone it reads the whole file, with `lines` or `ranges` those lines.",
-          "maxLength": 1024,
-          "minLength": 1,
-          "type": "string"
+        "force": {
+          "type": "boolean"
         },
-        "ranges": {
-          "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`.",
+        "items": {
+          "description": "Up to 32.",
           "items": {
-            "pattern": "^[0-9]+-[0-9]+$",
-            "type": "string"
+            "properties": {
+              "limit": {
+                "description": "Line count; default 2000.",
+                "type": "integer"
+              },
+              "offset": {
+                "description": "1-based first line.",
+                "type": "integer"
+              },
+              "path": {
+                "type": "string"
+              },
+              "symbol": {
+                "type": "string"
+              }
+            },
+            "type": "object"
           },
-          "maxItems": 16,
-          "minItems": 1,
-          "type": "array"
-        },
-        "symbol": {
-          "description": "Symbol path `file#Owner/name`; returns its body with the doc header.",
-          "maxLength": 1024,
-          "minLength": 1,
-          "type": "string"
-        },
-        "symbols": {
-          "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest; a bare file path reads the text of a file no IDE language reads.",
-          "items": {
-            "maxLength": 1024,
-            "minLength": 1,
-            "type": "string"
-          },
-          "maxItems": 16,
-          "minItems": 1,
           "type": "array"
         }
       },
@@ -389,38 +326,26 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Activate Agent IDE for this project — once per task, before any other ide.* call. Returns\na project card: languages with sizes, the build/check/test/lint commands, layout by\ndirectory, entry points and docs. Use it to orient instead of reading README, Cargo.toml\nor package.json. Then use ide.outline / ide.symbol instead of native file reads.",
+    "description": "Activate once per task; returns project card and batch call forms.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "activation_id": {
-          "description": "Any stable id for this activation (e.g. the task name); repeating it returns the same activation. Optional: a start that names none derives a stable id from this session, so repeating it also returns the same activation.",
-          "maxLength": 128,
-          "minLength": 1,
           "type": "string"
         },
         "environment": {
           "additionalProperties": {
-            "maxLength": 1024,
-            "minLength": 1,
             "type": "string"
           },
-          "description": "Pick the current environment per language, optionally per project root (`python:packages/alpha`). Value: a candidate the start card lists, or a path to one (relative to that root, or absolute), or `auto` to return to the default. Kept for this worktree until changed. Only languages whose card shows an environment line accept a choice.",
-          "maxProperties": 8,
-          "propertyNames": {
-            "pattern": "^(python|rust|typescript)(:[^\\u0000]{1,512})?$"
-          },
+          "description": "Per language, or `python:<root>`: a start-card candidate, a path or `auto`.",
           "type": "object"
         },
         "read_only": {
-          "default": false,
-          "description": "Start as a reader; the default is the one writer allowed per worktree.",
+          "description": "Reader; default: the one writer.",
           "type": "boolean"
         },
         "root": {
-          "description": "Absolute working directory to activate; defaults to the host's project directory. Must lie below a configured allowed root.",
-          "maxLength": 1024,
-          "minLength": 1,
+          "description": "Absolute; default: the host's project directory.",
           "type": "string"
         }
       },
@@ -435,14 +360,11 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "End this task's IDE session; edited files stay on disk. Lists up to eight test runs started\nin this binding whose results were never collected. Call once when done or before handing off.",
+    "description": "End activation once, at task end; keeps edits, lists retained tests and running commands.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "activation_id": {
-          "description": "Optional, accepted for symmetry with ide.start; stop always ends this session's activation.",
-          "maxLength": 128,
-          "minLength": 1,
           "type": "string"
         }
       },
@@ -455,44 +377,47 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Symbol card for `file#Owner/name` or a bare name: resolved signature, doc, definition\nlocation, usages split src/tests with the source line, callers and callees as full symbol\npaths, and with `history: true` the last commits touching the definition. Language-server\naccurate — replaces grep for usages and reading files to find callers. A bare name with\nseveral matches returns the candidate paths.",
+    "description": "Batch symbols: definition, docs, usages, immediate neighbors; deeper chains: ide.graph. path+byte_offset resolves a UTF-8 use-site.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "byte_offset": {
+          "type": "integer"
+        },
         "callees": {
           "default": 0,
-          "description": "Callees to list, 0–3 (0 = none).",
-          "maximum": 3,
-          "minimum": 0,
+          "description": "0–3; 0 omits.",
           "type": "integer"
         },
         "callers": {
           "default": 1,
-          "description": "Callers to list, 0–3 (0 = none); use ide.graph for deeper trees.",
-          "maximum": 3,
-          "minimum": 0,
+          "description": "0–3; 0 omits.",
           "type": "integer"
         },
         "history": {
-          "default": false,
-          "description": "Include the last commits touching the definition (opt-in).",
+          "description": "Last commits touching it.",
           "type": "boolean"
         },
-        "symbol": {
-          "description": "Symbol path `file#Owner/name`, or a bare name to search the project.",
-          "maxLength": 1024,
-          "minLength": 1,
+        "path": {
+          "description": "Only with byte_offset.",
           "type": "string"
+        },
+        "symbol": {
+          "description": "Address or bare name.",
+          "type": "string"
+        },
+        "symbols": {
+          "description": "Up to 8.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "usages": {
           "default": true,
-          "description": "Include usages (src/tests split, with source lines).",
           "type": "boolean"
         }
       },
-      "required": [
-        "symbol"
-      ],
       "type": "object"
     },
     "name": "ide.symbol"
@@ -501,68 +426,100 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Run tests selected by `symbol` (the tests that reference it), by `path`, by name\n`pattern`, or an explicit `command`; one background run per worktree under `budget_s`.\nExplicit commands may set a worktree-relative `cwd` and bounded inherited-environment\noverrides through `env`; their argv is limited to 16 KiB in total.\nReturns the pass/fail line with an exact rerun command; full output is paged through\nide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless of how\nthe runner was launched; otherwise the result includes the exit code and bounded output\ntail. Use it instead of running the test command in a shell: bounded selection and output.",
+    "description": "Batch up to 8 targets at project root; budget_s bounds runtime. Read result:N/history:true, cancel:N, or output:\"<ref>/output/N\".",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "budget_s": {
           "default": 120,
-          "description": "Seconds before the run is stopped and reported as timed out.",
-          "maximum": 600,
-          "minimum": 1,
+          "description": "Seconds before the run is stopped; at most 600.",
+          "type": "integer"
+        },
+        "cancel": {
           "type": "integer"
         },
         "command": {
-          "description": "Explicit argv to run instead of the detected runner; all argument bytes together are limited to 16 KiB.",
+          "description": "One argv (16 KiB total); may set cwd and env.",
           "items": {
-            "maxLength": 16384,
             "type": "string"
           },
-          "maxItems": 64,
-          "minItems": 1,
           "type": "array"
         },
         "cwd": {
-          "description": "Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`.",
-          "maxLength": 1024,
-          "minLength": 1,
+          "description": "Worktree-relative.",
+          "type": "string"
+        },
+        "detail_ref": {
           "type": "string"
         },
         "env": {
           "additionalProperties": {
-            "maxLength": 4096,
             "type": "string"
           },
-          "description": "Environment variables added to the inherited environment for this explicit command. Only with `command`; names are bounded environment identifiers.",
-          "maxProperties": 32,
           "type": "object"
         },
-        "path": {
-          "description": "Run the tests in this file or directory.",
-          "maxLength": 1024,
-          "minLength": 1,
+        "history": {
+          "enum": [
+            true
+          ],
+          "type": "boolean"
+        },
+        "output": {
+          "description": "Restore retained /output/N after context loss; exclusive, read-only.",
           "type": "string"
         },
-        "pattern": {
-          "description": "Run tests whose name matches this substring (runner filter).",
-          "maxLength": 512,
-          "minLength": 1,
-          "type": "string"
-        },
-        "status": {
-          "description": "Re-read run number N (from `tests #N`) instead of starting one.",
-          "minimum": 1,
+        "result": {
           "type": "integer"
         },
-        "symbol": {
-          "description": "Run the tests that reference this symbol (`file#Owner/name`).",
-          "maxLength": 1024,
-          "minLength": 1,
-          "type": "string"
+        "targets": {
+          "description": "Up to 8.",
+          "items": {
+            "properties": {
+              "command": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "path": {
+                "type": "string"
+              },
+              "pattern": {
+                "type": "string"
+              },
+              "symbol": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
         }
       },
       "type": "object"
     },
     "name": "ide.test"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Project map: call first in an unfamiliar repo. One call lists directories and files with sizes and the authors' one-line purpose, replacing rounds of ls/find/rg. No source bodies; path zooms in.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "description": "Levels; default 2 at root, 1 below.",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Directory to zoom into; default: project root.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.tree"
   }
 ]

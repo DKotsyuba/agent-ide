@@ -26,7 +26,7 @@ usage_text() {
         '                  [--share-dir DIR] [--downloader curl|wget] [-h]' \
         '' \
         'Downloads the sealed agent-ide release bundle, verifies its SHA256SUMS, and runs the' \
-        "bundle's own \`agent-ide self-install\`. macOS arm64 only." \
+        "bundle's own \`agent-ide self-install\`. macOS arm64 or Linux x86_64/arm64." \
         '' \
         '  --version X.Y.Z   install this version (a leading `v` is allowed); default: latest release' \
         '  --home DIR        state home (default: ~/.agent-ide; AGENT_IDE_HOME relocates the user home)' \
@@ -95,9 +95,13 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-# macOS arm64 is the only claimed platform.
-[ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] ||
-    fail 'agent-ide supports macOS arm64 only'
+# Select the archive for this host; Linux packages are local candidates, not qualified releases.
+case "$(uname -s):$(uname -m)" in
+    Darwin:arm64) target=aarch64-apple-darwin ;;
+    Linux:x86_64) target=x86_64-unknown-linux-gnu ;;
+    Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-gnu ;;
+    *) fail 'unsupported operating system or architecture' ;;
+esac
 
 # Resolves the downloader: forced --downloader wins, then curl, then wget.
 if [ -n "$downloader" ]; then
@@ -150,7 +154,7 @@ printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
     fail "--version must be X.Y.Z, got: $version"
 
 tag="v$version"
-asset="agent-ide-$tag-aarch64-apple-darwin.tar.gz"
+asset="agent-ide-$tag-$target.tar.gz"
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/agent-ide-install.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
@@ -171,8 +175,21 @@ fi
 # Entries may carry a leading directory (`./name`); match on the file name only.
 expected=$(awk -v asset="$asset" '{ name = $2; sub(/^.*\//, "", name) } name == asset { print $1 }' "$tmp_dir/SHA256SUMS")
 [ -n "$expected" ] || fail "SHA256SUMS does not list $asset"
-actual=$(shasum -a 256 "$tmp_dir/$asset" | awk '{print $1}')
-[ "$actual" = "$expected" ] || fail "the downloaded $asset does not match SHA256SUMS"
+case "$expected" in
+    *[!0-9a-f]*) fail "the downloaded $asset does not match SHA256SUMS" ;;
+esac
+[ "${#expected}" -eq 64 ] || fail "the downloaded $asset does not match SHA256SUMS"
+printf '%s  %s\n' "$expected" "$asset" >"$tmp_dir/selected-sum" || fail 'cannot prepare checksum verification'
+case "$target" in
+    aarch64-apple-darwin)
+        (cd "$tmp_dir" && shasum -a 256 -c selected-sum >/dev/null 2>&1) ||
+            fail "the downloaded $asset does not match SHA256SUMS"
+        ;;
+    *)
+        (cd "$tmp_dir" && sha256sum -c selected-sum >/dev/null 2>&1) ||
+            fail "the downloaded $asset does not match SHA256SUMS"
+        ;;
+esac
 
 # Lists the archive and rejects anything that is not a plain relative file or directory.
 tar -tvzf "$tmp_dir/$asset" >"$tmp_dir/listing" || fail 'cannot list the downloaded archive'
@@ -192,6 +209,30 @@ tar -xzf "$tmp_dir/$asset" --no-same-owner --no-same-permissions -C "$tmp_dir" |
 bundle="$tmp_dir/agent-ide-$tag"
 [ -d "$bundle" ] && [ -f "$bundle/COMPLETE" ] && [ -x "$bundle/agent-ide" ] ||
     fail "the archive is missing the $tag bundle"
+
+# Check the executable format and machine before running any downloaded code.
+case "$target" in
+    aarch64-apple-darwin)
+        file "$bundle/agent-ide" | grep -Fq 'Mach-O 64-bit executable arm64' ||
+            fail 'bundle executable does not match macOS arm64'
+        ;;
+    *)
+        # ELF64, little endian, current version, System V or GNU ABI, executable or PIE.
+        set -- $(od -An -tu1 -N20 "$bundle/agent-ide")
+        [ "$#" -eq 20 ] || fail 'truncated ELF executable'
+        [ "$1" = 127 ] && [ "$2" = 69 ] && [ "$3" = 76 ] && [ "$4" = 70 ] &&
+        [ "$5" = 2 ] && [ "$6" = 1 ] && [ "$7" = 1 ] || fail 'invalid ELF executable'
+        shift 7
+        { [ "$1" = 0 ] || [ "$1" = 3 ]; } && [ "$2" = 0 ] || fail 'unsupported ELF ABI'
+        shift 9
+        { [ "$1" = 2 ] || [ "$1" = 3 ]; } && [ "$2" = 0 ] && [ "$4" = 0 ] ||
+            fail 'unsupported ELF executable type or machine'
+        case "$target:$3" in
+            x86_64-unknown-linux-gnu:62|aarch64-unknown-linux-gnu:183) ;;
+            *) fail 'bundle executable does not match Linux architecture' ;;
+        esac
+        ;;
+esac
 
 # Installs through the bundle itself; every verification runs once more inside self-install.
 set -- "$bundle/agent-ide" self-install --release "$bundle" --version "$version"

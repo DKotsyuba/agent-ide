@@ -7,8 +7,8 @@
     {
       "name": "agent-ide",
       "source": "./",
-      "description": "Agent IDE coding-companion skill and Claude lifecycle hooks.",
-      "version": "0.10.8"
+      "description": "Batch related source discovery, reads, atomic multi-file edits and checks; automatic Bridge completion.",
+      "version": "0.10.9"
     }
   ]
 }

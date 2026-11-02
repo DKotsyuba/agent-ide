@@ -27,7 +27,7 @@ use super::{
 use crate::{
     checks::{
         BoxFuture, CheckRequest, Checker, ProblemSnapshot, UnavailableReason,
-        runner::{ConfinedRunner, RunOutput},
+        runner::{ConfinedRunner, RunOutput, RunSpec},
     },
     lang::Language,
 };
@@ -47,6 +47,9 @@ pub struct ModuleChecker {
     runner: Arc<dyn ConfinedRunner>,
     /// Total wall-clock ceiling of one check.
     timeout: Duration,
+    /// Immutable accepted factory facts; each run fills its own actual worktree before sending
+    /// them. Unknown provider evidence remains absent, never replaced with ambient paths.
+    configuration: super::contract::ModuleConfig,
     /// The module's `describe` answer for the section, asked once.
     described: tokio::sync::OnceCell<Described>,
 }
@@ -61,6 +64,10 @@ impl ModuleChecker {
         timeout: Duration,
     ) -> Self {
         Self {
+            configuration: super::contract::ModuleConfig {
+                checks: Some(section.clone()),
+                ..Default::default()
+            },
             language,
             host,
             section,
@@ -68,6 +75,13 @@ impl ModuleChecker {
             timeout,
             described: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Supplies accepted immutable launcher facts before sharing this checker. Run requests clone
+    /// them and set the admitted worktree; no cached module hello becomes current authority.
+    pub fn with_config(mut self, config: super::contract::ModuleConfig) -> Self {
+        self.configuration = config;
+        self
     }
 
     /// The module's `describe` answer for the section as admission inputs: named programs,
@@ -106,13 +120,26 @@ impl ModuleChecker {
             .await
     }
 
-    /// Runs one check, or the typed failure of its module.
+    /// Runs one check, or returns its typed module failure. Builds admission roots from this
+    /// request's current module configuration and read denies before the module plans effects.
     async fn run(&self, request: &CheckRequest) -> Result<ProblemSnapshot, ModuleUnavailable> {
+        let mut configuration = self.configuration.clone();
+        configuration.worktree = Some(request.worktree.clone());
+        configuration.read_denies = request.read_denies.clone();
         let mut described = self.described(&request.worktree).await?.clone();
         described.launcher_roots.extend(recipe::environment_roots(
             self.language.name(),
             &request.worktree,
+            &configuration,
         ));
+        described.launcher_roots.extend(
+            self.language
+                .support()
+                .configured_environments(&request.worktree, &configuration)
+                .into_iter()
+                .filter(|environment| environment.missing_next_step.is_none())
+                .filter_map(|environment| environment.chosen.map(|candidate| candidate.path)),
+        );
         let mut effects = CheckEffects {
             recipes: recipe::declared(self.language.name()),
             request,
@@ -130,9 +157,16 @@ impl ModuleChecker {
                     Capability::CheckPlan,
                     &request.worktree,
                     encode(&CheckPlanRequest {
+                        module_config: configuration,
                         request: request.clone(),
                         config: self.section.clone(),
                         timeout_ms: self.timeout.as_millis() as u64,
+                        // The module plans in the current environment: its own copy of the
+                        // selections may predate the last `ide.start environment` change.
+                        selections: crate::lang::environment::selections(
+                            &request.worktree,
+                            self.language,
+                        ),
                     }),
                 ),
                 self.timeout + super::router::budget_or(PLAN_MARGIN),
@@ -235,8 +269,23 @@ impl EffectRunner for CheckEffects<'_> {
                     );
                 }
             };
+            if let Err(error) = prepare_cache_directories(&spec, &self.request.cache_dir) {
+                return (
+                    EffectOutcome::Refused {
+                        cause: Cause::Exited,
+                        message: format!("creating cache directory: {}", error.kind()),
+                    },
+                    Vec::new(),
+                );
+            }
+            let failed_run = (spec.program.clone(), spec.args.clone(), spec.env.clone());
             match self.runner.run(spec).await {
-                Ok(output) => completed(output),
+                Ok(output) => {
+                    if output.status != Some(0) {
+                        record_failed_run(&self.request.cache_dir, &failed_run, &output);
+                    }
+                    completed(output)
+                }
                 Err(error) => (
                     EffectOutcome::Refused {
                         cause: if error.kind() == std::io::ErrorKind::NotFound {
@@ -251,6 +300,67 @@ impl EffectRunner for CheckEffects<'_> {
             }
         })
     }
+}
+
+/// Creates, before a run starts, the directories it is handed inside the private `cache_dir`:
+/// its write roots there and its temporary directory (`TMPDIR`, `TMP`, `TEMP`). The process may
+/// write only its declared roots and may not be able to create them itself; a compiler that
+/// cannot create its temporary file fails the whole build. Paths outside the cache are left as
+/// they are.
+fn prepare_cache_directories(spec: &RunSpec, cache_dir: &Path) -> std::io::Result<()> {
+    let temporary = spec
+        .env
+        .iter()
+        .filter(|(name, _)| matches!(name.as_str(), "TMPDIR" | "TMP" | "TEMP"))
+        .map(|(_, value)| PathBuf::from(value));
+    for directory in spec.write_roots.iter().cloned().chain(temporary) {
+        if directory.starts_with(cache_dir) {
+            std::fs::create_dir_all(&directory)?;
+        }
+    }
+    Ok(())
+}
+
+/// File in a check's private cache that holds the operator diagnostic of its last failed run.
+pub const FAILED_RUN_LOG: &str = "last-failed-run.log";
+
+/// Writes the operator diagnostic of one failed check run to [`FAILED_RUN_LOG`] in `cache_dir`:
+/// program, arguments, the complete (allowlisted) environment, exit status and the whole captured
+/// stderr. The agent's reply keeps only its bounded cause line; this file lets an operator see
+/// the underlying error (for example a build script's own output). Best effort, owner-only, and
+/// replaced by the next failed run; a write failure never changes the check result.
+fn record_failed_run(
+    cache_dir: &std::path::Path,
+    (program, args, env): &(PathBuf, Vec<std::ffi::OsString>, Vec<(String, String)>),
+    output: &RunOutput,
+) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut text = format!(
+        "status: {:?}\nprogram: {}\nargs:",
+        output.status,
+        program.display()
+    );
+    for arg in args {
+        text.push(' ');
+        text.push_str(&arg.to_string_lossy());
+    }
+    text.push_str("\nenv:\n");
+    for (name, value) in env {
+        text.push_str(&format!("  {name}={value}\n"));
+    }
+    text.push_str("stderr:\n");
+    let path = cache_dir.join(FAILED_RUN_LOG);
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.write_all(&output.stderr)
+        });
 }
 
 /// The outcome and output attachments (stdout 1, stderr 2) of a completed run.
@@ -277,9 +387,8 @@ mod tests {
     use std::{collections::BTreeMap, sync::Mutex};
 
     use super::*;
-    use crate::{
-        checks::runner::RunSpec,
-        modules::payload::{Arg, EffectRecipe, ExecutableSlot, Param, RunClass, SlotSource, Stdin},
+    use crate::modules::payload::{
+        Arg, EffectRecipe, ExecutableSlot, Param, RunClass, SlotSource, Stdin,
     };
 
     /// Runs the launcher program `tool` with one literal argument.
@@ -299,6 +408,67 @@ mod tests {
         capture_bytes: 64 << 20,
         assets: &[],
     }];
+
+    /// The cache root and a temporary directory inside it exist before a run; a temporary
+    /// directory outside the cache is not created.
+    #[test]
+    fn cache_directories_exist_before_a_run() {
+        let scratch = crate::scratch::ScratchDir::new("cache-directories");
+        let cache = scratch.join("language");
+        let outside = scratch.join("elsewhere/tmp");
+        let mut spec = RunSpec {
+            program: PathBuf::from("/bin/tool"),
+            args: Vec::new(),
+            cwd: scratch.to_path_buf(),
+            env: vec![
+                ("TMPDIR".to_owned(), cache.join("tmp").display().to_string()),
+                ("TEMP".to_owned(), outside.display().to_string()),
+            ],
+            read_roots: Vec::new(),
+            write_roots: vec![cache.clone()],
+            read_denies: Vec::new(),
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 1,
+        };
+        prepare_cache_directories(&spec, &cache).unwrap();
+        assert!(cache.join("tmp").is_dir());
+        assert!(!outside.exists());
+        spec.env.clear();
+        prepare_cache_directories(&spec, &cache).unwrap();
+    }
+
+    /// A failed run leaves its whole diagnostic in the cache, owner-only, replacing the last.
+    #[test]
+    fn a_failed_run_records_its_diagnostic_in_the_cache() {
+        let cache = crate::scratch::ScratchDir::new("failed-run-log");
+        let run = (
+            PathBuf::from("/bin/tool"),
+            vec![std::ffi::OsString::from("check")],
+            vec![("CC".to_owned(), "/x/clang".to_owned())],
+        );
+        let output = |stderr: &[u8]| RunOutput {
+            status: Some(101),
+            stderr: stderr.to_vec(),
+            ..RunOutput::default()
+        };
+        record_failed_run(&cache, &run, &output(b"first"));
+        record_failed_run(
+            &cache,
+            &run,
+            &output(b"--- stderr\nfatal: header not found\n"),
+        );
+        let path = cache.join(FAILED_RUN_LOG);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("status: Some(101)\nprogram: /bin/tool\nargs: check\n"));
+        assert!(text.contains("  CC=/x/clang\n"));
+        assert!(text.ends_with("stderr:\n--- stderr\nfatal: header not found\n"));
+        assert!(!text.contains("first"));
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     /// Records every spec and answers a fixed failed run.
     #[derive(Default)]
@@ -320,12 +490,15 @@ mod tests {
     }
 
     /// An admitted recipe runs through the runner with the core's working directory and returns
-    /// its outcome with stdout and stderr attachments; an unknown recipe is refused unrun.
+    /// its outcome with stdout and stderr attachments; its write roots inside the private cache
+    /// exist before it starts and its failure leaves the run log; an unknown recipe is refused
+    /// unrun.
     #[tokio::test]
     async fn effects_run_admitted_recipes_and_refuse_the_rest() {
+        let scratch = crate::scratch::ScratchDir::new("check-effects");
         let request = CheckRequest {
             worktree: PathBuf::from("/work/tree"),
-            cache_dir: PathBuf::from("/cache/alpha"),
+            cache_dir: scratch.join("alpha"),
             input_generation: 7,
             read_denies: Vec::new(),
         };
@@ -375,7 +548,15 @@ mod tests {
             assert_eq!(specs[0].program, PathBuf::from("/bin/sh"));
             assert_eq!(specs[0].args, ["--json"]);
             assert_eq!(specs[0].cwd, request.worktree);
+            let cache_roots: Vec<_> = specs[0]
+                .write_roots
+                .iter()
+                .filter(|root| root.starts_with(&request.cache_dir))
+                .collect();
+            assert!(!cache_roots.is_empty(), "{:?}", specs[0].write_roots);
+            assert!(cache_roots.iter().all(|root| root.is_dir()));
         }
+        assert!(request.cache_dir.join(FAILED_RUN_LOG).is_file());
         let (outcome, output) = effects.run(&fence, effect("other")).await;
         assert!(matches!(
             outcome,

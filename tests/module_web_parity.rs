@@ -217,7 +217,7 @@ async fn web_edits_match_in_process_results() {
 
 /// `kill -9` of the idle HTML module: the style sheets' facts keep answering at once, the next
 /// HTML-backed answer starts a fresh module on the same daemon, and the killed module leaves
-/// nothing behind.
+/// nothing behind. Reaping follows the new demand, which safely retires the exited idle instance.
 #[tokio::test]
 async fn a_killed_html_module_restarts_and_the_style_facts_stay() {
     let fixture = fixture();
@@ -237,7 +237,7 @@ async fn a_killed_html_module_restarts_and_the_style_facts_stay() {
         .expect("the HTML module runs");
     // SAFETY: `first.id` is the exact module identity captured as a child of this test's daemon.
     unsafe { libc::kill(first.id.pid, libc::SIGKILL) };
-    assert!(first.id.gone().await, "the killed module is reaped");
+    assert!(first.id.exited().await, "the killed module exited");
     // The CSS definitions are indexed and need no HTML module; the card answers at once.
     let during = session.call(&fixture, "ide.symbol", card.clone()).await;
     assert_eq!(during["kind"], "symbol", "{during}");
@@ -259,7 +259,7 @@ async fn a_killed_html_module_restarts_and_the_style_facts_stay() {
     while !after["text"]
         .as_str()
         .unwrap_or_default()
-        .contains("index.html:1")
+        .contains("index.html#main#main:1")
         && started.elapsed() < Duration::from_secs(20)
     {
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -269,9 +269,10 @@ async fn a_killed_html_module_restarts_and_the_style_facts_stay() {
         after["text"]
             .as_str()
             .unwrap_or_default()
-            .contains("index.html:1"),
+            .contains("index.html#main#main:1"),
         "the restarted module indexed the edit: {after}"
     );
+    assert!(first.id.gone().await, "recovery reaped the killed module");
     let second = daemon
         .tree()
         .module("html", "analyzer")

@@ -4,7 +4,7 @@
 use std::{
     ffi::OsString,
     fs,
-    os::unix::ffi::OsStringExt,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::atomic::{AtomicUsize, Ordering},
@@ -22,8 +22,49 @@ use serde_json::json;
 
 /// Counter separating concurrent test-owned temporary worktrees.
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
-/// Exact Apple Git executable exercised by the integration fixtures.
-pub const GIT: &str = "/usr/bin/git";
+/// Exact test-only Git path; an explicit absolute override leaves production selection untouched.
+pub fn git_program() -> &'static str {
+    static GIT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    GIT.get_or_init(|| {
+        let value = match std::env::var("AGENT_IDE_TEST_GIT") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => "/usr/bin/git".to_owned(),
+            Err(std::env::VarError::NotUnicode(_)) => panic!("AGENT_IDE_TEST_GIT must be UTF-8"),
+        };
+        assert!(
+            Path::new(&value).is_absolute(),
+            "AGENT_IDE_TEST_GIT must be absolute"
+        );
+        value
+    })
+}
+
+/// Quotes a UTF-8 path as one literal shell argument for the fixture's trusted wrappers.
+pub fn shell_path(path: &Path) -> String {
+    let text = path.to_str().expect("test wrapper path must be UTF-8");
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The selected Git path is absolute, including when the test-only override is set.
+#[test]
+fn selected_test_git_path_is_absolute() {
+    assert!(Path::new(git_program()).is_absolute());
+    if let Ok(configured) = std::env::var("AGENT_IDE_TEST_GIT") {
+        assert_eq!(git_program(), configured);
+    }
+}
+
+/// Wrapper paths containing shell metacharacters stay one literal argument.
+#[test]
+fn wrapper_path_is_shell_quoted() {
+    let path = Path::new("/path/it's $(exit 57) $git");
+    let output = Command::new("/bin/sh")
+        .args(["-c", &format!("printf '%s' {}", shell_path(path))])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, path.as_os_str().as_bytes());
+}
 
 /// Owns one recoverable local Git worktree and removes only that directory on drop.
 pub struct GitFixture {
@@ -183,7 +224,7 @@ fn unique_temp_path(prefix: &str) -> PathBuf {
 
 /// Starts Git with the same cleared environment and literal worktree selection as the fixture needs.
 fn base_git(root: &Path) -> Command {
-    let mut command = Command::new(GIT);
+    let mut command = Command::new(git_program());
     command
         .env_clear()
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -322,7 +363,7 @@ impl SnapshotRunner for Runner {
         }
         let (child, mut admissions) = launch_intent(
             &intent,
-            self.program.as_deref().unwrap_or(Path::new(GIT)),
+            self.program.as_deref().unwrap_or(Path::new(git_program())),
             if intent.label() == "check-attr" {
                 self.attribute_output_cap.unwrap_or(MAX_SNAPSHOT_BLOB_BYTES)
             } else {
@@ -379,7 +420,7 @@ pub async fn capture_with_authority(
 ) -> Result<GitSnapshot, GitError> {
     collect_snapshot(
         authority,
-        Path::new(GIT),
+        Path::new(git_program()),
         mode,
         1,
         "snapshot-operation",

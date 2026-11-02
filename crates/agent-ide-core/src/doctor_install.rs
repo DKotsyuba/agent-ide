@@ -922,7 +922,7 @@ mod observation_tests {
             assert_ne!(crate::test_seams::shared_runtime_root().unwrap(), selected);
             assert_eq!(
                 crate::test_seams::shared_runtime_root().unwrap(),
-                fs::canonicalize("/private/tmp").unwrap()
+                crate::hook_hints::configured_root().unwrap()
             );
             return;
         }

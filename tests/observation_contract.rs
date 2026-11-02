@@ -275,7 +275,26 @@ async fn malformed_health_preserves_observation_facts_and_doctor_errors() {
     );
     let common = fs::canonicalize(repo.join(".git")).unwrap();
     let identity = agent_ide::hook_hints::rendezvous_identity(&common);
-    let runtime = root.join(format!("ai-r-{}", &identity[..16]));
+    // Keep the fake daemon below a separate short private parent: Unix socket paths are bounded.
+    let runtime_parent = std::env::temp_dir().join(format!(
+        "o-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&runtime_parent)
+        .unwrap();
+    let runtime_parent = scratch::Scratch::own(fs::canonicalize(runtime_parent).unwrap());
+    let runtime = runtime_parent.join(format!("ai-r-{}", &identity[..16]));
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(
+            runtime.join("agent-ide.sock").as_os_str().as_bytes().len() <= 107,
+            "fixture Unix socket path exceeds Linux limit"
+        );
+    }
     fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
     fs::OpenOptions::new()
         .write(true)
@@ -285,6 +304,7 @@ async fn malformed_health_preserves_observation_facts_and_doctor_errors() {
         .unwrap();
     let listener = tokio::net::UnixListener::bind(runtime.join("agent-ide.sock")).unwrap();
     let before = snapshot(&root);
+    let before_runtime = snapshot(&runtime_parent);
     let peer = async {
         for _ in 0..3 {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -323,7 +343,7 @@ async fn malformed_health_preserves_observation_facts_and_doctor_errors() {
             .args(["observe", "--repo"])
             .arg(&repo)
             .arg("--json")
-            .env("AGENT_IDE_TEST_SHARED_RUNTIME_ROOT", &*root)
+            .env("AGENT_IDE_TEST_SHARED_RUNTIME_ROOT", &*runtime_parent)
             .kill_on_drop(true)
             .output()
             .await
@@ -357,4 +377,5 @@ async fn malformed_health_preserves_observation_facts_and_doctor_errors() {
     assert_eq!(instance["health"], "unavailable");
     assert!(instance["daemon_version"].is_null());
     assert_eq!(before, snapshot(&root));
+    assert_eq!(before_runtime, snapshot(&runtime_parent));
 }

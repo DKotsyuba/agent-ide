@@ -119,8 +119,10 @@ pub enum ServeError {
     Protocol(String),
     /// `hello` refused the offer.
     Incompatible(String),
-    /// The core cancelled the active request or shut the instance down during an effect.
+    /// The core cancelled only the active request during an effect; the instance remains usable.
     Cancelled,
+    /// The core shut the instance down during an effect; the serve loop exits without a response.
+    Shutdown,
 }
 
 impl std::fmt::Display for ServeError {
@@ -131,6 +133,7 @@ impl std::fmt::Display for ServeError {
             Self::Protocol(message) => write!(f, "protocol: {message}"),
             Self::Incompatible(message) => write!(f, "incompatible: {message}"),
             Self::Cancelled => f.write_str("cancelled"),
+            Self::Shutdown => f.write_str("shutdown"),
         }
     }
 }
@@ -219,8 +222,9 @@ pub struct Effects<'a> {
 
 impl Effects<'_> {
     /// Asks the core to run `effect` and waits for its outcome and output attachments (stdout id
-    /// 1, stderr id 2 when present). A `cancel` of this request or a `shutdown` ends the request
-    /// with [`ServeError::Cancelled`]; anything else unexpected is a protocol error.
+    /// 1, stderr id 2 when present). A matching `cancel` aborts only this request with
+    /// [`ServeError::Cancelled`]; instance shutdown returns [`ServeError::Shutdown`].
+    /// Both controls must propagate to the serve loop; anything else unexpected is a protocol error.
     pub async fn run(
         &mut self,
         effect: EffectRequest,
@@ -250,7 +254,7 @@ impl Effects<'_> {
                 Ok((reply.outcome, attachments))
             }
             (Control::Cancel(fence), _) if fence == self.fence => Err(ServeError::Cancelled),
-            (Control::Shutdown { .. }, _) => Err(ServeError::Cancelled),
+            (Control::Shutdown { .. }, _) => Err(ServeError::Shutdown),
             _ => Err(ServeError::Protocol(
                 "unexpected message during an effect".into(),
             )),
@@ -272,6 +276,8 @@ pub trait ModuleServer: Send {
 
     /// Answers one request of a declared, supported capability. `effects` runs core-owned
     /// effect recipes for this request; an answer must not claim completeness it lacks.
+    /// Propagate [`ServeError::Cancelled`] and [`ServeError::Shutdown`] from effects unchanged
+    /// so the loop can continue after request cancellation or exit after instance shutdown.
     fn call<'a>(
         &'a mut self,
         request: Incoming,
@@ -509,6 +515,7 @@ pub async fn serve<S: ModuleServer>(
             match server.call(incoming, effects).await {
                 Ok(answer) => answer,
                 Err(ServeError::Cancelled) => continue,
+                Err(ServeError::Shutdown) => return Ok(()),
                 Err(error) => return Err(error),
             }
         };
@@ -572,5 +579,122 @@ impl ModuleServer for Unimplemented {
         _effects: Effects<'a>,
     ) -> Result<Answer, ServeError> {
         Ok(Answer::error(ErrorCode::Unsupported, "not implemented"))
+    }
+}
+
+/// Protocol lifecycle regression: shutdown during an active effect must terminate the instance.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::modules::{
+        contract::{ModuleId, Request},
+        fake::{FakeModule, offer},
+    };
+    use std::time::Duration;
+
+    /// Minimal module issuing one host effect for checks and answering ordinary reads directly.
+    struct EffectServer;
+
+    impl ModuleServer for EffectServer {
+        /// Declares the existing neutral fixture capabilities without starting any provider.
+        fn declaration(&self) -> Declaration {
+            FakeModule::new(ModuleId::bundled("alpha"), "1.0").declaration()
+        }
+
+        /// Propagates check-effect cancellation/shutdown unchanged; other calls answer normally.
+        async fn call<'a>(
+            &'a mut self,
+            request: Incoming,
+            mut effects: Effects<'a>,
+        ) -> Result<Answer, ServeError> {
+            if request.capability == Capability::CheckPlan {
+                effects
+                    .run(EffectRequest {
+                        recipe: "fixture".into(),
+                        params: Default::default(),
+                    })
+                    .await?;
+            }
+            Ok(Answer::result(Value::Null))
+        }
+    }
+
+    /// Reads one control frame from the fixture stream; data frames are not part of this scenario.
+    async fn control(input: &mut tokio::io::DuplexStream) -> Control {
+        let Frame::Control(value) = read_frame(input).await.unwrap() else {
+            panic!("control required");
+        };
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// An ordinary effect Cancel permits another request, while effect Shutdown exits cleanly
+    /// with host stdin still open. Each effect frame proves readiness before its control arrives.
+    #[tokio::test]
+    async fn shutdown_during_effect_ends_instance_without_stdin_eof() {
+        let (mut host_out, module_in) = tokio::io::duplex(1 << 16);
+        let (module_out, mut host_in) = tokio::io::duplex(1 << 16);
+        let mut process = tokio::spawn(serve(EffectServer, Role::Checker, module_in, module_out));
+        write_control(
+            &mut host_out,
+            &Control::Hello(offer(ModuleId::bundled("alpha"), "1.0", Role::Checker, 1)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            control(&mut host_in).await,
+            Control::HelloReply(_)
+        ));
+        for request_id in 1..=3 {
+            let fence = Fence {
+                instance: 1,
+                request_id,
+                scope_key: "scope".into(),
+                revision_key: "r1".into(),
+            };
+            write_control(
+                &mut host_out,
+                &Control::Request(Request {
+                    fence: fence.clone(),
+                    capability: if request_id == 2 {
+                        Capability::FileDoc
+                    } else {
+                        Capability::CheckPlan
+                    },
+                    capability_version: 0,
+                    budget_ms: 1000,
+                    payload: Value::Null,
+                    body_attachment: None,
+                    attachments: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap();
+            let response = control(&mut host_in).await;
+            if request_id == 2 {
+                assert!(
+                    matches!(response,Control::Response(Response {fence:actual,outcome:Outcome::Result(_),..}) if actual==fence)
+                );
+            } else {
+                assert!(
+                    matches!(response,Control::Effect(EffectCall {fence:actual,..}) if actual==fence)
+                );
+                let instruction = if request_id == 1 {
+                    Control::Cancel(fence)
+                } else {
+                    Control::Shutdown { instance: 1 }
+                };
+                write_control(&mut host_out, &instruction).await.unwrap();
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut process).await;
+        if result.is_err() {
+            process.abort();
+            let _ = process.await;
+        }
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "shutdown must exit without waiting for host EOF: {result:?}"
+        );
+        drop(host_out);
     }
 }

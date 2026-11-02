@@ -96,16 +96,24 @@ pub struct RustProfile {
 /// files open detached and lose cross-file references.
 pub fn linked_projects(root: &Path) -> Option<Vec<String>> {
     let root_manifest = root.join("Cargo.toml");
-    let root_is_workspace = root_manifest.is_file() && {
-        let text = std::fs::read_to_string(&root_manifest).ok()?;
-        declares_workspace(&text)
-    };
+    let root_text = crate::environment::manifest_text(root, root, &[]).ok()?;
+    let root_is_workspace = root_text.as_deref().is_some_and(declares_workspace);
     let mut found = Vec::new();
     collect_manifests(root, LINKED_PROJECT_DEPTH, &mut found);
     found.retain(|path| *path != root_manifest);
+    found.retain(|path| {
+        path.parent()
+            .is_some_and(|project| crate::environment::excluded_project(root, project) == Ok(false))
+    });
     if root_is_workspace {
         found.retain(|path| {
-            std::fs::read_to_string(path).is_ok_and(|text| declares_workspace(&text))
+            path.parent()
+                .and_then(|project| {
+                    crate::environment::manifest_text(root, project, &[])
+                        .ok()
+                        .flatten()
+                })
+                .is_some_and(|text| declares_workspace(&text))
         });
     }
     if found.is_empty() {
@@ -148,7 +156,7 @@ fn collect_manifests(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
         {
             continue;
         }
-        if path.is_dir() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             let manifest = path.join("Cargo.toml");
             if manifest.is_file() {
                 found.push(manifest);
@@ -210,9 +218,11 @@ impl RustProfile {
     }
 
     /// Builds the complete server environment: the toolchain `PATH` plus `HOME`/`CARGO_HOME`
-    /// from the real operator home (the declared override winning when one is configured) and
-    /// the private-namespace target/temp directories. When no real cargo home exists the private
-    /// namespace copy is used so the analyzer never writes registry state outside it.
+    /// from the real operator home (the declared override winning when one is configured),
+    /// `RUSTUP_AUTO_INSTALL=0` (the analyzer's own cargo/rustc children refuse a missing
+    /// toolchain instead of installing one) and the private-namespace target/temp directories.
+    /// When no real cargo home exists the private namespace copy is used so the analyzer never
+    /// writes registry state outside it.
     fn environment(&self) -> BTreeMap<OsString, OsString> {
         let home = crate::home::real_home();
         let derived = crate::home::effective_cargo_home(self.cargo_home.as_deref(), &home);
@@ -247,6 +257,9 @@ impl RustProfile {
             (OsString::from("CARGO"), OsString::from(&self.cargo)),
             (OsString::from("RUSTC"), OsString::from(&self.rustc)),
             (OsString::from("CARGO_HOME"), cargo_home),
+            // Analyzer-side cargo/rustc invocations (cargo metadata, build scripts) resolve a
+            // missing declared toolchain as an honest failure, never a rustup install.
+            (OsString::from("RUSTUP_AUTO_INSTALL"), OsString::from("0")),
             (
                 OsString::from("CARGO_TARGET_DIR"),
                 OsString::from(Path::new(&self.cache_namespace).join("target")),
@@ -511,6 +524,15 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustModuleSession
 pub struct RustCompatibilityKey(String);
 
 impl RustCompatibilityKey {
+    /// Partitions semantic leases and cached facts by the current complete native environment.
+    /// A changed lock/config/member or same-path tool recreation cannot reuse the prior view.
+    pub fn with_environment(self, environment: &str) -> Self {
+        Self(
+            blake3::hash(format!("{}\0{environment}", self.0).as_bytes())
+                .to_hex()
+                .to_string(),
+        )
+    }
     /// Returns the stable opaque backend identity passed to Execution's lease registry.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -525,6 +547,12 @@ impl RustCompatibilityKey {
             worktree.worktree.incarnation()
         );
         Self(blake3::hash(identity.as_bytes()).to_hex().to_string())
+    }
+
+    /// Two distinct keys for reuse-rule tests, without building a worktree authority.
+    #[cfg(test)]
+    pub(crate) fn distinct_for_tests() -> (Self, Self) {
+        (Self("k1".to_owned()), Self("k2".to_owned()))
     }
 }
 
@@ -1090,6 +1118,11 @@ mod linked_project_tests {
         assert_eq!(
             environment.get(OsStr::new("CARGO_HOME")),
             Some(&OsString::from(&expected_cargo_home))
+        );
+        // The analyzer's own cargo/rustc children never install a missing toolchain.
+        assert_eq!(
+            environment.get(OsStr::new("RUSTUP_AUTO_INSTALL")),
+            Some(&OsString::from("0"))
         );
         // A declared cargo home override wins for the server environment, as for the check.
         let configured = session_profile_with_cargo_home(

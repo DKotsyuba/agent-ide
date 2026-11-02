@@ -670,10 +670,10 @@ async fn captured_streams_are_bounded_but_drained() {
 async fn group_teardown_case(leader_exits_first: bool) {
     let root = worktree();
     let marker = root.join("descendant.pid");
+    let leader_marker = root.join("leader.pid");
     let script = format!(
-        "(trap '' TERM; echo $$ > '{}'.tmp; mv '{}'.tmp '{}'; exec sleep 600) </dev/null >/dev/null 2>&1 & {}",
-        marker.display(),
-        marker.display(),
+        "echo $$ > '{}'; /bin/sh -c 'trap \"\" TERM; echo $$ > \"$1\".tmp; mv \"$1\".tmp \"$1\"; exec /bin/sleep 600' sh '{}' </dev/null & {}",
+        leader_marker.display(),
         marker.display(),
         if leader_exits_first { "exit 0" } else { "wait" }
     );
@@ -702,6 +702,12 @@ async fn group_teardown_case(leader_exits_first: bool) {
     })
     .await
     .expect("the descendant started");
+    let leader: libc::pid_t = fs::read_to_string(&leader_marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(descendant, leader, "the marker must name the descendant");
     if leader_exits_first {
         // The leader exits; it stays an unreaped zombie until the reap below.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -719,14 +725,12 @@ async fn group_teardown_case(leader_exits_first: bool) {
         leader_exits_first,
         "an exited leader keeps its own status; a live one died on TERM"
     );
-    let gone = tokio::time::timeout(Duration::from_secs(5), async {
-        // SAFETY: signal 0 only checks existence of the former descendant.
-        while unsafe { libc::kill(descendant, 0) } == 0 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-    assert!(gone.is_ok(), "the TERM-resistant descendant was killed");
+    // The fixture descendant inherits stdout and never closes it while running. EOF proves it
+    // stopped without relying on when init reaps an orphaned zombie.
+    assert!(
+        result.evidence.stdout().complete,
+        "the TERM-resistant descendant retained stdout"
+    );
     assert!(
         admission
             .release_reaped(result.settlement)

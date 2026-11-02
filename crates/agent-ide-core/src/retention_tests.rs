@@ -2,6 +2,7 @@
 
 use super::*;
 use std::cell::Cell;
+use std::os::unix::fs::DirBuilderExt;
 
 /// One day.
 const DAY: Duration = Duration::from_secs(86_400);
@@ -14,10 +15,16 @@ fn scratch(name: &str) -> crate::scratch::ScratchDir {
     crate::scratch::ScratchDir::new(&format!("retention-{name}"))
 }
 
+/// Creates each new fixture directory private even when the host has a permissive default ACL.
+fn private_dirs(path: impl AsRef<Path>) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(path)
+}
+
 /// Builds `checks/<REPO>/<worktree key>` for `worktree` with a small target file and marker.
 fn check_cache(home: &Path, worktree: &Path) -> PathBuf {
     let dir = home.join("checks").join(REPO).join(worktree_key(worktree));
-    fs::create_dir_all(dir.join("digest/lang/target")).unwrap();
+    private_dirs(dir.join("digest/lang/target")).unwrap();
     fs::write(dir.join("digest/lang/target/artifact"), vec![7u8; 8192]).unwrap();
     fs::write(dir.join(MARKER_FILE_NAME), worktree.as_os_str().as_bytes()).unwrap();
     dir
@@ -267,7 +274,7 @@ fn an_unreadable_marker_protects_even_an_aged_cache() {
 fn telemetry_lease_keys_cover_every_ancestor_even_without_a_lease_file_yet() {
     let home = scratch("telemetry-keys");
     let store = home.join("telemetry").join("c".repeat(64));
-    fs::create_dir_all(&store).unwrap();
+    private_dirs(&store).unwrap();
     let launch = Path::new("/repo/worktree/subdir");
     fs::write(store.join(MARKER_FILE_NAME), launch.as_os_str().as_bytes()).unwrap();
     let (entries, complete) = scan_telemetry(&home.join("telemetry"), &home.join("locks"));
@@ -376,6 +383,83 @@ fn legacy_or_unknown_processes_pause_all_check_and_telemetry_removal() {
     );
 }
 
+/// A namespace-local process list never authorizes the production Linux sweep, even for
+/// otherwise removable caches, releases or trash. Fixtures use no production state.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_global_visibility_keeps_caches_releases_and_trash() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = scratch("linux-global-visibility");
+    let gone = home.join("deleted-worktree");
+    let cache = check_cache(&home, &gone);
+    let mut protected = vec![cache.clone()];
+    for family in ["telemetry", "providers"] {
+        let entry = home.join(family).join("a".repeat(64));
+        private_dirs(&entry).unwrap();
+        fs::write(entry.join(MARKER_FILE_NAME), gone.as_os_str().as_bytes()).unwrap();
+        fs::write(entry.join("payload"), b"keep").unwrap();
+        protected.push(entry);
+    }
+    for family in ["checks", "telemetry", "providers"] {
+        let trash = home.join(family).join(".trash/leftover");
+        private_dirs(&trash).unwrap();
+        fs::write(trash.join("payload"), b"keep").unwrap();
+        protected.push(trash);
+    }
+    let standalone = home.join("standalone");
+    for version in ["0.1.0", "0.2.0", "0.3.0", "0.4.0"] {
+        protected.push(release(&standalone, version, DAY * 30, true));
+    }
+    let trash = standalone.join("releases/.trash-0.0.1-123");
+    private_dirs(&trash).unwrap();
+    fs::write(trash.join("agent-ide"), b"keep").unwrap();
+    protected.push(trash);
+
+    // Production correctly refuses group-writable state. Make this fixture private even when
+    // the test host uses umask 0002; changing the process-wide umask would race other tests.
+    let mut directories = vec![home.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        for entry in fs::read_dir(&directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                directories.push(entry.path());
+            }
+        }
+    }
+
+    let _lock = SweepLock::try_acquire(&home, None).unwrap();
+    for apply in [false, true] {
+        let report = sweep(&home, apply);
+        assert!(report.legacy.is_none(), "{report:?}");
+        assert!(report.paused());
+        assert_eq!(verdict(&report, &cache).fate, Fate::Paused);
+        assert_eq!(
+            report.releases.note,
+            Some("process list unknown, every release kept")
+        );
+        assert!(
+            report
+                .verdicts
+                .iter()
+                .all(|item| item.fate != Fate::Removed)
+        );
+        assert!(
+            report
+                .render(apply)
+                .contains("complete process visibility is unavailable")
+        );
+        for path in &protected {
+            assert!(path.exists(), "{} must be kept", path.display());
+        }
+    }
+    assert!(
+        hint_publishers_unsafe_as(&Identity::current(&home), &global_process_snapshot).is_none(),
+        "hint removal must also retain unknown publishers outside the visible namespace"
+    );
+}
+
 /// Only this binary and releases strictly newer than the floor take leases; everything else is legacy.
 #[test]
 fn only_this_binary_and_strictly_newer_releases_participate() {
@@ -425,7 +509,7 @@ fn identity_started(home: &Path, started: fn(i32) -> Option<SystemTime>) -> Iden
 
 /// Writes an executable named `agent-ide` below `dir` containing each of `proofs`.
 fn fake_build_with(dir: &Path, proofs: &[&[u8]]) -> PathBuf {
-    fs::create_dir_all(dir).unwrap();
+    private_dirs(dir).unwrap();
     let exe = dir.join("agent-ide");
     let mut bytes = vec![0xCFu8; 3 << 20];
     for (index, proof) in proofs.iter().enumerate() {
@@ -505,12 +589,17 @@ fn an_unproven_or_rebuilt_dev_executable_stays_legacy() {
     assert_eq!(pids(unknown.classify(&processes).legacy), [1, 2, 3]);
 }
 
-/// The real start time of this process is readable and not in the future.
+/// The platform either supplies a bounded wall-clock start or conservatively leaves it unknown.
 #[test]
 fn process_start_reads_the_real_start_time() {
-    let started = process_start(std::process::id() as i32).expect("own start time");
-    assert!(started <= SystemTime::now());
-    assert!(started > SystemTime::now() - 30 * DAY);
+    #[cfg(target_os = "macos")]
+    {
+        let started = process_start(std::process::id() as i32).expect("own start time");
+        assert!(started <= SystemTime::now());
+        assert!(started > SystemTime::now() - 30 * DAY);
+    }
+    #[cfg(target_os = "linux")]
+    assert!(process_start(std::process::id() as i32).is_none());
 }
 
 /// The participation floor is the legacy boundary whatever this build's version: every release
@@ -531,7 +620,7 @@ fn every_release_after_the_legacy_boundary_participates() {
 fn telemetry_stores_follow_their_writer_lock_and_marker() {
     let home = scratch("telemetry");
     let store = home.join("telemetry").join("a".repeat(64));
-    fs::create_dir_all(&store).unwrap();
+    private_dirs(&store).unwrap();
     fs::write(store.join("state.sqlite"), vec![1u8; 4096]).unwrap();
     fs::write(store.join(MARKER_FILE_NAME), b"/nonexistent/launch-dir").unwrap();
     let writer = try_exclusive(&store.join(TELEMETRY_LOCK)).expect("writer lock");
@@ -555,9 +644,9 @@ fn a_telemetry_store_below_an_activated_worktree_is_kept() {
     let home = scratch("telemetry-ancestor");
     let worktree = scratch("telemetry-ancestor-worktree");
     let launch = worktree.join("subdir");
-    fs::create_dir_all(&launch).unwrap();
+    private_dirs(&launch).unwrap();
     let store = home.join("telemetry").join("b".repeat(64));
-    fs::create_dir_all(&store).unwrap();
+    private_dirs(&store).unwrap();
     fs::write(store.join(MARKER_FILE_NAME), launch.as_os_str().as_bytes()).unwrap();
     let activation = Lease::acquire(&home, &worktree).expect("worktree lease");
     let report = sweep_with(&home, true, SystemTime::now() + DAY * 60, &nobody);
@@ -576,9 +665,9 @@ fn an_activation_after_the_scan_still_keeps_a_telemetry_store() {
     let home = scratch("telemetry-after-scan");
     let worktree = scratch("telemetry-after-scan-worktree");
     let launch = worktree.join("subdir");
-    fs::create_dir_all(&launch).unwrap();
+    private_dirs(&launch).unwrap();
     let store = home.join("telemetry").join("e".repeat(64));
-    fs::create_dir_all(&store).unwrap();
+    private_dirs(&store).unwrap();
     fs::write(store.join(MARKER_FILE_NAME), launch.as_os_str().as_bytes()).unwrap();
     let locks = home.join(LOCKS_DIR);
     let (entries, _) = scan_telemetry(&home.join("telemetry"), &locks);
@@ -609,7 +698,7 @@ fn a_dry_run_does_not_refresh_an_idle_cache() {
 fn a_telemetry_store_without_a_marker_waits_until_no_lease_is_held_anywhere() {
     let home = scratch("telemetry-unmarked");
     let store = home.join("telemetry").join("d".repeat(64));
-    fs::create_dir_all(&store).unwrap();
+    private_dirs(&store).unwrap();
     let elsewhere = Lease::acquire(&home, &scratch("telemetry-unmarked-other")).expect("lease");
     let report = sweep_with(&home, true, SystemTime::now() + DAY * 60, &nobody);
     assert_eq!(verdict(&report, &store).fate, Fate::InUse);
@@ -627,7 +716,7 @@ fn symlinked_cache_roots_and_entries_are_never_traversed() {
     let outside = scratch("symlink-outside");
     let victim = check_cache(&outside, &outside.join("deleted"));
     let trash_victim = outside.join("checks/.trash/leftover");
-    fs::create_dir_all(&trash_victim).unwrap();
+    private_dirs(&trash_victim).unwrap();
     std::os::unix::fs::symlink(outside.join("checks"), home.join("checks")).unwrap();
     let report = sweep_with(&home, true, SystemTime::now(), &nobody);
     assert!(report.verdicts.is_empty());
@@ -638,7 +727,7 @@ fn symlinked_cache_roots_and_entries_are_never_traversed() {
     );
 
     let home = scratch("symlink-entry");
-    fs::create_dir_all(home.join("checks").join(REPO)).unwrap();
+    private_dirs(home.join("checks").join(REPO)).unwrap();
     std::os::unix::fs::symlink(
         &victim,
         home.join("checks").join(REPO).join("fedcba9876543210"),
@@ -652,7 +741,7 @@ fn symlinked_cache_roots_and_entries_are_never_traversed() {
 /// Lays out `standalone/releases/<version>` with `COMPLETE` installed `age` ago.
 fn release(standalone: &Path, version: &str, age: Duration, complete: bool) -> PathBuf {
     let dir = standalone.join("releases").join(version);
-    fs::create_dir_all(&dir).unwrap();
+    private_dirs(&dir).unwrap();
     fs::write(dir.join("agent-ide"), b"binary").unwrap();
     if complete {
         fs::write(dir.join("COMPLETE"), b"sealed").unwrap();
@@ -767,7 +856,7 @@ fn marker_less_store(home: &Path, launch: &Path) -> PathBuf {
             .to_hex()
             .as_str(),
     );
-    fs::create_dir_all(&store).unwrap();
+    private_dirs(&store).unwrap();
     for dir in [home.join("telemetry"), store.clone()] {
         fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     }
@@ -993,14 +1082,14 @@ fn a_lease_only_build_is_not_a_hint_locking_publisher() {
 
 /// Writes `len` bytes of non-sparse data to `path`, creating parents.
 fn big_file(path: &Path, len: usize) {
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    private_dirs(path.parent().unwrap()).unwrap();
     fs::write(path, vec![0x5au8; len]).unwrap();
 }
 
 /// A check cache named by `name` holding one `unique` file of its own.
 fn sharing_cache(home: &Path, name: &str, unique: usize) -> PathBuf {
     let worktree = home.join(format!("wt-{name}"));
-    fs::create_dir_all(&worktree).unwrap();
+    private_dirs(&worktree).unwrap();
     let dir = home.join("checks").join(REPO).join(worktree_key(&worktree));
     big_file(&dir.join("digest/lang/target/unique"), unique);
     fs::write(dir.join(MARKER_FILE_NAME), worktree.as_os_str().as_bytes()).unwrap();
@@ -1398,7 +1487,7 @@ fn symlinked_target_incremental_and_session_directories_are_never_followed() {
     // The same holds for a symlinked `incremental` directory and symlinked session directories.
     fs::remove_file(cache.join("digest/lang/target")).unwrap();
     let target = cache.join("digest/lang/target");
-    fs::create_dir_all(target.join("debug")).unwrap();
+    private_dirs(target.join("debug")).unwrap();
     std::os::unix::fs::symlink(&incremental, target.join("debug/incremental")).unwrap();
     let report = sweep_with(&home, true, SystemTime::now(), &nobody);
     assert!(report.verdicts.is_empty(), "{report:?}");

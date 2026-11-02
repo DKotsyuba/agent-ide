@@ -9,6 +9,7 @@
 //! are the real-provider test's, which needs the accepted `AGENT_IDE_NODE`,
 //! `AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER` and `AGENT_IDE_TSSERVER`.
 
+use parity::{source_query, source_query_tool};
 #[path = "support/parity.rs"]
 mod parity;
 
@@ -74,15 +75,42 @@ fn typescript_provider() -> Value {
     agent_ide::languages::install();
     let unbound: agent_ide::assistance::launcher::ProviderLaunch =
         serde_json::from_value(provider.clone()).unwrap();
-    provider["typescript"]["codex_macos_evidence"] =
-        json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
-    provider["typescript"]["claude_macos_evidence"] =
-        json!(unbound.expected_typescript_claude_macos_evidence().unwrap());
+    if cfg!(target_os = "linux") {
+        provider["typescript"]["codex_macos_evidence"] = Value::Null;
+        provider["typescript"]["claude_macos_evidence"] = Value::Null;
+        provider["typescript"]["linux_operator_bundle"] = json!(
+            unbound
+                .expected_typescript_linux_operator_bundle()
+                .expect("measured Linux TypeScript bundle must match the supported release")
+        );
+    } else {
+        provider["typescript"]["codex_macos_evidence"] =
+            json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
+        provider["typescript"]["claude_macos_evidence"] =
+            json!(unbound.expected_typescript_claude_macos_evidence().unwrap());
+    }
     provider
 }
 
 /// The in-process fallback of the TypeScript module.
 const IN_PROCESS: (&str, &str) = (LANGUAGE_MODE, "typescript=in_process");
+
+/// Local adapter-parity stand-in that accepts only the exact stdin formatter argv and
+/// deterministically formats the compact fixture function and import quote without a registry.
+/// This checks adapter wiring, not compatibility with the real Prettier package.
+const PRETTIER_STAND_IN: &str = r##"#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (JSON.stringify(args) !== '["--stdin-filepath","src/index.js"]') process.exit(2);
+const file = args[1];
+if (!fs.existsSync(file)) process.exit(2);
+const source = fs.readFileSync(0, 'utf8');
+const compact = "export function hello(name){return shout('hello '+name)+legacy()}";
+const formatted = source.replace(compact,
+  "export function hello(name) {\n  return shout('hello ' + name) + legacy();\n}")
+  .replace("import { shout } from 'dep';", 'import { shout } from "dep";');
+process.stdout.write(formatted);
+"##;
 
 /// Every script extension with a function, a class with a method and an exported constant, plus a
 /// stylesheet and a page the scripts' class and element-id uses join, configured with `providers`.
@@ -162,14 +190,14 @@ fn calls(fixture: &Fixture) -> Vec<(&'static str, Value)> {
         .map(|path| ("ide.outline", json!({"path": path})))
         .collect();
     for path in FILES {
-        calls.push(("ide.context", json!({"path": path})));
+        calls.push(source_query(json!({"path": path})));
     }
     // A position inside the first declaration: the bridge's semantic context where the
     // extension has one.
     for (path, marker) in FILES.iter().zip(MARKERS) {
         let text = std::fs::read_to_string(fixture.root.join(path)).unwrap();
         let at = text.find(marker).expect("the marker") + 2;
-        calls.push(("ide.context", json!({"path": path, "byte_offset": at})));
+        calls.push(source_query(json!({"path": path, "byte_offset": at})));
     }
     calls.extend([
         ("ide.read", json!({"symbol":"src/a.ts#greet_ts"})),
@@ -286,7 +314,7 @@ async fn typescript_module_matches_in_process_answers_with_the_bridge() {
         .unwrap();
     }
     for path in ["src/a.ts", "src/panel.tsx", "src/c.js", "src/card.jsx"] {
-        let context = "ide.context {\"byte_offset\":";
+        let context = "ide.symbol {\"byte_offset\":";
         let reply = moduled.iter().find(|reply| {
             reply.starts_with(context) && reply.lines().next().is_some_and(|l| l.contains(path))
         });
@@ -296,7 +324,7 @@ async fn typescript_module_matches_in_process_answers_with_the_bridge() {
         );
     }
     for path in ["src/e.mts", "src/f.cts", "src/g.mjs", "src/h.cjs"] {
-        let context = "ide.context {\"byte_offset\":";
+        let context = "ide.symbol {\"byte_offset\":";
         let reply = moduled.iter().find(|reply| {
             reply.starts_with(context) && reply.lines().next().is_some_and(|l| l.contains(path))
         });
@@ -383,15 +411,15 @@ async fn edits_match(bridge: bool) {
     }
 }
 
-/// A Node back-end project: ESM entry with `exports`/`main`, a CommonJS module pair, a
-/// `node_modules` package the entry imports, `node:test` files (one passing, one failing, one
-/// TAP-style), and a server-side `tsconfig.json` the `tsc` check runs on.
+/// A Node back-end project with a fixture-local offline formatter adapter: ESM/CommonJS entries,
+/// an imported package, `node:test` files checking cwd/PATH/argv, and a `tsconfig.json` for `tsc`.
+/// Its formatter stand-in validates only adapter argv and is not real Prettier qualification.
 fn node_fixture(bridge: bool) -> Fixture {
     let fixture = Fixture::new(
         &[
             (
                 "package.json",
-                "{\"name\":\"api\",\"version\":\"1.0.0\",\"type\":\"module\",\"main\":\"src/index.js\",\"exports\":{\".\":\"./src/index.js\"},\"scripts\":{\"test\":\"node --test\"}}\n",
+                "{\"name\":\"api\",\"version\":\"1.0.0\",\"type\":\"module\",\"main\":\"src/index.js\",\"exports\":{\".\":\"./src/index.js\"},\"scripts\":{\"test\":\"node --test\"},\"devDependencies\":{\"prettier\":\"1.0.0\"}}\n",
             ),
             (
                 "tsconfig.json",
@@ -402,6 +430,14 @@ fn node_fixture(bridge: bool) -> Fixture {
                 "import { shout } from 'dep';\nimport { legacy } from './legacy.cjs';\n\nexport function hello(name) {\n  return shout('hello ' + name) + legacy();\n}\n\nexport const PORT = 8080;\n\nexport function broken() {\n  /** @type {number} */\n  const n = 'text';\n  return n;\n}\n",
             ),
             (".prettierrc", "{\"semi\":true}\n"),
+            (".npmrc", "offline=true\nyes=false\n"),
+            (".gitignore", "node_modules/.bin/prettier\n"),
+            (
+                "node_modules/prettier/package.json",
+                "{\"name\":\"prettier\",\"version\":\"1.0.0\",\"bin\":{\"prettier\":\"bin/prettier.cjs\"}}\n",
+            ),
+            ("node_modules/prettier/bin/prettier.cjs", PRETTIER_STAND_IN),
+            ("node_modules/.bin/.keep", ""),
             (
                 "src/legacy.cjs",
                 "const util = require('./util.cjs');\nfunction legacy() {\n  return util.tag();\n}\nmodule.exports = { legacy };\n",
@@ -420,7 +456,7 @@ fn node_fixture(bridge: bool) -> Fixture {
             ),
             (
                 "test/pass.test.mjs",
-                "import test from 'node:test';\nimport assert from 'node:assert';\n\ntest('adds', () => {\n  assert.equal(1 + 1, 2);\n});\n",
+                "import test from 'node:test';\nimport assert from 'node:assert';\nimport { delimiter, dirname, resolve } from 'node:path';\nimport { fileURLToPath } from 'node:url';\n\ntest('runs from the project recipe', () => {\n  assert.equal(process.cwd(), resolve(dirname(fileURLToPath(import.meta.url)), '..'));\n  assert.equal(process.env.PATH?.split(delimiter)[0], dirname(process.execPath));\n  assert.ok(process.argv.some((arg) => arg.endsWith('/test/pass.test.mjs') || arg === 'test/pass.test.mjs'));\n});\n\ntest('adds', () => {\n  assert.equal(1 + 1, 2);\n});\n",
             ),
             (
                 "test/fail.test.mjs",
@@ -433,6 +469,11 @@ fn node_fixture(bridge: bool) -> Fixture {
             json!([])
         },
     );
+    let prettier_link = fixture.root.join("node_modules/.bin/prettier");
+    std::os::unix::fs::symlink("../prettier/bin/prettier.cjs", &prettier_link).unwrap();
+    let prettier_script = fixture.root.join("node_modules/prettier/bin/prettier.cjs");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(prettier_script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let node = std::env::var("AGENT_IDE_NODE").unwrap();
     let tsc = Path::new(&std::env::var("AGENT_IDE_TSSERVER").unwrap())
         .with_file_name("tsc.js")
@@ -498,10 +539,33 @@ async fn run_tests(session: &mut Session, fixture: &Fixture, arguments: Value) -
 }
 
 /// The Node back-end transcript on a fresh daemon with `env`: reads, cards, positions, rename,
-/// test runs and the tsc check page.
+/// checked test recipes, and the tsc check page. Each route's command details are checked before
+/// only those route-specific recipe footer rows are canonicalized for parity. With `TS_DUMP`, it
+/// retains route-specific telemetry and source bytes around the rename for unknown-outcome review.
 async fn node_transcript(env: &[(&str, &str)]) -> (Vec<String>, String) {
     let fixture = node_fixture(true);
-    let _daemon = Daemon::start(&fixture, env).await;
+    let route = if env.is_empty() { "module" } else { "native" };
+    let dump_dir = std::env::var_os("TS_DUMP").map(PathBuf::from);
+    if let Some(directory) = &dump_dir {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let telemetry_directory = dump_dir.as_ref().map(|directory| {
+        let telemetry = directory.join("telemetry-0700");
+        std::fs::create_dir_all(&telemetry).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        // Durable telemetry rejects a public parent; keep it separate from ordinary dumps.
+        std::fs::set_permissions(&telemetry, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::canonicalize(telemetry).unwrap()
+    });
+    let telemetry_database = telemetry_directory
+        .as_ref()
+        .map(|directory| directory.join(format!("node-{route}.sqlite")));
+    let telemetry_database = telemetry_database.map(|path| path.display().to_string());
+    let mut daemon_env = env.to_vec();
+    if let Some(database) = telemetry_database.as_deref() {
+        daemon_env.push(("AGENT_IDE_TELEMETRY_DATABASE", database));
+    }
+    let _daemon = Daemon::start(&fixture, &daemon_env).await;
     let mut session = Session::start(&fixture).await;
     let text = std::fs::read_to_string(fixture.root.join("src/index.js")).unwrap();
     let hello = text.find("hello(").unwrap() + 2;
@@ -535,14 +599,8 @@ async fn node_transcript(env: &[(&str, &str)]) -> (Vec<String>, String) {
             json!({"symbol":"src/index.js#hello","callees":1}),
         ),
         ("ide.symbol", json!({"symbol":"src/index.js#PORT"})),
-        (
-            "ide.context",
-            json!({"path":"src/index.js","byte_offset":hello}),
-        ),
-        (
-            "ide.context",
-            json!({"path":"src/index.js","byte_offset":shout}),
-        ),
+        source_query(json!({"path":"src/index.js","byte_offset":hello})),
+        source_query(json!({"path":"src/index.js","byte_offset":shout})),
     ];
     for (tool, arguments) in reads {
         let reply = session.call(&fixture, tool, arguments.clone()).await;
@@ -555,19 +613,64 @@ async fn node_transcript(env: &[(&str, &str)]) -> (Vec<String>, String) {
         // A TAP stream from the explicit command the product parses too.
         json!({"command":["node","--test","--test-reporter=tap","test/fail.test.mjs"]}),
     ] {
-        let (reply, _) = run_tests(&mut session, &fixture, arguments.clone()).await;
+        let (reply, text) = run_tests(&mut session, &fixture, arguments.clone()).await;
+        assert_node_test_recipe(
+            &mut session,
+            &fixture,
+            &arguments,
+            &reply,
+            &text,
+            env.is_empty(),
+        )
+        .await;
         // Node reports the canonical spelling of the fixture root (`/private/var/…`).
         let canonical = fixture.root.canonicalize().unwrap().display().to_string();
-        replies
-            .push(line_for(&fixture, "ide.test", &arguments, &reply).replace(&canonical, "<root>"));
+        let entry =
+            line_for(&fixture, "ide.test", &arguments, &reply).replace(&canonical, "<root>");
+        replies.push(
+            entry
+                .lines()
+                .filter(|row| !row.starts_with("  full replay:"))
+                .map(|row| {
+                    if row.starts_with("  rerun") {
+                        "  rerun: <route-verified recipe>"
+                    } else {
+                        row
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
     }
     let rename = json!({"operation_id":"rename-port","op":"rename","symbol":"src/index.js#PORT","new_name":"LISTEN_PORT"});
+    if let Some(directory) = &dump_dir {
+        std::fs::write(
+            directory.join(format!("node-{route}-src-before-rename.js")),
+            std::fs::read(fixture.root.join("src/index.js")).unwrap(),
+        )
+        .unwrap();
+    }
     let reply = session.call(&fixture, "ide.edit", rename.clone()).await;
+    if let Some(directory) = &dump_dir {
+        std::fs::write(
+            directory.join(format!("node-{route}-src-after-rename.js")),
+            std::fs::read(fixture.root.join("src/index.js")).unwrap(),
+        )
+        .unwrap();
+    }
     replies.push(line_for(&fixture, "ide.edit", &rename, &reply));
     replies.push(std::fs::read_to_string(fixture.root.join("src/index.js")).unwrap());
     // An edit the formatter plan is asked about (prettier is configured by `.prettierrc`).
     let format = json!({"operation_id":"format-hello","op":"replace","symbol":"src/index.js#hello","content":"export function hello(name){return shout('hello '+name)+legacy()}"});
     let reply = session.call(&fixture, "ide.edit", format.clone()).await;
+    assert_eq!(reply["state"], "edit", "formatter-backed edit: {reply}");
+    let formatted_source = std::fs::read_to_string(fixture.root.join("src/index.js")).unwrap();
+    assert!(
+        formatted_source.contains(
+            "export function hello(name) {\n  return shout('hello ' + name) + legacy();\n}"
+        ),
+        "the fixture formatter made its deterministic formatting change:\n{formatted_source}"
+    );
     // The edit's own project-check duration is the one timing in the reply.
     replies.push(untimed(&line_for(&fixture, "ide.edit", &format, &reply)));
     replies.push(std::fs::read_to_string(fixture.root.join("src/index.js")).unwrap());
@@ -581,7 +684,7 @@ async fn node_transcript(env: &[(&str, &str)]) -> (Vec<String>, String) {
         let page = session
             .call(
                 &fixture,
-                "ide.context",
+                source_query_tool(&json!({"kind":"problems","language":"typescript"})),
                 json!({"kind":"problems","language":"typescript"}),
             )
             .await;
@@ -596,6 +699,136 @@ async fn node_transcript(env: &[(&str, &str)]) -> (Vec<String>, String) {
     }
     session.close(&fixture).await;
     (replies, served)
+}
+
+/// Verifies one route's settled Node test status and execution recipe before its footer is
+/// canonicalized for parity. Native preview receipts are recovered through the public output
+/// continuation; module-owned project recipes retain their explicit HOME, PATH, executable and
+/// argv, while explicit commands use the daemon-native route in either hosting mode. The passing
+/// fixture independently asserts the actual process cwd, PATH prefix and test argv.
+async fn assert_node_test_recipe(
+    session: &mut Session,
+    fixture: &Fixture,
+    arguments: &Value,
+    reply: &Value,
+    text: &str,
+    module: bool,
+) {
+    assert_eq!(reply["state"], "complete", "{reply}");
+    assert_eq!(reply["kind"], "test", "{reply}");
+
+    let (target, command_args, summary, exit) = if arguments["path"] == "test/pass.test.mjs" {
+        (
+            "test/pass.test.mjs",
+            vec!["--test", "test/pass.test.mjs"],
+            "2 passed, 0 failed",
+            "(exit 0)",
+        )
+    } else if arguments["path"] == "test/fail.test.mjs" {
+        (
+            "test/fail.test.mjs",
+            vec!["--test", "test/fail.test.mjs"],
+            "0 passed, 1 failed",
+            "(exit 1)",
+        )
+    } else if arguments["path"] == "src/index.js" {
+        assert!(text.contains("no tests in src/index.js"), "{text}");
+        assert!(!text.contains("  rerun"), "no command ran: {text}");
+        return;
+    } else {
+        (
+            "test/fail.test.mjs",
+            vec!["--test", "--test-reporter=tap", "test/fail.test.mjs"],
+            "0 passed, 1 failed",
+            "(exit 1)",
+        )
+    };
+    assert!(text.contains(summary) && text.contains(exit), "{text}");
+    if target == "test/fail.test.mjs" {
+        assert!(text.contains("FAIL subtracts"), "{text}");
+    }
+
+    let node = PathBuf::from(std::env::var("AGENT_IDE_NODE").unwrap())
+        .canonicalize()
+        .unwrap();
+    let node_dir = node.parent().unwrap().display().to_string();
+    let rerun = text
+        .lines()
+        .find(|line| line.starts_with("  rerun:") || line.starts_with("  rerun preview:"))
+        .expect("a started test has an actionable rerun recipe");
+    let module_recipe = module && arguments.get("command").is_none();
+    if module_recipe {
+        let path = format!("{node_dir}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+        let home = agent_ide::userhome::user_home().unwrap();
+        let prefix = format!(
+            "  rerun: /usr/bin/env -i 'HOME={}' 'PATH={path}'",
+            home.display()
+        );
+        let suffix = format!("{} {}", node.display(), command_args.join(" "));
+        assert_eq!(rerun, format!("{prefix} {suffix}"));
+    } else {
+        let inherited_path = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{node_dir}:{inherited_path}");
+        if rerun.starts_with("  rerun preview: ") {
+            assert!(
+                rerun.starts_with("  rerun preview: /usr/bin/env "),
+                "{rerun}"
+            );
+            assert!(rerun.ends_with('…'), "{rerun}");
+        } else {
+            assert_eq!(
+                rerun,
+                format!(
+                    "  rerun: /usr/bin/env 'PATH={path}' {} {}",
+                    node.display(),
+                    command_args.join(" ")
+                )
+            );
+        }
+    }
+
+    if let Some(line) = text
+        .lines()
+        .find(|line| line.starts_with("  full replay: ide.test "))
+    {
+        assert!(
+            !module_recipe,
+            "module recipes are already complete: {line}"
+        );
+        assert!(
+            rerun.contains("preview:"),
+            "full replay follows a preview: {text}"
+        );
+        let replay: Value =
+            serde_json::from_str(line.strip_prefix("  full replay: ide.test ").unwrap())
+                .expect("the preview carries its replay query");
+        let reference = replay["output"].as_str().unwrap();
+        assert!(reference.contains("/replay/output/1"), "{replay}");
+        let replay = parity::recover_test_replay(session, fixture, reference).await;
+        assert_eq!(
+            replay["cwd"], ".",
+            "replay runs from the project root: {replay}"
+        );
+        let expected_path = format!("{node_dir}:{}", std::env::var("PATH").unwrap_or_default());
+        let mut expected = vec![
+            "/usr/bin/env".to_owned(),
+            format!("PATH={expected_path}"),
+            node.to_str().unwrap().to_owned(),
+        ];
+        expected.extend(command_args.into_iter().map(str::to_owned));
+        let actual = replay["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|argument| argument.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "complete native argv: {replay}");
+    } else {
+        assert!(
+            !rerun.contains("preview"),
+            "a preview must have a full replay: {text}"
+        );
+    }
 }
 
 /// The Node back-end project answers the same in module mode and in process: outline, read, cards
@@ -628,8 +861,8 @@ async fn typescript_node_backend_matches_in_process_answers() {
     parity::assert_parity(&in_process, &moduled);
     let all = moduled.join("\n");
     for expected in [
-        "test_runner node",
-        "1 passed, 0 failed",
+        "test: npm run test",
+        "2 passed, 0 failed",
         "FAIL subtracts",
         "no tests in src/index.js",
         "renamed PORT → LISTEN_PORT",
@@ -662,7 +895,7 @@ async fn resolution_transcript(
     let mut replies = Vec::new();
     for (tool, arguments) in [
         ("ide.outline", json!({"path": path})),
-        ("ide.context", json!({"path": path, "byte_offset": at})),
+        source_query(json!({"path": path, "byte_offset": at})),
     ] {
         let reply = session.call(&fixture, tool, arguments.clone()).await;
         replies.push(line_for(&fixture, tool, &arguments, &reply));
@@ -671,7 +904,7 @@ async fn resolution_transcript(
     replies
 }
 
-/// A named project tree and whether its resolution is `semantic` or `unverified`.
+/// A named project tree and either its `semantic` verdict or exact lexical refusal reason.
 type ResolutionCase<'a> = (&'a str, Vec<(&'a str, String)>, &'a str);
 
 /// Accepted and refused project shapes give the same answers in module mode and in process: a
@@ -713,7 +946,7 @@ async fn typescript_project_resolution_matches_in_process_answers() {
                 ("tsconfig.json", format!("{{{options},\"include\":[\"src/**/*\"]}}")),
                 ("src/area.ts", source.to_owned()),
             ],
-            "unverified",
+            "entry `src/**/*` must be a unique normalized relative path without wildcards",
         ),
         (
             "exclude",
@@ -724,7 +957,7 @@ async fn typescript_project_resolution_matches_in_process_answers() {
                 ),
                 ("src/area.ts", source.to_owned()),
             ],
-            "unverified",
+            "`exclude` is unsupported; membership must be literal",
         ),
         (
             "paths mapping",
@@ -736,7 +969,7 @@ async fn typescript_project_resolution_matches_in_process_answers() {
                 ),
                 ("src/area.ts", source.to_owned()),
             ],
-            "unverified",
+            "`compilerOptions.paths` is unsupported",
         ),
         (
             "open types",
@@ -748,7 +981,7 @@ async fn typescript_project_resolution_matches_in_process_answers() {
                 ),
                 ("src/area.ts", source.to_owned()),
             ],
-            "unverified",
+            "`compilerOptions.types` must be `[]` or `[\"vite/client\"]`",
         ),
         (
             "document outside every config",
@@ -757,7 +990,7 @@ async fn typescript_project_resolution_matches_in_process_answers() {
                 ("lib/other.ts", "export const x = 1;\n".to_owned()),
                 ("src/area.ts", source.to_owned()),
             ],
-            "unverified",
+            "is not listed in `files` or under a literal `include` entry",
         ),
     ];
     for (name, files, expected) in cases {
@@ -768,10 +1001,10 @@ async fn typescript_project_resolution_matches_in_process_answers() {
         let joined = moduled.join("\n");
         match expected {
             "semantic" => assert!(joined.contains("mode: semantic"), "{name}:\n{joined}"),
-            _ => assert!(
-                joined.contains("project resolution unverified"),
-                "{name} is refused:\n{joined}"
-            ),
+            reason => {
+                assert!(joined.contains("mode: lexical"), "{name}:\n{joined}");
+                assert!(joined.contains(reason), "{name} refusal reason:\n{joined}");
+            }
         }
     }
 }
@@ -800,7 +1033,13 @@ async fn a_killed_typescript_module_is_replaced_and_leaves_nothing() {
     let text = std::fs::read_to_string(fixture.root.join("src/a.ts")).unwrap();
     let at = text.find("greet_ts").unwrap() + 2;
     let request = json!({"path":"src/a.ts","byte_offset":at});
-    let warm = session.call(&fixture, "ide.context", request.clone()).await;
+    let warm = session
+        .call(
+            &fixture,
+            source_query_tool(&request.clone()),
+            request.clone(),
+        )
+        .await;
     assert!(
         warm["text"]
             .as_str()
@@ -815,7 +1054,13 @@ async fn a_killed_typescript_module_is_replaced_and_leaves_nothing() {
     let started = std::time::Instant::now();
     let mut after;
     loop {
-        after = session.call(&fixture, "ide.context", request.clone()).await;
+        after = session
+            .call(
+                &fixture,
+                source_query_tool(&request.clone()),
+                request.clone(),
+            )
+            .await;
         if after["text"]
             .as_str()
             .unwrap_or_default()
@@ -917,7 +1162,13 @@ mod faults {
             let restarted = std::time::Instant::now();
             let mut recovered;
             loop {
-                recovered = session.call(&fixture, "ide.context", request.clone()).await;
+                recovered = session
+                    .call(
+                        &fixture,
+                        source_query_tool(&request.clone()),
+                        request.clone(),
+                    )
+                    .await;
                 if recovered["text"]
                     .as_str()
                     .unwrap_or_default()
@@ -1035,7 +1286,7 @@ mod faults {
             let reply = session
                 .call(
                     fixture,
-                    "ide.context",
+                    source_query_tool(&json!({"kind":"problems","language":"typescript"})),
                     json!({"kind":"problems","language":"typescript"}),
                 )
                 .await;
@@ -1050,9 +1301,8 @@ mod faults {
 }
 
 /// A project whose test runner is `runner` (a `devDependencies` entry), with a fake `npx` first
-/// on the daemon's `PATH` that prints the runner's own summary line for whatever it is asked to
-/// run, and the test replies of one daemon with `env`.
-async fn runner_transcript(runner: &str, summary: &str, env: &[(&str, &str)]) -> Vec<String> {
+/// on the daemon's `PATH` that marks any invocation, and the test replies of one daemon with `env`.
+async fn runner_transcript(runner: &str, env: &[(&str, &str)]) -> (Vec<String>, bool) {
     let fixture = Fixture::new(
         &[
             (
@@ -1069,11 +1319,9 @@ async fn runner_transcript(runner: &str, summary: &str, env: &[(&str, &str)]) ->
     let tools = fixture.base.join("fake-bin");
     std::fs::create_dir_all(&tools).unwrap();
     let script = tools.join("npx");
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\necho \"$@\"\necho '{summary}'\n"),
-    )
-    .unwrap();
+    let invoked = fixture.base.join("npx-invoked");
+    let invoked = invoked.display().to_string().replace('\'', "'\\''");
+    std::fs::write(&script, format!("#!/bin/sh\ntouch '{invoked}'\nexit 0\n")).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1098,32 +1346,342 @@ async fn runner_transcript(runner: &str, summary: &str, env: &[(&str, &str)]) ->
         replies.push(line_for(&fixture, "ide.test", &arguments, &reply));
     }
     session.close(&fixture).await;
-    replies
+    (replies, fixture.base.join("npx-invoked").exists())
 }
 
-/// Vitest and Jest runs planned by the module become the declared test recipes and report exactly
-/// what the in-process runs report (file selection, named pattern, directory, a file with no
-/// tests), with the runner's own summary parsed.
+/// Unprepared Vitest and Jest recipes refuse consistently without invoking ambient `npx`; a plain
+/// source file still reports that it has no tests.
 #[tokio::test]
-async fn typescript_test_runners_match_in_process_answers() {
-    for (runner, summary, rerun) in [
-        (
-            "vitest",
-            "Tests  1 passed (1)",
-            "npx vitest run src/a.test.ts",
-        ),
-        (
-            "jest",
-            "Tests:       1 passed, 1 total",
-            "npx jest src/a.test.ts",
-        ),
-    ] {
-        let in_process = runner_transcript(runner, summary, &[IN_PROCESS]).await;
-        let moduled = runner_transcript(runner, summary, &[]).await;
+async fn typescript_test_runners_refuse_unprepared_packages() {
+    for runner in ["vitest", "jest"] {
+        let (in_process, in_process_invoked) = runner_transcript(runner, &[IN_PROCESS]).await;
+        let (moduled, moduled_invoked) = runner_transcript(runner, &[]).await;
         parity::assert_parity(&in_process, &moduled);
+        assert!(!in_process_invoked, "native route invoked ambient npx");
+        assert!(!moduled_invoked, "module route invoked ambient npx");
         let all = moduled.join("\n");
-        assert!(all.contains("1 passed, 0 failed"), "{runner}:\n{all}");
-        assert!(all.contains(rerun), "{runner} reruns `{rerun}`:\n{all}");
+        assert!(all.contains("provider_unavailable"), "{runner}:\n{all}");
+        assert!(
+            all.contains(&format!(
+                "project-local {runner} runner is missing, read restricted or untrusted"
+            )),
+            "{runner}:\n{all}"
+        );
+        assert!(!all.contains("1 passed, 0 failed"), "{runner}:\n{all}");
         assert!(all.contains("no tests in src/plain.ts"), "{runner}:\n{all}");
     }
+}
+
+/// The configured checks Node (nodeA from `AGENT_IDE_NODE`) resolves and executes the project's
+/// tests in BOTH hosting modes even when a conflicting ambient `node` (nodeB stub writing a
+/// sentinel) leads the daemon's `PATH`: the test passes via nodeA, the nodeB sentinel is
+/// absent, the process tree contains no stub, and the test file itself records
+/// `process.execPath` (nodeA) and spawns a bare-`node` child whose `execPath` is also nodeA.
+/// Prepared Vitest/Jest stand-ins in a contained pnpm layout exercise the real test execution
+/// path and record exact file/pattern argv; missing packages refuse without ambient npx.
+#[ignore = "requires accepted AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER"]
+#[tokio::test]
+async fn configured_node_executes_prepared_runners_without_ambient_npx() {
+    let fixture = node_fixture(true);
+    let sentinel = fixture.base.join("nodeB-ran");
+    let ambient_bin = fixture.base.join("ambient-bin");
+    std::fs::create_dir_all(&ambient_bin).unwrap();
+    let stub = ambient_bin.join("node");
+    let sentinel_path = sentinel.display().to_string().replace('\'', "'\\''");
+    std::fs::write(
+        &stub,
+        format!("#!/bin/sh\ntouch '{sentinel_path}'\necho 'ambient nodeB ran' >&2\nexit 1\n"),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // A broken admission guard must hit this sentinel instead of a real package manager.
+    std::fs::copy(&stub, ambient_bin.join("npx")).unwrap();
+    let exec_recording = fixture.base.join("execPath-primary.txt");
+    let child_recording = fixture.base.join("execPath-child.txt");
+    let exec_recording_str = exec_recording.display().to_string();
+    let child_recording_str = child_recording.display().to_string();
+    // The primary writeFileSync uses a JSON-quoted path (valid JS string literal regardless
+    // of special characters in the approved TMPDIR).
+    let exec_recording_json =
+        serde_json::to_string(&exec_recording_str).expect("recording path is a string");
+    let child_recording_json =
+        serde_json::to_string(&child_recording_str).expect("recording path is a string");
+    // The child script is built as a plain JS string, then JSON-quoted THE ENTIRE SCRIPT so
+    // it splices into the spawnSync argv array as one properly escaped JS string literal —
+    // no quote nesting issues at any language boundary.
+    let child_script =
+        format!("require('fs').writeFileSync({child_recording_json}, process.execPath)");
+    let child_script_json = serde_json::to_string(&child_script).expect("child script is a string");
+    let test_source = format!(
+        r#"import test from 'node:test';
+import {{ spawnSync }} from 'node:child_process';
+import {{ writeFileSync }} from 'node:fs';
+test('records exec paths', () => {{
+  writeFileSync({exec_recording}, process.execPath);
+  const child = spawnSync('node', ['-e', {child_script}]);
+  if (child.status !== 0) throw new Error('child failed: ' + child.stderr);
+}});
+"#,
+        exec_recording = exec_recording_json,
+        child_script = child_script_json,
+    );
+    put_test_file(&fixture, "test/exec-path.test.mjs", &test_source);
+
+    let ambient_prepend = format!(
+        "{}:{}",
+        ambient_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let real_node = std::env::var("AGENT_IDE_NODE").unwrap();
+
+    for mode_env in [
+        vec![],           // module mode (default)
+        vec![IN_PROCESS], // native mode
+    ] {
+        let mut env = vec![("PATH", ambient_prepend.as_str())];
+        env.extend_from_slice(&mode_env);
+        let _daemon = Daemon::start(&fixture, &env).await;
+        let mut session = Session::start(&fixture).await;
+
+        let _ = std::fs::remove_file(&exec_recording);
+        let _ = std::fs::remove_file(&child_recording);
+
+        let (reply, text) = run_tests(
+            &mut session,
+            &fixture,
+            json!({"path":"test/exec-path.test.mjs"}),
+        )
+        .await;
+        assert!(
+            text.contains("1 passed, 0 failed,") && text.contains("(exit 0)"),
+            "test must report a parsed terminal pass with exit 0 in {:?}: {text}\n{reply:?}",
+            mode_env,
+        );
+
+        let primary = std::fs::read_to_string(&exec_recording).unwrap();
+        assert_eq!(
+            Path::new(&primary).canonicalize().unwrap(),
+            Path::new(&real_node).canonicalize().unwrap(),
+            "primary execPath must be the configured nodeA in {:?}",
+            mode_env,
+        );
+        let child = std::fs::read_to_string(&child_recording).unwrap();
+        assert_eq!(
+            Path::new(&child).canonicalize().unwrap(),
+            Path::new(&real_node).canonicalize().unwrap(),
+            "child execPath must be the configured nodeA in {:?}",
+            mode_env,
+        );
+        assert!(
+            !sentinel.exists(),
+            "ambient nodeB must never execute in {:?}: {} exists",
+            mode_env,
+            sentinel.display(),
+        );
+
+        let package_path = fixture.root.join("package.json");
+        let mut package: Value =
+            serde_json::from_str(&std::fs::read_to_string(&package_path).unwrap()).unwrap();
+        for runner in ["vitest", "jest"] {
+            package["devDependencies"] = json!({runner: "1.0.0"});
+            package["scripts"]["test"] = json!(runner);
+            package["engines"]["node"] = json!(">=16.9.0");
+            std::fs::write(&package_path, package.to_string()).unwrap();
+            let runner_link = fixture.root.join(format!("node_modules/{runner}"));
+            let _ = std::fs::remove_file(&runner_link);
+            let (_, missing) = run_tests(
+                &mut session,
+                &fixture,
+                json!({"path":"test/exec-path.test.mjs"}),
+            )
+            .await;
+            assert!(
+                missing.contains(&format!("project-local {runner} runner is missing")),
+                "{mode_env:?}: {missing}"
+            );
+
+            let relative = format!("node_modules/.pnpm/{runner}@1/node_modules/{runner}");
+            put_test_file(
+                &fixture,
+                &format!("{relative}/package.json"),
+                &format!(
+                    r#"{{"name":"{runner}","bin":{{"{runner}":"bin/cli.{}"}}}}"#,
+                    if runner == "vitest" { "mjs" } else { "cjs" }
+                ),
+            );
+            let record = fixture.root.join("runner-record.json");
+            let script = format!(
+                r#"
+{imports}
+const child = spawnSync('node', ['-p', 'process.execPath'], {{encoding:'utf8'}});
+if (child.status !== 0) throw new Error('child Node failed: ' + child.stderr);
+writeFileSync('runner-record.json', JSON.stringify({{node:process.execPath, child:child.stdout.trim(), args:process.argv.slice(2)}}));
+console.log({summary});
+"#,
+                imports = if runner == "vitest" {
+                    "import {spawnSync} from 'node:child_process'; import {writeFileSync} from 'node:fs'; import {pathToFileURL} from 'node:url'; if (import.meta.url !== pathToFileURL(process.argv[1]).href) throw new Error('ESM entry changed');"
+                } else {
+                    "const {spawnSync} = require('node:child_process'); const {writeFileSync} = require('node:fs'); if (require.main !== module) throw new Error('CJS entry changed');"
+                },
+                summary = serde_json::to_string(if runner == "vitest" {
+                    "Tests  1 passed (1)"
+                } else {
+                    "Tests: 1 passed, 1 total"
+                })
+                .unwrap()
+            );
+            put_test_file(
+                &fixture,
+                &format!(
+                    "{relative}/bin/cli.{}",
+                    if runner == "vitest" { "mjs" } else { "cjs" }
+                ),
+                &script,
+            );
+            std::os::unix::fs::symlink(
+                format!(".pnpm/{runner}@1/node_modules/{runner}"),
+                &runner_link,
+            )
+            .unwrap();
+            put_test_file(
+                &fixture,
+                "-dash test.test.ts",
+                "test('stand-in', () => {});\n",
+            );
+            for (arguments, mut expected) in [
+                (
+                    json!({"path":"-dash test.test.ts"}),
+                    vec!["./-dash test.test.ts"],
+                ),
+                (
+                    json!({"pattern":"-leading 🦀 [a-z]"}),
+                    vec!["-t", "-leading 🦀 [a-z]"],
+                ),
+                (
+                    json!({"path":"test/exec-path.test.mjs"}),
+                    vec!["test/exec-path.test.mjs"],
+                ),
+            ] {
+                if runner == "vitest" {
+                    expected.insert(0, "run");
+                }
+                let _ = std::fs::remove_file(&record);
+                let (_, text) = run_tests(&mut session, &fixture, arguments).await;
+                assert!(
+                    text.contains("1 passed, 0 failed,") && text.contains("(exit 0)"),
+                    "{runner} {mode_env:?}: {text}"
+                );
+                let observed: Value =
+                    serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+                assert_eq!(observed["args"], json!(expected), "{runner} {mode_env:?}");
+                for field in ["node", "child"] {
+                    assert_eq!(
+                        Path::new(observed[field].as_str().unwrap())
+                            .canonicalize()
+                            .unwrap(),
+                        Path::new(&real_node).canonicalize().unwrap(),
+                        "{runner} {field} {mode_env:?}"
+                    );
+                }
+                assert!(
+                    !sentinel.exists(),
+                    "ambient Node/npx executed: {runner} {mode_env:?}"
+                );
+            }
+            for requirement in [">=999", "unknown-node-alias", ""] {
+                package["engines"]["node"] = json!(requirement);
+                std::fs::write(&package_path, package.to_string()).unwrap();
+                std::fs::remove_file(&record).unwrap();
+                let (_, refused) = run_tests(
+                    &mut session,
+                    &fixture,
+                    json!({"path":"test/exec-path.test.mjs"}),
+                )
+                .await;
+                assert!(
+                    refused.contains("environment unavailable (exit 78)")
+                        && !refused.contains("0 passed"),
+                    "{runner} {requirement} {mode_env:?}: {refused}"
+                );
+                assert!(!record.exists(), "refused environment loaded {runner}");
+                // Keep the next iteration's record removal deterministic without executing the runner.
+                std::fs::write(&record, "refused").unwrap();
+            }
+            package["engines"]["node"] = json!(">=16.9.0");
+            std::fs::write(&package_path, package.to_string()).unwrap();
+            std::fs::remove_file(&record).unwrap();
+            let tsc = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap())
+                .with_file_name("tsc.js");
+            let config = agent_ide_core::modules::contract::ModuleConfig {
+                checks: Some(json!({"node":real_node,"tsc_cli":tsc})),
+                provider: Some(json!({"node":accepted_program(&real_node,"24.4.0")})),
+                ..Default::default()
+            };
+            let argv = if runner == "vitest" {
+                vec![
+                    runner.into(),
+                    "run".into(),
+                    "test/exec-path.test.mjs".into(),
+                ]
+            } else {
+                vec![runner.into(), "test/exec-path.test.mjs".into()]
+            };
+            for case in ["unknown-identity", "denied-verifier", "denied-runner"] {
+                let mut rejected = config.clone();
+                match case {
+                    "unknown-identity" => {
+                        rejected.provider.as_mut().unwrap()["node"]["identity"] = json!("unknown")
+                    }
+                    "denied-verifier" => {
+                        rejected.read_denies =
+                            vec![agent_ide_core::execution::seatbelt::ReadDeny::Path(
+                                tsc.with_file_name("typescript.js"),
+                            )]
+                    }
+                    _ => {
+                        rejected.read_denies =
+                            vec![agent_ide_core::execution::seatbelt::ReadDeny::Path(
+                                runner_link.canonicalize().unwrap(),
+                            )]
+                    }
+                }
+                assert!(
+                    agent_ide_lang_typescript::environment::command_argv(
+                        &fixture.root,
+                        &argv,
+                        &rejected
+                    )
+                    .is_err(),
+                    "native {case}"
+                );
+                assert!(
+                    agent_ide_lang_typescript::module::configured_effect(
+                        &argv,
+                        &rejected,
+                        &fixture.root
+                    )
+                    .is_err(),
+                    "module {case}"
+                );
+                assert!(!record.exists(), "{case} loaded {runner}");
+            }
+            std::fs::remove_file(&runner_link).unwrap();
+        }
+        package["devDependencies"] = serde_json::json!({});
+        package["scripts"]["test"] = serde_json::json!("node --test");
+        package.as_object_mut().unwrap().remove("engines");
+        std::fs::write(&package_path, package.to_string()).unwrap();
+        session.close(&fixture).await;
+    }
+    let _ = std::fs::remove_dir_all(&fixture.base);
+}
+
+/// Writes a test file into the fixture's worktree, creating parents.
+fn put_test_file(fixture: &Fixture, relative: &str, content: &str) {
+    let path = fixture.root.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
 }

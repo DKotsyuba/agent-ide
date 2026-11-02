@@ -24,6 +24,18 @@
         "matcher": "",
         "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"}]
       }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"}]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact|clear",
+        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"}]
+      }
     ]
   }
 }

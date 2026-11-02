@@ -20,8 +20,8 @@ use agent_ide::assistance::{
     assembly::ProductDispatcher,
     codex_rendezvous::ManagedCodexPublisher,
     facade::{
-        DaemonCurrencyNote, EvictFn, ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher,
-        SharedDaemonNote, StdioFacade,
+        CatalogHost, DaemonCurrencyNote, EvictFn, ReestablishFn, RerootFn, RerootOutcome,
+        SharedCodexPublisher, SharedDaemonNote, StdioFacade,
     },
     host_binding::HostKind,
     launcher::{AcceptedExecutable, LauncherConfig},
@@ -148,7 +148,7 @@ async fn main() -> ExitCode {
             .await;
             ExitCode::SUCCESS
         }
-        Ok(Command::Mcp { runtime_dir }) => {
+        Ok(Command::Mcp { runtime_dir, host }) => {
             let facade = match std::env::var("AGENT_IDE_HOST_ATTACHMENT") {
                 Ok(attachment) => {
                     match StdioFacade::with_host_attachment(runtime_dir, attachment) {
@@ -158,7 +158,8 @@ async fn main() -> ExitCode {
                 }
                 Err(std::env::VarError::NotPresent) => StdioFacade::new(runtime_dir),
                 Err(std::env::VarError::NotUnicode(_)) => return fail(AppError::InvalidResponse),
-            };
+            }
+            .with_catalog_host(host);
             match serve_server(facade, stdio()).await {
                 Ok(service) => match service.waiting().await {
                     Ok(_) => ExitCode::SUCCESS,
@@ -227,6 +228,21 @@ async fn main() -> ExitCode {
                 ExitCode::from(2)
             }
             Err(error) => fail(error),
+        },
+        #[cfg(target_os = "linux")]
+        Ok(Command::EvidenceTypeScript {
+            node,
+            bridge,
+            tsserver,
+        }) => match evidence_typescript(node, bridge, tsserver) {
+            Ok(fragment) => {
+                println!("{fragment}");
+                ExitCode::SUCCESS
+            }
+            Err(reason) => {
+                eprintln!("agent-ide: {reason}");
+                ExitCode::from(2)
+            }
         },
         Ok(Command::EvidenceExecutable { identity, path }) => {
             match evidence_executable(&identity, path) {
@@ -385,6 +401,99 @@ fn evidence_executable(identity: &str, path: PathBuf) -> Result<String, AppError
         "blake3": executable.blake3,
     })
     .to_string())
+}
+
+/// Measures explicit Node and pinned package members without executing them or changing config.
+/// Version labels name the supported contract, not a measurement of the Node version.
+#[cfg(target_os = "linux")]
+fn evidence_typescript(
+    node: PathBuf,
+    bridge: PathBuf,
+    tsserver: PathBuf,
+) -> Result<String, &'static str> {
+    use agent_ide::assistance::launcher::{ProviderLaunch, absolute};
+    use agent_ide::intelligence::typescript_backend::{
+        TYPESCRIPT_BRIDGE_VERSION_V1, TYPESCRIPT_NODE_VERSION_V1, TYPESCRIPT_VERSION_V1,
+        TypeScriptLaunch,
+    };
+    use serde_json::json;
+    fn measure(path: &Path, limit: u64) -> Result<serde_json::Value, &'static str> {
+        if !absolute(path) || path.to_str().is_none() {
+            return Err("TypeScript paths must be absolute, normalized UTF-8 paths");
+        }
+        let file = fs::File::open(path).map_err(|_| "cannot read a TypeScript bundle file")?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| "cannot inspect a TypeScript bundle file")?;
+        if !metadata.is_file() || metadata.len() > limit {
+            return Err("TypeScript bundle file is not regular or exceeds its size limit");
+        }
+        let mut file = file.take(limit + 1);
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0_u8; 32768];
+        let mut bytes = 0_u64;
+        loop {
+            let n = file
+                .read(&mut buffer)
+                .map_err(|_| "cannot read a TypeScript bundle file")?;
+            if n == 0 {
+                break;
+            }
+            bytes += n as u64;
+            if bytes > limit {
+                return Err("TypeScript bundle file exceeds its size limit");
+            }
+            hasher.update(&buffer[..n]);
+        }
+        Ok(json!({"path":path,"blake3":hasher.finalize().to_hex().to_string(),"bytes":bytes}))
+    }
+    let node_file = measure(&node, 256 * 1024 * 1024)?;
+    let bridge_file = measure(&bridge, 64 * 1024 * 1024)?;
+    let tsserver_file = measure(&tsserver, 64 * 1024 * 1024)?;
+    let ts_root = tsserver
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("tsserver path has no package root")?;
+    let bridge_root = bridge
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("bridge path has no package root")?;
+    let mut members = [
+        ts_root.join("lib/_tsserver.js"),
+        ts_root.join("lib/typescript.js"),
+        ts_root.join("package.json"),
+        bridge_root.join("package.json"),
+    ];
+    members.sort();
+    let closure = members
+        .iter()
+        .map(|path| measure(path, 64 * 1024 * 1024))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut declaration = json!({
+        "executable":{"path":bridge,"identity":TYPESCRIPT_BRIDGE_VERSION_V1,"blake3":bridge_file["blake3"]},
+        "settings":"typescript_defaults_v1","toolchain":TYPESCRIPT_NODE_VERSION_V1,
+        "node":{"path":node,"identity":TYPESCRIPT_NODE_VERSION_V1,"blake3":node_file["blake3"]},
+        "typescript":{"bridge_bytes":bridge_file["bytes"],"bridge_version":TYPESCRIPT_BRIDGE_VERSION_V1,
+            "tsserver":tsserver_file,"typescript_version":TYPESCRIPT_VERSION_V1,"closure":closure,
+            "codex_macos_evidence":null,"claude_macos_evidence":null},
+        "trust":"accepted-local","cache_namespace":"typescript-cache"
+    });
+    let unbound: ProviderLaunch = serde_json::from_value(declaration.clone())
+        .map_err(|_| "invalid TypeScript declaration")?;
+    let fingerprint = unbound
+        .expected_typescript_linux_operator_bundle()
+        .ok_or("TypeScript bundle does not match the pinned 6.0.0/5.9.3 files")?;
+    declaration["typescript"]["linux_operator_bundle"] = json!(fingerprint);
+    let bound: ProviderLaunch = serde_json::from_value(declaration.clone())
+        .map_err(|_| "invalid TypeScript declaration")?;
+    bound
+        .typescript_bundle()
+        .map_err(|_| "TypeScript bundle changed or Node is not executable")?;
+    bound
+        .executable
+        .verify()
+        .map_err(|_| "TypeScript bridge changed during measurement")?;
+    Ok(declaration.to_string())
 }
 
 /// Loads and verifies one launcher configuration's accepted executables without a running daemon.
@@ -613,9 +722,14 @@ async fn telemetry_owner(database: &Path) -> Result<Telemetry, AppError> {
 enum Command {
     /// Serves health and finite Assistance dispatch until interrupted or killed.
     Daemon { runtime_dir: PathBuf },
-    /// Serves the static six-tool MCP surface on stdio without creating local runtime state.
-    Mcp { runtime_dir: PathBuf },
-    /// Owns one private daemon and serves the same static six-tool surface until stdio ends.
+    /// Serves the ten-tool public catalog over stdio for either host.
+    Mcp {
+        /// Existing daemon endpoint directory; this unmanaged front never creates it.
+        runtime_dir: PathBuf,
+        /// Catalog advertised to the host; `claude` unless `--host` selects another (export).
+        host: CatalogHost,
+    },
+    /// Owns one private daemon and serves its selected host catalog until stdio ends.
     ManagedMcp {
         /// Absolute one-target launcher template rebound to this process and captured candidate.
         launcher_template: PathBuf,
@@ -667,6 +781,13 @@ enum Command {
         identity: String,
         /// Absolute executable whose current bytes are measured.
         path: PathBuf,
+    },
+    /// Measures a Linux TypeScript provider without executing its inputs.
+    #[cfg(target_os = "linux")]
+    EvidenceTypeScript {
+        node: PathBuf,
+        bridge: PathBuf,
+        tsserver: PathBuf,
     },
     /// Verifies one launcher configuration's accepted executables without starting a daemon.
     LauncherCheck {
@@ -890,6 +1011,8 @@ commands:
                                           install a sealed release bundle
   evidence executable --identity <id> <path>
                                           accepted-executable launcher fragment
+  evidence typescript --node <path> --bridge <path> --tsserver <path>
+                                          Linux TypeScript provider fragment
   launcher check <file>                   validate a launcher configuration
   telemetry query|export --database <file> [--tag <tag>] [--cursor <n>]
   cache status|prune                      show or apply the cache retention policy
@@ -1002,6 +1125,29 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             path: PathBuf::from(path),
         });
     }
+    #[cfg(target_os = "linux")]
+    if let [
+        mode,
+        sub,
+        node_flag,
+        node,
+        bridge_flag,
+        bridge,
+        tsserver_flag,
+        tsserver,
+    ] = arguments.as_slice()
+        && mode == "evidence"
+        && sub == "typescript"
+    {
+        if node_flag != "--node" || bridge_flag != "--bridge" || tsserver_flag != "--tsserver" {
+            return Err(AppError::InvalidResponse);
+        }
+        return Ok(Command::EvidenceTypeScript {
+            node: node.into(),
+            bridge: bridge.into(),
+            tsserver: tsserver.into(),
+        });
+    }
     // `errors` accepts its flags in any order, unlike every other mode above.
     if let [mode, rest @ ..] = arguments.as_slice()
         && mode == "errors"
@@ -1105,6 +1251,21 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             return Ok(Command::CodexHooksPrint);
         }
     }
+    // `mcp --runtime-dir DIR --host claude|codex` serves (and exports) one host's catalog.
+    if let [mode, flag, value, host_flag, host] = arguments.as_slice()
+        && mode == "mcp"
+        && flag == "--runtime-dir"
+        && host_flag == "--host"
+    {
+        let host = host
+            .to_str()
+            .and_then(CatalogHost::parse)
+            .ok_or(AppError::InvalidResponse)?;
+        return Ok(Command::Mcp {
+            runtime_dir: PathBuf::from(value),
+            host,
+        });
+    }
     let [mode, flag, value] = arguments.as_slice() else {
         return Err(AppError::InvalidResponse);
     };
@@ -1135,7 +1296,10 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             runtime_dir,
             json: false,
         }),
-        Some("mcp") => Ok(Command::Mcp { runtime_dir }),
+        Some("mcp") => Ok(Command::Mcp {
+            runtime_dir,
+            host: CatalogHost::Claude,
+        }),
         Some("codex-hook") => Ok(Command::CodexHook { runtime_dir }),
         Some("claude-hook") => Ok(Command::ClaudeHook { runtime_dir }),
         _ => Err(AppError::InvalidResponse),
@@ -1427,7 +1591,7 @@ impl ManagedRuntime {
 
     /// Exclusively creates the one deterministic shared Claude runtime directory with mode `0700`.
     ///
-    /// `path` must be the rendezvous-key-derived child of the canonical `/private/tmp` root. An
+    /// `path` must be the rendezvous-key-derived child of [`agent_ide::hook_hints::effective_root`]. An
     /// existing path is never opened, repaired, or removed here, so a fresh generation can never
     /// silently reuse or overwrite a live daemon's directory identity; [`Self::ensure_deterministic`]
     /// is the idempotent entry point a second worktree's MCP uses to join an existing rendezvous. The
@@ -1589,7 +1753,7 @@ fn absolute_local_path(path: &Path) -> bool {
             .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
 }
 
-/// Fixed short namespace for deterministic shared per-repository Claude runtimes below `/private/tmp`.
+/// Fixed short namespace for deterministic shared per-repository Claude runtimes.
 const CLAUDE_RUNTIME_PREFIX: &str = agent_ide::hook_hints::RUNTIME_PREFIX;
 /// Bounded deadline for the local `git` rendezvous-key probe; a real repository answers instantly.
 const GIT_COMMON_DIR_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1718,7 +1882,7 @@ fn claude_key_cache_path(candidate: &Path) -> std::io::Result<PathBuf> {
     let identity = blake3::hash(candidate.as_os_str().as_bytes())
         .to_hex()
         .to_string();
-    Ok(agent_ide::test_seams::shared_runtime_root()?
+    Ok(agent_ide::hook_hints::effective_root()?
         .join(format!("{CLAUDE_KEY_CACHE_PREFIX}{}", &identity[..16])))
 }
 
@@ -1885,14 +2049,18 @@ fn prepare_private_persistent_directory(path: &Path) -> std::io::Result<()> {
 /// `status` only reports; `prune` sweeps now under the machine-wide sweep lock (exit 2 when
 /// another sweep holds it), ignoring the hourly spacing but every lease and rule, and records its
 /// removals in the error log of the current directory's repository (the one `errors` reads).
+/// Hint status/prune uses the shared operator-selected Claude parent. An invalid parent exits 2
+/// with a repair message before any sweep; it never falls back to the legacy parent.
 async fn run_cache(prune: bool) -> ExitCode {
     let Some(root) = agent_ide::retention::state_root() else {
         eprintln!("agent-ide: cannot resolve the user home");
         return ExitCode::from(2);
     };
-    let tmp = match agent_ide::test_seams::shared_runtime_root() {
-        Ok(root) => root,
-        Err(error) => return fail(error.into()),
+    let Ok(tmp) = agent_ide::hook_hints::effective_root() else {
+        eprintln!(
+            "agent-ide: cannot resolve Claude rendezvous parent; set AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT to an existing absolute normalized directory"
+        );
+        return ExitCode::from(2);
     };
     if !prune {
         print!(
@@ -1947,7 +2115,9 @@ async fn run_cache(prune: bool) -> ExitCode {
 /// `agent-ide` process that is not a build proven to lock hint publication may still refresh a hint without
 /// taking the directory lock a collection relies on, so none is collected while one exists.
 fn hint_pause_note() -> String {
-    match agent_ide::retention::hint_publishers_unsafe(&agent_ide::retention::process_snapshot) {
+    match agent_ide::retention::hint_publishers_unsafe(
+        &agent_ide::retention::global_process_snapshot,
+    ) {
         Some(blocking) if blocking.is_empty() => String::new(),
         Some(blocking) => {
             let mut note = format!(
@@ -2066,11 +2236,11 @@ fn managed_telemetry_database(candidate: &Path) -> Result<PathBuf, TelemetryStat
 /// `key` is the rendezvous key resolved by [`claude_rendezvous_key`] (a repository's canonical git
 /// common directory, or the canonical candidate itself outside a git repository). The full digest
 /// remains in the attachment record to reject a theoretical collision in the sixteen-hex-character
-/// pathname prefix. The returned parent is canonical `/private/tmp`; no caller or model path can
-/// redirect the rendezvous elsewhere.
+/// pathname prefix. The parent is selected by [`agent_ide::hook_hints::effective_root`]; model arguments cannot
+/// redirect it.
 fn claude_runtime_path(key: &Path) -> std::io::Result<PathBuf> {
     let identity = claude_rendezvous_identity(key);
-    Ok(agent_ide::test_seams::shared_runtime_root()?
+    Ok(agent_ide::hook_hints::effective_root()?
         .join(format!("{CLAUDE_RUNTIME_PREFIX}{}", &identity[..16])))
 }
 
@@ -2082,7 +2252,7 @@ fn claude_runtime_path(key: &Path) -> std::io::Result<PathBuf> {
 /// allowlist entry a Claude session in the same repository resolves. `project_dir` may be
 /// relative and is canonicalized first; nothing is created, read, or removed under the reported
 /// paths. Returns an error when the directory is missing or not a directory, or when
-/// `/private/tmp` cannot be resolved; the caller reports any error with exit code 2.
+/// the configured rendezvous parent cannot be resolved; the caller reports any error with exit code 2.
 async fn claude_rendezvous_paths(project_dir: &Path) -> std::io::Result<PathBuf> {
     if !fs::symlink_metadata(project_dir).is_ok_and(|metadata| metadata.is_dir()) {
         return Err(std::io::Error::new(
@@ -2113,8 +2283,9 @@ fn shell_single_quote(path: &Path) -> String {
 
 /// Builds the exact managed Codex `hooks.json` fragment from T29B §6 for one executable path.
 ///
-/// Both handlers use one catch-all matcher, one second timeout, and no async execution, so the
+/// The tool handlers use one catch-all matcher, one second timeout, and no async execution, so the
 /// pre-observation arrives before the post and the post feedback stays immediate.
+/// `PreCompact` raises the session's compaction counter (§9.1).
 fn managed_hooks_fragment(executable: &Path) -> serde_json::Value {
     let command = format!("{} codex-hook --managed", shell_single_quote(executable));
     let handler = serde_json::json!({
@@ -2125,6 +2296,7 @@ fn managed_hooks_fragment(executable: &Path) -> serde_json::Value {
         "hooks": {
             "PreToolUse": [handler],
             "PostToolUse": [handler],
+            "PreCompact": [{"hooks": [{"type": "command", "command": command, "timeout": 1}]}],
         }
     })
 }
@@ -2388,11 +2560,13 @@ async fn run_managed_claude_hook() {
     if std::thread::Builder::new()
         .name("claude-hook-input".into())
         .spawn(move || {
-            let mut payload = Vec::new();
-            let result = std::io::stdin()
-                .take(agent_ide::assistance::codex_hook::MAX_HOOK_INPUT_BYTES + 1)
-                .read_to_end(&mut payload);
-            let _ = sender.send(result.ok().map(|_| payload));
+            // Bodies of any size stream through; only the routing `cwd` and the projected
+            // identity fields are kept for a payload over the transport bound.
+            let _ = sender.send(agent_ide::assistance::codex_hook::read_hook_payload(
+                std::io::stdin().lock(),
+                HostKind::Claude,
+                true,
+            ));
         })
         .is_err()
     {
@@ -2400,9 +2574,17 @@ async fn run_managed_claude_hook() {
         return;
     }
     let payload = match tokio::time::timeout_at(deadline, receiver).await {
-        Ok(Ok(Some(payload))) => payload,
+        Ok(Ok(Ok(payload))) => payload,
         Err(_) => {
             log("hook_input_timeout");
+            return;
+        }
+        Ok(Ok(Err(agent_ide::assistance::codex_hook::HookInputError::Oversize))) => {
+            log("hook_input_oversize");
+            return;
+        }
+        Ok(Ok(Err(agent_ide::assistance::codex_hook::HookInputError::Malformed))) => {
+            log("hook_no_cwd");
             return;
         }
         _ => {
@@ -2410,10 +2592,6 @@ async fn run_managed_claude_hook() {
             return;
         }
     };
-    if payload.len() > agent_ide::assistance::codex_hook::MAX_HOOK_INPUT_BYTES as usize {
-        log("hook_input_oversize");
-        return;
-    }
     let Some(cwd) = serde_json::from_slice::<serde_json::Value>(&payload)
         .ok()
         .and_then(|value| value.get("cwd")?.as_str().map(PathBuf::from))
@@ -2478,8 +2656,8 @@ async fn run_managed_claude_hook() {
 
 /// Dispatches one self-contained managed MCP generation to its host-specific lifecycle contract.
 ///
-/// Setup failure always still serves the static six tools through a connect-only unavailable
-/// facade, for either host.
+/// Setup failure still serves the selected host catalog through a connect-only unavailable
+/// facade: ten public tools for either host. No failure falls back to another host.
 async fn run_managed_mcp(
     launcher_template: PathBuf,
     candidate: std::io::Result<PathBuf>,
@@ -2499,15 +2677,31 @@ async fn run_managed_mcp(
 ///
 /// Codex owns one daemon and private runtime at a time. It holds a lease while serving and replaces
 /// a failed daemon on the next call; EOF or a termination signal tears down the current generation.
+/// Catalog/instruction selection remains Codex even when publication or setup is unavailable.
 async fn run_managed_codex_mcp(
     launcher_template: PathBuf,
     candidate: std::io::Result<PathBuf>,
 ) -> ExitCode {
+    let bridge_launcher = LauncherConfig::read(&launcher_template).ok();
     let Ok(candidate) = candidate else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
+        return serve_managed_stdio(
+            StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
     };
     let Ok(runtime) = ManagedRuntime::create() else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
+        return serve_managed_stdio(
+            StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
     };
     agent_ide::errorlog::init_repository(
         &claude_rendezvous_identity(&claude_rendezvous_key(&candidate).await)[..16],
@@ -2529,8 +2723,14 @@ async fn run_managed_codex_mcp(
             let Some(lease) = lease else {
                 terminate_owned_daemon(child).await;
                 let _ = runtime.remove();
-                return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None)
-                    .await;
+                return serve_managed_stdio(
+                    StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             };
             let lease = Arc::new(Mutex::new(Some(lease)));
             let runtime = Arc::new(OwnedCodexRuntime {
@@ -2570,14 +2770,28 @@ async fn run_managed_codex_mcp(
                     },
                 )
             };
-            let facade = facade.map(|facade| facade.with_wedge_eviction(evict));
+            // The catalog is a host property, independent of route publication or daemon health.
+            let facade = facade.map(|facade| {
+                facade
+                    .with_catalog_host(CatalogHost::Codex)
+                    .with_bridge_configuration(
+                        bridge_launcher.as_ref().and_then(LauncherConfig::bridge),
+                    )
+                    .with_wedge_eviction(evict)
+            });
             let Some(facade) = facade else {
                 terminate_owned_daemon(child).await;
                 if let Some(runtime) = runtime.current.lock().expect("owned runtime mutex").take() {
                     let _ = runtime.remove();
                 }
-                return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None)
-                    .await;
+                return serve_managed_stdio(
+                    StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             };
             if let Some(publisher) = &publisher {
                 tokio::spawn(unpublish_when_daemon_exits(
@@ -2591,7 +2805,14 @@ async fn run_managed_codex_mcp(
         }
         Err(_) => {
             let _ = runtime.remove();
-            serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await
+            serve_managed_stdio(
+                StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         }
     }
 }
@@ -4025,6 +4246,67 @@ mod tests {
         assert_eq!(value["blake3"].as_str().unwrap().len(), 64);
         std::fs::remove_file(path).unwrap();
     }
+    /// The offline Linux helper rejects bad argv and unpinned files without running Node.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn typescript_evidence_rejects_invalid_argv_and_unpinned_files() {
+        assert!(matches!(
+            command(args(&[
+                "evidence",
+                "typescript",
+                "--node",
+                "/n",
+                "--bridge",
+                "/b",
+                "--tsserver",
+                "/t"
+            ])),
+            Ok(Command::EvidenceTypeScript { .. })
+        ));
+        assert!(
+            command(args(&[
+                "evidence",
+                "typescript",
+                "--node",
+                "/n",
+                "--tsserver",
+                "/t",
+                "--bridge",
+                "/b"
+            ]))
+            .is_err()
+        );
+        assert!(command(args(&["evidence", "typescript", "--node", "/n"])).is_err());
+        assert!(evidence_typescript("relative".into(), "/b".into(), "/t".into()).is_err());
+        agent_ide::languages::install();
+        let dir =
+            std::env::temp_dir().join(format!("agent-ide-ts-evidence-{}", std::process::id()));
+        let node = dir.join("node");
+        let bridge = dir.join("tls/lib/cli.mjs");
+        let tsserver = dir.join("ts/lib/tsserver.js");
+        std::fs::create_dir_all(bridge.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(tsserver.parent().unwrap()).unwrap();
+        let marker = dir.join("node-executed");
+        std::fs::write(&node, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for path in [
+            &bridge,
+            &tsserver,
+            &dir.join("tls/package.json"),
+            &dir.join("ts/package.json"),
+            &dir.join("ts/lib/_tsserver.js"),
+            &dir.join("ts/lib/typescript.js"),
+        ] {
+            std::fs::write(path, b"not the pinned artifact").unwrap();
+        }
+        assert_eq!(
+            evidence_typescript(node, bridge, tsserver).unwrap_err(),
+            "TypeScript bundle does not match the pinned 6.0.0/5.9.3 files"
+        );
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// `launcher check` parses a bare path and reports malformed configuration consistently.
     #[test]
     fn launcher_check_round_trips_through_the_cli() {
@@ -4112,8 +4394,32 @@ mod tests {
         ));
         assert!(matches!(
             command(args(&["mcp", "--runtime-dir", "/private/tmp/runtime"])),
-            Ok(Command::Mcp { runtime_dir }) if runtime_dir == Path::new("/private/tmp/runtime")
+            Ok(Command::Mcp { runtime_dir, host: CatalogHost::Claude })
+                if runtime_dir == Path::new("/private/tmp/runtime")
         ));
+        assert!(matches!(
+            command(args(&[
+                "mcp",
+                "--runtime-dir",
+                "/private/tmp/runtime",
+                "--host",
+                "codex"
+            ])),
+            Ok(Command::Mcp {
+                host: CatalogHost::Codex,
+                ..
+            })
+        ));
+        assert!(
+            command(args(&[
+                "mcp",
+                "--runtime-dir",
+                "/private/tmp/runtime",
+                "--host",
+                "zcode"
+            ]))
+            .is_err()
+        );
         assert!(matches!(
             command(args(&["claude-hook"])),
             Ok(Command::ManagedClaudeHook)
@@ -4209,17 +4515,38 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Claude's shortened rendezvous is stable for one root and different for another root.
+    /// Claude runtime/cache share the configured parent and keep stable, distinct short identities.
     #[test]
     fn claude_runtime_path_is_stable_and_candidate_specific() {
         let first = Path::new("/private/tmp/agent-ide-claude-project-a");
         let second = Path::new("/private/tmp/agent-ide-claude-project-b");
         let first_path = claude_runtime_path(first).unwrap();
+        if agent_ide::test_seams::var("AGENT_IDE_TEST_SHARED_RUNTIME_ROOT").is_none()
+            && let Some(parent) = std::env::var_os("AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT")
+                .filter(|value| !value.is_empty())
+        {
+            assert_eq!(
+                first_path.parent(),
+                Some(fs::canonicalize(parent).unwrap().as_path())
+            );
+        }
         assert_eq!(first_path, claude_runtime_path(first).unwrap());
         assert_ne!(first_path, claude_runtime_path(second).unwrap());
         assert_eq!(
             first_path.parent(),
-            Some(fs::canonicalize(Path::new("/tmp")).unwrap().as_path())
+            Some(agent_ide::hook_hints::effective_root().unwrap().as_path())
+        );
+        assert_eq!(
+            claude_key_cache_path(first).unwrap().parent(),
+            first_path.parent()
+        );
+        assert!(
+            first_path
+                .join("agent-ide.sock")
+                .as_os_str()
+                .as_bytes()
+                .len()
+                < 104
         );
         assert!(canonical_claude_project(Some(OsString::from("relative"))).is_err());
         assert!(canonical_claude_project(Some(OsString::from("/private/tmp/../tmp"))).is_err());
@@ -4466,7 +4793,7 @@ mod tests {
         // The shortened suffix is the shared key digest's sixteen-hex-character prefix, not any
         // candidate-specific path digest.
         let key = claude_rendezvous_key(&fs::canonicalize(&repo).unwrap()).await;
-        let expected = agent_ide::test_seams::shared_runtime_root()
+        let expected = agent_ide::hook_hints::effective_root()
             .unwrap()
             .join(format!(
                 "{CLAUDE_RUNTIME_PREFIX}{}",
@@ -4618,6 +4945,11 @@ mod tests {
                         "timeout": 1
                     }]}],
                     "PostToolUse": [{"matcher": ".*", "hooks": [{
+                        "type": "command",
+                        "command": "'/operator tools/a'\\''b/agent-ide' codex-hook --managed",
+                        "timeout": 1
+                    }]}],
+                    "PreCompact": [{"hooks": [{
                         "type": "command",
                         "command": "'/operator tools/a'\\''b/agent-ide' codex-hook --managed",
                         "timeout": 1

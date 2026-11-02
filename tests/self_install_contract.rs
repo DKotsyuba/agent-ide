@@ -182,8 +182,17 @@ fn assert_layout(root: &Path, version: &str, _home: &Path) {
         .unwrap()
         .permissions()
         .mode()
-        & 0o777;
-    assert_eq!(mode, 0o755, "launcher must be mode 0755");
+        & 0o7777;
+    assert_eq!(
+        mode & 0o500,
+        0o500,
+        "launcher must be owner-readable and executable"
+    );
+    assert_eq!(
+        mode & !0o755,
+        0,
+        "launcher must not grant extra write or privilege bits"
+    );
 }
 
 /// Installs one sealed bundle into a disposable root and proves the complete layout, the JSON
@@ -288,8 +297,9 @@ fn a_byte_different_bundle_for_the_installed_version_is_refused() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// With `--replace` (source builds), a byte-different bundle for the installed version replaces
-/// the release directory whole and re-selects it.
+/// With `--replace` on macOS, a byte-different bundle for the installed version replaces
+/// the release directory whole and re-selects it once absence is proven.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn replace_reinstalls_a_byte_different_source_build_of_the_same_version() {
     let root = unique_root("replace");
@@ -342,6 +352,54 @@ fn replace_reinstalls_a_byte_different_source_build_of_the_same_version() {
         "the retired copy must be removed"
     );
     let _ = fs::remove_dir_all(&root);
+}
+
+/// Linux must preserve the old release and plugin when a global process absence cannot be proven.
+#[cfg(target_os = "linux")]
+#[test]
+fn replace_refuses_unknown_global_process_visibility() {
+    let root = unique_root("replace-unknown");
+    let original = sealed_bundle(&root, VERSION, "original");
+    install_ok(&original, &root, VERSION);
+    let release = root.join("prefix/releases").join(VERSION);
+    let manifest = fs::read(release.join("SHA256SUMS")).unwrap();
+    let executable = fs::read(release.join("agent-ide")).unwrap();
+    let plugin = root
+        .join("share/plugin")
+        .join(VERSION)
+        .join("skills/agent-ide/SKILL.md");
+    let plugin_bytes = fs::read(&plugin).unwrap();
+    let launcher = fs::read(root.join("bin/agent-ide")).unwrap();
+    let current = fs::read_link(root.join("prefix/current")).unwrap();
+    let plugin_current = fs::read_link(root.join("share/plugin/current")).unwrap();
+    let other = sealed_bundle_named(&root, "bundle-other", VERSION, "rebuilt bytes");
+    let refused = replace_install(&other, &root);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("complete process visibility is unavailable")
+    );
+    assert_eq!(fs::read(release.join("SHA256SUMS")).unwrap(), manifest);
+    assert_eq!(fs::read(release.join("agent-ide")).unwrap(), executable);
+    assert_eq!(fs::read(plugin).unwrap(), plugin_bytes);
+    assert_eq!(fs::read(root.join("bin/agent-ide")).unwrap(), launcher);
+    assert_eq!(fs::read_link(root.join("prefix/current")).unwrap(), current);
+    assert_eq!(
+        fs::read_link(root.join("share/plugin/current")).unwrap(),
+        plugin_current
+    );
+    assert!(
+        !fs::read_dir(root.join("prefix/releases"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".replaced-"))
+    );
+    // Identical reinstalls still succeed when the no-process proof is unavailable.
+    assert!(replace_install(&original, &root).status.success());
+    fs::remove_dir_all(root).unwrap();
 }
 
 /// A foreign script at the launcher path is refused and left untouched.
@@ -677,8 +735,8 @@ fn spawn_blocked(release: &Path, fifo: &Path) -> KillOnDrop {
     )
 }
 
-/// `--replace` never replaces or deletes a release directory a live process runs from: it is
-/// refused with the release byte-identical, and succeeds once the process has exited.
+/// `--replace` preserves a live release. On Linux it remains refused after exit because the
+/// namespace-local process observation cannot prove global absence.
 #[test]
 fn replace_refuses_a_release_a_live_process_runs_from() {
     let root = unique_root("live-release");
@@ -705,27 +763,47 @@ fn replace_refuses_a_release_a_live_process_runs_from() {
     let refused = replace_install(&other, &root);
     assert!(!refused.status.success(), "replace must be refused");
     let stderr = String::from_utf8_lossy(&refused.stderr);
+    #[cfg(not(target_os = "linux"))]
     assert!(stderr.contains("refusing to replace"), "{stderr}");
+    #[cfg(not(target_os = "linux"))]
     assert!(
         stderr.contains(&format!("pid {}", child.0.id())),
+        "{stderr}"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        stderr.contains("complete process visibility is unavailable"),
         "{stderr}"
     );
     assert_eq!(fs::read(release.join("SHA256SUMS")).unwrap(), manifest);
     assert!(release.join("agent-ide").is_file());
     assert_eq!(fs::read(&launcher).unwrap(), launcher_bytes);
     assert_eq!(fs::read_dir(root.join("bin")).unwrap().count(), 1);
-    // Release and reap the child; the replace then goes through.
+    // Reap the fixture child before trying again.
     drop(child);
-    let accepted = replace_install(&other, &root);
-    assert!(
-        accepted.status.success(),
-        "{}",
-        String::from_utf8_lossy(&accepted.stderr)
-    );
-    assert_eq!(
-        fs::read(release.join("SHA256SUMS")).unwrap(),
-        fs::read(other.join("SHA256SUMS")).unwrap()
-    );
+    let after_exit = replace_install(&other, &root);
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert!(
+            after_exit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&after_exit.stderr)
+        );
+        assert_eq!(
+            fs::read(release.join("SHA256SUMS")).unwrap(),
+            fs::read(other.join("SHA256SUMS")).unwrap()
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        assert!(!after_exit.status.success());
+        assert!(
+            String::from_utf8_lossy(&after_exit.stderr)
+                .contains("complete process visibility is unavailable")
+        );
+        assert_eq!(fs::read(release.join("SHA256SUMS")).unwrap(), manifest);
+        assert_eq!(fs::read(&launcher).unwrap(), launcher_bytes);
+    }
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -780,7 +858,7 @@ fn a_scratch_install_never_rewrites_the_live_launcher() {
 /// between the check and the swap) still keeps its release: the installer sees it under the
 /// retired path, puts the release back, refuses, and leaves a plain-binary launcher in place.
 /// Needs the pause seam, so run it with `--features test-seams`.
-#[cfg(feature = "test-seams")]
+#[cfg(all(feature = "test-seams", not(target_os = "linux")))]
 #[test]
 fn a_process_started_after_the_first_check_keeps_its_release_and_the_launcher() {
     let root = unique_root("race");

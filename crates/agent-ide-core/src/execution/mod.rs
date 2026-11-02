@@ -4,6 +4,9 @@
 //! children run as ordinary processes of the daemon's user: the IDE's only path policy is the
 //! configured `allowed_roots` list, which Assistance enforces before a request reaches here.
 
+/// Configured runner worker counts and bounded load-aware selection.
+pub mod test_workers;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
@@ -193,6 +196,9 @@ pub struct ControlledCommand {
     env: BTreeMap<OsString, OsString>,
     /// Optional already-open private input file; no repository path is passed as stdin.
     stdin_file: Option<Arc<std::fs::File>>,
+    /// Linux confinement's pinned mount sources; only its launcher inherits these descriptors.
+    #[cfg(target_os = "linux")]
+    linux_mounts: Vec<Arc<std::fs::File>>,
     /// Executable identity measured at declaration; construction fails closed without it.
     program_identity: ExecutableIdentity,
 }
@@ -211,6 +217,21 @@ impl PartialEq for ControlledCommand {
                 _ => false,
             }
             && self.program_identity == other.program_identity
+            && {
+                #[cfg(target_os = "linux")]
+                {
+                    self.linux_mounts.len() == other.linux_mounts.len()
+                        && self
+                            .linux_mounts
+                            .iter()
+                            .zip(&other.linux_mounts)
+                            .all(|(a, b)| Arc::ptr_eq(a, b))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    true
+                }
+            }
     }
 }
 
@@ -255,6 +276,8 @@ impl ControlledCommand {
             cwd,
             env,
             stdin_file: None,
+            #[cfg(target_os = "linux")]
+            linux_mounts: Vec::new(),
             program_identity,
         })
     }
@@ -283,12 +306,7 @@ impl ControlledCommand {
         if executable_identity(&self.program)? != self.program_identity {
             return Err(RequestError::ExecutableUnavailable);
         }
-        let mut process = Command::new(&self.program);
-        process
-            .args(&self.args)
-            .current_dir(&self.cwd)
-            .env_clear()
-            .envs(&self.env);
+        let mut process = build_command(self);
         configure_process_group(&mut process);
         Ok(process)
     }
@@ -3103,6 +3121,10 @@ fn build_command(command: &ControlledCommand) -> Command {
         .current_dir(&command.cwd)
         .env_clear()
         .envs(&command.env);
+    #[cfg(target_os = "linux")]
+    if !command.linux_mounts.is_empty() {
+        linux::inherit_mounts(&mut process, command.linux_mounts.clone());
+    }
     process
 }
 
@@ -3190,7 +3212,13 @@ fn leader_exited_unreaped(pid: u32) -> bool {
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
         };
-        result == 0 && info.si_pid == pid as libc::pid_t
+        #[cfg(target_os = "linux")]
+        // SAFETY: waitid filled this siginfo_t (or it remains zeroed on failure); si_pid is
+        // the Linux libc accessor for the child-status union, not a public struct field.
+        let observed_pid = unsafe { info.si_pid() };
+        #[cfg(not(target_os = "linux"))]
+        let observed_pid = info.si_pid;
+        result == 0 && observed_pid == pid as libc::pid_t
     }
     #[cfg(not(unix))]
     {
@@ -3200,7 +3228,8 @@ fn leader_exited_unreaped(pid: u32) -> bool {
 }
 
 /// Whether any member of the owned process group led by `pid` is still running; an exited but
-/// unreaped member (the leader included) does not count.
+/// unreaped member does not count on macOS. Other Unix platforms conservatively retain the
+/// group through its grace while the unreaped leader pins its id, including zombie-only groups.
 fn group_running(pid: u32) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -3236,7 +3265,7 @@ fn group_running(pid: u32) -> bool {
     {
         // SAFETY: signal 0 only checks existence and permission; nothing is delivered.
         let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
-        result == 0 && !leader_exited_unreaped(pid)
+        result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
     #[cfg(not(unix))]
     {
@@ -3547,6 +3576,8 @@ pub async fn run_inherited_child(
 }
 
 pub mod job;
+#[cfg(target_os = "linux")]
+mod linux;
 pub mod seatbelt;
 
 #[cfg(test)]

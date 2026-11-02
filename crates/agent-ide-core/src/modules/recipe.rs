@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use super::contract::ModuleConfig;
 use super::payload::{
     Arg, ChecksDescription, EffectRecipe, EffectRequest, EnvRule, Param, PathRole, PathRule,
     SlotSource,
@@ -137,6 +138,30 @@ impl Admission<'_> {
                 })
             }
             PathRole::Fixed(paths) => paths.iter().any(|fixed| root(Path::new(fixed)) == path),
+            PathRole::SystemTool(tool) => {
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    [
+                        "/usr/bin/cc",
+                        "/usr/bin/c++",
+                        "/usr/bin/ar",
+                        "/usr/bin/ranlib",
+                    ]
+                    .contains(&tool)
+                        && std::fs::canonicalize(tool).ok().is_some_and(|target| {
+                            target == path
+                                && std::fs::metadata(&target).is_ok_and(|metadata| {
+                                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                                })
+                        })
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = tool;
+                    false
+                }
+            }
             PathRole::DeveloperDir => self
                 .developer_dirs
                 .iter()
@@ -364,15 +389,18 @@ pub fn declared_roots(id: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A language's own host-side resolution of the environments a worktree has accepted (stored
-/// selections, configuration pins, discovered environments): the roots a run of them reads.
-pub type EnvironmentRoots = fn(&Path) -> Vec<PathBuf>;
+/// A language's host-side resolution of roots required by its currently accepted environments.
+/// The configuration supplies this request's read-deny policy; implementations must derive roots
+/// only from environments actually chosen under that policy, never ambient alternatives.
+pub type EnvironmentRoots = fn(&Path, &ModuleConfig) -> Vec<PathBuf>;
 
-/// Each language's [`EnvironmentRoots`], declared by the root.
+/// Each language's [`EnvironmentRoots`], declared by the root; entries are host-owned resolvers
+/// that receive the request's current `ModuleConfig` and must honor its read exclusions.
 static ENVIRONMENTS: std::sync::RwLock<Vec<(&'static str, EnvironmentRoots)>> =
     std::sync::RwLock::new(Vec::new());
 
-/// Declares languages' environment resolutions; a language already declared keeps its first.
+/// Declares host-side environment-root resolvers; the first callback for a language wins, and
+/// registration is protected by the process-wide registry lock.
 pub fn declare_environment_roots(roots: &'static [(&'static str, EnvironmentRoots)]) {
     let mut declared = ENVIRONMENTS
         .write()
@@ -384,17 +412,17 @@ pub fn declare_environment_roots(roots: &'static [(&'static str, EnvironmentRoot
     }
 }
 
-/// The roots of the environments `worktree` accepts for the language `id`, resolved now by the
-/// host (never taken from a module's answer); admitted as launcher roots, so a selected
-/// environment outside the static install roots runs as it does in process.
-pub fn environment_roots(id: &str, worktree: &Path) -> Vec<PathBuf> {
+/// Resolves extra trusted roots for `id` in `worktree` under the request's `config`; roots come
+/// from the registered host callback, with its current read denies, never from a module reply.
+/// Returns no roots when the language has no registered callback.
+pub fn environment_roots(id: &str, worktree: &Path, config: &ModuleConfig) -> Vec<PathBuf> {
     let resolve = ENVIRONMENTS
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .find(|(language, _)| *language == id)
         .map(|(_, resolve)| *resolve);
-    resolve.map_or_else(Vec::new, |resolve| resolve(worktree))
+    resolve.map_or_else(Vec::new, |resolve| resolve(worktree, config))
 }
 
 /// Expands `effect` with its recipe from `recipes` under `admission`.
@@ -404,6 +432,18 @@ pub fn expand(
     admission: &Admission<'_>,
 ) -> Result<RunSpec, Refusal> {
     expand_staged(recipes, effect, admission).map(|(spec, _)| spec)
+}
+
+/// Expands with an actual child cwd while retaining admission's original worktree boundary.
+/// A different cwd must be an existing, contained, readable directory; no admitted spec is
+/// mutated and parameter/path authority continues to use the authoritative worktree.
+pub fn expand_at(
+    recipes: &[EffectRecipe],
+    effect: &EffectRequest,
+    admission: &Admission<'_>,
+    cwd: &Path,
+) -> Result<RunSpec, Refusal> {
+    expand_staged_at(recipes, effect, admission, cwd).map(|(spec, _)| spec)
 }
 
 /// A run's assets with the admitted cache paths they are staged at.
@@ -416,6 +456,29 @@ pub fn expand_staged(
     effect: &EffectRequest,
     admission: &Admission<'_>,
 ) -> Result<(RunSpec, Staged), Refusal> {
+    expand_staged_at(recipes, effect, admission, admission.worktree)
+}
+
+/// Constructs the complete expansion with its validated cwd before admission is returned.
+fn expand_staged_at(
+    recipes: &[EffectRecipe],
+    effect: &EffectRequest,
+    admission: &Admission<'_>,
+    cwd: &Path,
+) -> Result<(RunSpec, Staged), Refusal> {
+    let cwd = if cwd == admission.worktree {
+        cwd.to_path_buf()
+    } else {
+        if !normal(cwd) || admission.denied(cwd) {
+            return Err(Refusal::OutOfRule("cwd".into(), cwd.to_path_buf()));
+        }
+        let cwd = resolved(cwd);
+        if !cwd.starts_with(resolved(admission.worktree)) || !cwd.is_dir() || admission.denied(&cwd)
+        {
+            return Err(Refusal::OutOfRule("cwd".into(), cwd));
+        }
+        cwd
+    };
     let recipe = recipes
         .iter()
         .find(|recipe| recipe.id == effect.recipe)
@@ -423,7 +486,10 @@ pub fn expand_staged(
     let mut declared: Vec<&str> = vec![recipe.program];
     for arg in recipe.args {
         match arg {
-            Arg::Param(name) | Arg::Each(name) | Arg::Joined(_, name) => declared.push(name),
+            Arg::Param(name)
+            | Arg::Each(name)
+            | Arg::Joined(_, name)
+            | Arg::OptionalJoined(_, name) => declared.push(name),
             Arg::Literal(_) => {}
         }
     }
@@ -529,6 +595,11 @@ pub fn expand_staged(
                 None => {}
                 Some(_) => return Err(Refusal::WrongKind((*name).to_owned())),
             },
+            Arg::OptionalJoined(prefix, name) => {
+                if let Some(value) = single(name)? {
+                    args.push(format!("{prefix}{value}").into());
+                }
+            }
             Arg::Joined(prefix, name) => args.push(
                 format!(
                     "{prefix}{}",
@@ -640,7 +711,7 @@ pub fn expand_staged(
         RunSpec {
             program,
             args,
-            cwd: admission.worktree.to_path_buf(),
+            cwd,
             env,
             read_roots,
             write_roots: vec![admission.cache_dir.to_path_buf()],
@@ -766,6 +837,26 @@ mod tests {
     use super::*;
     use crate::modules::payload::RecipeAsset;
     use crate::modules::payload::{ExecutableSlot, RunClass, Stdin};
+
+    /// The system-tool role admits only the current canonical executable for its fixed alias.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_tool_role_rejects_other_files_and_aliases() {
+        let layout = Layout::new("system-tool");
+        let admission = layout.admission(&[], &[], &[]);
+        let cc = std::fs::canonicalize("/usr/bin/cc").expect("test host provides a C compiler");
+        let role = PathRole::SystemTool("/usr/bin/cc");
+        assert!(admission.admits(&[role], &cc));
+        assert!(!admission.admits(&[role], cc.parent().unwrap()));
+        assert!(!admission.admits(&[role], &std::fs::canonicalize("/usr/bin/true").unwrap()));
+        assert!(!admission.admits(
+            &[PathRole::SystemTool("/usr/bin/true")],
+            &std::fs::canonicalize("/usr/bin/true").unwrap()
+        ));
+        let alias = layout.base.join("compiler-alias");
+        std::os::unix::fs::symlink(&cc, &alias).unwrap();
+        assert!(!admission.admits(&[role], &alias));
+    }
 
     /// Ancestor files a nested project check reads.
     const ANCESTOR_FILES: &[&str] = &["Cargo.toml", ".cargo/config.toml", ".cargo/config"];

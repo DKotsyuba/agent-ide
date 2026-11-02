@@ -340,14 +340,20 @@ const TEST_RECIPES: [EffectRecipe; 6] = [
 /// A test-run recipe: `program` is the `interpreter` path parameter (admitted under
 /// [`INTERPRETER_ROLES`]) or a home tool slot of the same name. The core runs exactly the
 /// expanded specification as the `ide.test` job: its complete environment is `HOME`, `PATH`
-/// (an activated environment's `bin` first, then the system directories) and, for an
-/// environment's own interpreter, `VIRTUAL_ENV`.
+/// (an activated environment's existing `bin` first, then the system directories) and, for an
+/// environment's own interpreter, `VIRTUAL_ENV`. Activation's `venv` and `bin` are required
+/// existing directories, derived only when the selected interpreter has a `pyvenv.cfg`.
 const fn test_run(id: &'static str, program: &'static str, args: &'static [Arg]) -> EffectRecipe {
     EffectRecipe {
         id,
         program,
         args,
         env: &[
+            EnvRule::Param {
+                name: "PYTEST_ADDOPTS",
+                param: "test_workers",
+                optional: true,
+            },
             EnvRule::Home { name: "HOME" },
             EnvRule::SearchPath {
                 name: "PATH",
@@ -370,13 +376,13 @@ const fn test_run(id: &'static str, program: &'static str, args: &'static [Arg])
             PathRule {
                 param: "venv",
                 roles: INTERPRETER_ROLES,
-                existing_only: true,
+                existing_only: false,
                 read_root: false,
             },
             PathRule {
                 param: "bin",
                 roles: INTERPRETER_ROLES,
-                existing_only: true,
+                existing_only: false,
                 read_root: false,
             },
         ],
@@ -848,6 +854,14 @@ impl CheckerServer {
         effects: &mut Effects<'_>,
     ) -> Result<Value, ServeError> {
         use agent_ide_core::checks::LanguageChecks;
+        // The check plans in the current environment: this instance's copy of the selections may
+        // predate the last `ide.start environment` change, and the planned Pyright interpreter is
+        // read back from the shared resolver.
+        agent_ide_core::lang::environment::replace_selections(
+            &query.request.worktree,
+            crate::LANGUAGE,
+            query.selections,
+        );
         let config = crate::checks::PythonChecks
             .parse_config(query.config)
             .map_err(|error| ServeError::Protocol(error.to_string()))?;

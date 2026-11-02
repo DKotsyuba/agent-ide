@@ -6,8 +6,11 @@
 
 use agent_ide_core::lang::{Language, LanguageDescriptor};
 
+#[cfg(test)]
+mod address_tests;
 pub mod backend;
 pub mod checks;
+pub mod environment;
 mod home;
 pub(crate) mod lexical;
 pub mod module;

@@ -44,10 +44,17 @@ fn unique_path(label: &str) -> PathBuf {
         ))
 }
 
-/// Runs one fixed local Git subcommand against `root` with all user/system configuration excluded.
+/// Runs one fixed local Git subcommand against `root` with user/system configuration excluded,
+/// preserving only the selected temporary-directory environment for Git subprocess scratch.
 fn git(root: &Path, args: &[&str]) {
-    let output = std::process::Command::new("/usr/bin/git")
-        .env_clear()
+    let mut command = std::process::Command::new("/usr/bin/git");
+    command.env_clear();
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let output = command
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .arg("-C")
@@ -85,11 +92,53 @@ fn add_worktree(repo: &Path, branch: &str) -> PathBuf {
     worktree
 }
 
+/// Reconstructs the platform's documented default without calling the product resolver.
+fn fixture_default_parent() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let private = |path: &Path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.mode() & 0o077 == 0
+            })
+        };
+        let runtime = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
+        if private(&runtime) {
+            return runtime;
+        }
+        if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+        {
+            assert!(
+                path.is_absolute()
+                    && path.components().all(|part| matches!(
+                        part,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    ))
+                    && private(&path),
+                "invalid XDG_RUNTIME_DIR must fail closed"
+            );
+            return path;
+        }
+        agent_ide::userhome::user_home().expect("effective home must exist")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        PathBuf::from("/private/tmp")
+    }
+}
+
 /// Reproduces the public deterministic rendezvous formula (EYES-r1 §2) for black-box assertions.
 ///
 /// The key is `candidate`'s canonical git common directory, independently rediscovered through the
 /// real `git` binary; a `candidate` outside any repository falls back to itself, exactly like the
-/// product code. This never inspects product internals, only its documented external contract.
+/// product code. The parent is the documented nonempty Claude rendezvous override, or the
+/// platform default when unset or empty; feature-enabled tests may select their fixture parent.
+/// This never calls the product resolver, keeping the black-box path assertion independent.
+/// Canonicalization failures fail this fixture explicitly.
 fn expected_runtime_path(candidate: &Path) -> PathBuf {
     let candidate = std::fs::canonicalize(candidate).unwrap();
     let output = std::process::Command::new("/usr/bin/git")
@@ -105,28 +154,105 @@ fn expected_runtime_path(candidate: &Path) -> PathBuf {
         candidate
     };
     let hash = blake3::hash(key.as_os_str().as_bytes());
-    agent_ide::test_seams::shared_runtime_root()
+    let test_parent = if cfg!(feature = "test-seams") {
+        std::env::var_os("AGENT_IDE_TEST_SHARED_RUNTIME_ROOT")
+    } else {
+        None
+    };
+    let parent = test_parent
+        .or_else(|| {
+            std::env::var_os("AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT").filter(|value| !value.is_empty())
+        })
+        .map_or_else(fixture_default_parent, PathBuf::from);
+    std::fs::canonicalize(parent)
         .unwrap()
         .join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
 }
 
-/// Sends SIGTERM to the exact process holding a shared daemon's runtime lock, if any.
-///
-/// A shared daemon deliberately outlives every MCP process's own EOF, so a test that causes one to
-/// be spawned must reap it explicitly. `lsof` is asked for the specific lock file's current holder
-/// only; this never pattern-kills by process name or command line.
+/// Signals only the pinned Linux process that holds this fixture's lock and runs its daemon.
+/// A pidfd prevents PID reuse from redirecting the signal; poll confirms process exit.
+#[cfg(target_os = "linux")]
+fn stop_fixture_linux(runtime: &Path, expected_exe: &Path) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::MetadataExt;
+    let Some(pid) = agent_ide::app::lock_holder_pid(runtime) else {
+        return Ok(());
+    };
+    if pid == std::process::id() as i32 {
+        return Err("fixture lock names test process".into());
+    }
+    // SAFETY: pidfd_open returns a new descriptor on success.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let fd = i32::try_from(fd)
+        .ok()
+        .filter(|fd| *fd >= 0)
+        .ok_or("pidfd_open failed")?;
+    // SAFETY: successful pidfd_open returned a new descriptor owned here.
+    let process = unsafe { OwnedFd::from_raw_fd(fd) };
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    let actual = std::fs::metadata(proc.join("exe")).map_err(|e| e.to_string())?;
+    let expected = std::fs::metadata(expected_exe).map_err(|e| e.to_string())?;
+    let args = std::fs::read(proc.join("cmdline")).map_err(|e| e.to_string())?;
+    let args: Vec<&[u8]> = args.split(|byte| *byte == 0).collect();
+    if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino())
+        || !args.windows(3).any(|parts| {
+            parts[0] == b"daemon"
+                && parts[1] == b"--runtime-dir"
+                && parts[2] == runtime.as_os_str().as_bytes()
+        })
+        || agent_ide::app::lock_holder_pid(runtime) != Some(pid)
+    {
+        return Err("fixture lock holder identity changed or is not its daemon".into());
+    }
+    // SAFETY: the pidfd pins the verified process generation; null siginfo and zero flags are valid.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            process.as_raw_fd(),
+            libc::SIGTERM,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "pidfd_send_signal: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut pollfd = libc::pollfd {
+        fd: process.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: pollfd is valid for one descriptor, and poll does not retain the pointer.
+    if unsafe { libc::poll(&mut pollfd, 1, 5000) } <= 0 || pollfd.revents & libc::POLLIN == 0 {
+        return Err("fixture daemon exit was not observed within five seconds".into());
+    }
+    Ok(())
+}
+
+/// Requests termination of the fixture lock holder and reports an unverified cleanup.
 fn terminate_shared_daemon(runtime: &Path) {
-    let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
+    #[cfg(target_os = "linux")]
+    if let Err(error) = stop_fixture_linux(runtime, Path::new(env!("CARGO_BIN_EXE_agent-ide"))) {
+        eprintln!(
+            "fixture daemon cleanup failed at {}: {error}",
+            runtime.display()
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
         .arg("-t")
         .arg(runtime.join("agent-ide.lock"))
         .output()
-    else {
-        return;
-    };
-    for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-        if let Ok(pid) = pid.parse::<libc::pid_t>() {
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
+    {
+        for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+            if let Ok(pid) = pid.parse::<libc::pid_t>() {
+                // SAFETY: lsof identified the holder of this fixture's lock.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
             }
         }
     }
@@ -158,8 +284,7 @@ async fn terminate_shared_daemon_and_await_removal(runtime: &Path, budget: Durat
     .expect("the terminated daemon must remove its own runtime directory");
 }
 
-/// Guarantees a shared daemon this test caused to be spawned is reaped, even if an assertion
-/// later in the same test panics, so a failing test cannot leak a long-lived orphan process.
+/// Requests cleanup even during unwinding; Linux also waits for the pinned process to exit.
 struct DaemonGuard(PathBuf);
 
 impl Drop for DaemonGuard {
@@ -168,21 +293,17 @@ impl Drop for DaemonGuard {
     }
 }
 
-/// Counts the exact processes currently holding a shared daemon's runtime lock open.
-///
-/// Used only to prove a start race converges to a single lock holder; reads `lsof`, never any
-/// process listing filtered by name or command line.
+/// The exclusive runtime lock admits at most one holder. An unreadable lock record fails the test.
 fn lock_holder_count(runtime: &Path) -> usize {
-    let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
-        .arg("-t")
-        .arg(runtime.join("agent-ide.lock"))
-        .output()
-    else {
-        return 0;
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .count()
+    if agent_ide::app::lock_is_held(runtime) {
+        assert!(
+            agent_ide::app::lock_holder_pid(runtime).is_some(),
+            "held fixture lock must record its holder"
+        );
+        1
+    } else {
+        0
+    }
 }
 
 /// Writes one minimal valid Claude launcher template accepting `candidate`, and returns its path.
@@ -593,13 +714,14 @@ async fn worktree_start_flow(
         .to_owned();
     // A fast activation now completes inline; a slow one still answers `pending` and is polled.
     assert!(
-        text.starts_with("pending:") || text.starts_with("complete"),
+        text.starts_with("pending:") || text.starts_with("activated:"),
         "{} {pending}",
         worktree.display()
     );
     let detail_ref = text
         .split("detail_ref ")
         .nth(1)
+        .and_then(|rest| rest.split([')', ' ', '\n']).next())
         .map(str::to_owned)
         .unwrap_or_default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -626,7 +748,7 @@ async fn worktree_start_flow(
             .to_owned();
     }
     assert!(
-        text.starts_with("complete"),
+        text.starts_with("activated:"),
         "{} {text}",
         worktree.display()
     );
@@ -705,7 +827,9 @@ fn assert_reached_live_daemon(response: &Value) {
     assert!(
         response["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+            .is_some_and(|text| text
+                .starts_with("The IDE received no host event for this session.")
+                && text.contains("\nRepair: ")),
         "{response}"
     );
 }
@@ -724,8 +848,9 @@ fn assert_reached_live_daemon_after_reconnect(response: &Value) {
     assert!(
         response["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("unavailable: host_binding")
-                && text.contains("retry: daemon restarted; repeat this call once")),
+            .is_some_and(|text| text
+                .starts_with("The IDE received no host event for this session.")
+                && text.contains("Repair: daemon restarted; repeat this call")),
         "{response}"
     );
 }

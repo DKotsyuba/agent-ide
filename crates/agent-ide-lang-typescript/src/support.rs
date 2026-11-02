@@ -32,6 +32,32 @@ use crate::LANGUAGE;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TypeScript;
 
+/// Test toolchain configuration families, each in the runner's own lookup order.
+const TEST_TOOLCHAIN_CONFIGS: &[&[&str]] = &[
+    &[
+        "vitest.config.ts",
+        "vitest.config.mts",
+        "vitest.config.cts",
+        "vitest.config.js",
+        "vitest.config.mjs",
+        "vitest.config.cjs",
+        "vite.config.ts",
+        "vite.config.mts",
+        "vite.config.cts",
+        "vite.config.js",
+        "vite.config.mjs",
+        "vite.config.cjs",
+        "jest.config.ts",
+        "jest.config.mts",
+        "jest.config.cts",
+        "jest.config.js",
+        "jest.config.mjs",
+        "jest.config.cjs",
+        "jest.config.json",
+    ],
+    &["tsconfig.json"],
+];
+
 /// Extensions of files this module treats as scripts.
 const SCRIPT_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
@@ -48,8 +74,45 @@ const SCRIPT_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "m
 /// no checker was proven.
 pub const TS_PROBE: &str = "let ts;try{ts=require(process.argv[1])}catch(e){process.exit(3)}let cs=[];process.stdin.on('data',c=>cs.push(c)).on('end',()=>{const d=Buffer.concat(cs).toString('utf8');const f=ts.createSourceFile(process.argv[2]||'c.ts',d,ts.ScriptTarget.Latest,true);const p=f.parseDiagnostics[0];if(p){const l=f.getLineAndCharacterOfPosition(p.start).line+1;console.log(l+': '+ts.flattenDiagnosticMessageText(p.messageText,' '));process.exit(1)}});";
 
+/// Source-only outline probe (`outline_probe.js`): TypeScript's own syntactic navigation tree of
+/// the source on stdin, as LSP document symbols converted the way typescript-language-server
+/// converts tsserver's navtree. Same argv shape as [`TS_PROBE`]; a syntactic language service over
+/// one in-memory snapshot, so no program, configuration, type package or `node_modules` is read.
+pub const TS_OUTLINE_PROBE: &str = concat!(
+    include_str!("class_context.js"),
+    "\n",
+    include_str!("outline_probe.js")
+);
+/// Largest accepted outline probe reply.
+const MAX_OUTLINE_PROBE_BYTES: usize = 256 * 1024;
+/// Most document symbols accepted from one outline probe reply.
+const MAX_OUTLINE_PROBE_SYMBOLS: usize = 4096;
+/// Deepest symbol nesting accepted from one outline probe reply.
+const MAX_OUTLINE_PROBE_DEPTH: usize = 64;
+
 /// Most lines scanned for one declaration's header and signature.
 const SCAN_LINES: usize = 200;
+
+impl TypeScript {
+    /// The runner argument of one file target: a directory (`__tests__/`) selects the test files
+    /// inside it and passes through unchanged; a plain script file must be one the runner would
+    /// collect by convention, or the module would be imported top-level as a test target, so any
+    /// other is [`LangError::Unsupported`].
+    fn test_file_argument(&self, file: &Path) -> Result<String, LangError> {
+        if file
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| SCRIPT_EXTENSIONS.contains(&extension))
+            && !self.is_test_file(file)
+        {
+            return Err(LangError::Unsupported(format!(
+                "no tests in {}",
+                file.display()
+            )));
+        }
+        Ok(file.display().to_string())
+    }
+}
 
 impl LanguageSupport for TypeScript {
     /// Always the TypeScript [`LANGUAGE`] (JavaScript files included).
@@ -244,6 +307,25 @@ impl LanguageSupport for TypeScript {
         true
     }
 
+    /// Reuses tokenization for templates, regular expressions and JSX instead of reading literals.
+    fn source_import_spans(&self, file: &Path, source: &str) -> Option<Vec<LineRange>> {
+        Some(crate::names::source_import_spans(
+            file,
+            source,
+            self.region_rules(),
+        ))
+    }
+
+    /// Only explicit whole type-only import/export statements are guaranteed erased.
+    /// Inline type specifiers can retain module side effects and are deliberately unclassified.
+    fn source_type_only_references(
+        &self,
+        file: &Path,
+        source: &str,
+    ) -> Vec<std::ops::Range<usize>> {
+        crate::names::source_type_only_references(file, source)
+    }
+
     /// Top-level declarations recognized from the text alone, for callers the server cannot
     /// answer (a file whose `tsconfig.json` lives below the worktree root). Each column-0
     /// `function`, `class`, `interface`, `type`, `enum`, `namespace` or `const`/`let`/`var`
@@ -274,13 +356,16 @@ impl LanguageSupport for TypeScript {
             }
             let text = lines[index..=last].join("\n");
             let (end, stop) = scan_signature(&text);
-            let range = LineRange::new(index as u32 + 1, last as u32 + 1);
+            let body = LineRange::new(index as u32 + 1, last as u32 + 1);
+            // A server outline starts a symbol at its JSDoc block; so does this one, which keeps
+            // a symbol's `:N` the same before and after the server loads (symbol-address-v1 §9).
+            let range = LineRange::new(jsdoc_start(&lines, index) as u32 + 1, last as u32 + 1);
             symbols.push(Symbol {
                 path: SymbolPath::new(Some(file.to_path_buf()), vec![name.clone()]),
                 kind,
                 name,
                 range,
-                body: range,
+                body,
                 signature: render_signature(&text[..end], stop, kind),
                 doc: None,
                 children: Vec::new(),
@@ -390,6 +475,27 @@ impl LanguageSupport for TypeScript {
         })
     }
 
+    /// TypeScript/JavaScript regions: shebang and directive-prologue header, `import ..` and
+    /// `export * from` imports.
+    fn region_rules(&self) -> &'static agent_ide_core::lang::regions::RegionRules {
+        &agent_ide_core::lang::regions::RegionRules {
+            header_prefixes: &["#!", "\"use strict\"", "'use strict'"],
+            import_prefixes: &[
+                "import ",
+                "import\"",
+                "import'",
+                "export * from",
+                "export * as",
+            ],
+            ..agent_ide_core::lang::regions::GENERIC_RULES
+        }
+    }
+
+    /// The test runner's configuration (Vitest, its Vite fallback, or Jest) and `tsconfig.json`.
+    fn test_toolchain_configs(&self) -> &'static [&'static [&'static str]] {
+        TEST_TOOLCHAIN_CONFIGS
+    }
+
     /// `*.test.*`, `*.spec.*` and anything under `__tests__/`, for every script extension.
     fn is_test_file(&self, file: &Path) -> bool {
         let script = file
@@ -408,15 +514,18 @@ impl LanguageSupport for TypeScript {
                     .any(|part| part.as_os_str() == "__tests__"))
     }
 
-    /// Runner from the `test_runner` fact (`node` when absent): `npx vitest run`, `npx jest` or
-    /// `node --test`. A symbol target runs the distinct files of its referencing tests filtered
+    /// Runner from the `test_runner` fact (`node` when absent): `vitest run`, `jest` or
+    /// `node --test`. Activation binds prepared runner bins to the configured Node without a
+    /// package manager or download. A symbol target runs the distinct files of its referencing tests filtered
     /// by `-t` (`--test-name-pattern=` for node) with their names as an escaped regex
     /// alternation (`describe > it` becomes the runner's space-joined `describe it`); beyond
     /// `MAX_NAMED_TESTS` only the files run. A symbol no test references is
     /// [`LangError::Unsupported`]. A file target runs whole only when the runner would collect
     /// it by convention (`*.test.*`, `*.spec.*`, under `__tests__/`); a directory target selects
-    /// the test files inside it; a non-test script file is [`LangError::Unsupported`]. Patterns
-    /// pass through unescaped.
+    /// the test files inside it; a non-test script file is [`LangError::Unsupported`]. Several
+    /// file targets (`Files`) are one runner invocation over all of them, each checked as a file
+    /// target. Leading-dash file arguments get a `./` prefix so they remain positional;
+    /// patterns pass through unescaped.
     fn test_selection(
         &self,
         project: &LanguageProject,
@@ -442,30 +551,29 @@ impl LanguageSupport for TypeScript {
                 let files = distinct_files(&tests);
                 (tests, files, pattern)
             }
-            TestTarget::File(file) => {
-                // A directory (`__tests__/`) selects the test files inside it and passes through
-                // unchanged; a plain script file must be one the runner would collect by
-                // convention, or the module would be imported top-level as a test target.
-                if file
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| SCRIPT_EXTENSIONS.contains(&extension))
-                    && !self.is_test_file(file)
-                {
-                    return Err(LangError::Unsupported(format!(
-                        "no tests in {}",
-                        file.display()
-                    )));
-                }
-                (Vec::new(), vec![file.display().to_string()], None)
-            }
+            TestTarget::File(file) => (Vec::new(), vec![self.test_file_argument(file)?], None),
+            TestTarget::Files(files) => (
+                Vec::new(),
+                files
+                    .iter()
+                    .map(|file| self.test_file_argument(file))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None,
+            ),
             TestTarget::Pattern(pattern) => (Vec::new(), Vec::new(), Some(pattern.clone())),
         };
         let mut command: Vec<String> = match runner {
-            "vitest" => vec!["npx".into(), "vitest".into(), "run".into()],
-            "jest" => vec!["npx".into(), "jest".into()],
+            "vitest" => vec!["vitest".into(), "run".into()],
+            "jest" => vec!["jest".into()],
             _ => vec!["node".into(), "--test".into()],
         };
+        let files = files.into_iter().map(|file| {
+            if file.starts_with('-') {
+                format!("./{file}")
+            } else {
+                file
+            }
+        });
         match pattern {
             Some(pattern) if matches!(runner, "vitest" | "jest") => {
                 command.extend(files);
@@ -478,6 +586,27 @@ impl LanguageSupport for TypeScript {
             None => command.extend(files),
         }
         Ok(TestSelection { tests, command })
+    }
+
+    /// Supplies the native engine's concurrency option for generated test commands.
+    fn test_worker_setting(
+        &self,
+        argv: &[String],
+        workers: std::num::NonZeroU16,
+    ) -> Option<agent_ide_core::execution::test_workers::WorkerSetting> {
+        let prefix = match argv.first().map(String::as_str) {
+            Some("vitest" | "jest") => "--maxWorkers=",
+            Some("node") if argv.get(1).is_some_and(|word| word == "--test") => {
+                "--test-concurrency="
+            }
+            _ => return None,
+        };
+        Some(
+            agent_ide_core::execution::test_workers::WorkerSetting::Argument {
+                prefix,
+                value: workers.to_string(),
+            },
+        )
     }
 
     /// Reads (after stripping ANSI colours) the vitest `Tests  N failed | M passed (T)` or jest
@@ -564,32 +693,195 @@ impl LanguageSupport for TypeScript {
         file: &Path,
         configured: Option<&ProbePrograms>,
     ) -> Option<Vec<String>> {
-        match file.extension().and_then(|ext| ext.to_str()) {
-            Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => {}
-            _ => return None,
+        probe_argv(TS_PROBE, root, file, configured)
+    }
+
+    /// [`TS_OUTLINE_PROBE`] under the same compiler and Node selection as
+    /// [`Self::syntax_probe_command`]: `[node, "-e", script, <typescript.js>, <file name>]`.
+    fn source_outline_probe_command(
+        &self,
+        _project: &LanguageProject,
+        root: &Path,
+        file: &Path,
+        configured: Option<&ProbePrograms>,
+        anchors: &[u32],
+    ) -> Option<Vec<String>> {
+        if anchors.len() > 32 || anchors.contains(&0) {
+            return None;
         }
-        let module = configured
-            .filter(|tools| tools.module.is_file())
-            .map(|tools| tools.module.clone())
-            .or_else(|| {
-                let local = root.join("node_modules/typescript/lib/typescript.js");
-                local.is_file().then_some(local)
-            })?;
-        let node = configured
-            .map(|tools| tools.program.display().to_string())
-            .unwrap_or_else(|| "node".to_owned());
-        let name = file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("c.ts")
-            .to_owned();
-        Some(vec![
-            node,
-            "-e".to_owned(),
-            TS_PROBE.to_owned(),
-            module.display().to_string(),
-            name,
-        ])
+        let mut argv = probe_argv(TS_OUTLINE_PROBE, root, file, configured)?;
+        if !anchors.is_empty() {
+            let name = argv.last()?.clone();
+            *argv.last_mut()? = serde_json::json!({"file": name, "anchors": anchors}).to_string();
+        }
+        Some(argv)
+    }
+
+    /// Accepts only ordered, in-source line spans covering every requested public anchor.
+    fn source_context_probe_result(
+        &self,
+        _file: &Path,
+        source: &str,
+        output: &str,
+        anchors: &[u32],
+    ) -> Option<Vec<LineRange>> {
+        if output.len() > MAX_OUTLINE_PROBE_BYTES || anchors.is_empty() || anchors.len() > 32 {
+            return None;
+        }
+        let value: Value = serde_json::from_str(output).ok()?;
+        let object = value.as_object()?;
+        if object.len() != 2 || object.get("v") != Some(&Value::from(1)) {
+            return None;
+        }
+        let raw: Vec<[u32; 2]> = serde_json::from_value(object.get("context")?.clone()).ok()?;
+        if raw.is_empty() || raw.len() > 512 {
+            return None;
+        }
+        let count = source.lines().count();
+        let mut end = None;
+        let mut spans = Vec::new();
+        for [first, last] in raw {
+            if first > last || last as usize >= count || end.is_some_and(|end| first <= end) {
+                return None;
+            }
+            spans.push(LineRange::new(first.checked_add(1)?, last.checked_add(1)?));
+            end = Some(last);
+        }
+        anchors
+            .iter()
+            .all(|at| {
+                spans
+                    .iter()
+                    .any(|span| span.start <= *at && *at <= span.end)
+            })
+            .then_some(spans)
+    }
+
+    /// The outline probe's reply as this language's outline, through the same position handling
+    /// and [`Self::normalize`] as the server path (describe/it/test callbacks become tests).
+    /// `None` unless the reply is exactly one bounded `{"v":1,"symbols":[…]}` line whose every
+    /// range lies inside `source`.
+    fn source_outline_probe_result(
+        &self,
+        file: &Path,
+        source: &str,
+        output: &str,
+    ) -> Option<Outline> {
+        outline_probe_symbols(source, output).map(|symbols| self.normalize(file, source, symbols))
+    }
+
+    /// The worktree's environment under this request's configured tools
+    /// ([`crate::environment::environments`]): the compiler the confined checker would run —
+    /// the operator's accepted one or the byte-qualified project compiler — with the exact
+    /// refusal cause otherwise, from the launcher sections the request carries.
+    fn configured_environments(
+        &self,
+        worktree: &Path,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Vec<agent_ide_core::lang::environment::ResolvedEnv> {
+        crate::environment::environments(worktree, config)
+    }
+
+    /// Detects project facts under this request's read policy, as far as this seam's gate
+    /// reaches: a host-denied root manifest, root config, or Node pin (`.nvmrc`,
+    /// `.node-version` — the detector's other reads) answers no project instead of falling
+    /// through to the unguarded detector. `tsconfig.*` siblings are enumerated as project
+    /// facts, not parsed here. Unrestricted requests detect as usual.
+    fn configured_detect(
+        &self,
+        root: &Path,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Option<LanguageProject> {
+        // The gate matches the confined checker's own admission policy: a PRESENT input that
+        // is host-denied, or a link (the checker refuses links as "not regular and link-free"
+        // even unconfined), blocks detection — never a partial read through a linked or
+        // denied authoritative input. An absent optional input (the Node pin files) does not
+        // block; absence is normal.
+        let blocked = |name: &str| {
+            let path = root.join(name);
+            let Ok(metadata) = path.symlink_metadata() else {
+                return false;
+            };
+            if metadata.file_type().is_symlink() {
+                return true;
+            }
+            !agent_ide_core::lang::environment::readable(&path, &config.read_denies)
+        };
+        if [
+            "package.json",
+            "tsconfig.json",
+            "jsconfig.json",
+            ".nvmrc",
+            ".node-version",
+        ]
+        .iter()
+        .any(|name| blocked(name))
+        {
+            return None;
+        }
+        self.detect(root)
+    }
+
+    /// `tsc`/`node` activate the request's configured tools
+    /// ([`crate::environment::command_env`]); a compiler or Node-pin obstruction refuses with
+    /// its cause before admission, and every other program stays unclaimed.
+    fn configured_command_env(
+        &self,
+        worktree: &Path,
+        _cwd: &Path,
+        program: &str,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Result<
+        Option<agent_ide_core::lang::environment::CommandEnv>,
+        agent_ide_core::lang::LangError,
+    > {
+        crate::environment::command_env(worktree, program, config)
+    }
+
+    /// Activation with the actual argv ([`crate::environment::command_argv`]): the
+    /// single-name call is the Launcher `node` slot's resolution (the configured Node alone —
+    /// exactly what a program slot can carry), and a full argv honors explicit selectors per
+    /// program.
+    fn configured_command_argv(
+        &self,
+        worktree: &Path,
+        _cwd: &Path,
+        argv: &[String],
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Result<
+        Option<agent_ide_core::lang::environment::CommandEnv>,
+        agent_ide_core::lang::LangError,
+    > {
+        crate::environment::command_argv(worktree, argv, config)
+    }
+
+    /// A package's index module, at its root or under `src/`.
+    fn package_doc_files(&self) -> &'static [&'static str] {
+        &[
+            "index.ts",
+            "index.tsx",
+            "index.js",
+            "src/index.ts",
+            "src/index.tsx",
+            "src/index.js",
+        ]
+    }
+
+    /// Exact manifest consulted for package descriptions.
+    fn manifest_description_files(&self) -> &'static [&'static str] {
+        &["package.json"]
+    }
+
+    /// The `description` string of `package.json` in `directory`.
+    fn manifest_description(&self, directory: &Path) -> Option<String> {
+        let text = std::fs::read_to_string(directory.join("package.json")).ok()?;
+        let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+        manifest
+            .get("description")?
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
     }
 
     /// A leading `//` comment, or the first text line of a leading `/** */` block.
@@ -836,6 +1128,22 @@ fn strip_modifiers(mut text: &str) -> &str {
     }
 }
 
+/// Index of the first line of the `/** … */` block that directly precedes the declaration on
+/// line `index` (no blank line between), or `index` itself when there is none.
+fn jsdoc_start(lines: &[&str], index: usize) -> usize {
+    let Some(previous) = index.checked_sub(1) else {
+        return index;
+    };
+    if !lines[previous].trim_end().ends_with("*/") {
+        return index;
+    }
+    (0..=previous)
+        .rev()
+        .find(|&at| lines[at].trim_start().starts_with("/**"))
+        .filter(|&at| (at..previous).all(|k| !lines[k].contains("*/")))
+        .unwrap_or(index)
+}
+
 /// The kind and name of a column-0 declaration line; `export default function` without a name
 /// is `default`.
 fn top_level_declaration(line: &str) -> Option<(SymbolKind, String)> {
@@ -878,6 +1186,104 @@ fn top_level_declaration(line: &str) -> Option<(SymbolKind, String)> {
         (true, true) => Some((kind, "default".to_owned())),
         (true, false) => None,
     }
+}
+
+/// `[node, "-e", script, <typescript.js>, <file name>]` for a stdin probe of a script-language
+/// file: the accepted compiler module from `configured`, else the project's own
+/// `node_modules/typescript`; `None` for another extension or when no compiler module exists.
+fn probe_argv(
+    script: &str,
+    root: &Path,
+    file: &Path,
+    configured: Option<&ProbePrograms>,
+) -> Option<Vec<String>> {
+    match file.extension().and_then(|ext| ext.to_str()) {
+        Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => {}
+        _ => return None,
+    }
+    let module = configured
+        .filter(|tools| tools.module.is_file())
+        .map(|tools| tools.module.clone())
+        .or_else(|| {
+            let local = root.join("node_modules/typescript/lib/typescript.js");
+            local.is_file().then_some(local)
+        })?;
+    let node = configured
+        .map(|tools| tools.program.display().to_string())
+        .unwrap_or_else(|| "node".to_owned());
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("c.ts")
+        .to_owned();
+    Some(vec![
+        node,
+        "-e".to_owned(),
+        script.to_owned(),
+        module.display().to_string(),
+        name,
+    ])
+}
+
+/// Document symbols of one outline probe reply, refused (`None`) when the reply is not exactly one
+/// `{"v":1,"symbols":[…]}` line within [`MAX_OUTLINE_PROBE_BYTES`], holds more than
+/// [`MAX_OUTLINE_PROBE_SYMBOLS`] symbols or nests deeper than [`MAX_OUTLINE_PROBE_DEPTH`], or has a
+/// range or selection range outside `source` (UTF-16 columns) or ending before it starts.
+fn outline_probe_symbols(source: &str, output: &str) -> Option<Vec<lsp::DocumentSymbol>> {
+    if output.len() > MAX_OUTLINE_PROBE_BYTES {
+        return None;
+    }
+    let mut lines = output.lines();
+    let reply: Value = serde_json::from_str(lines.next()?).ok()?;
+    if lines.any(|line| !line.trim().is_empty()) {
+        return None;
+    }
+    let object = reply.as_object()?;
+    if object.len() != 2 || object.get("v") != Some(&Value::from(1)) {
+        return None;
+    }
+    let mut symbols: Vec<lsp::DocumentSymbol> =
+        serde_json::from_value(object.get("symbols")?.clone()).ok()?;
+    let widths: Vec<usize> = source
+        .split('\n')
+        .map(|line| line.encode_utf16().count())
+        .collect();
+    let inside = |position: &lsp::Position| {
+        widths
+            .get(position.line as usize)
+            .is_some_and(|width| position.character as usize <= *width)
+    };
+    let ordered = |range: &lsp::Range| {
+        inside(&range.start)
+            && inside(&range.end)
+            && (range.start.line, range.start.character) <= (range.end.line, range.end.character)
+    };
+    let mut count = 0;
+    let mut pending: Vec<(&lsp::DocumentSymbol, usize)> =
+        symbols.iter().map(|symbol| (symbol, 1)).collect();
+    while let Some((symbol, depth)) = pending.pop() {
+        count += 1;
+        if count > MAX_OUTLINE_PROBE_SYMBOLS
+            || depth > MAX_OUTLINE_PROBE_DEPTH
+            || !ordered(&symbol.range)
+            || !ordered(&symbol.selection_range)
+        {
+            return None;
+        }
+        pending.extend(
+            symbol
+                .children
+                .iter()
+                .flatten()
+                .map(|child| (child, depth + 1)),
+        );
+    }
+    agent_ide_core::intelligence::context::utf16_symbols(
+        source,
+        &mut symbols,
+        &lsp::PositionEncodingKind::UTF16,
+    );
+    Some(symbols)
 }
 
 /// Whether a server symbol name is a test-framework callback: `describe("math") callback`,
@@ -1788,6 +2194,303 @@ export interface Options {
         assert_eq!(outline.symbols[0].kind, SymbolKind::Function);
     }
 
+    /// The outline probe reply goes through the same normalization as server symbols; a reply
+    /// that is not exactly one bounded, in-range `{"v":1,"symbols":[…]}` line is refused.
+    #[test]
+    fn source_outline_probe_result_normalizes_bounded_replies_only() {
+        let symbols = vec![symbol(
+            "describe(\"math\") callback",
+            lsp::SymbolKind::FUNCTION,
+            (2, 17, 6, 1),
+            vec![symbol(
+                "it(\"adds\") callback",
+                lsp::SymbolKind::FUNCTION,
+                (3, 13, 5, 3),
+                vec![],
+            )],
+        )];
+        let file = Path::new("src/math.test.ts");
+        let reply = |symbols: &[lsp::DocumentSymbol]| {
+            format!("{}\n", serde_json::json!({"v": 1, "symbols": symbols}))
+        };
+        let good = reply(&symbols);
+        let outline = TypeScript
+            .source_outline_probe_result(file, MATH_TEST, &good)
+            .unwrap();
+        assert_eq!(
+            outline,
+            TypeScript.normalize(file, MATH_TEST, symbols.clone())
+        );
+        assert_eq!(outline.symbols[0].kind, SymbolKind::Test);
+        assert_eq!(outline.symbols[0].children[0].kind, SymbolKind::Test);
+        let refused = |output: &str| {
+            TypeScript
+                .source_outline_probe_result(file, MATH_TEST, output)
+                .is_none()
+        };
+        assert!(refused(""));
+        assert!(refused("not json\n"));
+        assert!(refused(&format!("{good}{good}")));
+        assert!(refused(&format!(
+            "{}\n",
+            serde_json::json!({"v": 2, "symbols": symbols})
+        )));
+        assert!(refused(&format!(
+            "{}\n",
+            serde_json::json!({"v": 1, "symbols": symbols, "extra": true})
+        )));
+        let mut outside = symbols.clone();
+        outside[0].range.end.line = 40;
+        assert!(refused(&reply(&outside)));
+        let mut wide = symbols.clone();
+        wide[0].selection_range.end.character = 500;
+        assert!(refused(&reply(&wide)));
+        let mut backwards = symbols.clone();
+        backwards[0].range = lsp::Range::new(lsp::Position::new(5, 0), lsp::Position::new(2, 0));
+        assert!(refused(&reply(&backwards)));
+        let mut deep = symbol("x", lsp::SymbolKind::VARIABLE, (0, 0, 0, 1), vec![]);
+        for _ in 0..MAX_OUTLINE_PROBE_DEPTH {
+            deep = symbol("x", lsp::SymbolKind::VARIABLE, (0, 0, 0, 1), vec![deep]);
+        }
+        assert!(refused(&reply(&[deep])));
+        let many: Vec<_> = (0..=MAX_OUTLINE_PROBE_SYMBOLS)
+            .map(|_| symbol("x", lsp::SymbolKind::VARIABLE, (0, 0, 0, 1), vec![]))
+            .collect();
+        assert!(refused(&reply(&many)));
+        assert!(refused(&format!(
+            "{}\n",
+            " ".repeat(MAX_OUTLINE_PROBE_BYTES + 1)
+        )));
+    }
+
+    /// The outline probe shares the syntax probe's compiler and Node selection and argv shape;
+    /// its script is the syntactic navigation-tree probe and never builds a program.
+    #[test]
+    fn source_outline_probe_command_shares_the_syntax_probe_selection() {
+        let project = project(&[]);
+        let root =
+            std::env::temp_dir().join(format!("agent-ide-ts-outline-{}", std::process::id()));
+        let local = root.join("node_modules/typescript/lib");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("typescript.js"), "export {};\n").unwrap();
+        let file = Path::new("src/a.test.ts");
+        let outline = TypeScript
+            .source_outline_probe_command(&project, &root, file, None, &[])
+            .unwrap();
+        let syntax = TypeScript
+            .syntax_probe_command(&project, &root, file, None)
+            .unwrap();
+        assert_eq!(outline[2], TS_OUTLINE_PROBE);
+        assert!(outline[2].contains("LanguageServiceMode.Syntactic"));
+        assert!(outline[2].contains("getNavigationTree"));
+        assert!(!outline[2].contains("createProgram"));
+        assert_eq!((&outline[..2], &outline[3..]), (&syntax[..2], &syntax[3..]));
+        assert_eq!(
+            TypeScript.source_outline_probe_command(
+                &project,
+                &root,
+                Path::new("src/a.py"),
+                None,
+                &[]
+            ),
+            None
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Context replies must be bounded, ordered, within source, and cover every anchor.
+    #[test]
+    fn source_context_probe_rejects_unverified_ranges() {
+        let file = Path::new("a.ts");
+        let source = "a\nb\nc\n";
+        let good = r#"{"v":1,"context":[[0,0],[2,2]]}"#;
+        assert_eq!(
+            TypeScript.source_context_probe_result(file, source, good, &[1, 3]),
+            Some(vec![LineRange::new(1, 1), LineRange::new(3, 3)])
+        );
+        assert!(
+            TypeScript
+                .source_context_probe_result(file, source, good, &[2])
+                .is_none()
+        );
+        for output in [
+            r#"{"v":1,"context":null}"#,
+            r#"{"v":1,"context":[[0,3]]}"#,
+            r#"{"v":1,"context":[[1,0]]}"#,
+            r#"{"v":1,"context":[[0,1],[1,2]]}"#,
+            r#"{"v":1,"context":[[0,2]],"extra":true}"#,
+            "not json",
+        ] {
+            assert!(
+                TypeScript
+                    .source_context_probe_result(file, source, output, &[1])
+                    .is_none(),
+                "{output}"
+            );
+        }
+    }
+
+    /// Operator-only AST proof: preserve state/wrappers/overloads, refuse unknown receiver flow.
+    #[test]
+    #[ignore = "requires AGENT_IDE_NODE and AGENT_IDE_TSSERVER"]
+    fn source_context_probe_runs_on_the_accepted_compiler() {
+        use std::io::Write;
+        let node = std::env::var("AGENT_IDE_NODE").unwrap();
+        let module = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap())
+            .with_file_name("typescript.js");
+        let source = "class Box {\n  value = 1\n  constructor() { this.value = 2 }\n  #read = () => { return this.value }\n  read() { return this.#read() }\n  other(x: string): string\n  other(x: number): number\n  other(x: unknown) { return x }\n}\n";
+        for (text, anchor, allowed) in [
+            (source.to_owned(), 4, true),
+            (source.to_owned(), 8, true),
+            (
+                source.replace("return this.#read()", "consume(this); return this.#read()"),
+                4,
+                false,
+            ),
+            (
+                source.replace("return this.value", "const {value} = this; return value"),
+                4,
+                true,
+            ),
+            (
+                source.replace("return this.value", "return this['value']"),
+                4,
+                false,
+            ),
+            (
+                source.replace("return this.value", "return consume(this)"),
+                4,
+                false,
+            ),
+            (
+                source.replace("return this.value", "const self = this; return self.value"),
+                4,
+                false,
+            ),
+            (
+                source.replace("class Box {", "class Box extends Parent {"),
+                4,
+                false,
+            ),
+            (source.replace("return x }\n}", "return x } }"), 4, false),
+        ] {
+            let mut child = std::process::Command::new(&node)
+                .args(["-e", TS_OUTLINE_PROBE])
+                .arg(&module)
+                .arg(serde_json::json!({"file":"a.ts", "anchors":[anchor]}).to_string())
+                .env_clear()
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            let spans = TypeScript.source_context_probe_result(
+                Path::new("a.ts"),
+                &text,
+                std::str::from_utf8(&output.stdout).unwrap(),
+                &[anchor],
+            );
+            assert_eq!(spans.is_some(), allowed, "{text}");
+            if let Some(spans) = spans {
+                let lines: Vec<_> = text.lines().collect();
+                let selected = spans
+                    .iter()
+                    .flat_map(|span| {
+                        lines[(span.start - 1) as usize..span.end as usize]
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(selected.contains("constructor()") && selected.contains("value = 1"));
+                if anchor == 4 {
+                    assert!(selected.contains("#read =") && selected.contains("read()"));
+                    assert!(!selected.contains("other("));
+                } else {
+                    assert!(
+                        selected.contains("other(x: string)")
+                            && selected.contains("other(x: number)")
+                            && selected.contains("other(x: unknown)")
+                    );
+                    assert!(!selected.contains("#read ="));
+                }
+            }
+        }
+    }
+
+    /// Operator-only: the actual probe on the accepted Node and compiler turns a suite read from
+    /// stdin alone into nested test ranges.
+    #[test]
+    #[ignore = "requires AGENT_IDE_NODE and AGENT_IDE_TSSERVER (typescript.js beside it)"]
+    fn source_outline_probe_runs_on_the_accepted_compiler() {
+        use std::io::Write;
+        let node = std::env::var("AGENT_IDE_NODE").unwrap();
+        let module = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap())
+            .with_file_name("typescript.js");
+        let source = "\
+import { describe, it, expect } from 'vitest'
+
+describe('Body', () => {
+  test('reads', async () => {
+    expect(await read()).toBe('x')
+  })
+  describe('parse', () => {
+    it('parses', () => {
+      expect(1).toBe(1)
+    })
+  })
+})
+";
+        let mut child = std::process::Command::new(node)
+            .args(["-e", TS_OUTLINE_PROBE])
+            .arg(&module)
+            .arg("body.test.ts")
+            .env_clear()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let outline = TypeScript
+            .source_outline_probe_result(
+                Path::new("src/body.test.ts"),
+                source,
+                std::str::from_utf8(&output.stdout).unwrap(),
+            )
+            .unwrap();
+        let suite = outline
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == SymbolKind::Test)
+            .unwrap();
+        assert_eq!((suite.range.start, suite.range.end), (3, 12));
+        let ranges: Vec<_> = suite
+            .children
+            .iter()
+            .map(|child| (child.kind, child.range.start, child.range.end))
+            .collect();
+        assert_eq!(
+            ranges,
+            [(SymbolKind::Test, 4, 6), (SymbolKind::Test, 7, 11)]
+        );
+        assert_eq!(suite.children[1].children[0].kind, SymbolKind::Test);
+    }
+
     /// Bodies shrink to their nested declarations; class fields and interface members render
     /// annotation-or-value; no local, object-literal property or statement symbol survives.
     #[test]
@@ -1946,6 +2649,19 @@ src/transport.ts  (29 lines, typescript)
         }
     }
 
+    /// Vitest's own config wins over its Vite fallback and Jest; `tsconfig.json` is its own family.
+    #[test]
+    fn test_toolchain_families_follow_runner_lookup_order() {
+        let families = TypeScript.test_toolchain_configs();
+        assert_eq!(families.len(), 2);
+        let runner = families[0];
+        let position = |name: &str| runner.iter().position(|entry| *entry == name).unwrap();
+        assert_eq!(runner[0], "vitest.config.ts");
+        assert!(position("vitest.config.mjs") < position("vite.config.ts"));
+        assert!(position("vite.config.cjs") < position("jest.config.ts"));
+        assert_eq!(families[1], ["tsconfig.json"]);
+    }
+
     /// A project with only the given environment facts.
     fn project(environment: &[(&str, &str)]) -> LanguageProject {
         LanguageProject {
@@ -1989,7 +2705,6 @@ src/transport.ts  (29 lines, typescript)
         assert_eq!(
             vitest.command,
             argv(&[
-                "npx",
                 "vitest",
                 "run",
                 "src/math.test.ts",
@@ -2001,12 +2716,12 @@ src/transport.ts  (29 lines, typescript)
         let jest = TypeScript
             .test_selection(&project(&[("test_runner", "jest")]), &file)
             .unwrap();
-        assert_eq!(jest.command, argv(&["npx", "jest", "src/a.test.ts"]));
+        assert_eq!(jest.command, argv(&["jest", "src/a.test.ts"]));
         let pattern = TestTarget::Pattern("adds".to_owned());
         let jest = TypeScript
             .test_selection(&project(&[("test_runner", "jest")]), &pattern)
             .unwrap();
-        assert_eq!(jest.command, argv(&["npx", "jest", "-t", "adds"]));
+        assert_eq!(jest.command, argv(&["jest", "-t", "adds"]));
         let node = TypeScript.test_selection(&project(&[]), &pattern).unwrap();
         assert_eq!(
             node.command,
@@ -2014,6 +2729,28 @@ src/transport.ts  (29 lines, typescript)
         );
         let node = TypeScript.test_selection(&project(&[]), &file).unwrap();
         assert_eq!(node.command, argv(&["node", "--test", "src/a.test.ts"]));
+        // Several file targets are one runner invocation over all of them.
+        let several = TestTarget::Files(vec![
+            PathBuf::from("src/a.test.ts"),
+            PathBuf::from("src/__tests__"),
+        ]);
+        let vitest = TypeScript
+            .test_selection(&project(&[("test_runner", "vitest")]), &several)
+            .unwrap();
+        assert_eq!(
+            vitest.command,
+            argv(&["vitest", "run", "src/a.test.ts", "src/__tests__"])
+        );
+        assert!(matches!(
+            TypeScript.test_selection(
+                &project(&[]),
+                &TestTarget::Files(vec![
+                    PathBuf::from("src/a.test.ts"),
+                    PathBuf::from("src/details.tsx"),
+                ])
+            ),
+            Err(LangError::Unsupported(_))
+        ));
     }
 
     /// Non-test script files never become runner targets; directories pass through and let the

@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::{
     assistance::{
         facade::{AssistanceTool, HookIngressOutcome},
-        reply::{EditDiagnostics, FailureCode, MissingPeer, PeerReply},
+        reply::{EditBatchOutcome, EditDiagnostics, FailureCode, MissingPeer, PeerReply},
     },
     changes::edit::EditOutcome,
     checks::{CheckState, ProblemSnapshot, UnavailableReason},
@@ -335,12 +335,14 @@ fn reply_detail(reply: &PeerReply) -> Option<String> {
 pub(crate) fn tool_stage(tool: AssistanceTool) -> &'static str {
     match tool {
         AssistanceTool::Start => "start",
+        AssistanceTool::Prepare => "prepare",
         AssistanceTool::Context => "context",
         AssistanceTool::Diff => "diff",
         AssistanceTool::Inspect => "inspect",
         AssistanceTool::Stop => "stop",
         AssistanceTool::Edit => "edit",
         AssistanceTool::Outline => "outline",
+        AssistanceTool::Tree => "tree",
         AssistanceTool::Read => "read",
         AssistanceTool::Symbol => "symbol",
         AssistanceTool::Graph => "graph",
@@ -537,12 +539,13 @@ pub fn project_check(telemetry: &Telemetry, snapshot: &ProblemSnapshot) {
 fn tool_method(tool: AssistanceTool) -> ToolMethod {
     match tool {
         AssistanceTool::Start => ToolMethod::Start,
+        AssistanceTool::Prepare => ToolMethod::Context,
         AssistanceTool::Context => ToolMethod::Context,
         AssistanceTool::Diff => ToolMethod::Diff,
         AssistanceTool::Inspect => ToolMethod::Inspect,
         AssistanceTool::Stop => ToolMethod::Stop,
         AssistanceTool::Edit => ToolMethod::Edit,
-        AssistanceTool::Outline => ToolMethod::Outline,
+        AssistanceTool::Outline | AssistanceTool::Tree => ToolMethod::Outline,
         AssistanceTool::Read => ToolMethod::Read,
         AssistanceTool::Symbol => ToolMethod::Symbol,
         AssistanceTool::Graph => ToolMethod::Graph,
@@ -588,6 +591,11 @@ fn reply_outcome(reply: &PeerReply) -> ToolOutcome {
             | EditOutcome::CapacityNoEffect
             | EditOutcome::OutcomeUnknown => ToolOutcome::Incomplete,
             EditOutcome::UnavailableBeforeDispatch => ToolOutcome::Unavailable,
+        },
+        PeerReply::EditBatch { outcome, .. } => match outcome {
+            EditBatchOutcome::Applied => ToolOutcome::Completed,
+            EditBatchOutcome::ConflictingDuplicate => ToolOutcome::Invalid,
+            EditBatchOutcome::Partial | EditBatchOutcome::OutcomeUnknown => ToolOutcome::Incomplete,
         },
     }
 }

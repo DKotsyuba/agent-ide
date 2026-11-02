@@ -5,7 +5,8 @@ use std::path::Path;
 use crate::app::transport::OpaqueJson;
 use serde::{Deserialize, Serialize};
 
-/// Maximum complete Assistance JSON envelope including escaped text and all keys.
+/// Maximum complete Assistance JSON envelope including escaped text and all keys. Read and
+/// Prepare source (`PeerReply::delivers_source`) is exempt and bounded only by the IPC prefix.
 pub const MAX_REPLY_BYTES: usize = 64 * 1024;
 /// Maximum model-visible feedback text returned to a native host hook.
 pub const MAX_FEEDBACK_BYTES: usize = 4 * 1024;
@@ -92,6 +93,15 @@ pub enum HostBindingCause {
         /// Bounded requested root exactly as the model named it.
         asked: String,
     },
+    /// Another actor's `ide.start` took this session's activation over as a stale writer
+    /// (start-index-state r2 §4c). The tag stays `taken_over`; `reason` is the fixed phrase the
+    /// reply text adds (`after this session's IDE connection closed` or `after <m> min without
+    /// activity`), never host data.
+    TakenOver {
+        /// Why the activation was taken over, as [`super::host_binding::TakeoverReason::displaced`]
+        /// words it.
+        reason: String,
+    },
 }
 
 impl HostBindingCause {
@@ -112,6 +122,9 @@ impl HostBindingCause {
             super::host_binding::BindingUnavailable::InactiveBinding => Self::InactiveBinding,
             super::host_binding::BindingUnavailable::NeverActivated => Self::NeverActivated,
             super::host_binding::BindingUnavailable::CapacityExceeded => Self::CapacityExceeded,
+            super::host_binding::BindingUnavailable::TakenOver(reason) => Self::TakenOver {
+                reason: reason.displaced(),
+            },
         })
     }
 
@@ -159,6 +172,7 @@ impl HostBindingCause {
             Self::OtherRepository { bound, asked } => {
                 format!("other_repository: bound to {bound}, asked {asked}")
             }
+            Self::TakenOver { .. } => "taken_over".to_owned(),
         }
     }
 }
@@ -292,9 +306,13 @@ impl ExecutionProfileCause {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultKind {
+    /// A task-selected current source packet from ide.prepare.
+    Prepare,
+    /// Nonterminal edit progress, naming requested paths, confirmed commits and current stage.
+    EditProgress,
     /// Durable Workspace activated and authorized the exact binding.
     Activation,
-    /// Intelligence returned source context or the project problems page.
+    /// Private legacy source context. Public positional/diagnostic queries use Symbol/Inspect.
     Context,
     /// Changes composed evidence for a current Workspace comparison scope.
     Diff,
@@ -310,6 +328,65 @@ pub enum ResultKind {
     Graph,
     /// A background test run result from `ide.test`.
     Test,
+    /// Inspect facts/references (OUTBOX-r3 §8.5), project check problems, or file provider diagnostics.
+    /// Diagnostic reports have their own bounded continuation; facts gathering remains unpaged.
+    Inspect,
+}
+
+/// Closed outcome of one multi-file `ide.edit {files}` (batch-api-v1 §7).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditBatchOutcome {
+    /// Every file now holds its candidate.
+    Applied,
+    /// Some files are written and the rest are not; the same `operation_id` resumes them.
+    Partial,
+    /// The `operation_id` already names a different request; nothing was written.
+    ConflictingDuplicate,
+    /// A write may have happened that the call could not establish (a lost write result, a
+    /// panic after a write); the receipt's digests settle it on the retry.
+    OutcomeUnknown,
+}
+
+/// Closed state of one file of a multi-file edit after the call (batch-api-v1 §7).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditBatchFileState {
+    /// The file did not exist and now holds its candidate.
+    Created,
+    /// The file's bytes were replaced by its candidate.
+    Replaced,
+    /// The candidate equalled the file's bytes; nothing was written.
+    Unchanged,
+    /// The file was not written; `reason` says why.
+    NotWritten,
+    /// A write may have happened; its result is not established.
+    Unknown,
+}
+
+/// Closed reason a file of a multi-file edit was not written (batch-api-v1 §7).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditBatchReason {
+    /// Its bytes changed after the call validated them.
+    ChangedAfterValidation,
+    /// The write failed or could not be performed.
+    IoError,
+    /// The commit stopped at an earlier file.
+    NotReached,
+}
+
+/// One file of a multi-file edit result, in request order.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditBatchFile {
+    /// Worktree-relative path as requested.
+    pub path: String,
+    /// What the file holds after the call.
+    pub state: EditBatchFileState,
+    /// Why the file was not written; present only with [`EditBatchFileState::NotWritten`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<EditBatchReason>,
 }
 
 /// Serde's skip test for a zero count.
@@ -361,14 +438,16 @@ pub enum EditDiagnostics {
 impl EditDiagnostics {
     /// Converts one correlated provider snapshot without interpreting silence as cleanliness.
     ///
-    /// Current semantic context, matching source/generation/version identities, and an explicit
-    /// clean or reported readiness are all required. Unavailable, stale, lexical, unversioned, or
+    /// Current source context, matching source/generation/version identities, and an explicit
+    /// clean or reported readiness are all required. Unavailable, stale, unversioned, or
     /// unready snapshots return [`Self::Unknown`]. Messages name `path`, the worktree-relative
-    /// edited file (see [`diagnostic_line`]).
+    /// edited file (see [`diagnostic_line_at`]); `map` is the address map of the edited text, when
+    /// the caller has one, and puts each message's position address in its row.
     pub(crate) fn from_snapshot(
         path: &str,
         context: &crate::intelligence::context::ContextResult,
         diagnostics: &crate::intelligence::session::DiagnosticSnapshot,
+        map: Option<&crate::lang::address::AddressMap>,
     ) -> Self {
         use crate::intelligence::freshness::{DiagnosticReadiness, Freshness};
 
@@ -392,7 +471,7 @@ impl EditDiagnostics {
                     .diagnostics
                     .iter()
                     .take(8)
-                    .map(|diagnostic| diagnostic_line(path, diagnostic))
+                    .map(|diagnostic| diagnostic_line_at(path, diagnostic, map))
                     .collect::<Vec<String>>();
                 Self::CurrentReported {
                     delta: format!(
@@ -435,9 +514,26 @@ impl EditDiagnostics {
 
 /// Renders one language-server diagnostic as `path:line:col severity [code] message` (1-based
 /// position, severity omitted when the server sent none), bounded to 256 UTF-8 bytes.
+#[cfg(test)]
 pub(crate) fn diagnostic_line(path: &str, diagnostic: &async_lsp::lsp_types::Diagnostic) -> String {
+    diagnostic_line_at(path, diagnostic, None)
+}
+
+/// [`diagnostic_line`] with the position address of the diagnostic's line after the location,
+/// `path:line:col file#unit:N (L123) severity [code] message`, when `map` resolves it. The
+/// 256-byte bound covers the whole row and clips the message first.
+pub(crate) fn diagnostic_line_at(
+    path: &str,
+    diagnostic: &async_lsp::lsp_types::Diagnostic,
+    map: Option<&crate::lang::address::AddressMap>,
+) -> String {
     use async_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
 
+    let line = diagnostic.range.start.line + 1;
+    let address = map
+        .and_then(|map| map.address_at(Path::new(path), line))
+        .map(|address| format!("{address} (L{line}) "))
+        .unwrap_or_default();
     let severity = match diagnostic.severity {
         Some(DiagnosticSeverity::ERROR) => "error ",
         Some(DiagnosticSeverity::WARNING) => "warning ",
@@ -452,8 +548,7 @@ pub(crate) fn diagnostic_line(path: &str, diagnostic: &async_lsp::lsp_types::Dia
     };
     bounded_utf8_prefix(
         &format!(
-            "{path}:{}:{} {severity}{code}{}",
-            diagnostic.range.start.line + 1,
+            "{path}:{line}:{} {address}{severity}{code}{}",
             diagnostic.range.start.character + 1,
             diagnostic.message
         ),
@@ -561,6 +656,23 @@ pub enum PeerReply {
         #[serde(default)]
         operation: Option<String>,
     },
+    /// One multi-file `ide.edit {files}` result (batch-api-v1 §7): the closed operation outcome
+    /// and per-file states, with the compact reply text that also carries the diagnostics.
+    EditBatch {
+        /// The caller's operation id.
+        operation_id: String,
+        /// Closed outcome of the whole operation.
+        outcome: EditBatchOutcome,
+        /// Edit base valid for every written file; absent when no file holds its candidate.
+        source_ref: Option<String>,
+        /// Every requested file in request order (empty for a conflicting duplicate).
+        files: Vec<EditBatchFile>,
+        /// The compact reply, summary line first.
+        text: String,
+        /// True when serialized-result budgeting cut the text.
+        #[serde(default)]
+        truncated: bool,
+    },
 }
 impl std::fmt::Debug for PeerReply {
     /// Omits text and detail handles from diagnostics.
@@ -569,30 +681,59 @@ impl std::fmt::Debug for PeerReply {
     }
 }
 
-/// One daemon method reply wrapped around an attached status plate (T28B).
+/// One daemon method reply wrapped around private delivery metadata.
 ///
-/// The daemon encodes this shape exactly when a terminal reply carries a due plate for a host
-/// whose feed delivery rides replies; every other reply stays a bare [`PeerReply`], byte-identical
-/// to earlier releases.
+/// `status` carries a due plate for a host whose feed delivery rides replies. `lost_handoff`
+/// reports whether Bridge accepted custody of a re-activation's `lost-after-restart` notice or
+/// its publication outcome is uncertain. Every reply with neither field stays a bare [`PeerReply`],
+/// byte-identical to earlier releases.
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct StatusCarriedReply {
-    /// The complete `<agent-ide>` plate, delivered verbatim at the top of the rendered reply.
-    status: String,
-    /// The closed reply the plate was attached to.
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct DeliveredReply {
+    /// The complete `<agent-ide>` plate, delivered verbatim at the top of the rendered reply;
+    /// absent when this wrapper carries only the restart handoff result.
+    #[serde(default)]
+    status: Option<String>,
+    /// Whether the restart-loss publication was accepted or uncertain; absent for ordinary calls.
+    #[serde(default)]
+    lost_handoff: Option<bool>,
+    /// The unchanged closed reply the private metadata accompanies.
     reply: PeerReply,
 }
 impl PeerReply {
-    /// Fits the complete serialized budget by trimming only owner text at UTF-8 boundaries.
-    /// Invalid references fail closed. Trimming sets truncated and never changes the evidence kind.
+    /// Whether this reply carries requested source that reaches the caller whole: a completed
+    /// Read or Prepare result. Such a reply is bounded only by the IPC length prefix
+    /// ([`crate::app::MAX_PREFIXED_FRAME_BYTES`]) and its text is never shrunk.
+    pub(crate) fn delivers_source(&self) -> bool {
+        matches!(
+            self,
+            Self::Complete {
+                kind: ResultKind::Read | ResultKind::Prepare,
+                ..
+            }
+        )
+    }
+    /// Serialized byte bound of this reply: the IPC length prefix for source
+    /// ([`Self::delivers_source`]), `MAX_REPLY_BYTES - MCP_RESERVE` for every other reply.
+    fn max_serialized_bytes(&self) -> usize {
+        if self.delivers_source() {
+            crate::app::MAX_PREFIXED_FRAME_BYTES
+        } else {
+            MAX_REPLY_BYTES - MCP_RESERVE
+        }
+    }
+    /// Fits the reply's serialized bound by trimming only owner text at UTF-8 boundaries.
+    /// Source replies ([`Self::delivers_source`]) are never trimmed. Invalid references fail
+    /// closed. Trimming sets truncated and never changes the evidence kind.
     pub(crate) fn encode(mut self) -> Option<OpaqueJson> {
         if !self.valid_reference() {
             return None;
         }
         loop {
             let serialized = serde_json::to_string(&self).ok()?;
-            if serialized.len() <= MAX_REPLY_BYTES - MCP_RESERVE {
-                return OpaqueJson::new(serialized, MAX_REPLY_BYTES);
+            let bound = self.max_serialized_bytes();
+            if serialized.len() <= bound {
+                return OpaqueJson::new(serialized, bound);
             }
             if !self.shrink_text() {
                 return None;
@@ -600,11 +741,20 @@ impl PeerReply {
         }
     }
     /// Reduces only owner text while preserving UTF-8 and explicitly marking omitted content.
-    /// Returns false for non-text results or already empty text; callers then fail closed.
+    /// Returns false for Read and Prepare source, non-text results or empty text;
+    /// callers retain a due status plate or fail closed without falsifying source delivery.
     pub(crate) fn shrink_text(&mut self) -> bool {
-        let Self::Complete {
+        // Read and Prepare have already recorded the delivery of every source block they carry.
+        // Cutting them here would invalidate those receipts.
+        if self.delivers_source() {
+            return false;
+        }
+        let (Self::Complete {
             text, truncated, ..
-        } = self
+        }
+        | Self::EditBatch {
+            text, truncated, ..
+        }) = self
         else {
             return false;
         };
@@ -619,42 +769,74 @@ impl PeerReply {
         *truncated = true;
         true
     }
-    /// Decodes a closed envelope only when serialized bytes and reference syntax are bounded.
+    /// Decodes a closed envelope only when serialized bytes and reference syntax are bounded;
+    /// the byte bound is the decoded reply's own ([`Self::delivers_source`]).
     pub(crate) fn decode(value: &str) -> Option<Self> {
-        if value.len() > MAX_REPLY_BYTES - MCP_RESERVE {
+        if value.len() > crate::app::MAX_PREFIXED_FRAME_BYTES {
             return None;
         }
         let reply: Self = serde_json::from_str(value).ok()?;
-        reply.valid_reference().then_some(reply)
+        (reply.valid_reference() && value.len() <= reply.max_serialized_bytes()).then_some(reply)
     }
-    /// Decodes one daemon method reply with its optional carried status plate (T28B).
+    /// Byte bound of the private delivery wrapper around `reply`: the IPC length prefix for
+    /// source, [`MAX_REPLY_BYTES`] for every other reply.
+    fn max_delivered_bytes(reply: &Self) -> usize {
+        if reply.delivers_source() {
+            crate::app::MAX_PREFIXED_FRAME_BYTES
+        } else {
+            MAX_REPLY_BYTES
+        }
+    }
+    /// Decodes one daemon method reply with its optional carried status plate and restart-loss
+    /// handoff result.
     ///
     /// Accepts the bare closed reply (`status` absent, the historical wire form) and the
-    /// [`StatusCarriedReply`] wrapper. Both forms enforce the same byte bound; a carried plate
+    /// [`DeliveredReply`] wrapper. Both forms enforce the reply's own byte bound; a carried plate
     /// must be a nonempty block within [`MAX_FEEDBACK_BYTES`] — the ceiling a hook-delivered
     /// plate has too, since due git and environment notices join the feed's
     /// [`crate::feed::MAX_BLOCK_BYTES`] block — and its reply must pass the same
-    /// closed-reference validation as a bare one.
-    pub(crate) fn decode_delivered(value: &str) -> Option<(Self, Option<String>)> {
-        if let Ok(carried) = serde_json::from_str::<StatusCarriedReply>(value) {
-            if value.len() > MAX_REPLY_BYTES {
+    /// closed-reference validation as a bare one. The final tuple item is present only when the
+    /// daemon evaluated a restart-loss handoff.
+    pub(crate) fn decode_delivered(value: &str) -> Option<(Self, Option<String>, Option<bool>)> {
+        if let Ok(carried) = serde_json::from_str::<DeliveredReply>(value) {
+            if value.len() > Self::max_delivered_bytes(&carried.reply) {
                 return None;
             }
             let valid = carried.reply.valid_reference()
-                && !carried.status.is_empty()
-                && carried.status.len() <= MAX_FEEDBACK_BYTES;
-            return valid.then_some((carried.reply, Some(carried.status)));
+                && (carried.status.is_some() || carried.lost_handoff.is_some())
+                && carried
+                    .status
+                    .as_ref()
+                    .is_none_or(|status| !status.is_empty() && status.len() <= MAX_FEEDBACK_BYTES);
+            return valid.then_some((carried.reply, carried.status, carried.lost_handoff));
         }
-        Some((Self::decode(value)?, None))
+        Some((Self::decode(value)?, None, None))
     }
-    /// Encodes one reply with an attached status plate in the [`StatusCarriedReply`] wire form.
+    /// Encodes one reply with optional private delivery metadata.
     ///
-    /// Callers attach a plate only after the complete final MCP carrier was proven to fit
-    /// (`content::fits_with_status`), so the wrapper — strictly smaller than that carrier —
-    /// always stays inside the transport bound; failure returns `None` rather than a cut plate.
-    pub(crate) fn encode_with_status(reply: &Self, status: &str) -> Option<OpaqueJson> {
-        let wrapped = serde_json::json!({"status": status, "reply": reply});
-        OpaqueJson::new(serde_json::to_string(&wrapped).ok()?, MAX_REPLY_BYTES)
+    /// At least one metadata field must be present. A status plate is supplied only after the
+    /// complete final MCP carrier was proven to fit (`content::fits_with_status`), so this wrapper
+    /// stays inside the reply's transport bound; a source reply is bounded only by the IPC prefix. `lost_handoff` follows Bridge's existing boolean custody
+    /// contract and never claims model observation.
+    pub(crate) fn encode_delivered(
+        reply: &Self,
+        status: Option<&str>,
+        lost_handoff: Option<bool>,
+    ) -> Option<OpaqueJson> {
+        if status.is_none() && lost_handoff.is_none() {
+            return None;
+        }
+        let mut wrapped = serde_json::json!({"reply": reply});
+        if let Some(status) = status {
+            wrapped["status"] = serde_json::json!(status);
+        }
+        if let Some(lost_handoff) = lost_handoff {
+            wrapped["lost_handoff"] = serde_json::json!(lost_handoff);
+        }
+        OpaqueJson::new(
+            serde_json::to_string(&wrapped).ok()?,
+            Self::max_delivered_bytes(reply),
+        )
     }
     /// Checks reference syntax; ownership and current liveness remain worker admission gates.
     fn valid_reference(&self) -> bool {
@@ -668,6 +850,7 @@ impl PeerReply {
         let reference = match self {
             Self::Pending { detail_ref, .. } => Some(detail_ref),
             Self::Complete { detail_ref, .. } => detail_ref.as_ref(),
+            Self::EditBatch { source_ref, .. } => source_ref.as_ref(),
             _ => None,
         };
         reference.is_none_or(|value| {
@@ -704,8 +887,9 @@ fn envelopes_are_closed_and_fit_serialized_budget() {
     }
 }
 
-/// The status-carried wire form (T28B) round-trips the plate and the closed reply, keeps the bare
-/// form decoding without a plate, and refuses oversize, overlong-plate or invalid-reference wraps.
+/// The private delivery wrapper round-trips status and restart handoff metadata, keeps the bare
+/// form decoding without metadata, and refuses oversize, overlong-plate or invalid-reference
+/// wraps.
 #[test]
 fn status_carried_replies_round_trip_and_stay_closed() {
     let plate = "<agent-ide>\nrust: 2 errors, 0 warnings\n</agent-ide>";
@@ -716,15 +900,25 @@ fn status_carried_replies_round_trip_and_stay_closed() {
         truncated: false,
         continuation: false,
     };
-    let encoded = PeerReply::encode_with_status(&reply, plate).unwrap();
-    let (decoded, status) = PeerReply::decode_delivered(encoded.as_str()).unwrap();
+    let encoded = PeerReply::encode_delivered(&reply, Some(plate), None).unwrap();
+    let (decoded, status, lost_handoff) = PeerReply::decode_delivered(encoded.as_str()).unwrap();
     assert_eq!(decoded, reply);
     assert_eq!(status.as_deref(), Some(plate));
+    assert_eq!(lost_handoff, None);
 
     // Bare replies decode exactly as before, with no plate.
-    let (bare, status) =
+    let (bare, status, lost_handoff) =
         PeerReply::decode_delivered(reply.clone().encode().unwrap().as_str()).unwrap();
-    assert_eq!((bare, status), (reply.clone(), None));
+    assert_eq!((bare, status, lost_handoff), (reply.clone(), None, None));
+
+    // Restart-loss acknowledgment is private metadata and carries both success and refusal.
+    for handed_off in [false, true] {
+        let encoded = PeerReply::encode_delivered(&reply, None, Some(handed_off)).unwrap();
+        assert_eq!(
+            PeerReply::decode_delivered(encoded.as_str()),
+            Some((reply.clone(), None, Some(handed_off)))
+        );
+    }
 
     // A wrapped reply whose inner reference is invalid fails closed.
     let forged = serde_json::json!({
@@ -740,13 +934,13 @@ fn status_carried_replies_round_trip_and_stay_closed() {
         "<agent-ide>\n{}\n</agent-ide>",
         "x".repeat(crate::feed::MAX_BLOCK_BYTES)
     );
-    let encoded = PeerReply::encode_with_status(&reply, &noticed).unwrap();
+    let encoded = PeerReply::encode_delivered(&reply, Some(&noticed), None).unwrap();
     assert!(PeerReply::decode_delivered(encoded.as_str()).is_some());
     let overlong = format!(
         "<agent-ide>\n{}\n</agent-ide>",
         "x".repeat(MAX_FEEDBACK_BYTES)
     );
-    let encoded = PeerReply::encode_with_status(&reply, &overlong).unwrap();
+    let encoded = PeerReply::encode_delivered(&reply, Some(&overlong), None).unwrap();
     assert!(PeerReply::decode_delivered(encoded.as_str()).is_none());
 }
 

@@ -1,5 +1,18 @@
 //! Executable MCP roundtrips for static discovery, separated ingress, and finite daemon routing.
 
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[path = "context_product/mod.rs"]
+mod context_product;
+
+/// Compact test results and explicit output-page product checks.
+#[path = "result_economy/mod.rs"]
+mod result_economy;
+
+/// Shared Linux procfs process identity reader used by the parity harness.
+#[cfg(target_os = "linux")]
+#[path = "support/parity.rs"]
+mod linux_process_support;
+
 use std::{
     os::unix::{ffi::OsStrExt, fs::DirBuilderExt, fs::PermissionsExt},
     path::{Path, PathBuf},
@@ -108,8 +121,23 @@ impl Mcp {
     /// version and client capabilities in `_meta`, so the caller's own first frame opens the
     /// session and proves the modern lifecycle on the raw wire (MCP-02).
     async fn start_raw(runtime: &Path, attachment: Option<&str>) -> Self {
+        Self::start_raw_with(runtime, attachment, false).await
+    }
+
+    /// Starts the raw session without the structured-reply test seam, so replies are exactly what
+    /// a production binary sends: one text block and no `structuredContent` (harness-reply-v1 R1).
+    async fn start_raw_text_only(runtime: &Path, attachment: Option<&str>) -> Self {
+        Self::start_raw_with(runtime, attachment, true).await
+    }
+
+    /// Shared body of [`Self::start_raw`]; `text_only` removes the structured-reply seam that
+    /// `.cargo/config.toml` sets for every product test.
+    async fn start_raw_with(runtime: &Path, attachment: Option<&str>, text_only: bool) -> Self {
         let mut command = Command::new(product_binary());
         command.env("TOKIO_WORKER_THREADS", "1");
+        if text_only {
+            command.env_remove("AGENT_IDE_TEST_STRUCTURED_REPLIES");
+        }
         command
             .args(["mcp", "--runtime-dir"])
             .arg(runtime)
@@ -300,8 +328,13 @@ impl Mcp {
             .args(["mcp", "--auto-launcher-template"])
             .arg(template)
             .current_dir(cwd);
+        // An empty value removes the variable instead of setting it.
         for (name, value) in evidence {
-            command.env(name, value);
+            if value.is_empty() {
+                command.env_remove(name);
+            } else {
+                command.env(name, value);
+            }
         }
         command
             .stdin(Stdio::piped())
@@ -324,12 +357,14 @@ impl Mcp {
     }
 
     /// Starts the auto-mode MCP as the live ZCode child runs: `ZCODE_*` evidence, no
-    /// `CLAUDE_PROJECT_DIR`, the workspace directory as the captured candidate.
+    /// `CLAUDE_PROJECT_DIR`, the workspace directory as the captured candidate. It also drops the
+    /// structured-reply seam, so its replies are the production text-only carrier.
     async fn start_managed_auto(template: &Path, cwd: &Path) -> Self {
         Self::start_managed_auto_with(
             template,
             cwd,
             &[
+                ("AGENT_IDE_TEST_STRUCTURED_REPLIES", ""),
                 ("ZCODE_APP_VERSION", "3.14.3"),
                 ("ZCODE_ENV", "production"),
                 ("ZCODE_PROCESS_LABEL", "local-1"),
@@ -389,6 +424,286 @@ impl Mcp {
     }
 }
 
+/// Builds the independent expected complete numbered Read body for nonempty UTF-8 `source`.
+/// `path` is the worktree-relative heading; every source line must end with a newline. The
+/// returned body preserves those bytes after a right-aligned 1-based gutter and performs no I/O.
+fn numbered_source(path: &str, source: &str) -> String {
+    assert!(!source.is_empty() && source.ends_with('\n'));
+    let count = source.lines().count();
+    let range = if count == 1 {
+        "1".to_owned()
+    } else {
+        format!("1–{count}")
+    };
+    let mut expected = format!("{path}  (lines {range})\n");
+    let width = count.to_string().len();
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+        expected.push_str(&format!("{:>width$}\t{line}", index + 1));
+    }
+    expected
+}
+
+/// Accepts a complete rerun recipe or verifies that its clipped preview links to this owner's
+/// complete replay query. The retained output cursor remains a separate receipt.
+fn assert_rerun_receipt(text: &str, detail_ref: &str) {
+    if let Some(preview) = text
+        .lines()
+        .find(|line| line.starts_with("  rerun preview: "))
+    {
+        assert!(preview.ends_with('…'), "{preview}");
+        let query = text
+            .lines()
+            .find_map(|line| line.strip_prefix("  full replay: ide.test "))
+            .expect("a rerun preview has its full replay query");
+        let query: Value = serde_json::from_str(query).expect("the replay query is JSON");
+        assert_eq!(
+            query["output"],
+            json!(format!("{detail_ref}/replay/output/1")),
+            "the replay belongs to the run owner: {text}"
+        );
+    } else {
+        assert!(
+            text.lines().any(|line| line.starts_with("  rerun: ")),
+            "a started run has a complete rerun recipe: {text}"
+        );
+    }
+}
+
+/// Reads the terminal run's complete same-owner replay JSON through public output pages.
+/// Validates the retained cursor, ordered byte progress and complete JSON within twenty pages;
+/// it never starts or retries a test, and malformed or unavailable replies fail the caller.
+async fn product_test_replay(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    result: &Value,
+) -> Value {
+    assert_rerun_receipt(
+        result["text"].as_str().unwrap(),
+        result["detail_ref"].as_str().unwrap(),
+    );
+    let mut cursor = format!("{}/replay/output/1", result["detail_ref"].as_str().unwrap());
+    let mut text = String::new();
+    for page in 1..=20 {
+        let reply = actor
+            .call(fixture, "ide.test", json!({"output":cursor}))
+            .await;
+        assert_eq!(reply["kind"], "test", "{reply}");
+        let body = reply["text"].as_str().unwrap();
+        if !body.starts_with("page ") {
+            assert_eq!(page, 1, "only a whole replay can omit the page marker");
+            assert_eq!(reply["continuation"], false, "{reply}");
+            return serde_json::from_str(body).expect("whole replay JSON");
+        }
+        let (number, last, from, to, total) = page_marker(body);
+        assert_eq!((number, from), (page, text.len()), "{reply}");
+        assert!(from < to && to <= total, "{reply}");
+        text.push_str(body.split_once('\n').unwrap().1);
+        assert_eq!(text.len(), to, "{reply}");
+        assert_eq!(reply["continuation"], json!(!last), "{reply}");
+        if last {
+            assert_eq!(to, total, "{reply}");
+            return serde_json::from_str(&text).expect("complete replay JSON");
+        }
+        cursor = reply["detail_ref"].as_str().unwrap().to_owned();
+    }
+    panic!("test replay exceeded twenty pages");
+}
+
+/// Verifies positive provider locations are compact source addresses, never JSON URI arrays.
+/// `text` is a settled positional Symbol body and `group` is definitions or references. Every
+/// advertised row must be present and contain a relative path/line; unsupported or empty groups
+/// fail because these callers specifically expect real semantic resolution. No I/O occurs.
+fn assert_addressed_locations(text: &str, group: &str) {
+    let mut lines = text
+        .lines()
+        .skip_while(|line| !line.starts_with(&format!("{group}: ")));
+    let header = lines
+        .next()
+        .unwrap_or_else(|| panic!("missing {group}: {text}"));
+    let count: usize = header
+        .strip_prefix(&format!("{group}: "))
+        .unwrap()
+        .parse()
+        .expect("semantic location count");
+    assert!(count > 0, "{text}");
+    for _ in 0..count {
+        let row = lines.next().expect("advertised location row");
+        assert!(
+            row.starts_with("  ")
+                && row.contains(':')
+                && !row.contains("file://")
+                && !row.contains("\"uri\""),
+            "{row}"
+        );
+    }
+    assert!(
+        !text.contains("authority_epoch:") && !text.contains("source_sequence:"),
+        "{text}"
+    );
+}
+
+/// Both shipping host catalogs expose ten tools including Graph, and refuse removed Context
+/// before dispatch. Uses fresh unbound raw MCP processes so neither discovery nor refusal may
+/// create runtime state; closes both subprocesses and checks their exit statuses.
+#[tokio::test]
+async fn both_hosts_publish_ten_tools_and_refuse_removed_context_before_dispatch() {
+    for host in ["claude", "codex"] {
+        let runtime = runtime();
+        let mut command = Command::new(product_binary());
+        command
+            .env("TOKIO_WORKER_THREADS", "1")
+            .args(["mcp", "--runtime-dir"])
+            .arg(&runtime)
+            .args(["--host", host])
+            .env_remove("AGENT_IDE_HOST_ATTACHMENT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let mut mcp = Mcp {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        };
+        let initialized = mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-03-26","capabilities":{},
+                    "clientInfo":{"name":"removed-context-contract","version":"1"}
+                }}),
+            )
+            .await;
+        assert!(initialized["result"].is_object(), "{initialized}");
+        mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await;
+        let discovery = mcp
+            .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+            .await;
+        let tools = discovery["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 11, "{host}: {discovery}");
+        assert!(
+            tools.iter().any(|tool| tool["name"] == "ide.graph"),
+            "{host}: {discovery}"
+        );
+        assert!(
+            !tools.iter().any(|tool| tool["name"] == "ide.context"),
+            "{host}: {discovery}"
+        );
+        let refused = mcp.exchange(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"src/lib.rs"}}})).await;
+        assert!(
+            refused["error"].is_object() && refused.get("result").is_none(),
+            "{host}: {refused}"
+        );
+        assert!(
+            !runtime.exists(),
+            "{host}: removed tool must never dispatch"
+        );
+        mcp.close().await;
+        assert!(!runtime.exists());
+    }
+}
+
+/// A positional lookup refuses split UTF-8 and past-end positions without writing, identifies
+/// lexical evidence honestly, and file diagnostics remain unknown when no provider has reported.
+/// The same source symlink escape is refused by Read, Symbol and Inspect on a live binding.
+#[tokio::test]
+async fn positional_symbol_and_file_diagnostics_preserve_source_safety() {
+    let fixture = ProductFixture::new(json!([]));
+    let source = "pub fn café() {}\npub fn caller() { café(); }\n";
+    std::fs::write(fixture.root.join("utf8.rs"), source).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", fixture.root.join("escape.rs")).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "positional-source-safety").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"positions"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for offset in [source.find('é').unwrap() + 1, source.len() + 1] {
+        let refused = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"path":"utf8.rs","byte_offset":offset}),
+            )
+            .await;
+        let refused = actor.settle(&fixture, refused).await;
+        assert_eq!(refused["code"], "source_unavailable", "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("utf8.rs")).unwrap(),
+            source
+        );
+    }
+    let symbol = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"path":"utf8.rs","byte_offset":source.rfind("café").unwrap()}),
+        )
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+    let text = symbol["text"].as_str().unwrap();
+    assert!(
+        text.contains("mode: lexical")
+            && text.contains("definitions: unavailable")
+            && text.contains("references: unavailable"),
+        "{symbol}"
+    );
+    assert!(
+        !text.contains(source) && !text.contains("source_sequence:"),
+        "{symbol}"
+    );
+    for (tool, arguments) in [
+        ("ide.read", json!({"path":"escape.rs"})),
+        ("ide.symbol", json!({"path":"escape.rs","byte_offset":0})),
+        (
+            "ide.inspect",
+            json!({"kind":"diagnostics","path":"escape.rs"}),
+        ),
+    ] {
+        let refused = actor.call(&fixture, tool, arguments).await;
+        let refused = actor.settle(&fixture, refused).await;
+        assert_eq!(refused["code"], "source_unavailable", "{tool}: {refused}");
+    }
+    let diagnostics = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"kind":"diagnostics","path":"utf8.rs"}),
+        )
+        .await;
+    let diagnostics = actor.settle(&fixture, diagnostics).await;
+    assert_eq!(diagnostics["kind"], "inspect", "{diagnostics}");
+    let text = diagnostics["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("diagnostics: utf8.rs\n") && text.contains("diagnostics: unknown"),
+        "{diagnostics}"
+    );
+    assert!(
+        !text.contains("diagnostics: 0") && !text.contains(source),
+        "{diagnostics}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Returns whether `text` has the harness-reply-v1 R5 refusal shape: a head of at most 160 bytes,
+/// exactly one `Repair: ` line of at most 120 bytes directly after it, and any further line
+/// quoted as indented data. A refusal that echoes a long identifier or path in its head, or
+/// puts a second repair step on the line, fails here.
+fn refusal_shape_holds(text: &str) -> bool {
+    let lines = text.lines().collect::<Vec<_>>();
+    lines.len() >= 2
+        && lines[0].len() <= 160
+        && !lines[0].starts_with("Repair: ")
+        && lines[1].starts_with("Repair: ")
+        && lines[1].len() <= 120
+        && lines[2..].iter().all(|line| line.starts_with("  "))
+}
+
 /// Verifies one successful MCP tool carrier has a single non-JSON block matching its typed state.
 ///
 /// `reply` must be a JSON-RPC tools/call response with `structuredContent`. The assertion performs
@@ -396,12 +711,16 @@ impl Mcp {
 /// may legitimately occur in the compact block, while the complete typed value remains separate.
 /// A reply-delivered host's terminal reply may lead with the due status plate (T28B); the plate is
 /// stripped from the text before the state comparison and must lead the structured copy's text too.
+/// Nonterminal edit progress carries confirmed paths and stage rather than an edit outcome.
+/// A test's explicit full replay may be JSON with only its cwd and string argv fields.
+/// Read pages validate their byte position and continuation flags; only the first page must
+/// begin with a complete read header, since subsequent bodies can start inside a source line.
 fn assert_compact_envelope(reply: &Value) {
     let result = reply["result"].as_object().expect("tool result object");
     let content = result["content"].as_array().expect("content array");
     assert_eq!(content.len(), 1, "{reply}");
     let text = content[0]["text"].as_str().expect("sole text block");
-    assert!(serde_json::from_str::<Value>(text).is_err(), "{reply}");
+
     let structured = result
         .get("structuredContent")
         .and_then(Value::as_object)
@@ -415,58 +734,173 @@ fn assert_compact_envelope(reply: &Value) {
         None => text,
     };
     let kind = structured.get("kind").and_then(Value::as_str);
+    // Explicit replay output is the documented exception to ordinary non-JSON tool prose.
+    let replay = serde_json::from_str::<Value>(text).ok();
+    let replay_body = kind == Some("test")
+        && replay.as_ref().is_some_and(|value| {
+            value.as_object().is_some_and(|object| object.len() == 2)
+                && value["cwd"].is_string()
+                && value["argv"]
+                    .as_array()
+                    .is_some_and(|argv| !argv.is_empty() && argv.iter().all(Value::is_string))
+        });
+    assert!(replay.is_none() || replay_body, "{reply}");
     // Paged bodies carry a `page N; bytes A-B of TOTAL` marker before their header.
     let body = match text.strip_prefix("page ") {
         Some(rest) => rest.split_once('\n').map_or("", |(_, rest)| rest),
         None => text,
     };
+    // An approximate symbol or graph answer (a loading server) leads with its own label line.
+    let body = match body.strip_prefix("approximate: ") {
+        Some(rest) => rest.split_once('\n').map_or("", |(_, rest)| rest),
+        None => body,
+    };
     match (state, kind) {
-        ("error", _) if structured["code"] == "conflict" => assert!(
-            text.starts_with("error: conflict") || text.starts_with("refused: read_only ("),
-            "{reply}"
-        ),
+        ("error", _) | ("invalid_parameters", _) => {
+            let lines = text.lines().collect::<Vec<_>>();
+            assert!(
+                lines[0].len() <= 160 && lines[1].starts_with("Repair: ") && lines[1].len() <= 120,
+                "{reply}"
+            );
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.starts_with("Repair: "))
+                    .count(),
+                1,
+                "{reply}"
+            );
+            assert!(
+                !lines[0].starts_with("error:")
+                    && !lines[1].contains(" or ")
+                    && !lines[1].contains("; otherwise"),
+                "{reply}"
+            );
+        }
         ("complete", Some("test")) => assert!(
             text.starts_with("tests #")
                 || text.starts_with("tests: could not start ")
                 || text.starts_with("tests: no tests in ")
-                || text.starts_with("page "),
+                || text.starts_with("tests: no retained runs")
+                || text.starts_with("output page ")
+                || text.starts_with("page ")
+                || replay_body
+                || (structured["detail_ref"].is_string() && !body.is_empty()),
             "{reply}"
         ),
         // A card or an ambiguity list; a later page continues one of them.
         ("complete", Some("symbol")) => assert!(
             body.starts_with("symbol: ")
-                || body.starts_with("ambiguous_symbol: ")
+                || body.starts_with("symbols: ")
+                || body
+                    .split_once(" candidates for ")
+                    .is_some_and(|(count, _)| count.parse::<u32>().is_ok())
                 || (text.starts_with("page ") && !text.starts_with("page 1;")),
             "{reply}"
         ),
         ("complete", Some("graph")) => assert!(body.starts_with("graph: "), "{reply}"),
-        // `<file>  (<n> lines, <lang>)` outline header.
-        ("complete", Some("outline")) => {
-            let header = body.lines().next().unwrap_or_default();
-            let (file, details) = header.split_once("  (").expect("outline file header");
-            assert!(!file.is_empty() && details.ends_with(')'), "{reply}");
+        // A multi-file edit (batch-api-v1 §7) opens with its outcome line, or is a bounded
+        // refusal (head sentence, one Repair line), and carries its closed structured result.
+        ("edit_batch", _) => assert!(
+            (body.starts_with("edit: ") || refusal_shape_holds(body))
+                && structured["operation_id"].is_string()
+                && structured["outcome"].is_string()
+                && structured["files"].is_array(),
+            "{reply}"
+        ),
+        // OUTBOX-r3 §8.5: consolidated `ide.inspect` text is plain, with no header of its own.
+        ("complete", Some("inspect")) => assert!(!body.is_empty(), "{reply}"),
+        // File outlines begin with a complete addressed unit row; a directory still uses its
+        // header, and a batch or empty file explains its exceptional delivery.
+        ("complete", Some("outline")) if body.starts_with("outline: ") => {}
+        // An `ide.tree` project map opens with its own `tree <dir> · N files · depth D` header.
+        ("complete", Some("outline")) if body.starts_with("tree ") => {
             assert!(
-                details.contains(" lines, ") || details.contains(" files, "),
+                body.lines()
+                    .next()
+                    .unwrap_or_default()
+                    .contains(" files · depth "),
                 "{reply}"
             );
         }
+        ("complete", Some("outline")) => {
+            let header = body.lines().next().unwrap_or_default();
+            if let Some((file, details)) = header.split_once("  (") {
+                assert!(!file.is_empty() && details.ends_with(')'), "{reply}");
+                assert!(details.contains(" files, "), "{reply}");
+            } else {
+                let (span, row) = header.split_once(' ').expect("addressed outline row");
+                let first = span.split('–').next().unwrap();
+                assert!(first.parse::<u32>().is_ok_and(|line| line > 0), "{reply}");
+                let address = row.split("  ").next().unwrap();
+                assert!(address.contains('#'), "{reply}");
+            }
+        }
         // `<title>  (lines A–B)` read header.
         ("complete", Some("read")) => {
+            let later_page = if text.starts_with("page ") {
+                let (number, last, from, to, total) = page_marker(text);
+                assert!(number > 0 && from < to && to <= total, "{reply}");
+                assert_eq!(number == 1, from == 0, "{reply}");
+                assert_eq!(last, to == total, "{reply}");
+                assert_eq!(structured["continuation"], json!(!last), "{reply}");
+                assert_eq!(structured["truncated"], json!(!last), "{reply}");
+                number > 1
+            } else {
+                false
+            };
             let header = body.lines().next().unwrap_or_default();
             // A batch may open with a per-item refusal line instead of a block, and an empty
             // file's block says so instead of naming lines.
-            if !(header.starts_with("no such ")
-                || header.starts_with("not a readable text file")
-                || header.contains(" has no code symbols; ")
-                || header.ends_with("  (empty file)"))
+            // A batch read opens with its summary line (batch-api-v1 §2).
+            if header.starts_with("unchanged since your read ") {
+                assert!(
+                    header.contains("\"force\":true returns the text"),
+                    "{reply}"
+                );
+            } else if !later_page
+                && !(header.starts_with("read: ")
+                    || header.starts_with("no such ")
+                    || header.starts_with("file has ")
+                    || header.contains(": file has ")
+                    || header.starts_with("not a readable text file")
+                    || header.contains(" has no code symbols; ")
+                    || header.ends_with("  (empty file)")
+                    // A multi-reference inspection that carries a whole retained read.
+                    || header.starts_with("== "))
             {
-                let (title, details) = header.split_once("  (lines ").expect("read symbol header");
+                // `<title>  (lines A–B)` for a range, `<address>  (<n> lines; file lines A-B)` for
+                // a unit and `<address>:A-B  (lines A-B of <n>; file lines C-D)` for a window.
+                let (title, details) = header.split_once("  (").expect("read symbol header");
                 assert!(!title.is_empty() && details.ends_with(')'), "{reply}");
             }
         }
-        ("invalid_parameters", _) => {
-            assert!(text.starts_with("invalid bounded parameters:"), "{reply}")
+        // Unlabelled replies (harness-reply-v1 R2): the text is the delivery itself.
+        ("complete", Some("edit_progress")) => {
+            assert!(
+                text.contains("committed:") && text.contains("stage:"),
+                "{reply}"
+            );
         }
+        // One-call packet: the status line leads and no page marker ever appears.
+        ("complete", Some("prepare")) => {
+            assert!(body.starts_with("prepare: "), "{reply}");
+        }
+        ("complete", Some("activation" | "diff" | "stop")) => {
+            assert!(!body.is_empty(), "{reply}")
+        }
+        ("unavailable", _) => assert!(text.contains("\nRepair: "), "{reply}"),
+        ("pending", _) => assert!(
+            text.contains("Result retained under")
+                && text.contains("Bridge delivers it automatically."),
+            "{reply}"
+        ),
+        // A durable edit refusal is a head sentence and one Repair line; an applied edit leads
+        // with its outcome word.
+        ("edit", _) if text.contains("\nRepair: ") => assert!(
+            refusal_shape_holds(text) && !text.starts_with("edit: "),
+            "{reply}"
+        ),
         _ => assert!(text.starts_with(state), "{reply}"),
     }
     if kind == Some("edit") {
@@ -475,9 +909,19 @@ fn assert_compact_envelope(reply: &Value) {
         let word = structured["operation"].as_str().unwrap_or(outcome);
         assert!(text.starts_with(&format!("edit: {word}")), "{reply}");
     }
+    // Closed failures and edits that were refused, cancelled, left unknown or applied in part are
+    // MCP errors; a created, replaced or unchanged file and a fully applied edit are not.
+    let failed = matches!(state, "error" | "invalid_parameters")
+        || (state == "edit"
+            && !matches!(
+                structured["result"]["outcome"].as_str(),
+                Some("created" | "replaced" | "unchanged")
+            ))
+        || (state == "edit_batch" && structured["outcome"].as_str() != Some("applied"));
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
-        matches!(state, "error" | "invalid_parameters")
+        failed,
+        "{reply}"
     );
 }
 
@@ -488,7 +932,8 @@ fn carried_status(structured: &Value) -> Option<&str> {
 
 /// Asserts the Claude host projection carries no `structuredContent` duplicate (T14B): Claude hands
 /// that field straight to its model in place of `content`, defeating the compact renderer, so the
-/// managed Claude MCP omits it entirely. Returns the sole compact text block for `claude_fields`.
+/// managed Claude MCP omits it entirely. The same projection also validates default-build
+/// replies on other hosts. Returns the sole compact text block for `claude_fields`.
 fn assert_claude_envelope(reply: &Value) -> &str {
     let result = reply["result"].as_object().expect("tool result object");
     let content = result["content"].as_array().expect("content array");
@@ -499,9 +944,21 @@ fn assert_claude_envelope(reply: &Value) -> &str {
         result.get("structuredContent").is_none(),
         "Claude must never receive the structured JSON duplicate: {reply}"
     );
+    // Closed failures and edits that were refused, cancelled or left unknown are MCP errors; a
+    // created, replaced or unchanged file, or one an operation word (inserted, deleted, renamed)
+    // reports, is not (the same rule as `assert_compact_envelope`).
+    let fields = claude_fields("", text);
+    let failed = matches!(
+        fields["state"].as_str(),
+        Some("error" | "invalid_parameters")
+    ) || (fields["state"] == "edit"
+        && !matches!(
+            fields["result"]["outcome"].as_str(),
+            Some("created" | "replaced" | "unchanged" | "inserted" | "deleted" | "renamed")
+        ));
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
-        text.starts_with("error") || text.starts_with("refused: read_only ("),
+        failed,
         "{reply}"
     );
     text
@@ -512,14 +969,15 @@ fn assert_claude_envelope(reply: &Value) -> &str {
 /// longer sends `structuredContent` to Claude, so tests read the same facts the model itself
 /// receives instead of the typed JSON copy. Only successful edits can advertise a post-read
 /// source reference; refusal prose is never parsed as one. Unset fields are simply absent from
-/// the returned object, matching `serde_json::Value`'s null-on-missing-key indexing.
-fn claude_fields(text: &str) -> Value {
-    /// Returns the bounded token starting at `text`, ending at the first space, `;`, `\n`, `.` or
-    /// the string end; every identifier this parser extracts (`reason`, `code`, `outcome`,
+/// the returned object, matching `serde_json::Value`'s null-on-missing-key indexing. Refusals
+/// retain the exact original model text alongside reconstructed facts, including any status plate.
+fn claude_fields(tool: &str, text: &str) -> Value {
+    /// Returns the bounded token starting at `text`, ending at the first space, `;`, `\n`, `.`, `)`
+    /// or the string end; every identifier this parser extracts (`reason`, `code`, `outcome`,
     /// `detail_ref`, `source_ref`) is itself a single space-free token, so this stops exactly where
     /// the surrounding sentence resumes.
     fn token(text: &str) -> &str {
-        let end = text.find([' ', ';', '\n', '.']).unwrap_or(text.len());
+        let end = text.find([' ', ';', '\n', '.', ')']).unwrap_or(text.len());
         text[..end].trim()
     }
     /// Returns the bounded token immediately following the first occurrence of `marker`, if any.
@@ -528,14 +986,167 @@ fn claude_fields(text: &str) -> Value {
             .map(|index| token(&text[index + marker.len()..]))
     }
 
-    if let Some(rest) = text.strip_prefix("unavailable: ") {
-        return json!({"state":"unavailable","reason":token(rest)});
+    // A delivered fact (an `edit-checked` status plate) may precede the reply proper; the reply's
+    // own facts follow it. The unparsed fallback below keeps the whole text.
+    let original = text;
+    let text = text
+        .strip_prefix("<agent-ide>\n")
+        .and_then(|rest| rest.split_once("</agent-ide>\n"))
+        .map_or(text, |(_, reply)| reply);
+    // Refusal types are reconstructed from their decision-facing meaning, never an internal
+    // label. The independent envelope oracle still compares this meaning with actual isError.
+    if text
+        .lines()
+        .nth(1)
+        .is_some_and(|line| line.starts_with("Repair: "))
+        && !text.starts_with("edit: ")
+    {
+        let head = text.lines().next().unwrap();
+        // A durable edit refusal keeps the settled-write state its internal outcome names; the
+        // head states the effect, so the outcome is recovered from that sentence.
+        let durable = if head.starts_with("Nothing was written; this operation_id already names") {
+            Some("conflicting_duplicate")
+        } else if head.contains("is a symlink or special file the IDE may not write") {
+            Some("unsafe_target")
+        } else if head.starts_with("Nothing was written; the edit was cancelled") {
+            Some("cancelled_no_effect")
+        } else if head.starts_with("Nothing was written; the edit ran out of time") {
+            Some("deadline_no_effect")
+        } else if head.starts_with("Nothing was written; the IDE was too busy to edit") {
+            Some("capacity_no_effect")
+        } else if head.starts_with("The edit may or may not have been written") {
+            Some("outcome_unknown")
+        } else if head.starts_with("Nothing was written; the IDE session is not active") {
+            Some("unavailable_before_dispatch")
+        } else if head.starts_with("Nothing was written; the file changed")
+            || (head.ends_with("; nothing was written.") && !head.starts_with("Edit refused;"))
+        {
+            Some("stale_source")
+        } else {
+            None
+        };
+        if let Some(outcome) = durable {
+            return json!({
+                "state":"edit",
+                "result":{"outcome":outcome,"source_ref":null},
+                "text":original,
+            });
+        }
+        let code = if head.starts_with("This activation started with read_only:")
+            || head.starts_with("Another agent session owns")
+            || head.starts_with("Another session for this actor")
+            || head.starts_with("This actor's IDE activation")
+            || head.starts_with("Another active session owns")
+            || head.starts_with("A live IDE session owns")
+            || head.starts_with("This activation_id was committed")
+        {
+            Some("conflict")
+        } else if head.starts_with("This result reference")
+            || head.starts_with("This activation_id was already used")
+            || head.starts_with("This test run is unknown")
+        {
+            Some("invalid_detail")
+        } else if head.starts_with("The source changed")
+            || head.starts_with("The requested source")
+            || head.starts_with("The requested range")
+            || head.starts_with("This file is not readable")
+            || head.starts_with("This directory is not a Git")
+            || head.starts_with("Git evidence for this")
+            || head.starts_with("The activation's start commit")
+        {
+            Some("source_unavailable")
+        } else if head.starts_with("The requested root")
+            || head.starts_with("This environment selector")
+        {
+            Some("outside_allowed_roots")
+        } else if head.starts_with("Edit refused;") {
+            Some("edit_refused")
+        } else if head.starts_with("No symbol matches") {
+            Some("unknown_symbol")
+        } else if head.starts_with("The IDE could not complete this request") {
+            Some("internal")
+        } else if head.starts_with("The IDE's bounded queue")
+            || head.starts_with("The IDE's bounded request queue")
+            || head.starts_with("The IDE's bounded result store")
+            || head.starts_with("This diff exceeds")
+            || head.starts_with("This call would consume capacity")
+        {
+            Some("capacity")
+        } else if head.starts_with("The language server has not finished") {
+            Some("provider_loading")
+        } else if head.starts_with("The language server returned")
+            || head.starts_with("The language server failed")
+            || head.starts_with("No language server")
+            || head.starts_with("The server cannot answer")
+            || head.starts_with("No language-server result")
+            || head.starts_with("Tests could not be selected")
+        {
+            Some("provider_unavailable")
+        } else if head.starts_with("The project could not be activated")
+            || head.starts_with("Git worktree discovery")
+            || head.starts_with("Saved workspace state")
+            || head.starts_with("The worktree could not be resolved")
+        {
+            Some("workspace_activation")
+        } else if head.contains("its outcome is unknown")
+            || head.starts_with("This call may have run")
+        {
+            Some("outcome_unknown")
+        } else if head.starts_with("The IDE could not identify this stop's session") {
+            Some("stop_unidentified")
+        } else if head.starts_with("The IDE is serving too many calls") {
+            Some("busy")
+        } else if head.starts_with("The IDE restarted after an internal fault") {
+            Some("restarting")
+        } else if head.starts_with("The language server could not verify") {
+            Some("resolution_unverified")
+        } else if head.starts_with("The IDE could not safely run")
+            || head.starts_with("The IDE could not start the required process")
+            || head.starts_with("The IDE could not establish the allowed Git")
+            || head.starts_with("The Git query was refused")
+            || head.starts_with("The configured Git does not support")
+            || head.starts_with("The process request was invalid")
+            || head.starts_with("The process tried to write data reserved")
+            || head.starts_with("The failed process did not stop")
+            || head.starts_with("This cached result crosses a symlink")
+        {
+            Some("execution_profile")
+        } else if head.starts_with("This operation exceeded")
+            || head.starts_with("Stopping exceeded")
+            || head.starts_with("Recording this stop took too long")
+        {
+            Some("deadline")
+        } else if head.starts_with("This call was cancelled") {
+            Some("cancelled")
+        } else if head.starts_with("This result belongs to an older IDE activation")
+            || head.starts_with("This stop conflicts")
+            || head.starts_with("This stop is not recorded")
+        {
+            Some("workspace_authority")
+        } else if head.starts_with("The IDE could not match this session") {
+            Some("launcher_configuration")
+        } else if head.starts_with("The configured Git lacks a required capture") {
+            Some("unsupported_git")
+        } else if head.starts_with("The IDE host attachment is unavailable")
+            || head.starts_with("The IDE connection")
+            || head.starts_with("The IDE exited and could not reconnect")
+            || head.starts_with("The IDE's result is unavailable")
+            || head.starts_with("The IDE result exceeds the reply limit")
+        {
+            Some("transport")
+        } else {
+            None
+        };
+        if head == "These arguments do not match the tool schema." {
+            return json!({"state":"invalid_parameters","text":original});
+        }
+        return code.map_or_else(
+            || json!({"state":"unavailable","reason":"host_binding","text":original}),
+            |code| json!({"state":"error","code":code,"text":original}),
+        );
     }
-    if let Some(rest) = text.strip_prefix("error: ") {
-        return json!({"state":"error","code":token(rest)});
-    }
-    if let Some(rest) = text.strip_prefix("pending: ") {
-        return json!({"state":"pending","detail_ref":after(rest, "detail_ref ")});
+    if let Some(rest) = text.strip_prefix("Result retained under ") {
+        return json!({"state":"pending","detail_ref":rest.split('.').next().unwrap_or_default()});
     }
     if let Some(rest) = text.strip_prefix("edit: ") {
         let outcome = token(rest);
@@ -551,31 +1162,64 @@ fn claude_fields(text: &str) -> Value {
             "result":{"outcome":outcome,"source_ref":source_ref},
         });
     }
-    for kind in ["activation", "context", "diff", "stop"] {
-        let Some(rest) = text.strip_prefix(&format!("complete {kind}: ")) else {
-            continue;
-        };
-        let continuation = rest.contains("\nOutput is truncated; use ide.inspect");
-        let truncated = continuation || rest.contains("\nOutput is incomplete;");
-        let detail_ref = after(rest, "detail_ref ").or_else(|| after(rest, "source_ref "));
-        let body_end = [
-            "\nNext: use ide.outline a file or ide.symbol a name",
-            "\nOutput is truncated;",
-            "\nOutput is incomplete;",
-            "\nDiagnostics are exactly as reported;",
-            "\nNext: use ide.stop",
-            "\nWorkspace authority is released",
-        ]
-        .into_iter()
-        .filter_map(|marker| rest.find(marker))
-        .min()
-        .unwrap_or(rest.len());
+    // Complete replies carry no label (harness-reply-v1 R2): the tool that was called names the
+    // kind, and a cut ends with one `Cut; …` trailer line.
+    let kind = match tool {
+        "ide.start" => Some("activation"),
+        "ide.read" => Some("read"),
+        "ide.symbol" => Some("symbol"),
+        "ide.graph" => Some("graph"),
+        "ide.test" => Some("test"),
+        "ide.diff" => Some("diff"),
+        "ide.stop" => Some("stop"),
+        // A continuation or a settled pending answer: its text says what it continues.
+        "ide.inspect" if text.contains("call forms (") => Some("activation"),
+        "ide.inspect" if text.starts_with("mode: ") || text.starts_with("diff (") => Some("diff"),
+        "ide.inspect" if text.contains("symbol: ") => Some("symbol"),
+        "ide.inspect"
+            if text.starts_with("page ")
+                || text.lines().next().is_some_and(|line| {
+                    line.contains("  (lines ") || line.ends_with("  (empty file)")
+                }) =>
+        {
+            Some("read")
+        }
+        "ide.inspect" if !text.starts_with("tests #") => Some("inspect"),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        let rest = text;
+        let trailer = rest.lines().last().unwrap_or_default();
+        let continuation = ["ide.inspect", "ide.read", "ide.graph", "ide.test"]
+            .iter()
+            .any(|tool| trailer.starts_with(&format!("Cut; {tool} {{\"detail_ref\":")))
+            && trailer.ends_with("} continues");
+        let truncated = continuation || rest.contains("\nCut; nothing more to fetch");
+        let detail_ref = after(rest, "{\"detail_ref\":\"")
+            .map(|reference| reference.split('"').next().unwrap_or(reference));
+        let body_end = rest.rfind("\nCut; ").unwrap_or(rest.len());
         return json!({
             "state":"complete","kind":kind,"text":&rest[..body_end],
             "truncated":truncated,"continuation":continuation,"detail_ref":detail_ref,
         });
     }
-    json!({"text":text})
+    json!({"text":original})
+}
+
+/// The test decoder accepts every supported originating-tool trailer and keeps the saved
+/// reference/page state, rather than treating a new read/graph/test footer as end-of-output.
+#[test]
+fn claude_decoder_recognizes_originating_continuations() {
+    for tool in ["ide.read", "ide.graph", "ide.test", "ide.inspect"] {
+        let text = format!(
+            "page 1; bytes 0-4 of 8\nbody\nCut; {tool} {{\"detail_ref\":\"next\"}} continues"
+        );
+        let decoded = claude_fields("ide.read", &text);
+        assert_eq!(decoded["continuation"], true, "{tool}: {decoded}");
+        assert_eq!(decoded["truncated"], true);
+        assert_eq!(decoded["detail_ref"], "next");
+        assert!(!decoded["text"].as_str().unwrap().contains("Cut;"));
+    }
 }
 
 /// Calls one managed Codex tool using only trusted request metadata for actor and sandbox identity.
@@ -649,8 +1293,7 @@ async fn binary_rejects_invalid_launcher_attachments_before_serving() {
 /// truthful annotation set (MCP-06): every unset hint stays the MCP default, `readOnlyHint` is
 /// claimed only by the read tools, `destructiveHint` only by ide.edit, `idempotentHint` only by
 /// the operations whose durable receipts make a same-argument repeat a no-op, ide.test (arbitrary
-/// project commands) claims no relaxation at all, and nothing claims
-/// an open world.
+/// project commands) claims no relaxation at all; prepare declares its optional external model calls.
 #[tokio::test]
 async fn server_identity_and_tool_annotations_are_pinned() {
     let runtime = runtime();
@@ -669,13 +1312,13 @@ async fn server_identity_and_tool_annotations_are_pinned() {
     let tools = discovery["result"]["tools"].as_array().unwrap();
     let read_only = json!({"readOnlyHint": true, "openWorldHint": false});
     let mut expected = std::collections::BTreeMap::from([
-        ("ide.context", read_only.clone()),
         ("ide.diff", read_only.clone()),
         ("ide.inspect", read_only.clone()),
         ("ide.outline", read_only.clone()),
         ("ide.read", read_only.clone()),
         ("ide.symbol", read_only.clone()),
-        ("ide.graph", read_only),
+        ("ide.graph", read_only.clone()),
+        ("ide.tree", read_only),
         (
             "ide.start",
             json!({
@@ -732,7 +1375,6 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
     assert_eq!(
         names,
         [
-            "ide.context",
             "ide.diff",
             "ide.edit",
             "ide.graph",
@@ -742,7 +1384,8 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
             "ide.start",
             "ide.stop",
             "ide.symbol",
-            "ide.test"
+            "ide.test",
+            "ide.tree"
         ]
     );
     assert!(
@@ -762,7 +1405,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
         unavailable["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("continue with native tools")
+            .contains("Continue with native tools")
     );
     let invalid = mcp
         .exchange(
@@ -776,21 +1419,19 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
         invalid["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("invalid bounded parameters")
+            .contains("These arguments do not match the tool schema.")
     );
-    // The plain `ide.context` schema cannot express "path or problems", so the handler explains it.
-    let no_target = mcp
+    // Removed public methods fail at dispatch rather than reaching the workspace handler.
+    let removed = mcp
         .exchange(
             json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
-                "name":"ide.context","arguments":{}
+                "name":"ide.context","arguments":{"path":"tracked.txt"}
             }}),
         )
         .await;
-    assert_eq!(no_target["result"]["isError"], true);
-    assert_eq!(
-        no_target["result"]["content"][0]["text"],
-        "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\""
-    );
+    assert!(removed["error"].is_object(), "{removed}");
+    assert!(removed.get("result").is_none(), "{removed}");
+    assert!(!runtime.exists(), "removed method must never dispatch");
     mcp.close().await;
     assert!(!runtime.exists());
 }
@@ -908,17 +1549,17 @@ async fn modern_tools_call_is_fail_open_and_selects_host_from_request_meta() {
         (
             2,
             json!({"claudecode/toolUseId":"modern-claude-call"}),
-            "Assistance host metadata or attachment is unavailable; continue with native tools",
+            "The IDE host attachment is unavailable.\nRepair: Continue with native tools.",
         ),
         (
             3,
             json!({"threadId":"actor","callId":"call-3","x-codex-turn-metadata":{"turn":"test"}}),
-            "Assistance host metadata or attachment is unavailable; continue with native tools",
+            "The IDE host attachment is unavailable.\nRepair: Continue with native tools.",
         ),
         (
             4,
             json!({}),
-            "unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools",
+            "This host did not identify the call in a supported format.\nRepair: Continue this work with native tools.",
         ),
     ] {
         let reply = mcp
@@ -933,15 +1574,14 @@ async fn modern_tools_call_is_fail_open_and_selects_host_from_request_meta() {
     mcp.close().await;
 }
 
-/// Managed startup failure remains a disconnected static ten-tool MCP with bounded fallback calls.
+/// Managed Codex startup failure retains the eleven-tool Codex catalog and bounded fallback calls,
+/// including graph, without advertising context or granting any daemon binding authority.
 #[tokio::test]
 async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     let candidate = std::env::current_dir().unwrap();
-    let mut mcp = Mcp::start_managed(
-        Path::new("/private/tmp/agent-ide-missing-launcher-template"),
-        &candidate,
-    )
-    .await;
+    let area = runtime();
+    let mut mcp =
+        Mcp::start_managed(&area.join("missing-launcher-template.json"), &candidate).await;
     let discovery = mcp
         .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
         .await;
@@ -955,7 +1595,6 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     assert_eq!(
         names,
         [
-            "ide.context",
             "ide.diff",
             "ide.edit",
             "ide.graph",
@@ -965,7 +1604,8 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
             "ide.start",
             "ide.stop",
             "ide.symbol",
-            "ide.test"
+            "ide.test",
+            "ide.tree"
         ]
     );
     let unavailable = mcp
@@ -980,7 +1620,7 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
         unavailable["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("continue with native tools")
+            .contains("Continue with native tools")
     );
     mcp.close().await;
 }
@@ -1026,11 +1666,11 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
     // No supported host metadata can never correlate: the closed cause names it (T15B follow-up).
     assert_eq!(
         no_metadata["result"]["content"][0]["text"],
-        "unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools"
+        "This host did not identify the call in a supported format.\nRepair: Continue this work with native tools."
     );
     for (index, (name, arguments)) in [
         ("ide.start", json!({"activation_id":"activate"})),
-        ("ide.context", json!({"path":"src/main.rs","byte_offset":0})),
+        ("ide.read", json!({"path":"src/main.rs"})),
         ("ide.diff", json!({})),
         ("ide.inspect", json!({"detail_ref":"detail"})),
         ("ide.stop", json!({})),
@@ -1053,7 +1693,7 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
         assert_eq!(response["result"]["content"].as_array().unwrap().len(), 1);
         assert_eq!(
             response["result"]["content"][0]["text"],
-            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
+            "The IDE received no host event for this session.\nRepair: Call ide.start in this project."
         );
         assert_eq!(
             response["result"]["structuredContent"],
@@ -1075,17 +1715,17 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
         lost["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("daemon transport is unavailable")
+            .contains("The IDE connection is unavailable.")
     );
     mcp.close().await;
     std::fs::remove_dir_all(runtime).unwrap();
 }
 
-/// A modern Codex session (2026-07-28, no `initialize`) still receives the `structuredContent`
-/// duplicate: the Codex contract is selected from per-request `_meta`, never from the handshake,
-/// and ordinary calls route to the typed daemon reply exactly as the legacy twin above.
+/// A modern Codex session (2026-07-28, no `initialize`) receives one text block and no
+/// `structuredContent` (harness-reply-v1 R1): the Codex contract is selected from per-request
+/// `_meta`, never from the handshake, and Codex shows only `structuredContent` when present.
 #[tokio::test]
-async fn modern_codex_call_keeps_structured_content_without_initialize() {
+async fn modern_codex_call_is_text_only_without_initialize() {
     let runtime = runtime();
     let mut daemon = Command::new(product_binary())
         .args(["daemon", "--runtime-dir"])
@@ -1113,7 +1753,7 @@ async fn modern_codex_call_keeps_structured_content_without_initialize() {
     })
     .await
     .unwrap();
-    let mut mcp = Mcp::start_raw(&runtime, Some("private-host-channel")).await;
+    let mut mcp = Mcp::start_raw_text_only(&runtime, Some("private-host-channel")).await;
     let response = mcp
         .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
             "name":"ide.diff","arguments":{},
@@ -1121,9 +1761,19 @@ async fn modern_codex_call_keeps_structured_content_without_initialize() {
         }}))
         .await;
     assert_ne!(response["result"]["isError"], json!(true), "{response}");
+    assert!(
+        response["result"].get("structuredContent").is_none(),
+        "{response}"
+    );
     assert_eq!(
-        response["result"]["structuredContent"],
-        json!({"state":"unavailable","reason":"host_binding"}),
+        response["result"]["content"].as_array().map(Vec::len),
+        Some(1),
+        "{response}"
+    );
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| claude_fields("", text)["state"] == "unavailable"),
         "{response}"
     );
     daemon.kill().await.unwrap();
@@ -1251,17 +1901,18 @@ async fn named_hook(
 ///
 /// Kept short under the task temp root: fixture Unix-socket paths must stay under
 /// `SUN_LEN`, and the area must never be a real production rendezvous root.
-fn rendezvous_area(tag: &str) -> PathBuf {
+fn rendezvous_area(_tag: &str) -> PathBuf {
     let base = std::fs::canonicalize(std::env::temp_dir())
         .unwrap()
         .join(format!(
-            ".airvb-{tag}-{}-{}",
+            ".rv-{}-{}",
             std::process::id(),
             NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
         ));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir(&base).unwrap();
-    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&base)
+        .unwrap();
     base
 }
 
@@ -1351,8 +2002,8 @@ async fn managed_root_call(
 fn host_call(actor: &str, call: &str, name: &str) -> Value {
     let arguments = if name == "ide.start" {
         json!({"activation_id":"same-activation"})
-    } else if name == "ide.context" {
-        json!({"path":"src/main.rs","byte_offset":0})
+    } else if name == "ide.read" {
+        json!({"path":"src/main.rs"})
     } else {
         json!({})
     };
@@ -1375,10 +2026,27 @@ fn operator_cargo_home(namespace: &Path) -> PathBuf {
     }
 }
 
-/// Checks a closed host boundary response and proves private launch/input fields were not rendered.
+/// Checks a closed host boundary response against its independent structured host-binding oracle
+/// or the exact expected prose, and proves private launch/input fields were not rendered.
 fn boundary(response: &Value, expected: &str) {
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains(expected), "{response}");
+    if expected == "host_binding" {
+        assert_eq!(
+            response["result"]["structuredContent"],
+            json!({"state":"unavailable","reason":"host_binding"}),
+            "{response}"
+        );
+        assert_ne!(response["result"]["isError"], json!(true), "{response}");
+        assert!(
+            text.lines()
+                .nth(1)
+                .is_some_and(|line| line.starts_with("Repair: ")),
+            "{response}"
+        );
+        assert!(!text.contains("host_binding"), "{response}");
+    } else {
+        assert!(text.contains(expected), "{response}");
+    }
     for private in [
         "private-host-channel",
         "must-never-leave-hook",
@@ -1448,8 +2116,8 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         hook(&runtime, "PreToolUse", "agent_id", "child", "after-stop")
     );
     let (root_reply, child_reply) = tokio::join!(
-        root.exchange(host_call("root", "after-stop", "ide.context")),
-        child.exchange(host_call("child", "after-stop", "ide.context"))
+        root.exchange(host_call("root", "after-stop", "ide.read")),
+        child.exchange(host_call("child", "after-stop", "ide.read"))
     );
     boundary(&root_reply, "host_binding");
     assert_compact_envelope(&child_reply);
@@ -1466,15 +2134,28 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         restarted["result"]["structuredContent"]["code"],
         "host_binding"
     );
-    // Duplicate and premature post observations cannot be repaired by a subsequent MCP call.
-    for (call, second_phase) in [("duplicate", "PreToolUse"), ("early-post", "PostToolUse")] {
-        hook(&runtime, "PreToolUse", "session_id", "root", call).await;
-        hook(&runtime, second_phase, "session_id", "root", call).await;
-        boundary(
-            &root.exchange(host_call("root", call, "ide.start")).await,
-            "host_binding",
-        );
+    // The same pre delivered twice (one handler registered twice) is one pre and admits its
+    // call (T-010); a premature post cannot be repaired by a subsequent MCP call.
+    for _ in 0..2 {
+        hook(&runtime, "PreToolUse", "session_id", "root", "duplicate").await;
     }
+    let doubled = root
+        .exchange(host_call("root", "duplicate", "ide.start"))
+        .await;
+    assert_compact_envelope(&doubled);
+    assert_ne!(
+        doubled["result"]["structuredContent"]["code"],
+        "host_binding"
+    );
+    hook(&runtime, "PostToolUse", "session_id", "root", "duplicate").await;
+    hook(&runtime, "PreToolUse", "session_id", "root", "early-post").await;
+    hook(&runtime, "PostToolUse", "session_id", "root", "early-post").await;
+    boundary(
+        &root
+            .exchange(host_call("root", "early-post", "ide.start"))
+            .await,
+        "host_binding",
+    );
     // MCP-before-pre is permanently rejected for that exact invocation.
     boundary(
         &root
@@ -1496,7 +2177,7 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         &root
             .exchange(host_call("root", "daemon-lost", "ide.start"))
             .await,
-        "daemon transport is unavailable",
+        "The IDE connection is unavailable.",
     );
     tokio::join!(root.close(), child.close());
     std::fs::remove_dir_all(runtime).unwrap();
@@ -1537,6 +2218,68 @@ async fn binary_codex_hook_fail_open_inactive_invalid_and_stdin_deadline() {
         drop(input);
     }
     assert!(!runtime.exists());
+}
+
+/// A valid pre-hook whose stdin never reaches EOF fails open without admitting its MCP call.
+///
+/// The next call with that exact identity must report the missing pre-event in its public text;
+/// a fresh hook-paired inspection succeeds on the same activation without restarting it.
+#[tokio::test]
+async fn binary_codex_pre_hook_stdin_deadline_refuses_only_its_call() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "stdin-deadline").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"stdin-deadline"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    let mut child = hook_process(&fixture.runtime, Some(actor.attachment));
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(
+            json!({"hook_event_name":"PreToolUse","session_id":actor.actor,"tool_use_id":call})
+                .to_string()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    // Keep valid input open: the real hook's bounded read cannot finish or submit this pre.
+    let output = tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_managed_hook_silent(&output);
+    drop(input);
+
+    let refused = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":"ide.inspect","arguments":{"kind":"problems"},
+            "_meta":{"threadId":actor.actor,"callId":call,"x-codex-turn-metadata":{},
+                "codex/sandbox-state-meta":actor.state}}}),
+        )
+        .await;
+    assert_eq!(
+        refused["result"]["content"][0]["text"],
+        "The host's before-tool event did not reach the IDE.\nRepair: Repeat the call.",
+        "{refused}"
+    );
+    let fresh = actor
+        .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
+        .await;
+    assert_eq!(fresh["kind"], "inspect", "{fresh}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
 }
 
 /// Claude ingress is silent on malformed identity and daemon loss, without creating runtime state.
@@ -1982,6 +2725,9 @@ async fn binary_codex_hooks_print_emits_only_the_managed_fragment() {
                     "type": "command", "command": command, "timeout": 1}]}],
                 "PostToolUse": [{"matcher": ".*", "hooks": [{
                     "type": "command", "command": command, "timeout": 1}]}],
+                // OUTBOX-r3 §9.1: the compaction signal; no Stop/SubagentStop hold exists.
+                "PreCompact": [{"hooks": [{
+                    "type": "command", "command": command, "timeout": 1}]}],
             }
         })
     );
@@ -2176,7 +2922,7 @@ async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_comm
     hook(&runtime, "PreToolUse", "session_id", "actor", "start").await;
     boundary(
         &mcp.exchange(host_call("actor", "start", "ide.start")).await,
-        "complete activation",
+        "End the task with ide.stop.",
     );
     assert_eq!(
         post_ack(&runtime, "actor", "start").await["state"],
@@ -2288,12 +3034,12 @@ async fn binary_renders_typed_lifecycle_replies_without_transport_errors() {
         (
             host_call("actor", "unavailable", "ide.start"),
             json!({"state":"unavailable","reason":"host_binding"}),
-            "unavailable: host_binding; continue with native tools",
+            "The host could not bind this IDE call.\nRepair: Repeat the call as a new tool invocation.",
         ),
         (
             host_call("actor", "stopped", "ide.stop"),
             json!({"state":"host_stopped"}),
-            "host_stopped: host binding released; no workspace authority was created",
+            "Host binding released.",
         ),
     ];
     for (call, expected, text) in replies {
@@ -2390,7 +3136,7 @@ async fn configured_daemon_opens_workspace_once_after_exclusive_lock() {
 struct ProcessIdentity {
     /// Process id at capture time.
     pid: libc::pid_t,
-    /// Kernel start time of that process: seconds and microseconds.
+    /// Kernel start time: seconds/microseconds on macOS, boot ticks on Linux.
     started: (u64, u64),
 }
 
@@ -2398,6 +3144,7 @@ impl ProcessIdentity {
     /// Returns the identity of `pid`, its parent PID and its kernel run state (`SZOMB` for an
     /// exited process its parent has not reaped, `SSTOP` once a `SIGSTOP` has taken effect), or
     /// `None` once the kernel no longer lists it.
+    #[cfg(target_os = "macos")]
     fn of(pid: libc::pid_t) -> Option<(Self, libc::pid_t, u32)> {
         // SAFETY: an all-zero `proc_bsdinfo` is a valid plain-data value for the kernel to fill.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -2422,6 +3169,13 @@ impl ProcessIdentity {
         ))
     }
 
+    /// Reads the Linux process generation, parent and state from procfs.
+    #[cfg(target_os = "linux")]
+    fn of(pid: libc::pid_t) -> Option<(Self, libc::pid_t, u32)> {
+        let (started, parent, state) = linux_process_support::linux_process_info(pid)?;
+        Some((Self { pid, started }, parent, state))
+    }
+
     /// Reports whether the kernel still lists this exact process (not a later holder of its PID),
     /// a zombie included: an exited provider only counts as gone once its parent or `launchd`
     /// has reaped it.
@@ -2431,11 +3185,12 @@ impl ProcessIdentity {
 
     /// Reports whether this exact process is still running, that is listed and not a zombie.
     fn running(self) -> bool {
-        Self::of(self.pid).is_some_and(|(now, _, state)| now == self && state != libc::SZOMB)
+        Self::of(self.pid).is_some_and(|(now, _, state)| now == self && state != process_zombie())
     }
 
     /// Lists the live direct children of `parent`; only call it while `parent` is a process this
     /// test holds an unreaped `Child` handle for, so its PID cannot belong to anyone else.
+    #[cfg(target_os = "macos")]
     fn children_of(parent: libc::pid_t) -> Vec<Self> {
         let mut pids = vec![0 as libc::pid_t; 1024];
         let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
@@ -2444,6 +3199,17 @@ impl ProcessIdentity {
         pids.into_iter()
             .take(usize::try_from(listed).unwrap_or(0))
             .filter(|pid| *pid > 0)
+            .filter_map(Self::of)
+            .filter(|(_, ppid, _)| *ppid == parent)
+            .map(|(identity, _, _)| identity)
+            .collect()
+    }
+
+    /// Lists Linux children only after checking each process's current parent and generation.
+    #[cfg(target_os = "linux")]
+    fn children_of(parent: libc::pid_t) -> Vec<Self> {
+        linux_process_support::linux_process_ids()
+            .into_iter()
             .filter_map(Self::of)
             .filter(|(_, ppid, _)| *ppid == parent)
             .map(|(identity, _, _)| identity)
@@ -2476,6 +3242,18 @@ impl ProcessIdentity {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+    }
+}
+
+/// The platform's zombie value in the process-state result.
+fn process_zombie() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        libc::SZOMB
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_process_support::PROCESS_ZOMBIE
     }
 }
 
@@ -2527,7 +3305,7 @@ impl OwnedDaemon {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while std::time::Instant::now() < deadline
                 && ProcessIdentity::of(pid)
-                    .is_some_and(|(_, _, state)| state != SSTOP && state != libc::SZOMB)
+                    .is_some_and(|(_, _, state)| state != SSTOP && state != process_zombie())
             {
                 std::thread::sleep(Duration::from_micros(200));
             }
@@ -2736,8 +3514,11 @@ impl ProductFixture {
     }
     /// Runs fixed local fixture setup with all user/system Git configuration excluded.
     fn git(&self, args: &[&str]) {
-        let output = std::process::Command::new("/usr/bin/git")
+        let output = std::process::Command::new(fixture_git())
             .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
+            .env("TMP", std::env::temp_dir())
+            .env("TEMP", std::env::temp_dir())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["-C"])
@@ -2755,8 +3536,11 @@ impl ProductFixture {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("tracked.txt"), "other\n").unwrap();
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("/usr/bin/git")
+            let output = std::process::Command::new(fixture_git())
                 .env_clear()
+                .env("TMPDIR", std::env::temp_dir())
+                .env("TMP", std::env::temp_dir())
+                .env("TEMP", std::env::temp_dir())
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .args(["-C"])
@@ -2782,7 +3566,7 @@ impl ProductFixture {
     /// [`Self::write_config`] with a caller-selected child capture budget; the shipped
     /// `agent-ide init` default is 65 536.
     fn write_config_with_output_bytes(&self, providers: Value, output_bytes: usize) {
-        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":output_bytes},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program("/usr/bin/git","fixture-git"),"providers":providers}]});
+        let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":output_bytes},"allowed_roots":[self.base],"targets":[{"attachment":"private-host-channel","candidate":self.root,"git":accepted_program(&fixture_git(),"fixture-git"),"providers":providers}]});
         std::fs::write(&self.config, config.to_string()).unwrap();
     }
     /// Returns the current fixture's complete measured-state-shaped payload outside model arguments.
@@ -2846,7 +3630,8 @@ impl ProductFixture {
         .await
     }
     /// [`Self::spawn_configured_daemon`] with extra environment variables (test seams) for the
-    /// daemon process.
+    /// daemon process. `PRODUCT_DUMP`, when set, retains stderr under that task-local directory
+    /// so a daemon abort after startup is observable without changing its outcome.
     async fn spawn_configured_daemon_with_env(
         &self,
         home: Option<&Path>,
@@ -2872,6 +3657,17 @@ impl ProductFixture {
         if durable_telemetry {
             command.env("AGENT_IDE_TELEMETRY_DATABASE", &self.telemetry);
         }
+        let stderr_path = std::env::var_os("PRODUCT_DUMP").map(|directory| {
+            let directory = PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            directory.join(format!(
+                "daemon-{}.stderr",
+                self.base.file_name().unwrap().to_string_lossy()
+            ))
+        });
+        let stderr = stderr_path.as_ref().map_or_else(Stdio::piped, |path| {
+            Stdio::from(std::fs::File::create(path).unwrap())
+        });
         let mut daemon = OwnedDaemon::new(
             command
                 .args(["daemon", "--runtime-dir"])
@@ -2879,7 +3675,7 @@ impl ProductFixture {
                 .env("AGENT_IDE_LAUNCHER_CONFIG", &self.config)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
+                .stderr(stderr)
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap(),
@@ -2894,13 +3690,11 @@ impl ProductFixture {
                 }
                 if let Some(status) = daemon.try_wait().unwrap() {
                     let mut stderr = String::new();
-                    daemon
-                        .stderr
-                        .take()
-                        .unwrap()
-                        .read_to_string(&mut stderr)
-                        .await
-                        .unwrap();
+                    if let Some(mut pipe) = daemon.stderr.take() {
+                        pipe.read_to_string(&mut stderr).await.unwrap();
+                    } else if let Some(path) = &stderr_path {
+                        stderr = std::fs::read_to_string(path).unwrap();
+                    }
                     panic!("configured daemon exited with {status}: {stderr}");
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2912,10 +3706,11 @@ impl ProductFixture {
     }
 }
 impl Drop for ProductFixture {
-    /// Releases every registered gate, then removes only the test-owned private tree.
+    /// Releases every registered gate, then removes the test's private tree.
     ///
     /// Runs on success, on panic unwinding and when a timeout drops the test future. The daemon
     /// handle ([`OwnedDaemon`]), declared after the fixture, has already stopped its providers.
+    /// Cleanup also runs during panic unwinding, so failed tests never retain their fixture.
     fn drop(&mut self) {
         for gate in self
             .gates
@@ -2967,7 +3762,7 @@ fn accepted_pyright_provider(cache_namespace: &str) -> Value {
 ///
 /// The Node executable, bridge module, and `tsserver.js` must be absolute readable files from the
 /// accepted 24.4.0/6.0.0/5.9.3 bundle. Missing files or environment values panic because callers
-/// are ignored release tests, and the returned JSON contains both bundle-bound host evidence hashes.
+/// are ignored release tests, and the returned JSON contains the platform-specific bundle binding.
 fn accepted_typescript_provider() -> Value {
     let node = PathBuf::from(std::env::var("AGENT_IDE_NODE").unwrap());
     let bridge = PathBuf::from(std::env::var("AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER").unwrap());
@@ -3006,10 +3801,20 @@ fn accepted_typescript_provider() -> Value {
     agent_ide::languages::install();
     let unbound: agent_ide::assistance::launcher::ProviderLaunch =
         serde_json::from_value(provider.clone()).unwrap();
-    provider["typescript"]["codex_macos_evidence"] =
-        json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
-    provider["typescript"]["claude_macos_evidence"] =
-        json!(unbound.expected_typescript_claude_macos_evidence().unwrap());
+    if cfg!(target_os = "linux") {
+        provider["typescript"]["codex_macos_evidence"] = Value::Null;
+        provider["typescript"]["claude_macos_evidence"] = Value::Null;
+        provider["typescript"]["linux_operator_bundle"] = json!(
+            unbound
+                .expected_typescript_linux_operator_bundle()
+                .expect("measured Linux TypeScript bundle must match the supported release")
+        );
+    } else {
+        provider["typescript"]["codex_macos_evidence"] =
+            json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
+        provider["typescript"]["claude_macos_evidence"] =
+            json!(unbound.expected_typescript_claude_macos_evidence().unwrap());
+    }
     provider
 }
 
@@ -3019,6 +3824,62 @@ fn toolchain_bin(tool: &str) -> String {
     let root = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
         .unwrap_or_else(|_| "/Users/pluto/.rustup/toolchains/1.98.1-aarch64-apple-darwin".into());
     format!("{root}/bin/{tool}")
+}
+
+/// Identifies the prepared rustup toolchain used by inline fixture providers.
+fn fixture_toolchain_name() -> String {
+    std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap_or_else(|_| {
+        Path::new(&toolchain_bin("cargo"))
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+/// Writes the launcher provider for a fixture-owned server executable.
+///
+/// `identity` is the server's accepted display identity and `cache_namespace` isolates its
+/// provider state. The compiler pair and rustup toolchain name come from the prepared process
+/// environment, so fixture declarations satisfy the same layout and digest checks as production.
+fn write_fixture_rust_provider(
+    fixture: &ProductFixture,
+    executable: &Path,
+    identity: &str,
+    cache_namespace: &str,
+) {
+    fixture.write_config(json!([{
+        "executable":accepted_program(executable.to_str().unwrap(),identity),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":fixture_toolchain_name(),
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":cache_namespace
+    }]));
+}
+
+/// Gives a product fixture the operator-selected prepared toolchain for real Cargo consumers.
+///
+/// Requires `AGENT_IDE_RUST_TOOLCHAIN_DIR`; preserves the fixture's current launcher settings and
+/// writes only the `project_checks.rust.toolchain_dir` selection.
+fn configure_prepared_rust_checks(fixture: &ProductFixture) {
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+        .expect("prepared Rust tests require AGENT_IDE_RUST_TOOLCHAIN_DIR");
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    if !config["project_checks"].is_object() {
+        config["project_checks"] = json!({});
+    }
+    if !config["project_checks"]["rust"].is_object() {
+        config["project_checks"]["rust"] = json!({});
+    }
+    config["project_checks"]["rust"]["toolchain_dir"] = json!(toolchain);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
 }
 
 /// A real MCP client plus host actor/call correlation owned by one configured test target.
@@ -3155,7 +4016,10 @@ impl ProductActor {
             .claude_lifecycle_output(fixture, "PostToolUse", &call)
             .await;
         assert!(post.status.success() && post.stderr.is_empty());
-        (claude_fields(assert_claude_envelope(&reply)), post.stdout)
+        (
+            claude_fields(name, assert_claude_envelope(&reply)),
+            post.stdout,
+        )
     }
     /// Runs one native Claude tool's Pre/Post hooks and returns the post hook's stdout.
     ///
@@ -3242,31 +4106,49 @@ impl ProductActor {
         reply["result"]["structuredContent"].clone()
     }
     /// Runs exact Pre→MCP→Post like [`Self::call`] but returns the whole raw MCP reply, for
-    /// assertions on the compact text an error's structured copy does not carry.
+    /// assertions on compact text. Test-seams builds retain the strict independent typed oracle;
+    /// default builds require the production text-only envelope instead.
     async fn call_raw(&mut self, fixture: &ProductFixture, name: &str, arguments: Value) -> Value {
         self.next += 1;
         let call = format!("call-{}", self.next);
         self.lifecycle(fixture, "PreToolUse", &call).await;
         let reply=self.mcp.exchange(json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":{"threadId":self.actor,"callId":call,"x-codex-turn-metadata":{},"codex/sandbox-state-meta":self.state}}})).await;
         self.lifecycle(fixture, "PostToolUse", &call).await;
-        assert_compact_envelope(&reply);
+        if cfg!(feature = "test-seams") {
+            assert_compact_envelope(&reply);
+        } else {
+            assert_claude_envelope(&reply);
+        }
         reply
     }
 
     /// [`Self::settle`] for a raw reply: polls the retained detail through raw inspect calls.
+    /// Uses the independent typed oracle with test-seams, or the actually delivered pending
+    /// reference in a default build. Both paths preserve the same deadline and poll ceiling.
+    /// Default callers settle activation, non-language read and stop; approximate Symbol/Graph
+    /// settlement requires the typed test-seams oracle because their text omits that reference.
     async fn settle_raw(&mut self, fixture: &ProductFixture, mut reply: Value) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
         let mut polls = 0;
         let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
-        while reply["result"]["structuredContent"]["state"] == "pending" {
+        // An approximate answer (a loading server) is followed to its precise one, as `pending`.
+        loop {
+            #[cfg(feature = "test-seams")]
+            let fields = &reply["result"]["structuredContent"];
+            #[cfg(not(feature = "test-seams"))]
+            let fields = claude_fields("ide.inspect", assert_claude_envelope(&reply));
+            if fields["state"] != "pending"
+                && !fields["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("approximate: "))
+            {
+                break;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
                 "product operation did not settle: {reply}"
             );
-            let reference = reply["result"]["structuredContent"]["detail_ref"]
-                .as_str()
-                .unwrap()
-                .to_owned();
+            let reference = fields["detail_ref"].as_str().unwrap().to_owned();
             tokio::time::sleep(delay).await;
             polls += 1;
             reply = self
@@ -3286,7 +4168,12 @@ impl ProductActor {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
         let mut polls = 0;
         let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
-        while reply["state"] == "pending" {
+        // An approximate answer (a loading server) is followed to its precise one, as `pending`.
+        while reply["state"] == "pending"
+            || reply["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("approximate: "))
+        {
             assert!(
                 tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
                 "product operation did not settle"
@@ -3303,6 +4190,71 @@ impl ProductActor {
     }
 }
 
+/// Uses an explicit absolute UTF-8 test Git when provided, otherwise the platform system Git.
+fn fixture_git() -> String {
+    std::env::var_os("AGENT_IDE_TEST_GIT")
+        .and_then(|value| value.into_string().ok())
+        .filter(|path| Path::new(path).is_absolute())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "linux") {
+                "/usr/bin/git".to_owned()
+            } else {
+                "/Library/Developer/CommandLineTools/usr/bin/git".to_owned()
+            }
+        })
+}
+
+/// Reconstructs the platform's documented default without calling the product resolver.
+fn fixture_default_parent() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let private = |path: &Path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.mode() & 0o077 == 0
+            })
+        };
+        let runtime = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
+        if private(&runtime) {
+            return runtime;
+        }
+        if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+        {
+            assert!(
+                path.is_absolute()
+                    && path.components().all(|part| matches!(
+                        part,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    ))
+                    && private(&path),
+                "invalid XDG_RUNTIME_DIR must fail closed"
+            );
+            return path;
+        }
+        agent_ide::userhome::user_home().expect("effective home must exist")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        PathBuf::from("/private/tmp")
+    }
+}
+
+/// Independently reproduces the test-selected or operator-selected Claude parent.
+/// The parent must already exist; fixture code never creates or changes the operator's root.
+fn managed_claude_parent() -> PathBuf {
+    let parent = agent_ide::test_seams::var("AGENT_IDE_TEST_SHARED_RUNTIME_ROOT")
+        .map(std::ffi::OsString::from)
+        .or_else(|| {
+            std::env::var_os("AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT").filter(|value| !value.is_empty())
+        })
+        .map_or_else(fixture_default_parent, PathBuf::from);
+    std::fs::canonicalize(parent).unwrap()
+}
+
 /// Reproduces the public deterministic Claude candidate-cache slot for product-edge assertions.
 ///
 /// The candidate cache is keyed by the canonical candidate path itself (never the rendezvous key),
@@ -3316,8 +4268,7 @@ fn managed_claude_candidate_attachment(project: &Path) -> String {
             .as_os_str()
             .as_bytes(),
     );
-    let path = agent_ide::test_seams::shared_runtime_root()
-        .unwrap()
+    let path = managed_claude_parent()
         .join(format!("ai-k-{}", &identity.to_hex().as_str()[..16]))
         .join("candidate-attachment");
     std::fs::read_to_string(path).unwrap_or_default()
@@ -3330,7 +4281,7 @@ fn managed_claude_candidate_attachment(project: &Path) -> String {
 /// this stays a black-box reproduction of the product formula instead of a peek at its internals.
 fn managed_claude_runtime_path(project: &Path) -> PathBuf {
     let project = std::fs::canonicalize(project).unwrap();
-    let output = std::process::Command::new("/usr/bin/git")
+    let output = std::process::Command::new(fixture_git())
         .arg("-C")
         .arg(&project)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -3343,9 +4294,7 @@ fn managed_claude_runtime_path(project: &Path) -> PathBuf {
         project
     };
     let hash = blake3::hash(key.as_os_str().as_bytes());
-    agent_ide::test_seams::shared_runtime_root()
-        .unwrap()
-        .join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
+    managed_claude_parent().join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
 }
 
 /// Returns the private journal directory a project's hooks and daemon write under the redirected
@@ -3353,7 +4302,7 @@ fn managed_claude_runtime_path(project: &Path) -> PathBuf {
 /// reproduces.
 fn hook_journal_dir(project: &Path) -> PathBuf {
     let project = std::fs::canonicalize(project).unwrap();
-    let output = std::process::Command::new("/usr/bin/git")
+    let output = std::process::Command::new(fixture_git())
         .arg("-C")
         .arg(&project)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -3370,13 +4319,70 @@ fn hook_journal_dir(project: &Path) -> PathBuf {
         .join(&blake3::hash(key.as_os_str().as_bytes()).to_hex().as_str()[..16])
 }
 
-/// Sends SIGTERM to the exact process holding a shared Claude daemon's runtime lock, if any.
-/// A shared daemon deliberately outlives every MCP process's own EOF (EYES-r1 §2), so a test that
-/// causes one to be spawned must reap it explicitly instead of leaving it running past the test
-/// binary's own exit. `lsof` is asked for the specific lock file's current holder only; this never
-/// pattern-kills by process name or command line.
-/// Guarantees a shared daemon a test caused to be spawned is reaped even if an assertion later in
-/// the same test panics, so a failing test cannot leak a long-lived orphan process.
+/// Signals only the pinned Linux process that holds this fixture's lock and runs its daemon.
+/// A pidfd prevents PID reuse from redirecting the signal; poll confirms process exit.
+#[cfg(target_os = "linux")]
+fn stop_fixture_linux(runtime: &Path, expected_exe: &Path) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::MetadataExt;
+    let Some(pid) = agent_ide::app::lock_holder_pid(runtime) else {
+        return Ok(());
+    };
+    if pid == std::process::id() as i32 {
+        return Err("fixture lock names test process".into());
+    }
+    // SAFETY: pidfd_open returns a new descriptor on success.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let fd = i32::try_from(fd)
+        .ok()
+        .filter(|fd| *fd >= 0)
+        .ok_or("pidfd_open failed")?;
+    // SAFETY: successful pidfd_open returned a new descriptor owned here.
+    let process = unsafe { OwnedFd::from_raw_fd(fd) };
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    let actual = std::fs::metadata(proc.join("exe")).map_err(|e| e.to_string())?;
+    let expected = std::fs::metadata(expected_exe).map_err(|e| e.to_string())?;
+    let args = std::fs::read(proc.join("cmdline")).map_err(|e| e.to_string())?;
+    let args: Vec<&[u8]> = args.split(|byte| *byte == 0).collect();
+    if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino())
+        || !args.windows(3).any(|parts| {
+            parts[0] == b"daemon"
+                && parts[1] == b"--runtime-dir"
+                && parts[2] == runtime.as_os_str().as_bytes()
+        })
+        || agent_ide::app::lock_holder_pid(runtime) != Some(pid)
+    {
+        return Err("fixture lock holder identity changed or is not its daemon".into());
+    }
+    // SAFETY: the pidfd pins the verified process generation; null siginfo and zero flags are valid.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            process.as_raw_fd(),
+            libc::SIGTERM,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "pidfd_send_signal: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut pollfd = libc::pollfd {
+        fd: process.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: pollfd is valid for one descriptor, and poll does not retain the pointer.
+    if unsafe { libc::poll(&mut pollfd, 1, 5000) } <= 0 || pollfd.revents & libc::POLLIN == 0 {
+        return Err("fixture daemon exit was not observed within five seconds".into());
+    }
+    Ok(())
+}
+
+/// Requests cleanup during unwinding and reports failure to observe fixture daemon exit.
 struct SharedClaudeDaemonGuard(PathBuf);
 
 impl Drop for SharedClaudeDaemonGuard {
@@ -3385,16 +4391,19 @@ impl Drop for SharedClaudeDaemonGuard {
     }
 }
 
+/// Stops only the verified fixture holder; Linux waits for the pinned generation to exit.
 fn terminate_shared_claude_daemon(runtime: &Path) {
-    let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
-        .arg("-t")
-        .arg(runtime.join("agent-ide.lock"))
-        .output()
-    else {
-        return;
-    };
-    for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-        if let Ok(pid) = pid.parse::<libc::pid_t>() {
+    #[cfg(target_os = "linux")]
+    if let Err(error) = stop_fixture_linux(runtime, &product_binary()) {
+        eprintln!(
+            "fixture daemon cleanup failed at {}: {error}",
+            runtime.display()
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(pid) = agent_ide::app::lock_holder_pid(runtime) {
+        if pid != std::process::id() as libc::pid_t {
+            // SAFETY: the fixture's held lock records this daemon's PID.
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
             }
@@ -3450,7 +4459,7 @@ async fn managed_claude_call(
     )
     .await;
     assert!(post.status.success() && post.stderr.is_empty());
-    claude_fields(assert_claude_envelope(&reply))
+    claude_fields(name, assert_claude_envelope(&reply))
 }
 
 /// Runs one managed Claude hook whose shell `cwd` is `cwd` while `CLAUDE_PROJECT_DIR` stays
@@ -3507,7 +4516,7 @@ async fn managed_claude_call_from(
     )
     .await;
     assert!(post.status.success() && post.stderr.is_empty());
-    claude_fields(assert_claude_envelope(&reply))
+    claude_fields(name, assert_claude_envelope(&reply))
 }
 
 /// Polls one pending managed Claude start through hook-paired `ide.inspect` calls until it settles.
@@ -3583,7 +4592,7 @@ async fn managed_claude_modern_call(
     )
     .await;
     assert!(post.status.success() && post.stderr.is_empty());
-    claude_fields(assert_claude_envelope(&reply))
+    claude_fields(name, assert_claude_envelope(&reply))
 }
 
 /// Lists live short managed runtime directories so EOF cleanup can be observed at the product edge.
@@ -3696,20 +4705,84 @@ impl Drop for ManagedCodexCleanup {
     }
 }
 
-/// Returns the exact managed daemon holding this runtime's lock, without process-name matching.
+/// Returns this fixture runtime's recorded holder only while its lock is held and PID is live.
+/// Asserts that the record exists and is not this test process; benign file readers do not change
+/// the result. The caller owns this private runtime; no process-name or opener selection is used.
 async fn managed_daemon_pid(runtime: &Path) -> libc::pid_t {
-    let output = Command::new("/usr/sbin/lsof")
-        .arg("-t")
-        .arg(runtime.join("agent-ide.lock"))
-        .output()
+    let pid = agent_ide::app::lock_holder_pid(runtime)
+        .expect("fixture runtime lock must be held with a recorded PID");
+    assert_ne!(
+        pid,
+        std::process::id() as libc::pid_t,
+        "the fixture daemon is a separate process"
+    );
+    // SAFETY: signal 0 only checks the recorded fixture holder's liveness.
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "recorded fixture holder must be live"
+    );
+    pid
+}
+
+/// A reader may open the lock file without owning its exclusive lock; PID lookup must still
+/// select the real fixture daemon rather than count every `lsof` opener as another holder.
+#[tokio::test]
+async fn managed_pid_ignores_benign_runtime_lock_reader() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let expected = daemon.id().unwrap() as libc::pid_t;
+    let reader = std::fs::File::open(fixture.runtime.join("agent-ide.lock")).unwrap();
+    assert!(agent_ide::app::lock_is_held(&fixture.runtime));
+    assert_eq!(
+        agent_ide::app::lock_holder_pid(&fixture.runtime),
+        Some(expected)
+    );
+    assert_eq!(managed_daemon_pid(&fixture.runtime).await, expected);
+    drop(reader);
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Shared-daemon cleanup signals only the recorded fixture holder; a separately owned child
+/// keeps a benign read descriptor open and must exit normally after its stdin closes.
+#[tokio::test]
+async fn shared_claude_cleanup_preserves_benign_runtime_lock_reader() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let expected = daemon.id().unwrap() as libc::pid_t;
+    assert_eq!(
+        agent_ide::app::lock_holder_pid(&fixture.runtime),
+        Some(expected)
+    );
+    let mut reader = Command::new("/usr/bin/perl")
+        .args(["-e", "open my $lock, '<', $ARGV[0] or die $!; $|=1; print qq(ready\\n); scalar <STDIN>; print qq(reader survived\\n);"])
+        .arg(fixture.runtime.join("agent-ide.lock"))
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .kill_on_drop(true).spawn().unwrap();
+    let mut output = BufReader::new(reader.stdout.take().unwrap());
+    let mut ready = String::new();
+    tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut ready))
         .await
+        .unwrap()
         .unwrap();
-    let pids = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .map(|pid| pid.parse::<libc::pid_t>().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(pids.len(), 1, "one daemon must hold the runtime lock");
-    pids[0]
+    assert_eq!(ready, "ready\n");
+    reader.stdout = Some(output.into_inner());
+    terminate_shared_claude_daemon(&fixture.runtime);
+    tokio::time::timeout(Duration::from_secs(5), daemon.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let survived = tokio::time::timeout(Duration::from_secs(5), reader.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        survived.status.success(),
+        "benign reader was signalled: {survived:?}"
+    );
+    assert_eq!(survived.stdout, b"reader survived\n");
+    assert!(survived.stderr.is_empty());
 }
 
 /// Resumes an exact test daemon even if an assertion aborts a transient-timeout scenario.
@@ -3758,8 +4831,8 @@ async fn managed_codex_smoke_and_eof_cleanup() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -3771,8 +4844,8 @@ async fn managed_codex_smoke_and_eof_cleanup() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","detail_ref":original_ref,"byte_offset":0}),
+        "ide.inspect",
+        json!({"detail_ref":original_ref}),
         &state,
     )
     .await;
@@ -3808,8 +4881,8 @@ async fn managed_codex_smoke_and_eof_cleanup() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -3845,11 +4918,11 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     assert_eq!(retrieved, diff, "{retrieved}");
 
     next += 1;
-    let forged = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt","actor_id":"forged","sandbox":state},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
+    let forged = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"tracked.txt","actor_id":"forged","sandbox":state},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
     assert_eq!(forged["result"]["isError"], true, "{forged}");
 
     next += 1;
-    let isolated = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":"managed-stranger","callId":format!("managed-stranger-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
+    let isolated = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"tracked.txt"},"_meta":{"threadId":"managed-stranger","callId":format!("managed-stranger-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}})).await;
     assert_compact_envelope(&isolated);
     assert_eq!(
         isolated["result"]["structuredContent"],
@@ -3864,7 +4937,7 @@ async fn managed_codex_smoke_and_eof_cleanup() {
     assert_eq!(managed_runtime_paths(&fixture), before);
 }
 
-/// A problems lookup and unchanged re-observation keep an older Context edit ref usable;
+/// A problems lookup and unchanged re-observation keep an older Read edit ref usable;
 /// an actual byte change refuses the same operation without touching the target.
 #[tokio::test]
 async fn managed_context_problems_then_edit_tracks_content() {
@@ -3891,24 +4964,24 @@ async fn managed_context_problems_then_edit_tracks_content() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
     let context = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     next += 1;
     let problems = managed_call(
         &mut mcp,
         next,
         actor,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
         &state,
     )
     .await;
-    assert_eq!(problems["kind"], "context", "{problems}");
+    assert_eq!(problems["kind"], "inspect", "{problems}");
     assert_eq!(problems["detail_ref"], Value::Null, "{problems}");
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
@@ -3935,8 +5008,8 @@ async fn managed_context_problems_then_edit_tracks_content() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -3946,8 +5019,8 @@ async fn managed_context_problems_then_edit_tracks_content() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -3974,8 +5047,8 @@ async fn managed_context_problems_then_edit_tracks_content() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4056,8 +5129,8 @@ async fn managed_codex_publishes_distinct_actor_routes_and_retires_them_on_shutd
         next,
         actor,
         "root-session-b",
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4137,8 +5210,8 @@ async fn managed_codex_context_after_crash_requires_start_and_republishes_route(
         next,
         actor,
         session,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4146,7 +5219,7 @@ async fn managed_codex_context_after_crash_requires_start_and_republishes_route(
     assert_eq!(reply["reason"], "host_binding", "{reply}");
     assert_eq!(
         reply["retry"],
-        "daemon restarted; call ide.start first, then repeat this call with fresh references"
+        "daemon restarted; call ide.start in this project"
     );
     assert!(
         discover(&root, &identity).is_some(),
@@ -4158,8 +5231,8 @@ async fn managed_codex_context_after_crash_requires_start_and_republishes_route(
         next,
         actor,
         session,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4183,13 +5256,13 @@ async fn managed_codex_context_after_crash_requires_start_and_republishes_route(
         next,
         actor,
         session,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
     let context = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     mcp.close().await;
     std::fs::remove_dir_all(base).unwrap();
 }
@@ -4227,7 +5300,7 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
     next += 1;
     let timed_out = tokio::time::timeout(
         Duration::from_secs(4),
-        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
+        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
     ).await;
     drop(paused);
     let timed_out =
@@ -4243,13 +5316,13 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
         &mut mcp,
         next,
         actor,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
     let context = settle_managed(&mut mcp, &mut next, actor, &state, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     assert_eq!(managed_daemon_pid(&runtime).await, pid);
     mcp.close().await;
 }
@@ -4319,7 +5392,7 @@ async fn managed_codex_wedged_daemon_is_replaced_in_place_without_agent_action()
     next += 1;
     let lost = tokio::time::timeout(
         Duration::from_secs(20),
-        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
+        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
     )
     .await
     .expect("the call that met the wedge returns its own failure");
@@ -4557,8 +5630,8 @@ async fn managed_codex_publication_failure_leaves_replies_working() {
         next,
         actor,
         "root-session-a",
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -4694,8 +5767,8 @@ async fn parallel_managed_daemons_do_not_fence_each_others_workspace() {
         &mut first,
         first_id,
         "parallel-first",
-        "ide.context",
-        json!({"path":"src/lib.rs","byte_offset":0}),
+        "ide.read",
+        json!({"path":"src/lib.rs"}),
         &state,
     )
     .await;
@@ -4707,7 +5780,7 @@ async fn parallel_managed_daemons_do_not_fence_each_others_workspace() {
         still_live,
     )
     .await;
-    assert_eq!(still_live["kind"], "context", "{still_live}");
+    assert_eq!(still_live["kind"], "read", "{still_live}");
 
     first.close().await;
     second.close().await;
@@ -4774,15 +5847,49 @@ async fn managed_claude_hook_distinguishes_input_timeout_and_oversize() {
     assert_managed_hook_silent(&output);
     drop(open_input);
 
+    // Only metadata the daemon needs that alone exceeds the 64 KiB transport bound is oversize.
     let mut oversized = launch();
     let mut input = oversized.stdin.take().unwrap();
     input
-        .write_all(&vec![b'x'; 8 * 1024 * 1024 + 1])
+        .write_all(
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "s".repeat(80 * 1024),
+                "tool_use_id": "call",
+                "cwd": project,
+            })
+            .to_string()
+            .as_bytes(),
+        )
         .await
         .unwrap();
     input.shutdown().await.unwrap();
     drop(input);
     let output = oversized.wait_with_output().await.unwrap();
+    assert_managed_hook_silent(&output);
+
+    // A post over the former 8 MiB input cap streams its tool bodies away: never oversize. A
+    // debug build may hit the 250 ms hook deadline mid-stream and close its stdin first, so the
+    // write may end in a broken pipe; either way the event is not classified as oversize.
+    let mut streamed = launch();
+    let mut input = streamed.stdin.take().unwrap();
+    let _ = input
+        .write_all(
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session",
+                "tool_use_id": "call",
+                "tool_name": "mcp__agent-ide__ide_read",
+                "cwd": project,
+                "tool_response": [{"type": "text", "text": "x".repeat(9 * 1024 * 1024)}],
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .await;
+    let _ = input.shutdown().await;
+    drop(input);
+    let output = streamed.wait_with_output().await.unwrap();
     assert_managed_hook_silent(&output);
 
     // A payload merely over the old 64 KiB bound now projects its tool body away instead of
@@ -4831,7 +5938,7 @@ async fn managed_claude_hook_distinguishes_input_timeout_and_oversize() {
         .count();
     assert_eq!(
         oversize_events, 1,
-        "only the beyond-8-MiB payload names oversize: {events:?}"
+        "only metadata beyond the transport bound names oversize: {events:?}"
     );
     std::fs::remove_dir_all(home).unwrap();
 }
@@ -4856,7 +5963,7 @@ async fn managed_claude_startup_requires_template() {
         response["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("continue with native tools")
+            .contains("Continue with native tools")
     );
     mcp.close().await;
     // The shared rendezvous directory this MCP created is never removed on exit, even when no
@@ -4978,8 +6085,8 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
         )
         .await;
     assert_eq!(
-        claude_fields(assert_claude_envelope(&unbound)),
-        json!({"state":"unavailable","reason":"host_binding"}),
+        claude_fields("ide.start", assert_claude_envelope(&unbound)),
+        json!({"state":"unavailable","reason":"host_binding","text":assert_claude_envelope(&unbound)}),
         "{unbound}"
     );
     assert_eq!(std::fs::read(&attachment_path).unwrap(), first_attachment);
@@ -5017,8 +6124,8 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
         )
         .await;
     assert_eq!(
-        claude_fields(assert_claude_envelope(&denied)),
-        json!({"state":"unavailable","reason":"host_binding"}),
+        claude_fields("ide.start", assert_claude_envelope(&denied)),
+        json!({"state":"unavailable","reason":"host_binding","text":assert_claude_envelope(&denied)}),
         "{denied}"
     );
 
@@ -5139,12 +6246,10 @@ async fn managed_claude_first_worktree_start_pairs_before_mcp_call() {
     let runtime = managed_claude_runtime_path(&left);
     let _guard = SharedClaudeDaemonGuard(runtime.clone());
     assert!(!runtime.exists());
-    let cache = agent_ide::test_seams::shared_runtime_root()
-        .unwrap()
-        .join(format!(
-            "ai-k-{}",
-            &blake3::hash(left.as_os_str().as_bytes()).to_hex().as_str()[..16]
-        ));
+    let cache = managed_claude_parent().join(format!(
+        "ai-k-{}",
+        &blake3::hash(left.as_os_str().as_bytes()).to_hex().as_str()[..16]
+    ));
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&cache)
@@ -5206,7 +6311,7 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
         .await;
     assert_eq!(
         assert_claude_envelope(&refused),
-        "unavailable: host_binding (outside_allowed_roots); the session project is outside the directories the IDE may open. Call ide.start with an allowed root, or continue with native tools",
+        "This project is outside the directories the IDE may open.\nRepair: Call ide.start with an allowed root.",
         "{refused}"
     );
 
@@ -5237,13 +6342,13 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
     let rerooted_text = assert_claude_envelope(&rerooted);
     assert!(
         rerooted_text.starts_with(
-            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
+            "The IDE received no host event for this session.\nRepair: session re-rooted to the requested root; repeat this call"
         ),
         "{rerooted_text}"
     );
     assert!(
         rerooted_text
-            .ends_with("; retry: session re-rooted to the requested root; repeat this call once"),
+            .ends_with("Repair: session re-rooted to the requested root; repeat this call"),
         "{rerooted_text}"
     );
     assert!(
@@ -5427,15 +6532,16 @@ async fn managed_claude_cross_repository_start_is_refused_without_moving_the_ses
         .await;
     let refused_text = assert_claude_envelope(&refused);
     assert!(
-        refused_text.starts_with("unavailable: host_binding (other_repository: bound to "),
+        refused_text.starts_with("Other agents still use the bound repository; nothing moved."),
         "{refused_text}"
     );
     assert!(
-        refused_text.contains(&format!(", asked {}", other.display())),
+        refused_text.contains(&format!("requested root: {}", other.display())),
         "{refused_text}"
     );
     assert!(
-        refused_text.contains("this start was refused and nothing moved"),
+        refused_text.contains("nothing moved")
+            && refused_text.contains("Repair: Call ide.start under the bound repository."),
         "{refused_text}"
     );
     assert!(
@@ -5578,10 +6684,10 @@ async fn claude_call_with_a_late_pre_hook_is_served_not_refused() {
     })
     .await
     .expect("late-pre call answers within the deadline");
-    let fields = claude_fields(assert_claude_envelope(&reply));
+    let fields = claude_fields("ide.read", assert_claude_envelope(&reply));
     let text = fields["text"].as_str().unwrap_or_default();
     assert!(
-        text.contains("pub fn value() -> i32") && text.contains("source_ref: "),
+        text.contains("pub fn value() -> i32") && !text.contains("source_ref"),
         "the late-pre read must be served, not refused: {reply}"
     );
     mcp.close().await;
@@ -5635,6 +6741,20 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
     assert_eq!(started["kind"], "activation", "{started}");
 
     // One call before the restart, keeping its reference for the stale-reference check.
+    // A diff too large for one reply is cut, and the cut names the `detail_ref` that continues it
+    // (Read is never cut, so it names no reference).
+    std::fs::write(
+        fixture.root.join("restart-pages.txt"),
+        "padding padding padding\n".repeat(5_000),
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "restart-pages.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "paged diff fixture"]);
+    std::fs::write(
+        fixture.root.join("restart-pages.txt"),
+        "changed changed changed\n".repeat(5_000),
+    )
+    .unwrap();
     next += 1;
     let before = managed_claude_call(
         &mut mcp,
@@ -5642,15 +6762,14 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
         next,
         "restart-session",
         None,
-        "ide.read",
-        json!({"path":"src/lib.rs","lines":"1-2"}),
+        "ide.diff",
+        json!({}),
     )
     .await;
-    let stale_ref = claude_text(&before)
-        .split("source_ref: ")
-        .nth(1)
-        .map(|tail| tail.trim().to_owned())
-        .expect("read reply carries a source_ref");
+    let stale_ref = before["detail_ref"]
+        .as_str()
+        .map(str::to_owned)
+        .expect("a cut diff reply names its detail_ref");
 
     // The shared daemon generation ends; the watcher must heal it before the next pre-hook.
     let stale_attachment = managed_claude_candidate_attachment(&fixture.root);
@@ -5698,8 +6817,8 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
         .await;
     let stale_text = assert_claude_envelope(&stale);
     assert!(
-        stale_text.starts_with("error: invalid_detail")
-            && stale_text.contains("issued before the IDE restarted; re-read"),
+        stale_text.starts_with("This result reference was issued before the IDE restarted.")
+            && stale_text.contains("Repair: Repeat the original IDE call"),
         "{stale_text}"
     );
 
@@ -5839,8 +6958,7 @@ async fn a_pre_hook_on_a_dead_generations_attachment_fails_open_until_the_cache_
 
     let live = managed_claude_candidate_attachment(&fixture.root);
     assert_eq!(live.len(), 64, "a published attachment is 64 hex digits");
-    let cache = agent_ide::test_seams::shared_runtime_root()
-        .unwrap()
+    let cache = managed_claude_parent()
         .join(format!(
             "ai-k-{}",
             &blake3::hash(
@@ -5873,19 +6991,18 @@ async fn a_pre_hook_on_a_dead_generations_attachment_fails_open_until_the_cache_
     mcp.close().await;
 }
 
-/// A paged Context survives native tool activity between its pages: a non-inert post (Bash) no
-/// longer discards a page whose bytes are unchanged, while a real edit between pages still
-/// refuses with the explicit changed-source recovery.
+/// A Claude Read of about 150 KB arrives whole in one reply with no page, and native tool
+/// activity (a non-inert Bash post) does not invalidate it: the read stays an edit base for its
+/// unchanged bytes.
 #[tokio::test]
-async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
+async fn claude_large_read_is_whole_and_survives_native_posts() {
     let fixture = ProductFixture::new(json!([]));
-    // ~150 KB of short lines, comfortably multi-page.
     let content: String = (0..3300)
         .map(|line| format!("value_{line:05} = \"padding padding padding {line:05}\"\n"))
         .collect();
     std::fs::write(fixture.root.join("claude-pages.py"), &content).unwrap();
     fixture.git(&["add", "--", "claude-pages.py"]);
-    fixture.git(&["commit", "--quiet", "-m", "claude paged source"]);
+    fixture.git(&["commit", "--quiet", "-m", "claude large source"]);
 
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "claude-paged-context").await;
@@ -5896,72 +7013,621 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     assert_eq!(started["kind"], "activation", "{started}");
 
     let first_call = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"claude-pages.py","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"claude-pages.py"}))
         .await;
-    let (page1, _) = actor.settle_claude(&fixture, first_call).await;
-    assert_eq!(page1["kind"], "context", "{page1}");
-    assert_eq!(page1["continuation"], true, "{page1}");
-    let reference = page1["detail_ref"].as_str().unwrap().to_owned();
-    let (_, _, _, end, total) = page_marker(page1["text"].as_str().unwrap());
+    let (read, _) = actor.settle_claude(&fixture, first_call).await;
+    assert_eq!(read["kind"], "read", "{}", read["kind"]);
+    assert_eq!(read["continuation"], false, "{}", read["continuation"]);
+    assert_eq!(
+        read["text"].as_str().unwrap(),
+        numbered_source("claude-pages.py", &content)
+    );
 
-    // A non-inert native post (Bash) between pages bumps the native epoch without touching the
-    // file: page two must still be served byte-exactly.
+    // A non-inert native post (Bash) bumps the native epoch without touching the file.
     actor
         .claude_lifecycle(&fixture, "PostToolUse", "paged-bash")
         .await;
-    let next = actor
-        .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
-        .await;
-    assert_eq!(next["kind"], "context", "{next}");
-    let text = next["text"].as_str().unwrap();
-    let (number, _, from, to, _) = page_marker(text);
-    assert_eq!(number, 2, "page two is served after a Bash post: {text}");
-    assert_eq!(from, end, "page two continues byte-exactly: {text}");
-    assert!(
-        to > from && to <= total,
-        "page two covers real bytes: {text}"
-    );
-
-    // A real edit between pages changes the bytes: the next page refuses with the explicit
-    // changed-source recovery instead of a bare source_unavailable.
-    let edited = content.replace("value_00002", "value_EDITED");
-    std::fs::write(fixture.root.join("claude-pages.py"), &edited).unwrap();
-    actor.next += 1;
-    let call = format!("call-{}", actor.next);
-    actor.claude_lifecycle(&fixture, "PreToolUse", &call).await;
-    let refused = actor
-        .mcp
-        .exchange(
-            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
-                "name":"ide.inspect","arguments":{"detail_ref":&reference},
-                "_meta":{"claudecode/toolUseId":call}
-            }}),
+    let edit = actor
+        .call_claude(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"after-bash","path":"claude-pages.py",
+                   "changes":[{"lines":"3-3","content":"value_EDITED = 1"}]}),
         )
         .await;
-    let refused_text = assert_claude_envelope(&refused);
-    let _ = total;
-    assert!(
-        refused_text.contains("error: source_unavailable")
-            && refused_text.contains("inspect:source_changed")
-            && refused_text.contains("\"claude-pages.py\" changed since this result was captured")
-            && refused_text.contains("Call ide.context with this path again for fresh bytes"),
-        "{refused_text}"
-    );
+    let (edit, _) = actor.settle_claude(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
 
-/// A pending edit is collectible: when its project check outlasts the inline wait, the edit
-/// answers `pending` and `ide.inspect` later returns the settled edit reply — never the silent
-/// `inspect:internal` a byte-overlong diagnostic message used to turn the whole detail into.
+/// Replays cold matrix request shapes against actual configured providers and prints the
+/// exclusive journaled stages. Each fixture owns its provider cache and home; no warm semantic
+/// call precedes the measured request. Source/write assertions also protect the public result.
 #[tokio::test]
-async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
+#[ignore = "requires accepted Rust and TypeScript provider environment"]
+async fn cold_matrix_reply_shapes_journal_stage_timings() {
+    for edit in [false, true] {
+        let fixture = if edit {
+            ProductFixture::new(json!([accepted_typescript_provider()]))
+        } else {
+            symbol_test_fixture()
+        };
+        let count = if edit { 9 } else { 5 };
+        let mut items = Vec::new();
+        let mut files = Vec::new();
+        for index in 0..count {
+            let path = format!("src/cold_{index}.{}", if edit { "ts" } else { "rs" });
+            let content = if edit {
+                format!("export const value{index} = 1;\n")
+            } else {
+                format!("pub fn value{index}() -> i32 {{ 1 }}\n")
+            };
+            std::fs::write(fixture.root.join(&path), &content).unwrap();
+            items.push(json!({"path":path,"lines":"1-1"}));
+            files.push(json!({"path":path,"changes":[{"old":"= 1", "new":"= 2"}]}));
+        }
+        if edit {
+            std::fs::write(
+                fixture.root.join("tsconfig.json"),
+                "{\"compilerOptions\":{\"types\":[]},\"include\":[\"src/*.ts\"]}",
+            )
+            .unwrap();
+        }
+        let home = provider_home(&fixture);
+        let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+        let mut actor = ProductActor::new(&fixture, "cold-matrix-shape").await;
+        let started = actor.call(&fixture, "ide.start", json!({})).await;
+        assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+        let began = std::time::Instant::now();
+        let reply = if edit {
+            actor
+                .call(&fixture, "ide.edit", json!({"files":files}))
+                .await
+        } else {
+            actor
+                .call(&fixture, "ide.read", json!({"items":items}))
+                .await
+        };
+        assert_ne!(reply["state"], "pending", "bare inline handle: {reply}");
+        if !edit {
+            assert_eq!(reply["kind"], "read", "{reply}");
+            assert!(
+                reply["text"].as_str().unwrap().contains("value4"),
+                "{reply}"
+            );
+        }
+        eprintln!(
+            "cold matrix {} inline {:?}: {}",
+            if edit { "edit-9" } else { "read-5" },
+            began.elapsed(),
+            reply
+        );
+        let reference = reply["detail_ref"]
+            .as_str()
+            .or_else(|| reply["source_ref"].as_str())
+            .unwrap()
+            .to_owned();
+        let mut settled = actor.settle(&fixture, reply).await;
+        // This diagnostic qualification explicitly recovers the independently pending check;
+        // the useful write receipt above already completed in its initial request.
+        if edit
+            && (settled["kind"] == "edit_progress"
+                || settled["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("diagnostics: pending")))
+        {
+            settled = actor
+                .call(
+                    &fixture,
+                    "ide.inspect",
+                    json!({"detail_ref":reference,"wait_s":30}),
+                )
+                .await;
+        }
+        let events = std::fs::read_dir(home.join(".agent-ide/logs"))
+            .unwrap()
+            .flatten()
+            .flat_map(|entry| agent_ide::errorlog::read_events(&entry.path()))
+            .collect::<Vec<_>>();
+        let stages = events
+            .iter()
+            .filter(|event| {
+                event.correlation.as_deref() == Some(&reference)
+                    && event
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.starts_with("stage: "))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !stages.is_empty(),
+            "missing stages for {reference}: {events:?}"
+        );
+        if !edit {
+            assert!(
+                stages.iter().any(|event| event
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("stage: provider_wait;"))
+                    && event.duration_ms == Some(0)),
+                "plain reads awaited a provider: {stages:?}"
+            );
+            assert_eq!(settled["kind"], "read", "{settled}");
+        }
+        for event in stages {
+            eprintln!(
+                "cold matrix stage {} {}ms",
+                event.detail.as_deref().unwrap(),
+                event.duration_ms.unwrap()
+            );
+        }
+        if edit {
+            for index in 0..count {
+                assert!(
+                    std::fs::read_to_string(fixture.root.join(format!("src/cold_{index}.ts")))
+                        .unwrap()
+                        .contains("= 2"),
+                    "{settled}"
+                );
+            }
+        } else {
+            assert!(
+                settled["text"].as_str().unwrap().contains("value4"),
+                "{settled}"
+            );
+        }
+        actor.call(&fixture, "ide.stop", json!({})).await;
+        actor.mcp.close().await;
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+    }
+}
+
+/// Plain source is useful on the initial call with no provider, a cold configured provider,
+/// and a live provider that never answers. Source outlines stay independent; an explicit
+/// semantic request starts the hung fixture before source is read again without recovery.
+#[tokio::test]
+async fn plain_source_does_not_wait_for_absent_cold_or_hung_providers() {
+    use std::os::unix::fs::PermissionsExt;
+    for configured in [false, true] {
+        let fixture = ProductFixture::new(json!([]));
+        let marker = fixture.base.join("plain-provider-started");
+        if configured {
+            let program = fixture.base.join("plain-provider");
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\nprintf '%s\n' $$ >> '{}'\nexec /bin/sleep 30\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            write_fixture_rust_provider(
+                &fixture,
+                &program,
+                "hung-plain-provider",
+                "plain-provider-cache",
+            );
+        }
+        let mut held_provider = None;
+        let items = (0..5)
+            .map(|index| {
+                let path = format!("src/plain_{index}.rs");
+                std::fs::write(
+                    fixture.root.join(&path),
+                    format!("pub fn plain{index}() -> i32 {{ {index} }}\n"),
+                )
+                .unwrap();
+                if index % 2 == 0 {
+                    json!({"path":path,"lines":"1-1"})
+                } else {
+                    json!({"path":path})
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut daemon = fixture
+            .daemon_with_home(Some(&provider_home(&fixture)))
+            .await;
+        let mut actor = ProductActor::new(&fixture, "plain-provider-independent").await;
+        let started = actor.call(&fixture, "ide.start", json!({})).await;
+        assert_eq!(started["kind"], "activation", "{started}");
+        assert!(
+            started["text"].as_str().unwrap().contains("rust module"),
+            "qualify actual production module mode: {started}"
+        );
+        eprintln!("T1 effective_mode=rust-module");
+        let began = std::time::Instant::now();
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            actor.call(&fixture, "ide.read", json!({"items":items,"force":true})),
+        )
+        .await
+        .expect("plain source must not spend the inline window waiting for a provider");
+        assert_eq!(read["kind"], "read", "{read}");
+        assert!(
+            read["text"].as_str().unwrap().contains("pub fn plain4()"),
+            "{read}"
+        );
+        assert!(!marker.exists(), "plain read started a language provider");
+        eprintln!(
+            "T1 configured={configured} cold request_to_usable_ms={} progress=0 recovery_requests=0 source_files=5",
+            began.elapsed().as_millis()
+        );
+        let outline = tokio::time::timeout(
+            Duration::from_secs(5),
+            actor.call(&fixture, "ide.outline", json!({"path":"src/lib.rs"})),
+        )
+        .await
+        .expect("available source outline is synchronous");
+        assert_eq!(outline["kind"], "outline", "{outline}");
+        assert!(
+            outline["text"].as_str().unwrap().contains("value"),
+            "{outline}"
+        );
+        if configured {
+            assert!(
+                !marker.exists(),
+                "source outline started an unnecessary semantic provider"
+            );
+            let _semantic = actor
+                .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+                .await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the explicit semantic request starts the never-ready provider fixture");
+            let pid: libc::pid_t = std::fs::read_to_string(&marker)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            held_provider = Some(ProcessIdentity::of(pid).expect("owned provider exists").0);
+            let began = std::time::Instant::now();
+            let before = actor.next;
+            let read = tokio::time::timeout(
+                Duration::from_secs(5),
+                actor.call(&fixture, "ide.read", json!({"items":items,"force":true})),
+            )
+            .await
+            .expect("live hung provider must not delay source");
+            assert_eq!(read["kind"], "read", "{read}");
+            assert!(
+                read["text"].as_str().unwrap().contains("pub fn plain4()"),
+                "{read}"
+            );
+            assert_eq!(actor.next, before + 1, "ordinary source needs one request");
+            eprintln!(
+                "T1 hung request_to_usable_ms={} progress=0 recovery_requests=0 source_files=5",
+                began.elapsed().as_millis()
+            );
+        }
+        let ranges = actor
+            .call(
+                &fixture,
+                "ide.read",
+                json!({"path":"src/lib.rs","ranges":["1-1","2-2"],"force":true}),
+            )
+            .await;
+        assert_eq!(ranges["kind"], "read", "{ranges}");
+        assert!(
+            ranges["text"].as_str().unwrap().contains("pub fn caller()"),
+            "{ranges}"
+        );
+        if configured {
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap().lines().count(),
+                1,
+                "readiness retries must not relaunch the same granted provider"
+            );
+        }
+        let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+        assert_eq!(stopped["kind"], "stop", "{stopped}");
+        if let Some(provider) = held_provider {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while provider.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("stop must reap the initializing provider, including zombies");
+        }
+
+        actor.mcp.close().await;
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+    }
+}
+
+/// A durable batch receipt is useful while the first check is held. Exact pending retries keep
+/// the same source/check identity without rewriting; bounded diagnostic recovery preserves that
+/// receipt, and releasing the explicit check gate settles the independently retained result.
+#[tokio::test]
+async fn edit_progress_and_bounded_inspect_preserve_committed_files() {
+    let fixture = ProductFixture::new(json!([]));
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "stage-progress").await;
+    let start = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
+    let parameters = json!({"operation_id":"committed-before-check","files":[
+        {"path":"src/lib.rs","changes":[{"old":"{ 7 }","new":"{ 8 }"}]}]});
+    let began = std::time::Instant::now();
+    let before = actor.next;
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        actor.call(&fixture, "ide.edit", parameters.clone()),
+    )
+    .await
+    .expect("a committed receipt must not consume the eight-second inline window");
+    assert_eq!(reply["state"], "edit_batch", "{reply}");
+    assert_eq!(reply["files"][0]["state"], "replaced", "{reply}");
+    assert!(
+        reply["text"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostics: pending"),
+        "{reply}"
+    );
+    assert_eq!(
+        actor.next,
+        before + 1,
+        "normal committed edits need one request"
+    );
+    eprintln!(
+        "T2 batch request_to_usable_ms={} progress=0 recovery_requests=0",
+        began.elapsed().as_millis()
+    );
+    let reference = reply["source_ref"].as_str().unwrap().to_owned();
+    let modified = std::fs::metadata(fixture.root.join("src/lib.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let retry = actor.call(&fixture, "ide.edit", parameters).await;
+    assert_eq!(
+        retry["source_ref"], reference,
+        "pending retry must reuse source/check identity: {retry}"
+    );
+    assert_eq!(
+        retry["files"][0]["state"], "replaced",
+        "same retained receipt: {retry}"
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.root.join("src/lib.rs"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        modified,
+        "lost/delayed receipt recovery must not write again"
+    );
+    let recovered = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+        .await;
+    assert_eq!(recovered["source_ref"], reference, "{recovered}");
+    for parameters in [
+        json!({"detail_ref":reference,"wait_s":1}),
+        json!({"detail_refs":[reference,reference],"wait_s":1}),
+    ] {
+        let began = std::time::Instant::now();
+        let pending = actor.call(&fixture, "ide.inspect", parameters).await;
+        assert!(
+            began.elapsed() >= Duration::from_millis(900)
+                && began.elapsed() < Duration::from_secs(2),
+            "{:?}: {pending}",
+            began.elapsed()
+        );
+        assert!(
+            pending["text"]
+                .as_str()
+                .unwrap()
+                .contains("diagnostics: pending"),
+            "{pending}"
+        );
+    }
+    release_checks_gate(&fixture);
+    let settled = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":reference,"wait_s":30}),
+        )
+        .await;
+    assert_eq!(settled["state"], "edit_batch", "{settled}");
+    assert_eq!(settled["source_ref"], reference, "{settled}");
+    assert!(
+        !settled["text"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostics: pending"),
+        "{settled}"
+    );
+    let events = std::fs::read_dir(home.join(".agent-ide/logs"))
+        .unwrap()
+        .flatten()
+        .flat_map(|entry| agent_ide::errorlog::read_events(&entry.path()))
+        .collect::<Vec<_>>();
+    let useful = events
+        .iter()
+        .filter(|event| {
+            event.correlation.as_deref() == Some(&reference)
+                && event
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("usable_result;"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        useful.len(),
+        1,
+        "one journaled usable receipt per request: {events:?}"
+    );
+    assert!(useful[0].duration_ms.unwrap() < 5000, "{useful:?}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A hung semantic provider cannot delay a durable one-file receipt. Its retained source can
+/// authorize the next write while checks are held; exact pending retries do not apply twice.
+#[tokio::test]
+async fn committed_single_edit_receipt_survives_hung_provider_and_chains_source() {
+    let fixture = ProductFixture::new(json!([]));
+    let program = fixture.base.join("hung-edit-provider");
+    let marker = fixture.base.join("hung-edit-provider-started");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf '%s' $$ > '{}'\nexec /bin/sleep 30\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_fixture_rust_provider(
+        &fixture,
+        &program,
+        "hung-edit-provider",
+        "hung-edit-provider-cache",
+    );
+    let home =
+        enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
+    // This test uses fixture executables for both the hung provider's immutable tool facts and
+    // project checks; the helper's copied real rustfmt still supplies actual formatting behavior.
+    let fake_bin = home.join(".rustup/toolchains/fake/bin");
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    let provider = &mut config["targets"][0]["providers"][0];
+    provider["toolchain"] = json!("fake");
+    provider["cargo"] = accepted_program(fake_bin.join("cargo").to_str().unwrap(), "fixture-cargo");
+    provider["cargo_version"] = json!("fixture-cargo");
+    provider["rustc"] = accepted_program(fake_bin.join("rustc").to_str().unwrap(), "fixture-rustc");
+    provider["rustc_version"] = json!("fixture-rustc");
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "single-receipt").await;
+    let start = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/lib.rs","force":true}),
+        )
+        .await;
+    let parameters = json!({"operation_id":"single-before-check","path":"src/lib.rs",
+        "source_ref":read["detail_ref"],"content":"pub fn value() -> i32 { 8 }\n"});
+    let began = std::time::Instant::now();
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(5),
+        actor.call(&fixture, "ide.edit", parameters.clone()),
+    )
+    .await
+    .expect("post-commit provider enrichment must not delay the receipt");
+    assert_eq!(receipt["state"], "edit", "{receipt}");
+    assert_eq!(receipt["result"]["outcome"], "replaced", "{receipt}");
+    assert_eq!(receipt["diagnostics"]["state"], "pending", "{receipt}");
+    assert!(
+        !marker.exists(),
+        "post-write receipt started an unnecessary semantic provider"
+    );
+    eprintln!(
+        "T2 single request_to_usable_ms={} progress=0 recovery_requests=0",
+        began.elapsed().as_millis()
+    );
+    let reference = receipt["result"]["source_ref"].as_str().unwrap().to_owned();
+    assert_eq!(receipt["diagnostics"]["detail_ref"], reference, "{receipt}");
+    let retry = actor.call(&fixture, "ide.edit", parameters).await;
+    assert_eq!(retry["result"]["source_ref"], reference, "{retry}");
+    let next_parameters = json!({"operation_id":"single-next","path":"src/lib.rs",
+        "source_ref":reference,"content":"pub fn value() -> i32 { 9 }\n"});
+    let chained = actor
+        .call(&fixture, "ide.edit", next_parameters.clone())
+        .await;
+    assert_eq!(
+        chained["result"]["outcome"], "replaced",
+        "a pending receipt is a usable edit base: {chained}"
+    );
+    release_checks_gate(&fixture);
+    let next_ref = chained["result"]["source_ref"].as_str().unwrap();
+    let settled = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":next_ref,"wait_s":30}),
+        )
+        .await;
+    assert_ne!(settled["diagnostics"]["state"], "pending", "{settled}");
+    let modified = std::fs::metadata(fixture.root.join("src/lib.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let terminal_retry = actor
+        .call(&fixture, "ide.edit", next_parameters.clone())
+        .await;
+    assert_eq!(
+        terminal_retry["result"]["outcome"], "replaced",
+        "{terminal_retry}"
+    );
+    assert_eq!(
+        terminal_retry["result"]["source_ref"], next_ref,
+        "terminal recovery retains the committed source identity: {terminal_retry}"
+    );
+
+    assert_eq!(
+        std::fs::metadata(fixture.root.join("src/lib.rs"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        modified,
+        "terminal recovery must not write again"
+    );
+    let mut conflict_parameters = next_parameters.clone();
+    conflict_parameters["content"] = json!("pub fn different() {}\n");
+    let conflict = actor.call(&fixture, "ide.edit", conflict_parameters).await;
+    assert_eq!(
+        conflict["result"]["outcome"], "conflicting_duplicate",
+        "different payload cannot reuse this id: {conflict}"
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.root.join("src/lib.rs"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        modified
+    );
+    let native = "pub fn native() {}\n";
+    std::fs::write(fixture.root.join("src/lib.rs"), native).unwrap();
+    let stale = actor.call(&fixture, "ide.edit", next_parameters).await;
+    assert_eq!(
+        stale["code"], "source_unavailable",
+        "a stale receipt cannot pretend fresh source authority: {stale}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        native
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// OUTBOX-r4 §8.6: when an edit's project check outlasts the inline wait, the edit answers with
+/// its write and `diagnostics: pending` (never a whole-reply `pending`), and the edit's own
+/// reference later returns the settled reply — never the silent `inspect:internal` a
+/// byte-overlong diagnostic message used to turn it into. Without a Bridge route no fact is
+/// delivered by IDE itself.
+#[tokio::test]
+async fn a_slow_edit_check_answers_at_once_and_its_reference_settles() {
     let fixture = ProductFixture::new(json!([]));
     // A rust check held past the inline wait, reporting one over-long multibyte message: 300
     // characters of "é" are 600 bytes, so a character-bound truncation used to leave a message
@@ -5998,14 +7664,33 @@ async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
             &fixture,
             "ide.edit",
             json!({"operation_id":"pending-edit-1","path":"src/lib.rs","lines":"1-1",
-                   "source_ref":source_ref,"content":"pub fn value() -> i32 { 7 }"}),
+                   "source_ref":source_ref,"content":"pub fn value() -> i32 { 8 }"}),
         )
         .await;
-    assert!(
-        matches!(edit["state"].as_str(), Some("pending" | "edit")),
-        "the held check parks the edit or settles inline: {edit}"
+    assert_eq!(
+        edit["state"], "edit",
+        "the held check never parks the reply: {edit}"
     );
-    let settled = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    assert_eq!(edit["diagnostics"]["state"], "pending", "{edit}");
+    let reference = edit["diagnostics"]["detail_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let settled = loop {
+        let settled = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+            .await;
+        if settled["state"] == "edit" && settled["diagnostics"]["state"] != "pending" {
+            break settled;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the check never settled: {settled}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     assert_eq!(settled["state"], "edit", "{settled}");
     assert_eq!(settled["result"]["outcome"], "replaced", "{settled}");
     assert!(
@@ -6024,6 +7709,82 @@ async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
         }
     }
     actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Reply hygiene (M024-M027-REPLY-HYGIENE r2, M024-M026 outbox texts): every real reply of a batch
+/// read, a batch edit whose project check outlasts the call, the two inspections that hand over its
+/// fact and the `ide.stop` reply states what happened and never invites polling, in its text and
+/// carried status.
+#[tokio::test]
+async fn pending_and_batch_replies_never_invite_polling() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 12");
+    write_problems_count(&fixture.root, "1");
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "hygiene-batch").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"hygiene"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let mut seen = vec![started.clone()];
+
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"items":[{"path":"src/lib.rs","lines":"1-2"},{"path":"missing.rs"}]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
+    seen.push(read);
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"hygiene-1","source_ref":source_ref,
+                   "files":[{"path":"src/lib.rs","changes":[{"lines":"1-1","content":"pub fn value() -> i32 { 8 }"}]}]}),
+        )
+        .await;
+    assert_eq!(edit["state"], "edit_batch", "{edit}");
+    assert_eq!(edit["outcome"], "applied", "{edit}");
+    assert_eq!(
+        edit["files"],
+        json!([{"path":"src/lib.rs","state":"replaced"}]),
+        "{edit}"
+    );
+    assert!(edit["source_ref"].as_str().is_some(), "{edit}");
+    assert!(
+        edit["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("diagnostics: pending")
+                && text.contains("project check retained under")),
+        "{edit}"
+    );
+    seen.push(edit);
+    // The stop reply is read after a call too: it is held to the same rule.
+    seen.push(actor.call(&fixture, "ide.stop", json!({})).await);
+    for reply in &seen {
+        let shown = format!(
+            "{} {}",
+            reply["text"].as_str().unwrap_or_default(),
+            reply["status"].as_str().unwrap_or_default()
+        )
+        .to_lowercase();
+        for banned in [
+            "poll",
+            "every few seconds",
+            "in a few seconds",
+            "until it completes",
+            "again every",
+        ] {
+            assert!(!shown.contains(banned), "{banned}: {reply}");
+        }
+    }
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
@@ -6066,10 +7827,29 @@ async fn a_pending_edit_under_a_capped_check_of_other_files_settles_unknown() {
             &fixture,
             "ide.edit",
             json!({"operation_id":"capped-edit-1","path":"src/lib.rs","lines":"1-1",
-                   "source_ref":source_ref,"content":"pub fn value() -> i32 { 7 }"}),
+                   "source_ref":source_ref,"content":"pub fn value() -> i32 { 8 }"}),
         )
         .await;
-    let settled = actor.settle(&fixture, edit).await;
+    // OUTBOX-r4 §8.6: the write answers at once; the check settles under the edit's reference.
+    assert_eq!(edit["diagnostics"]["state"], "pending", "{edit}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let settled = loop {
+        let settled = actor
+            .call(
+                &fixture,
+                "ide.inspect",
+                json!({"detail_ref":edit["diagnostics"]["detail_ref"]}),
+            )
+            .await;
+        if settled["state"] == "edit" && settled["diagnostics"]["state"] != "pending" {
+            break settled;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the check never settled: {settled}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     assert_eq!(settled["state"], "edit", "{settled}");
     assert_eq!(settled["result"]["outcome"], "replaced", "{settled}");
     assert_eq!(
@@ -6099,19 +7879,17 @@ async fn an_edit_to_an_undeclared_rust_module_is_not_analysed() {
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let mut edit = async |path: &str, operation: &str, content: &str| {
-        let context = actor
-            .call(&fixture, "ide.context", json!({"path":path}))
-            .await;
+        let context = actor.call(&fixture, "ide.read", json!({"path":path})).await;
         let context = actor.settle(&fixture, context).await;
-        let edit = actor
-            .call(
-                &fixture,
-                "ide.edit",
-                json!({"operation_id":operation,"path":path,
-                       "source_ref":context["detail_ref"],"content":content}),
-            )
-            .await;
-        actor.settle(&fixture, edit).await
+        let mut arguments = json!({"operation_id":operation,"path":path,"content":content});
+        // An absent file has no read reference; creation observes it directly. Existing reads
+        // retain their actual delivered reference, preserving the legacy freshness check.
+        if let Some(reference) = context["detail_ref"].as_str() {
+            arguments["source_ref"] = json!(reference);
+        }
+        let edit = actor.call(&fixture, "ide.edit", arguments).await;
+        let edit = actor.settle(&fixture, edit).await;
+        settle_edit_check(&mut actor, &fixture, edit).await
     };
     let orphan = edit("src/orphan.rs", "orphan-create", "pub fn orphan() {}\n").await;
     assert_eq!(orphan["result"]["outcome"], "created", "{orphan}");
@@ -6189,7 +7967,7 @@ printf '{"reason":"build-finished","success":true}\n'
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let problems = actor
-            .call(&fixture, "ide.context", json!({"kind":"problems"}))
+            .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
             .await;
         let problems = actor.settle(&fixture, problems).await;
         if problems["text"]
@@ -6226,6 +8004,7 @@ printf '{"reason":"build-finished","success":true}\n'
         )
         .await;
     let edited = actor.settle(&fixture, edited).await;
+    let edited = settle_edit_check(&mut actor, &fixture, edited).await;
     assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
     assert_eq!(
         edited["diagnostics"]["state"], "current_reported",
@@ -6293,26 +8072,22 @@ async fn a_full_file_edit_without_source_ref_creates_only_a_missing_file() {
         content
     );
 
-    let before = std::fs::read(fixture.root.join("src/lib.rs")).unwrap();
-    let refused = actor
+    // symbol-read-edit-v1 E10: a whole-file `content` edit of an existing file needs no
+    // `source_ref`; it replaces the current bytes.
+    let replaced = actor
         .call(
             &fixture,
             "ide.edit",
             json!({"operation_id":"create-existing","path":"src/lib.rs",
-                   "content":"pub fn clobbered() {}\n"}),
+                   "content":"pub fn replaced() {}\n"}),
         )
         .await;
-    let refused = actor.settle(&fixture, refused).await;
-    assert_eq!(refused["state"], "invalid_parameters", "{refused}");
+    let replaced = actor.settle(&fixture, replaced).await;
+    assert_eq!(replaced["state"], "edit", "{replaced}");
+    assert_eq!(replaced["result"]["outcome"], "replaced", "{replaced}");
     assert_eq!(
-        refused["text"],
-        "invalid bounded parameters: \"source_ref\" is required to replace an existing file: \
-         read it first (ide.read)",
-        "{refused}"
-    );
-    assert_eq!(
-        std::fs::read(fixture.root.join("src/lib.rs")).unwrap(),
-        before
+        std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        "pub fn replaced() {}\n"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
@@ -6514,10 +8289,11 @@ async fn binary_and_unreadable_files_refuse_softly_naming_a_native_tool() {
             json!({"symbols":[path]}),
         ] {
             let (reply, text) = settled_read(&mut actor, &fixture, arguments.clone()).await;
-            let soft = reply["code"] == "source_unavailable" && text.contains("native tool")
+            let native_tool = text.contains("native tool") || text.contains("native file tool");
+            let soft = reply["code"] == "source_unavailable" && native_tool
                 || reply["kind"] == "read"
                     && text.contains("not a readable text file")
-                    && text.contains("native tool");
+                    && native_tool;
             if !soft {
                 refusals.push(format!("{arguments}: {reply} {text}"));
             }
@@ -6669,8 +8445,12 @@ async fn text_file_read_forms_each_answer_and_a_second_call_still_answers() {
             if reply["kind"] != "read" || !text.contains(expected) {
                 failures.push(format!("{path} {form} {arguments}: {reply} {text}"));
             }
-            let (after, text) =
-                settled_read(&mut actor, &fixture, json!({"path":path,"lines":"2-2"})).await;
+            let (after, text) = settled_read(
+                &mut actor,
+                &fixture,
+                json!({"path":path,"lines":"2-2","force":true}),
+            )
+            .await;
             if after["kind"] != "read" || !text.contains(second) {
                 failures.push(format!(
                     "{path} {form}: the second call broke: {after} {text}"
@@ -7068,21 +8848,28 @@ async fn release_build_ignores_the_panic_seam() {
         .await;
     let mut actor = ProductActor::new(&fixture, "release-panic-seam").await;
     let started = actor
-        .call(
+        .call_raw(
             &fixture,
             "ide.start",
             json!({"activation_id":"release-panic-seam"}),
         )
         .await;
-    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    let (read, text) = settled_read(
-        &mut actor,
-        &fixture,
-        json!({"path":"boom.log","lines":"1-1"}),
-    )
-    .await;
+    let started = actor.settle_raw(&fixture, started).await;
     assert!(
-        read["kind"] == "read" && text.contains("1\tone"),
+        assert_claude_envelope(&started).contains("activated: epoch "),
+        "{started}"
+    );
+    let read = actor
+        .call_raw(
+            &fixture,
+            "ide.read",
+            json!({"path":"boom.log","lines":"1-1"}),
+        )
+        .await;
+    let read = actor.settle_raw(&fixture, read).await;
+    let text = assert_claude_envelope(&read);
+    assert!(
+        read["result"]["isError"] != json!(true) && text.contains("1\tone"),
         "a release build must ignore the panic seam: {read} {text}"
     );
     let journal = home
@@ -7099,7 +8886,8 @@ async fn release_build_ignores_the_panic_seam() {
         !events.contains("fatal"),
         "no fault was injected into a release build: {events}"
     );
-    actor.call(&fixture, "ide.stop", json!({})).await;
+    let stopped = actor.call_raw(&fixture, "ide.stop", json!({})).await;
+    assert_ne!(stopped["result"]["isError"], json!(true), "{stopped}");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
@@ -7194,8 +8982,7 @@ async fn managed_auto_zcode_host_reroots_like_claude() {
     let mut mcp = Mcp::start_managed_auto(&fixture.config, &workspace).await;
 
     // A call carrying no supported host metadata can never correlate: it names the closed cause.
-    // (An unrecognized host is not known to misuse `structuredContent`, so this call keeps both
-    // projections; only a recognized Claude call is text-only.)
+    // (Every host, recognized or not, receives one text block and no `structuredContent`.)
     let unrecognized = mcp
         .exchange(
             json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
@@ -7205,12 +8992,11 @@ async fn managed_auto_zcode_host_reroots_like_claude() {
         .await;
     assert_eq!(
         unrecognized["result"]["content"][0]["text"],
-        "unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools",
+        "This host did not identify the call in a supported format.\nRepair: Continue this work with native tools.",
         "{unrecognized}"
     );
-    assert_eq!(
-        unrecognized["result"]["structuredContent"],
-        json!({"state":"unavailable","reason":"host_binding"}),
+    assert!(
+        unrecognized["result"].get("structuredContent").is_none(),
         "{unrecognized}"
     );
 
@@ -7237,7 +9023,7 @@ async fn managed_auto_zcode_host_reroots_like_claude() {
     let rerooted_text = assert_claude_envelope(&rerooted);
     assert!(
         rerooted_text.starts_with(
-            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools; retry: session re-rooted"
+            "The IDE received no host event for this session.\nRepair: session re-rooted"
         ),
         "{rerooted_text}"
     );
@@ -7483,7 +9269,7 @@ async fn managed_claude_hook_pairs_through_project_dir_when_the_shell_cwd_left_t
             &outside,
             next,
             "cwd-session",
-            "ide.context",
+            "ide.inspect",
             json!({"kind":"problems"}),
         )
         .await;
@@ -7524,7 +9310,7 @@ async fn managed_claude_hook_pairs_through_project_dir_when_the_shell_cwd_left_t
     let refused = mcp
         .exchange(
             json!({"jsonrpc":"2.0","id":90,"method":"tools/call","params":{
-                "name":"ide.context","arguments":{"kind":"problems"},
+                "name":"ide.inspect","arguments":{"kind":"problems"},
                 "_meta":{"claudecode/toolUseId":"stranger-call"}
             }}),
         )
@@ -7532,7 +9318,7 @@ async fn managed_claude_hook_pairs_through_project_dir_when_the_shell_cwd_left_t
     assert!(
         refused["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+            .is_some_and(|text| claude_fields("", text)["state"] == "unavailable"),
         "a pre routed nowhere cannot pair: {refused}"
     );
     mcp.close().await;
@@ -7595,7 +9381,7 @@ async fn managed_claude_hook_never_routes_a_wandering_cwd_to_another_registered_
     let refused = other
         .exchange(
             json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
-                "name":"ide.context","arguments":{"kind":"problems"},
+                "name":"ide.inspect","arguments":{"kind":"problems"},
                 "_meta":{"claudecode/toolUseId":"managed-claude-1"}
             }}),
         )
@@ -7603,7 +9389,7 @@ async fn managed_claude_hook_never_routes_a_wandering_cwd_to_another_registered_
     assert!(
         refused["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+            .is_some_and(|text| claude_fields("", text)["state"] == "unavailable"),
         "the stray pre never reached the other repository: {refused}"
     );
     mcp.close().await;
@@ -7664,7 +9450,7 @@ async fn managed_claude_hook_with_a_vanished_project_dir_never_routes_to_another
         let refused = other
             .exchange(
                 json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{
-                    "name":"ide.context","arguments":{"kind":"problems"},
+                    "name":"ide.inspect","arguments":{"kind":"problems"},
                     "_meta":{"claudecode/toolUseId":call}
                 }}),
             )
@@ -7672,7 +9458,7 @@ async fn managed_claude_hook_with_a_vanished_project_dir_never_routes_to_another
         assert!(
             refused["result"]["content"][0]["text"]
                 .as_str()
-                .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+                .is_some_and(|text| claude_fields("", text)["state"] == "unavailable"),
             "a pre of unusable project {project:?} never reaches the repository the shell stands in: {refused}"
         );
         next += 1;
@@ -7720,7 +9506,7 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
         next,
         "context-session",
         None,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
     )
     .await;
@@ -7742,9 +9528,21 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
             .is_some_and(|text| text.contains("src/lib.rs")),
         "{outline}"
     );
-    // A lexical context answer is a degraded success that retains a result; inspecting that
-    // result after the call's own degraded mark was consumed reports it degraded again, names
-    // the call that queued it as `origin`, and is typed as delivered.
+    // A paged diff retains a result (Read is never paged, so it names no continuation);
+    // inspection keeps its completed outcome, names the originating call and is typed as
+    // delivered.
+    std::fs::write(
+        fixture.root.join("context-pages.txt"),
+        "padding padding padding\n".repeat(5_000),
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "context-pages.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "paged diff fixture"]);
+    std::fs::write(
+        fixture.root.join("context-pages.txt"),
+        "changed changed changed\n".repeat(5_000),
+    )
+    .unwrap();
     next += 1;
     let context_call = next;
     let lexical = managed_claude_call(
@@ -7753,8 +9551,8 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
         next,
         "context-session",
         None,
-        "ide.context",
-        json!({"path":"src/lib.rs"}),
+        "ide.diff",
+        json!({}),
     )
     .await;
     let detail_ref = lexical["detail_ref"]
@@ -7799,36 +9597,40 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     assert_eq!(start.form.as_deref(), Some("activation_id"));
     let context = events
         .iter()
-        .find(|event| event.method == "context" && event.request.is_some())
+        .find(|event| {
+            event.method == "inspect"
+                && event.form.as_deref() == Some("kind")
+                && event.request.is_some()
+        })
         .unwrap_or_else(|| panic!("a context dispatch line: {raw}"));
     assert_eq!(context.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
     assert_eq!(context.host.as_deref(), Some("claude"));
     assert_eq!(context.role.as_deref(), Some("writer"));
     assert_eq!(context.form.as_deref(), Some("kind"));
     assert_eq!(context.eligible, Some(true));
-    // With no language server configured, the outline answers from source: a degraded success
-    // marked by the daemon itself, not by the reply text.
+    // Exact source structure completes the requested outline without semantic provider work.
+    // The journal records completion rather than a degraded semantic fallback.
     let outline = events
         .iter()
         .find(|event| event.method == "outline" && event.request.is_some())
         .unwrap_or_else(|| panic!("an outline dispatch line: {raw}"));
-    assert_eq!(outline.outcome, "degraded", "{outline:?}");
+    assert_eq!(outline.outcome, "completed", "{outline:?}");
     assert_eq!(outline.language.as_deref(), Some("rust"));
     assert_eq!(outline.form.as_deref(), Some("path"));
     let lexical_context = events
         .iter()
         .find(|event| {
-            event.method == "context" && event.correlation.as_deref() == Some(detail_ref.as_str())
+            event.method == "diff" && event.correlation.as_deref() == Some(detail_ref.as_str())
         })
         .unwrap_or_else(|| panic!("the lexical context line: {raw}"));
-    assert_eq!(lexical_context.outcome, "degraded", "{lexical_context:?}");
+    assert_eq!(lexical_context.outcome, "completed", "{lexical_context:?}");
     let inspection = events
         .iter()
         .find(|event| {
             event.method == "inspect" && event.correlation.as_deref() == Some(detail_ref.as_str())
         })
         .unwrap_or_else(|| panic!("the inspection line: {raw}"));
-    assert_eq!(inspection.outcome, "degraded", "{inspection:?}");
+    assert_eq!(inspection.outcome, "completed", "{inspection:?}");
     assert_eq!(inspection.delivered, Some(true));
     assert_eq!(
         inspection.origin.as_deref(),
@@ -7981,20 +9783,25 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
         "{retried}"
     );
     let context = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let context = actor.settle(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
-    assert!(context["text"].as_str().unwrap().contains("mode: lexical"));
+    assert_eq!(context["kind"], "read", "{context}");
+    let diagnostics = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"kind":"diagnostics","path":"src/lib.rs"}),
+        )
+        .await;
+    let diagnostics = actor.settle(&fixture, diagnostics).await;
+    assert_eq!(diagnostics["kind"], "inspect", "{diagnostics}");
     assert!(
-        context["text"]
+        diagnostics["text"]
             .as_str()
             .unwrap()
-            .contains("diagnostics_freshness: unknown")
+            .contains("diagnostics: unknown"),
+        "{diagnostics}"
     );
     assert!(context["text"].as_str().unwrap().contains("pub fn value"));
     let old_context = context["detail_ref"].as_str().unwrap().to_owned();
@@ -8003,14 +9810,10 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     // confirm it from the durable store during the diff capture that follows, not merely accept
     // the trait's default `None`.
     let tracked_context = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"tracked.txt","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let tracked_context = actor.settle(&fixture, tracked_context).await;
-    assert_eq!(tracked_context["kind"], "context", "{tracked_context}");
+    assert_eq!(tracked_context["kind"], "read", "{tracked_context}");
 
     let mut diff_ref = String::new();
     for mode in ["head", "staged", "unstaged"] {
@@ -8091,11 +9894,7 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
         .await;
     assert_eq!(stale_diff["kind"], "diff", "{stale_diff}");
     let latest = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let latest = actor.settle(&fixture, latest).await;
     assert!(latest["text"].as_str().unwrap().contains("changed"));
@@ -8191,6 +9990,169 @@ async fn configured_product_task_diff_includes_committed_and_uncommitted_changes
         head_text.contains("+pub fn value() -> i32 { 8 }"),
         "{head_text}"
     );
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A diff that names no mode answers only what changed since the activation's previous diff: the
+/// first call is whole, a repeat on an unchanged tree is one short line, a later change shows only
+/// its own hunk, returning to earlier bytes is reported again, and naming a mode answers the
+/// whole diff. Continuation pages count as delivered and never suppress a newly changed late hunk.
+#[tokio::test]
+async fn configured_product_default_diff_answers_only_what_changed_since_the_last_diff() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "since-last-diff").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"since-last-diff"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> i32 { 8 }\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    let first = actor.call(&fixture, "ide.diff", json!({})).await;
+    let first = actor.settle(&fixture, first).await;
+    let first_text = first["text"].as_str().unwrap();
+    assert!(
+        first_text.contains("+pub fn value() -> i32 { 8 }"),
+        "{first_text}"
+    );
+
+    let again = actor.call(&fixture, "ide.diff", json!({})).await;
+    let again = actor.settle(&fixture, again).await;
+    let again_text = again["text"].as_str().unwrap();
+    assert!(
+        again_text.contains("no changes since your last diff"),
+        "{again_text}"
+    );
+    assert!(!again_text.contains("+pub fn value"), "{again_text}");
+
+    std::fs::write(fixture.root.join("tracked.txt"), "changed after the diff\n").unwrap();
+    let later = actor.call(&fixture, "ide.diff", json!({})).await;
+    let later = actor.settle(&fixture, later).await;
+    let later_text = later["text"].as_str().unwrap();
+    assert!(
+        later_text.contains("+changed after the diff")
+            && later_text.contains("unchanged since your last diff: 1 hunks")
+            && !later_text.contains("+pub fn value"),
+        "{later_text}"
+    );
+
+    let whole = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let whole = actor.settle(&fixture, whole).await;
+    let whole_text = whole["text"].as_str().unwrap();
+    assert!(
+        whole_text.contains("+pub fn value() -> i32 { 8 }")
+            && whole_text.contains("+changed after the diff"),
+        "{whole_text}"
+    );
+
+    // History is not the previous capture: A -> B -> A must deliver the returning A.
+    std::fs::write(fixture.root.join("tracked.txt"), "intermediate diff\n").unwrap();
+    let intermediate = actor.call(&fixture, "ide.diff", json!({})).await;
+    let intermediate = actor.settle(&fixture, intermediate).await;
+    assert!(
+        intermediate["text"]
+            .as_str()
+            .unwrap()
+            .contains("+intermediate diff"),
+        "{intermediate}"
+    );
+    std::fs::write(fixture.root.join("tracked.txt"), "changed after the diff\n").unwrap();
+    let returned = actor.call(&fixture, "ide.diff", json!({})).await;
+    let returned = actor.settle(&fixture, returned).await;
+    assert!(
+        returned["text"]
+            .as_str()
+            .unwrap()
+            .contains("+changed after the diff"),
+        "{returned}"
+    );
+
+    // More than one page must stay new until delivered, then repeat as one short line.
+    for index in 0..40 {
+        std::fs::write(
+            fixture.root.join(format!("incremental-{index:02}.txt")),
+            format!("incremental-marker-{index:02}\n"),
+        )
+        .unwrap();
+    }
+    let first = actor.call(&fixture, "ide.diff", json!({})).await;
+    let mut page = actor.settle(&fixture, first).await;
+    let reference = page["detail_ref"].as_str().unwrap().to_owned();
+    let mut delivered = String::new();
+    let mut page_count = 0;
+    loop {
+        assert_eq!(page["kind"], "diff", "{page}");
+        delivered.push_str(page["text"].as_str().unwrap());
+        page_count += 1;
+        assert!(page_count < 16, "incremental pages did not terminate");
+        if page["continuation"] == false {
+            break;
+        }
+        page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+    }
+    assert!(page_count > 1);
+    for index in 0..40 {
+        assert_eq!(
+            delivered
+                .matches(&format!("+incremental-marker-{index:02}"))
+                .count(),
+            1,
+            "{delivered}"
+        );
+    }
+    let repeated = actor.call(&fixture, "ide.diff", json!({})).await;
+    let repeated = actor.settle(&fixture, repeated).await;
+    assert!(
+        repeated["text"]
+            .as_str()
+            .unwrap()
+            .contains("no changes since your last diff"),
+        "{repeated}"
+    );
+    assert_eq!(repeated["continuation"], false, "{repeated}");
+
+    std::fs::write(
+        fixture.root.join("incremental-39.txt"),
+        "changed-late-hunk\n",
+    )
+    .unwrap();
+    let first = actor.call(&fixture, "ide.diff", json!({})).await;
+    let mut page = actor.settle(&fixture, first).await;
+    let reference = page["detail_ref"].as_str().unwrap().to_owned();
+    let mut changed = String::new();
+    let mut page_count = 0;
+    loop {
+        assert_eq!(page["kind"], "diff", "{page}");
+        changed.push_str(page["text"].as_str().unwrap());
+        page_count += 1;
+        assert!(page_count < 16, "late incremental hunk was lost");
+        if page["continuation"] == false {
+            break;
+        }
+        page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+    }
+    assert!(changed.contains("+changed-late-hunk"), "{changed}");
+    assert!(!changed.contains("+incremental-marker-"), "{changed}");
 
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -8327,7 +10289,7 @@ async fn configured_product_task_diff_refuses_unknown_activation_commit() {
     let text = task["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(
         text,
-        "error: source_unavailable (diff:activation_commit_unknown); the start commit of this activation is unknown, so the task view is unavailable; use ide.diff {\"mode\": \"head\"}"
+        "The activation's start commit is unknown; the task diff is unavailable.\nRepair: Call ide.diff with {\"mode\":\"head\"}."
     );
 
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -8339,7 +10301,7 @@ async fn configured_product_task_diff_refuses_unknown_activation_commit() {
 
 /// A later Codex binding's `ide.diff` covers a path an earlier grant's `ide.edit` observed.
 ///
-/// Session A registers a durable observation for `tracked.txt` (`ide.context` + `ide.edit`) and
+/// Session A registers a durable observation for `tracked.txt` (`ide.read` + `ide.edit`) and
 /// stops. Session B is a new binding on the same daemon and store, so its authority epoch is
 /// later; the store still holds A's row for the path. The diff capture must not compare that
 /// row's epoch with B's grant and answer `source_unavailable` (`diff:unstable`): the row belongs
@@ -8360,14 +10322,10 @@ async fn configured_product_later_binding_diffs_path_edited_under_earlier_grant(
     assert_eq!(started["kind"], "activation", "{started}");
     let first_epoch = activation_epoch(&started);
     let context = first
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"tracked.txt","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let context = first.settle(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     let edited = first
         .call(
             &fixture,
@@ -8455,8 +10413,11 @@ async fn configured_product_clean_tree_diff_completes_over_large_metadata_and_ig
     fixture.git(&["add", "--", "."]);
     fixture.git(&["commit", "--quiet", "-m", "large clean fixture"]);
     assert_eq!(
-        std::process::Command::new("/usr/bin/git")
+        std::process::Command::new(fixture_git())
             .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
+            .env("TMP", std::env::temp_dir())
+            .env("TEMP", std::env::temp_dir())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["-C"])
@@ -8522,7 +10483,7 @@ async fn diff_default_reply_is_compact_and_hash_free() {
     let text = diff["text"].as_str().unwrap();
     assert_eq!(
         text,
-        "diff (head): 1 files, +1 \u{2212}0\ninventory: 1 tracked, 0 untracked, 0 conflicted; hunks delivered: 1\npaths: \"a.txt\"\nfile: \"a.txt\"\n@@ -1 +1,2 @@\n line1\n+line2\n",
+        "diff (head): 1 files, +1 \u{2212}0\nfile: \"a.txt\"\n@@ -1 +1,2 @@\n line1\n+line2\n",
         "{text}"
     );
     for field in [
@@ -8649,7 +10610,8 @@ async fn diff_with_an_untracked_symlink_lists_it_and_completes() {
 
 /// The degraded plain `git diff` fallback never answers for a path the exact capture refuses: a
 /// tracked directory replaced by a symlink to a directory outside the worktree refuses the whole
-/// diff instead of delivering hunks for the paths behind it.
+/// diff instead of delivering hunks for the paths behind it. Before refusal, default fallback
+/// calls suppress repeats, report returning hunks again and keep explicit full diffs available.
 #[tokio::test]
 async fn diff_plain_fallback_refuses_a_path_the_exact_capture_refuses() {
     let fixture = ProductFixture::new(json!([]));
@@ -8672,13 +10634,9 @@ async fn diff_plain_fallback_refuses_a_path_the_exact_capture_refuses() {
     // A recorded observation edited out of band makes every exact capture unstable, so each
     // `ide.diff` below goes through the plain fallback.
     let observed = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"a-observed.txt","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"a-observed.txt"}))
         .await;
-    assert_eq!(actor.settle(&fixture, observed).await["kind"], "context");
+    assert_eq!(actor.settle(&fixture, observed).await["kind"], "read");
     std::fs::write(fixture.root.join("a-observed.txt"), "unreconciled\n").unwrap();
     let degraded = actor
         .call(&fixture, "ide.diff", json!({"mode":"head"}))
@@ -8691,6 +10649,52 @@ async fn diff_plain_fallback_refuses_a_path_the_exact_capture_refuses() {
             .unwrap()
             .contains("exact capture unavailable"),
         "{degraded}"
+    );
+
+    let repeated = actor.call(&fixture, "ide.diff", json!({})).await;
+    let repeated = actor.settle(&fixture, repeated).await;
+    assert!(
+        repeated["text"]
+            .as_str()
+            .unwrap()
+            .contains("no changes since your last diff"),
+        "{repeated}"
+    );
+    assert!(
+        repeated["text"]
+            .as_str()
+            .unwrap()
+            .contains("exact capture unavailable"),
+        "{repeated}"
+    );
+    std::fs::write(
+        fixture.root.join("a-observed.txt"),
+        "intermediate fallback\n",
+    )
+    .unwrap();
+    let changed = actor.call(&fixture, "ide.diff", json!({})).await;
+    let changed = actor.settle(&fixture, changed).await;
+    assert!(
+        changed["text"]
+            .as_str()
+            .unwrap()
+            .contains("+intermediate fallback"),
+        "{changed}"
+    );
+    std::fs::write(fixture.root.join("a-observed.txt"), "unreconciled\n").unwrap();
+    let returned = actor.call(&fixture, "ide.diff", json!({})).await;
+    let returned = actor.settle(&fixture, returned).await;
+    assert!(
+        returned["text"].as_str().unwrap().contains("+unreconciled"),
+        "{returned}"
+    );
+    let full = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let full = actor.settle(&fixture, full).await;
+    assert!(
+        full["text"].as_str().unwrap().contains("+unreconciled"),
+        "{full}"
     );
 
     let outside = fixture.base.join("outside-linked");
@@ -8789,7 +10793,7 @@ async fn configured_product_test_command_uses_cwd_env_and_parses_wrapped_pytest_
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    let reply = actor
+    let run = actor
         .call(
             &fixture,
             "ide.test",
@@ -8800,11 +10804,15 @@ async fn configured_product_test_command_uses_cwd_env_and_parses_wrapped_pytest_
             }),
         )
         .await;
-    let reply = actor.settle(&fixture, reply).await;
+    let detail_ref = run["detail_ref"]
+        .as_str()
+        .expect("test result reference")
+        .to_owned();
+    let reply = actor.settle(&fixture, run).await;
     assert_eq!(reply["kind"], "test", "{reply}");
     let text = reply["text"].as_str().unwrap();
     assert!(text.contains("2 passed, 1 failed"), "{text}");
-    assert!(text.contains("rerun:"), "{text}");
+    assert_rerun_receipt(text, &detail_ref);
     let outside = fixture.base.join("outside-package");
     std::fs::create_dir_all(&outside).unwrap();
     std::os::unix::fs::symlink(&outside, fixture.root.join("escape")).unwrap();
@@ -8830,7 +10838,7 @@ async fn configured_product_test_command_uses_cwd_env_and_parses_wrapped_pytest_
     let text = command["text"].as_str().unwrap();
     assert!(text.starts_with("tests #"), "{text}");
     assert!(
-        text.contains("exit 1") && text.contains("output (tail):\ngit diff output"),
+        text.contains("exit 1") && text.contains("output (tail):\n    git diff output"),
         "{text}"
     );
     assert!(
@@ -8941,6 +10949,7 @@ async fn configured_product_typescript_non_test_file_answers_no_tests() {
 #[tokio::test]
 async fn configured_product_test_runs_in_background_and_reports_failures() {
     let fixture = ProductFixture::new(json!([]));
+    configure_prepared_rust_checks(&fixture);
     std::fs::write(
         fixture.root.join("src/lib.rs"),
         r#"
@@ -9002,8 +11011,8 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     );
     assert_eq!(
         start_text.trim_end(),
-        "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); poll: call \
-         ide.test with {\"status\": 1}",
+        "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); the result \
+         is retained under its reference; Bridge delivers it automatically",
         "{start_text}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -9024,24 +11033,20 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     };
     let result_text = completed["text"].as_str().unwrap();
     assert!(result_text.contains("FAIL tests::fails"), "{result_text}");
+    // OUTBOX-r4: a run's outcome is never a plate line, and a run read through its own
+    // handle is not repeated by any carrier (IDE has none besides Bridge).
     assert!(
-        carried_status(&completed)
-            .is_some_and(|status| status.contains("tests #1: 1 passed, 1 failed")),
-        "completion status plate must carry the test delta once: {completed}"
-    );
-    assert_eq!(
-        carried_status(&completed).and_then(|status| status.lines().nth(1)),
-        result_text.lines().next(),
-        "the result and completion plate use the same worker status snapshot"
+        carried_status(&completed).is_none_or(|status| !status.contains("tests #1")),
+        "a read run is not carried again: {completed}"
     );
     let repeated = actor.call(&fixture, "ide.test", json!({"status":1})).await;
     assert!(
-        carried_status(&repeated).is_none(),
-        "the completion plate must not repeat: {repeated}"
+        carried_status(&repeated).is_none_or(|status| !status.contains("tests #1")),
+        "the outcome must not repeat: {repeated}"
     );
     println!("ide.test start: {start_text}");
     println!("ide.test result: {result_text}");
-    println!("ide.test status: {}", carried_status(&completed).unwrap());
+    println!("ide.test status: {:?}", carried_status(&completed));
 
     // The runner keeps a 256 KiB tail, and ide.inspect must page that tail rather than shrink it.
     let verbose_start = actor
@@ -9065,7 +11070,11 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     };
     assert_eq!(verbose_result["detail_ref"], verbose_ref);
     let mut page = actor
-        .call(&fixture, "ide.inspect", json!({"detail_ref":verbose_ref}))
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":format!("{verbose_ref}/output/1")}),
+        )
         .await;
     assert_eq!(
         page["continuation"], true,
@@ -9076,7 +11085,7 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
             .call(
                 &fixture,
                 "ide.inspect",
-                json!({"detail_ref":verbose_result["detail_ref"]}),
+                json!({"detail_ref":page["detail_ref"]}),
             )
             .await;
     }
@@ -9107,7 +11116,7 @@ async fn a_branch_switched_outside_the_ide_is_noticed_once_on_the_plate() {
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     fixture.git(&["checkout", "--quiet", "-b", "moved-elsewhere"]);
     let early = actor
-        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let early = actor.settle(&fixture, early).await;
     assert!(
@@ -9116,7 +11125,7 @@ async fn a_branch_switched_outside_the_ide_is_noticed_once_on_the_plate() {
     );
     tokio::time::sleep(Duration::from_secs(31)).await;
     let context = actor
-        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let context = actor.settle(&fixture, context).await;
     let plate = carried_status(&context).unwrap_or_else(|| panic!("{context}"));
@@ -9128,7 +11137,7 @@ async fn a_branch_switched_outside_the_ide_is_noticed_once_on_the_plate() {
         "{plate}"
     );
     let again = actor
-        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let again = actor.settle(&fixture, again).await;
     assert!(
@@ -9196,7 +11205,7 @@ async fn configured_product_test_handle_answers_after_stop() {
         .await;
     assert_eq!(detail["state"], "unavailable", "{detail}");
     let context = actor
-        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     assert_eq!(context["state"], "unavailable", "{context}");
     actor.mcp.close().await;
@@ -9237,7 +11246,7 @@ async fn configured_product_test_status_repeats_after_output_is_paged() {
         run["text"]
             .as_str()
             .unwrap()
-            .contains("output (tail):\nretained-output"),
+            .contains("output (tail):\n    retained-output"),
         "{run}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -9269,12 +11278,44 @@ async fn configured_product_test_status_repeats_after_output_is_paged() {
     daemon.wait().await.unwrap();
 }
 
-/// Builds the fixture for `ide.test {symbol}`: a real rust-analyzer provider (through a wrapper
-/// script so the accepted executable stays fixture-owned), one method `FileFlag::is_file`, and one
-/// integration test referencing it. The daemon is not started; every caller starts its own.
-fn symbol_test_fixture() -> ProductFixture {
-    use std::os::unix::fs::PermissionsExt;
+/// Measures the prepared Linux analyzer's reported identity; macOS retains the accepted fixture.
+fn real_rust_analyzer_identity() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let analyzer =
+            std::env::var("AGENT_IDE_RUST_ANALYZER").expect("prepared rust-analyzer path");
+        let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").expect("prepared Rust toolchain");
+        let toolchain_dir = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+            .expect("prepared Rust toolchain directory");
+        assert!(std::path::Path::new(&analyzer).is_absolute());
+        assert!(std::path::Path::new(&toolchain_dir).is_absolute());
+        let output = std::process::Command::new(&analyzer)
+            .arg("--version")
+            .env("RUSTUP_TOOLCHAIN", &toolchain)
+            .output()
+            .expect("measure prepared rust-analyzer version");
+        assert!(
+            output.status.success(),
+            "prepared rust-analyzer --version failed"
+        );
+        let identity = String::from_utf8(output.stdout).expect("rust-analyzer version is UTF-8");
+        let identity = identity.trim_end();
+        assert!(
+            identity.starts_with("rust-analyzer 1.98.1 ") && !identity.contains('\n'),
+            "unexpected rust-analyzer version: {identity}"
+        );
+        identity.to_owned()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".to_owned()
+    }
+}
 
+/// Builds the fixture for `ide.test {symbol}` with the accepted prepared rust-analyzer directly,
+/// one method `FileFlag::is_file`, and one integration test referencing it. The daemon is not
+/// started; every caller starts its own.
+fn symbol_test_fixture() -> ProductFixture {
     let toolchain_dir = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
         .unwrap_or_else(|_| "/Users/pluto/.rustup/toolchains/1.98.1-aarch64-apple-darwin".into());
     let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER")
@@ -9287,18 +11328,8 @@ fn symbol_test_fixture() -> ProductFixture {
             .into_owned()
     });
     let fixture = ProductFixture::new(json!([]));
-    let wrapper = fixture.base.join("rust-provider");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nexec '{}' \"$@\"\n",
-            analyzer.replace('\'', "'\\''")
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let providers = json!([{
-        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "executable":accepted_program(&analyzer, &real_rust_analyzer_identity()),
         "settings":"rust_cache_priming_disabled_v1",
         "toolchain":toolchain,
         "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
@@ -9575,7 +11606,7 @@ async fn configured_product_symbol_card_answers_requested_callees() {
     let work = card(&mut actor, "src/lib.rs#Service/work").await;
     let work_text = work["text"].as_str().unwrap_or_default();
     assert!(
-        work_text.contains("callees: 1\n  src/lib.rs#Service/helper  src/lib.rs:4\n"),
+        work_text.contains("callees: 1\n  src/lib.rs#Service/helper (L4)\n"),
         "the method's callee must be listed: {work_text}"
     );
     let idle = card(&mut actor, "src/lib.rs#idle").await;
@@ -9585,6 +11616,56 @@ async fn configured_product_symbol_card_answers_requested_callees() {
         "an answered zero must be stated, not omitted: {idle_text}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// The first `ide.symbol` and `ide.graph` calls on a cold Rust worktree never answer `pending`
+/// (symbol-graph-item r2 §4): while the real rust-analyzer indexes they answer at once with an
+/// `approximate:` answer whose `detail_ref` later settles to the precise one; a server that is
+/// already ready answers precisely. The first answer arrives well inside the inline window.
+#[tokio::test]
+async fn configured_product_cold_rust_symbol_and_graph_never_answer_pending() {
+    let fixture = graph_test_fixture();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "cold-approximate").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"cold-approximate"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for (tool, arguments, precise) in [
+        ("ide.symbol", json!({"symbol":"src/lib.rs#c"}), "symbol: c"),
+        (
+            "ide.graph",
+            json!({"symbol":"src/lib.rs#c","direction":"callers","depth":1}),
+            "graph: callers of src/lib.rs#c",
+        ),
+    ] {
+        let asked = std::time::Instant::now();
+        let first = actor.call(&fixture, tool, arguments).await;
+        let elapsed = asked.elapsed();
+        assert_ne!(first["state"], "pending", "{tool}: {first}");
+        assert!(elapsed < Duration::from_secs(8), "{tool}: {elapsed:?}");
+        let text = first["text"].as_str().unwrap_or_default().to_owned();
+        if text.starts_with("approximate: ") {
+            assert!(
+                text.contains(
+                    "the precise answer is retained under its reference; Bridge delivers it automatically"
+                ),
+                "{text}"
+            );
+        }
+        let settled = actor.settle(&fixture, first).await;
+        let settled = settled["text"].as_str().unwrap_or_default();
+        assert!(settled.starts_with(precise), "{tool}: {settled}");
+    }
+    let stop = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stop).await["kind"], "stop");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
@@ -9630,7 +11711,7 @@ async fn configured_product_symbol_card_answers_callees_alongside_default_caller
     let reply = actor.settle(&fixture, reply).await;
     let text = reply["text"].as_str().unwrap_or_default();
     assert!(
-        text.contains("callees: 1\n  src/lib.rs#Service/helper  src/lib.rs:4\n"),
+        text.contains("callees: 1\n  src/lib.rs#Service/helper (L4)\n"),
         "the callee must still be listed with default callers requested too: {text}"
     );
     assert!(
@@ -9689,6 +11770,380 @@ async fn configured_product_outline_kinds_filter_keeps_containers_and_states_the
     assert!(
         text.contains("showing") && text.contains("by kinds fn,method"),
         "the footer must state the cut: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A source whose every line has an address: header (1-2), imports (3), `value` (5-7), `caller`
+/// (8-10), `Service` (12) and its impl with `work` (14) and `idle` (15). The address tests below
+/// share it (symbol-address-v1).
+const ADDRESS_SOURCE: &str = "//! Crate docs.\n\nuse std::fmt;\n\npub fn value() -> i32 {\n    7\n}\npub fn caller() -> i32 {\n    value()\n}\n\npub struct Service;\nimpl Service {\n    pub fn work(&self) -> bool { true }\n    pub fn idle(&self) {}\n}\n";
+
+/// The outline lists regions with their addresses, `kinds: region` lists only them, `path:line`
+/// (relative and absolute) resolves to the enclosing symbol, a line in a region names the region,
+/// and an unknown member answers `unknown_symbol` with `near:` addresses (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_address_outline_path_line_and_near() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(fixture.root.join("src/lib.rs"), ADDRESS_SOURCE).unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "address fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "address-outline").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"address-outline-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let reply = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    let reply = actor.settle(&fixture, reply).await;
+    let text = reply["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with("1–2 src/lib.rs#@header\n"), "{text}");
+    assert!(text.contains("\n3 src/lib.rs#@imports\n"), "{text}");
+    assert!(
+        text.contains(" src/lib.rs#value  pub fn value() -> i32"),
+        "{text}"
+    );
+    assert!(text.contains(" src/lib.rs#Service/work  "), "{text}");
+    assert!(
+        !text.contains(" symbols"),
+        "unfiltered outline has no redundant counts: {text}"
+    );
+
+    let reply = actor
+        .call(
+            &fixture,
+            "ide.outline",
+            json!({"path":"src/lib.rs","kinds":"region"}),
+        )
+        .await;
+    let reply = actor.settle(&fixture, reply).await;
+    let text = reply["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("src/lib.rs#@header") && text.contains("src/lib.rs#@imports"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("pub fn value") && text.contains("by kinds region"),
+        "kinds: region lists only regions and states the cut: {text}"
+    );
+
+    let absolute = format!("{}:6", fixture.root.join("src/lib.rs").display());
+    for location in ["src/lib.rs:9", absolute.as_str()] {
+        let reply = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"symbol":location,"usages":false,"callers":0}),
+            )
+            .await;
+        let reply = actor.settle(&fixture, reply).await;
+        let text = reply["text"].as_str().unwrap_or_default();
+        let expected = if location == "src/lib.rs:9" {
+            "symbol: caller — fn, src/lib.rs#caller"
+        } else {
+            "symbol: value — fn, src/lib.rs#value"
+        };
+        assert!(text.contains(expected), "{location}: {reply}");
+    }
+    // The refusal text (not the settled structured value, which carries only the code) names the
+    // region and the near addresses.
+    let region = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.symbol",
+        json!({"symbol":"src/lib.rs:3","usages":false,"callers":0}),
+    )
+    .await;
+    let (region, region_text) = batch_settle_with_text(&mut actor, &fixture, region).await;
+    assert_eq!(region["code"], "unknown_symbol", "{region}");
+    assert!(
+        region_text.contains("src/lib.rs#@imports"),
+        "a line in a region names the region address: {region_text}"
+    );
+
+    let near = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.symbol",
+        json!({"symbol":"src/lib.rs#Service/wrok"}),
+    )
+    .await;
+    let (near, near_text) = batch_settle_with_text(&mut actor, &fixture, near).await;
+    assert_eq!(near["code"], "unknown_symbol", "{near}");
+    assert!(
+        near_text.starts_with("No symbol matches the requested address.\nRepair: ")
+            && near_text.contains("src/lib.rs#Service/work"),
+        "an unknown member lists the addresses near it: {near_text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A changed hunk is preceded by `@ <address> (L<line>)` of its first changed line, and a deleted
+/// file by `@ <path> (deleted)` (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_diff_hunks_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("src/lib.rs"), ADDRESS_SOURCE).unwrap();
+    std::fs::write(fixture.root.join("src/gone.rs"), "pub fn gone() {}\n").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "src/gone.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "diff address fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "diff-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"diff-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        ADDRESS_SOURCE.replace("    7\n", "    8\n"),
+    )
+    .unwrap();
+    std::fs::remove_file(fixture.root.join("src/gone.rs")).unwrap();
+    let diff = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert!(text.contains("\n@ src/lib.rs#value:2 (L6)\n"), "{text}");
+    assert!(text.contains("\n@ src/gone.rs (deleted)\n"), "{text}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Pages of a long diff reached through `ide.inspect` carry the same `@ address (L..)` lines as
+/// page 1 (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_later_diff_pages_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    let functions = |value: i32| -> String {
+        (0..40)
+            .map(|n| {
+                format!(
+                    "pub fn f{n}() -> i32 {{\n    {value}\n}}\n{}",
+                    "\n".repeat(8)
+                )
+            })
+            .collect()
+    };
+    std::fs::write(fixture.root.join("src/lib.rs"), functions(1)).unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "many functions"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "diff-pages-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"diff-pages-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    std::fs::write(fixture.root.join("src/lib.rs"), functions(2)).unwrap();
+    let first = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let first = actor.settle(&fixture, first).await;
+    assert_eq!(first["continuation"], true, "{first}");
+    assert!(
+        first["text"]
+            .as_str()
+            .unwrap()
+            .contains("\n@ src/lib.rs#f0:2 (L2)\n"),
+        "{first}"
+    );
+    let reference = first["detail_ref"].as_str().unwrap().to_owned();
+    let mut later = String::new();
+    for _ in 0..6 {
+        let page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+        let page = actor.settle(&fixture, page).await;
+        later.push_str(page["text"].as_str().unwrap_or_default());
+        if page["continuation"] != true {
+            break;
+        }
+    }
+    assert!(later.contains("\n@ src/lib.rs#f39:2 (L"), "{later}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Name-index usage rows, name-card definitions and ambiguity candidates of a style name carry
+/// the addresses of their lines (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_name_cards_and_index_usages_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("styles.css"),
+        ".btn {\n  color: red;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("index.html"),
+        "<main id=\"app\">\n<button class=\"btn\">Save</button>\n</main>\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("app.py"), "def btn():\n    return 1\n").unwrap();
+    fixture.git(&["add", "--", "styles.css", "index.html", "app.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "name card fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "name-card-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"name-card-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let card = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":".btn"}))
+        .await;
+    let card = actor.settle(&fixture, card).await;
+    let text = card["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("styles.css#.btn (L1)  [css] .btn"),
+        "the definition row carries its address: {text}"
+    );
+    assert!(
+        text.contains("index.html#")
+            && text
+                .lines()
+                .any(|line| line.contains("(L2)") && line.contains("<button class=\"btn\">")),
+        "the index usage row carries its address: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Project problems rows carry the position address of their line (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_problems_rows_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let cargo = home.join(".rustup/toolchains/fake/bin/cargo");
+    let script = r#"#!/bin/sh
+for entry in "1:5" "2:9" "3:14"; do
+  n=${entry%%:*}
+  line=${entry##*:}
+  printf '{"reason":"compiler-message","package_id":"fixture","message":{"level":"error","message":"fake %s","code":null,"spans":[{"file_name":"src/lib.rs","is_primary":true,"line_start":%s,"column_start":1}]}}\n' "$n" "$line"
+done
+printf '{"reason":"compiler-artifact","package_id":"fixture"}\n'
+printf '{"reason":"build-finished","success":true}\n'
+"#;
+    std::fs::write(&cargo, script).unwrap();
+    std::fs::write(fixture.root.join("src/lib.rs"), ADDRESS_SOURCE).unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "problem address fixture"]);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "problem-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"problem-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let text = loop {
+        let problems = actor
+            .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
+            .await;
+        let problems = actor.settle(&fixture, problems).await;
+        let text = problems["text"].as_str().unwrap_or_default().to_owned();
+        if text.contains("rust: ready; errors: 3") {
+            break text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial check did not settle: {problems}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    for row in [
+        "src/lib.rs:5:1 src/lib.rs#value:1 (L5) error fake 1",
+        "src/lib.rs:9:1 src/lib.rs#caller:2 (L9) error fake 2",
+        "src/lib.rs:14:1 src/lib.rs#Service/work:1 (L14) error fake 3",
+    ] {
+        assert!(text.contains(row), "{row}\n{text}");
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A failing test's assertion site prints as the test's position address with the absolute line
+/// (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_test_failures_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    configure_prepared_rust_checks(&fixture);
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fails() { assert_eq!(2 + 2, 5); }\n}\n",
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "test-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"test-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    actor
+        .call(&fixture, "ide.test", json!({"path":"src/lib.rs"}))
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let completed = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture tests did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        if status["text"]
+            .as_str()
+            .unwrap()
+            .contains("0 passed, 1 failed")
+        {
+            break status;
+        }
+    };
+    let text = completed["text"].as_str().unwrap();
+    assert!(text.contains("FAIL tests::fails"), "{text}");
+    assert!(
+        text.contains("src/lib.rs#tests/fails:2 (L4)"),
+        "the assertion site is the test's position address with its absolute line: {text}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
@@ -9767,14 +12222,13 @@ async fn configured_product_batch_read_then_edit_reports_landings_and_bytes() {
     let edit = actor.settle(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     let note = edit["note"].as_str().unwrap_or_default();
+    // The changed lines are named by address (`src/util.rs#second (L5-7)` when the file's map
+    // is available, `src/util.rs:5-7 (L5-7)` otherwise) with their absolute lines.
     assert!(
-        note.contains("change 1: lines 1 replaced (now 1)"),
+        note.contains("src/util.rs") && note.contains("(L1)  replaced (1 lines → 1)"),
         "{edit}"
     );
-    assert!(
-        note.contains("change 2: old text at line 5 replaced (now 5–7)"),
-        "{edit}"
-    );
+    assert!(note.contains("(L5-7)  replaced (3 lines → 3)"), "{edit}");
     assert_eq!(
         std::fs::read(fixture.root.join("src/util.rs")).unwrap(),
         b"// changed\npub fn utility() -> i32 {\n    2\n}\npub fn second() -> i32 {\n    42\n}\n"
@@ -9887,7 +12341,9 @@ async fn batch_call_with_text(
     (reply["result"]["structuredContent"].clone(), text)
 }
 
-/// [`ProductActor::settle`] for calls whose compact text must be asserted too.
+/// [`ProductActor::settle`] for calls whose compact text must be asserted too. A pending
+/// diagnostic lookup re-enters the same pending loop instead of escaping as a terminal edit;
+/// the existing deadline and poll ceiling apply to the whole settlement.
 async fn batch_settle_with_text(
     actor: &mut ProductActor,
     fixture: &ProductFixture,
@@ -9896,13 +12352,22 @@ async fn batch_settle_with_text(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
     let mut polls = 0;
     let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
-    while reply.0["state"] == "pending" {
+    loop {
+        let reference = if reply.0["state"] == "pending" {
+            reply.0["detail_ref"].as_str().unwrap().to_owned()
+        } else if reply.0["state"] == "edit" && reply.0["diagnostics"]["state"] == "pending" {
+            reply.0["diagnostics"]["detail_ref"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        } else {
+            return reply;
+        };
         assert!(
             tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
             "product operation did not settle: {}",
             reply.0
         );
-        let reference = reply.0["detail_ref"].as_str().unwrap().to_owned();
         tokio::time::sleep(delay).await;
         polls += 1;
         reply = batch_call_with_text(
@@ -9914,22 +12379,53 @@ async fn batch_settle_with_text(
         .await;
         delay = delay.saturating_mul(2).min(PRODUCT_SETTLE_MAX_DELAY);
     }
-    reply
 }
 
-/// Starts one actor over `fixture` and warms the analyzer until `path`'s outline answers from
-/// the live server, so no later reply carries the loading-time `outline: from source` note.
+/// An edit reply whose diagnostics are still `pending` settled through its own reference
+/// (symbol-read-edit-v1 §3.3); any other reply is returned unchanged.
+async fn settle_edit_check(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    mut edit: Value,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    while edit["state"] == "edit" && edit["diagnostics"]["state"] == "pending" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "edit check did not settle: {edit}"
+        );
+        let reference = edit["diagnostics"]["detail_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        tokio::time::sleep(PRODUCT_SETTLE_INITIAL_DELAY).await;
+        let next = actor
+            .call(fixture, "ide.inspect", json!({"detail_ref":reference}))
+            .await;
+        let next = actor.settle(fixture, next).await;
+        if next["state"] == "edit" {
+            edit = next;
+        }
+    }
+    edit
+}
+
+/// Starts one actor over `fixture` and warms its Rust function's semantic provider.
+/// `path` names a Rust fixture with a `fn` declaration; source outlines do not start providers.
 async fn batch_started_actor(
     fixture: &ProductFixture,
     name: &'static str,
     path: &str,
 ) -> ProductActor {
     let mut actor = ProductActor::new(fixture, name).await;
-    let started = actor
-        .call(fixture, "ide.start", json!({"activation_id":name}))
+    let raw = actor
+        .call_raw(fixture, "ide.start", json!({"activation_id":name}))
         .await;
-    assert_eq!(actor.settle(fixture, started).await["kind"], "activation");
-    batch_wait_semantic_outline(&mut actor, fixture, path).await;
+    let text = raw["result"]["content"][0]["text"].as_str().unwrap_or("");
+    let started = raw["result"]["structuredContent"].clone();
+    let started = actor.settle(fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}; {text}");
+    batch_wait_semantic_provider(&mut actor, fixture, path).await;
     actor
 }
 
@@ -9945,22 +12441,30 @@ fn batch_without_status_plate(text: &str) -> &str {
     }
 }
 
-/// Waits until `path`'s outline answers from the live server, not the loading-time source
-/// outline, so symbol-addressed edits never carry the `outline: from source` note.
-async fn batch_wait_semantic_outline(
+/// Explicitly warms the semantic provider for tests that require live symbol/rename behavior.
+/// `path` names a Rust fixture containing a function declaration. Query its name, since a
+/// comment/whitespace position has no semantic identifier and cannot start a provider.
+/// Source outlines do not start providers; the existing sixty-second ceiling bounds readiness.
+async fn batch_wait_semantic_provider(
     actor: &mut ProductActor,
     fixture: &ProductFixture,
     path: &str,
 ) {
+    let source = std::fs::read_to_string(fixture.root.join(path)).unwrap();
+    let offset = source.find("fn ").expect("Rust function fixture") + 3;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let outline = actor
-            .call(fixture, "ide.outline", json!({"path":path}))
+            .call(
+                fixture,
+                "ide.symbol",
+                json!({"path":path,"byte_offset":offset}),
+            )
             .await;
         let settled = actor.settle(fixture, outline).await;
-        assert_eq!(settled["kind"], "outline", "{settled}");
+        assert_eq!(settled["kind"], "symbol", "{settled}");
         let text = settled["text"].as_str().unwrap_or_default();
-        if !text.contains("outline: from source") {
+        if text.contains("mode: semantic") {
             return;
         }
         assert!(
@@ -9976,8 +12480,11 @@ async fn batch_wait_semantic_outline(
 /// project checks can run at all (a Seatbelt-denied host answers `unknown` for every edit).
 fn batch_diagnostics_segment(edit: &Value) -> String {
     match edit["diagnostics"]["state"].as_str().unwrap_or_default() {
-        "current_clean" => "diagnostics: current_clean. Next: use ide.diff".to_owned(),
-        "unknown" => "diagnostics: unknown. Next: use ide.context with kind problems".to_owned(),
+        "current_clean" => "diagnostics: current_clean".to_owned(),
+        "unknown" => {
+            "diagnostics: unknown (ide.inspect {\"kind\":\"problems\"} shows the project check)"
+                .to_owned()
+        }
         "not_analysed" => format!(
             "diagnostics: not_analysed ({})",
             edit["diagnostics"]["reason"].as_str().unwrap_or_default()
@@ -9986,13 +12493,745 @@ fn batch_diagnostics_segment(edit: &Value) -> String {
     }
 }
 
+/// Full-file, line, change, file-list and address edits share canonical containment for native
+/// absolute spellings; every outside/symlink escape refuses without changing source bytes.
+#[tokio::test]
+async fn configured_product_edit_native_absolute_shapes_share_containment() {
+    let content = "pub fn first() -> i32 {\n    1\n}\n";
+    let fixture = batch_edit_fixture(content);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "native-edit-shapes", "src/batch.rs").await;
+    let outside = fixture.base.join("shape-outside.rs");
+    std::fs::write(&outside, content).unwrap();
+    std::os::unix::fs::symlink(&fixture.base, fixture.root.join("src/shape-escape")).unwrap();
+    let paths = [
+        format!("{}/src/./batch.rs", fixture.root.display()),
+        format!("{}/src/../src/batch.rs", fixture.root.display()),
+        format!("{}//src//batch.rs", fixture.root.display()),
+        outside.display().to_string(),
+        format!(
+            "{}/src/shape-escape/../shape-denied.rs",
+            fixture.root.display()
+        ),
+    ];
+    for (index, path) in paths.into_iter().enumerate() {
+        let symbol = format!("{path}#first");
+        let calls = [
+            json!({"path":path,"content":content}),
+            json!({"path":path,"lines":"1-3","content":content}),
+            json!({"path":path,"changes":[{"old":"1","new":"1"}]}),
+            json!({"files":[{"path":path,"content":content}]}),
+            json!({"symbol":symbol,"content":content}),
+            json!({"path":path,"changes":[{"symbol":symbol,"content":content}]}),
+            json!({"path":path,"changes":[{"old":"1","new":"1","within":symbol}]}),
+        ];
+        for (form, mut parameters) in calls.into_iter().enumerate() {
+            parameters["operation_id"] = json!(format!("native-shape-{index}-{form}"));
+            let reply = batch_call_with_text(&mut actor, &fixture, "ide.edit", parameters).await;
+            let (reply, text) = batch_settle_with_text(&mut actor, &fixture, reply).await;
+            if index < 3 {
+                assert!(
+                    matches!(reply["state"].as_str(), Some("edit" | "edit_batch")),
+                    "{reply}: {text}"
+                );
+            } else {
+                assert_eq!(reply["code"], "edit_refused", "{reply}: {text}");
+                assert!(text.contains("outside the worktree"), "{reply}: {text}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/batch.rs")).unwrap(),
+                content
+            );
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), content);
+            assert!(!fixture.base.join("shape-denied.rs").exists());
+        }
+        if index < 3 {
+            let read = actor
+                .call(&fixture, "ide.read", json!({"path":"src/batch.rs"}))
+                .await;
+            let read = actor.settle(&fixture, read).await;
+            let reference = read["detail_ref"].as_str().expect("fresh source reference");
+            let reply = actor
+                .call(
+                    &fixture,
+                    "ide.edit",
+                    json!({
+                        "operation_id":format!("native-shape-source-{index}"),"path":path,
+                        "source_ref":reference,"content":content
+                    }),
+                )
+                .await;
+            let reply = actor.settle(&fixture, reply).await;
+            assert_eq!(reply["state"], "edit", "{reply}");
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/batch.rs")).unwrap(),
+                content
+            );
+        }
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A complete batch fences existing and future filesystem aliases (including parent aliases)
+/// before an otherwise valid first source changes; distinct future creates still succeed.
+#[tokio::test]
+async fn configured_product_edit_batch_native_aliases_refuse_before_source_writes() {
+    let content = "pub fn first() -> i32 {\n    1\n}\n";
+    let fixture = batch_edit_fixture(content);
+    std::fs::write(fixture.root.join("src/Existing.rs"), content).unwrap();
+    std::fs::write(fixture.root.join("src/é.rs"), content).unwrap();
+    let insensitive = std::fs::metadata(fixture.root.join("src/existing.rs")).is_ok();
+    let normalization_insensitive = std::fs::metadata(fixture.root.join("src/e\u{301}.rs")).is_ok();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "batch-native-aliases", "src/batch.rs").await;
+    for (case, pair, collides, reason) in [
+        (
+            "existing",
+            ["src/Existing.rs", "src/existing.rs"],
+            insensitive,
+            "repeated_file:",
+        ),
+        (
+            "future",
+            ["src/Planned/New.rs", "src/planned/new.rs"],
+            insensitive,
+            "repeated_file:",
+        ),
+        (
+            "parent",
+            ["src/Future", "src/future/child.rs"],
+            insensitive,
+            "future_file_parent:",
+        ),
+        (
+            "unicode",
+            ["src/new-é.rs", "src/new-e\u{301}.rs"],
+            normalization_insensitive,
+            "repeated_file:",
+        ),
+        (
+            "unicode-parent",
+            ["src/Parent-é", "src/Parent-e\u{301}/child.rs"],
+            normalization_insensitive,
+            "future_file_parent:",
+        ),
+    ] {
+        if !collides {
+            continue;
+        }
+        for reversed in [false, true] {
+            let mut aliases = pair.map(|path| json!({"path":path,"content":"pub fn alias() {}\n"}));
+            if reversed {
+                aliases.reverse();
+            }
+            let files = vec![
+                json!({"path":"src/batch.rs","content":"pub fn must_not_write() {}\n"}),
+                aliases[0].clone(),
+                aliases[1].clone(),
+            ];
+            let reply = batch_call_with_text(
+                &mut actor,
+                &fixture,
+                "ide.edit",
+                json!({
+                    "operation_id":format!("native-alias-{case}-{reversed}"),"files":files
+                }),
+            )
+            .await;
+            let (reply, text) = batch_settle_with_text(&mut actor, &fixture, reply).await;
+            assert_eq!(reply["code"], "edit_refused", "{reply}: {text}");
+            assert!(text.contains(reason), "{reply}: {text}");
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/batch.rs")).unwrap(),
+                content
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("src/Existing.rs")).unwrap(),
+                content
+            );
+            assert!(!fixture.root.join("src/Planned").exists());
+            assert!(!fixture.root.join("src/Future").exists());
+            assert!(!fixture.root.join("src/new-é.rs").exists());
+            assert!(!fixture.root.join("src/Parent-é").exists());
+        }
+    }
+    let reply = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"native-distinct-future","files":[
+                {"path":"src/distinct/one.rs","create":true,"content":"pub fn one() {}\n"},
+                {"path":"src/distinct/two.rs","create":true,"content":"pub fn two() {}\n"}
+            ]
+        }),
+    )
+    .await;
+    let (reply, text) = batch_settle_with_text(&mut actor, &fixture, reply).await;
+    assert_eq!(reply["state"], "edit_batch", "{reply}: {text}");
+    assert!(text.contains("applied 2 of 2 files"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/distinct/one.rs")).unwrap(),
+        "pub fn one() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/distinct/two.rs")).unwrap(),
+        "pub fn two() {}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Replays absolute apply_patch headers and create-parent failures through the product binary.
+///
+/// Canonical in-worktree absolute headers and nested creates must apply. An absolute outside path
+/// or a symlink escape returns the outside-root reason. For file-list edits, an unwritable parent
+/// or outside target refuses the entire batch before either of its other files is written.
+#[tokio::test]
+async fn configured_product_edit_normalizes_absolute_patch_paths_and_preflights_batches() {
+    let batch = "pub fn first() -> i32 {\n    1\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "edit-path-preflight", "src/batch.rs").await;
+    let absolute_update = fixture.root.join("src/batch.rs");
+    let absolute_nested = fixture.root.join("src/new/deeper/added.rs");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-    1\n+    2\n*** Add File: {}\n+pub fn nested() {{}}\n*** End Patch",
+        absolute_update.display(),
+        absolute_nested.display()
+    );
+    let patched = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"absolute-patch","patch":patch.clone()}),
+    )
+    .await;
+    let (patched, patched_text) = batch_settle_with_text(&mut actor, &fixture, patched).await;
+    assert_eq!(patched["state"], "edit_batch", "{patched}");
+    assert!(batch_without_status_plate(&patched_text).starts_with("edit: applied 2 of 2 files"));
+    assert_eq!(
+        std::fs::read_to_string(&absolute_nested).unwrap(),
+        "pub fn nested() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&absolute_update).unwrap(),
+        "pub fn first() -> i32 {\n    2\n}\n"
+    );
+
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&absolute_update).unwrap());
+    let replay = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"absolute-patch","patch":patch}),
+        )
+        .await;
+    let replay = actor.settle(&fixture, replay).await;
+    assert_eq!(replay["outcome"], "applied", "{replay}");
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&absolute_update).unwrap()),
+        inode,
+        "a same-id patch never replaces the file twice"
+    );
+    let conflict = actor.call(&fixture, "ide.edit", json!({"operation_id":"absolute-patch","patch":"*** Begin Patch\n*** Add File: src/conflict.rs\n+pub fn conflict() {}\n*** End Patch"})).await;
+    let conflict = actor.settle(&fixture, conflict).await;
+    assert_eq!(conflict["outcome"], "conflicting_duplicate", "{conflict}");
+    assert!(!fixture.root.join("src/conflict.rs").exists());
+
+    let alias = fixture.base.join("worktree-alias");
+    std::os::unix::fs::symlink(&fixture.root, &alias).unwrap();
+    let aliased_file = alias.join("src/batch.rs");
+    let alias_patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-    2\n+    3\n*** End Patch",
+        aliased_file.display()
+    );
+    let edited_alias = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"absolute-canonical-alias","patch":alias_patch}),
+    )
+    .await;
+    let (edited_alias, edited_alias_text) =
+        batch_settle_with_text(&mut actor, &fixture, edited_alias).await;
+    assert_eq!(edited_alias["state"], "edit_batch", "{edited_alias}");
+    assert!(
+        batch_without_status_plate(&edited_alias_text).starts_with("edit: applied 1 of 1 files"),
+        "{edited_alias_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&absolute_update).unwrap(),
+        "pub fn first() -> i32 {\n    3\n}\n"
+    );
+
+    let outside = fixture.base.join("symlink-outside.rs");
+    std::fs::write(&outside, "pub fn outside() {}\n").unwrap();
+    let escape = fixture.root.join("src/symlink-escape.rs");
+    std::os::unix::fs::symlink(&outside, &escape).unwrap();
+    let escape_patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n+pub fn injected() {{}}\n*** End Patch",
+        escape.display()
+    );
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"absolute-symlink-escape","patch":escape_patch}),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("use a worktree-relative path"),
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "pub fn outside() {}\n"
+    );
+
+    let outside = fixture.base.join("outside.rs");
+    let outside_patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n+pub fn outside() {{}}\n*** End Patch",
+        outside.display()
+    );
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"outside-patch","patch":outside_patch}),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("use a worktree-relative path"),
+        "{refused_text}; structured={refused}"
+    );
+    assert!(!outside.exists());
+
+    let locked = fixture.root.join("src/locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let first = fixture.root.join("src/first-must-not-write.rs");
+    let locked_file = locked.join("blocked.rs");
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"unwritable-batch",
+            "files":[
+                {"path":"src/first-must-not-write.rs","content":"pub fn first() {}\n"},
+                {"path":locked_file.display().to_string(),"content":"pub fn blocked() {}\n"}
+            ]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("src/locked/blocked.rs"),
+        "{refused}"
+    );
+    assert!(
+        !first.exists(),
+        "the batch must be refused before the first file write"
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let outside_file = fixture.base.join("outside-batch.rs");
+    let first = fixture.root.join("src/first-must-not-write-either.rs");
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"outside-batch",
+            "files":[
+                {"path":"src/first-must-not-write-either.rs","content":"pub fn first() {}\n"},
+                {"path":outside_file.display().to_string(),"content":"pub fn outside() {}\n"}
+            ]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        batch_without_status_plate(&refused_text).contains("use a worktree-relative path"),
+        "{refused_text}; structured={refused}"
+    );
+    assert!(!first.exists());
+    assert!(!outside_file.exists());
+
+    // Every public path form reaches the same normalization, including whole-file content.
+    let absolute_content = "pub fn first() -> i32 {\n    4\n}\n";
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-whole-file", "path":absolute_update.display().to_string(),
+                "content":absolute_content
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let created = actor.call(&fixture, "ide.edit", json!({
+        "operation_id":"absolute-whole-create", "path":fixture.root.join("src/plain/deep/created.rs").display().to_string(),
+        "content":"pub fn created() {}\n"
+    })).await;
+    let created = actor.settle(&fixture, created).await;
+    assert_eq!(created["result"]["outcome"], "created", "{created}");
+    assert!(fixture.root.join("src/plain/deep/created.rs").is_file());
+
+    for (operation, path, old, new) in [
+        (
+            "absolute-files",
+            absolute_update.display().to_string(),
+            "4",
+            "5",
+        ),
+        ("relative-files", "src/batch.rs".to_owned(), "5", "6"),
+    ] {
+        let edited = actor.call(&fixture, "ide.edit", json!({"operation_id":operation,"files":[{"path":path,"changes":[{"old":old,"new":new}]}]})).await;
+        let edited = actor.settle(&fixture, edited).await;
+        assert_eq!(edited["state"], "edit_batch", "{edited}");
+    }
+    let location = format!("{}:2", absolute_update.display());
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"absolute-location","symbol":location,"old":"6","new":"7"}),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["state"], "edit", "{edited}");
+    assert!(
+        std::fs::read_to_string(&absolute_update)
+            .unwrap()
+            .contains("7")
+    );
+
+    let read = actor
+        .call(&fixture, "ide.read", json!({"path":"src/batch.rs"}))
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-with-source", "path":absolute_update.display().to_string(),
+                "source_ref":read["detail_ref"], "content":"pub fn first() -> i32 {\n    8\n}\n"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-lines", "path":absolute_update.display().to_string(),
+                "lines":"2-2", "content":"    9"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let symbol = format!("{}#first", absolute_update.display());
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-symbol", "symbol":symbol,
+                "content":"pub fn first() -> i32 { 10 }\n"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited = actor.call(&fixture, "ide.edit", json!({
+        "operation_id":"absolute-nested-symbol", "path":absolute_update.display().to_string(),
+        "changes":[{"symbol":symbol,"content":"pub fn first() -> i32 { 11 }\n"}]
+    })).await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"absolute-within", "path":absolute_update.display().to_string(),
+                "changes":[{"old":"11","new":"12","within":symbol}]
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    let before_duplicate = std::fs::read(&absolute_update).unwrap();
+    let refused = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"absolute-relative-duplicate","files":[
+                {"path":absolute_update.display().to_string(),"content":"pub fn duplicate() {}\n"},
+                {"path":"src/batch.rs","content":"pub fn duplicate() {}\n"}
+            ]}),
+        )
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(std::fs::read(&absolute_update).unwrap(), before_duplicate);
+    for (index, path) in [
+        fixture
+            .root
+            .join("src/../src/batch.rs")
+            .display()
+            .to_string(),
+        format!("{}//src/batch.rs", fixture.root.display()),
+        fixture.root.join("src/./batch.rs").display().to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {path}\n@@\n-    12\n+    12\n*** End Patch"
+        );
+        let edited = actor
+            .call(
+                &fixture,
+                "ide.edit",
+                json!({"operation_id":format!("absolute-shape-{index}"),"patch":patch}),
+            )
+            .await;
+        let edited = actor.settle(&fixture, edited).await;
+        assert_eq!(edited["outcome"], "applied", "{edited}");
+    }
+
+    // The future file surface is checked in both orders before even a directory is created.
+    for reversed in [false, true] {
+        let mut files = vec![
+            json!({"path":"src/future-parent","create":true,"content":"parent\n"}),
+            json!({"path":"src/future-parent/child.rs","create":true,"content":"pub fn child() {}\n"}),
+        ];
+        if reversed {
+            files.reverse();
+        }
+        let refused = batch_call_with_text(
+            &mut actor,
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":format!("future-parent-{reversed}"),"files":files}),
+        )
+        .await;
+        let (refused, text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+        assert_eq!(refused["code"], "edit_refused", "{refused}");
+        assert!(text.contains("future_file_parent:"), "{text}");
+        assert!(!fixture.root.join("src/future-parent").exists());
+    }
+    let unsafe_parent = fixture.root.join("src/outside-parent");
+    std::os::unix::fs::symlink(&fixture.base, &unsafe_parent).unwrap();
+    // Resolving `..` before a symlink would incorrectly hide this actual canonical escape.
+    let escaped = unsafe_parent.join("../must-not-create.rs");
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: {}\n+pub fn denied() {{}}\n*** End Patch",
+        escaped.display()
+    );
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"symlink-before-parent-dotdot","patch":patch}),
+    )
+    .await;
+    let (refused, text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(text.contains("outside the worktree"), "{text}");
+    let escaped_symbol = format!(
+        "{}#outside",
+        fixture.root.join("src/symlink-escape.rs").display()
+    );
+    let refused = actor.call(&fixture, "ide.edit", json!({"operation_id":"absolute-symbol-symlink-escape","symbol":escaped_symbol,"content":"pub fn denied() {}\n"})).await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+
+    for (index, target, reason) in [
+        (
+            0,
+            "src/outside-parent/deeper/new.rs".to_owned(),
+            "unsafe_parent:",
+        ),
+        (1, "src/symlink-escape.rs".to_owned(), "unsafe_target:"),
+        (
+            2,
+            format!("src/missing/{}/new.rs", "x".repeat(256)),
+            "name_too_long:",
+        ),
+    ] {
+        let refused = batch_call_with_text(&mut actor, &fixture, "ide.edit", json!({"operation_id":format!("predictable-path-{index}"),"files":[
+            {"path":"src/no-parent-effects/deeper/new.rs","create":true,"content":"pub fn untouched() {}\n"},
+            {"path":target,"content":"pub fn denied() {}\n"}
+        ]})).await;
+        let (refused, text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+        assert_eq!(refused["code"], "edit_refused", "{refused}");
+        assert!(text.contains(reason), "{text}");
+        assert!(!fixture.root.join("src/no-parent-effects").exists());
+    }
+
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A real daemon crash after the first patch write reports unknown, keeps the batch receipt,
+/// and resumes from proven candidate/base digests without replacing the first file twice.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn configured_product_batch_patch_crash_recovers_from_receipt_digests() {
+    let fixture = batch_edit_fixture("pub fn first() -> i32 { 1 }\n");
+    std::fs::write(
+        fixture.root.join("src/second.rs"),
+        "pub fn second() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    let (fault, _) = fault_flag(&fixture, "batch_edit_after_write_1", true);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = batch_started_actor(&fixture, "batch-patch-crash", "src/batch.rs").await;
+    let arguments = json!({"operation_id":"patch-crash-recovery","patch":
+        "*** Begin Patch\n*** Update File: src/batch.rs\n@@\n-pub fn first() -> i32 { 1 }\n+pub fn first() -> i32 { 2 }\n*** Update File: src/second.rs\n@@\n-pub fn second() -> i32 { 1 }\n+pub fn second() -> i32 { 2 }\n*** End Patch"});
+    let lost = actor.call(&fixture, "ide.edit", arguments.clone()).await;
+    let lost = actor.settle(&fixture, lost).await;
+    assert_eq!(lost["outcome"], "outcome_unknown", "{lost}");
+    let first = fixture.root.join("src/batch.rs");
+    let second = fixture.root.join("src/second.rs");
+    let committed_first = std::fs::read_to_string(&first).unwrap();
+    let original_second = std::fs::read_to_string(&second).unwrap();
+    assert!(committed_first.contains('2'));
+    assert!(
+        original_second.contains('1'),
+        "the multi-file commit was interrupted after only its first write"
+    );
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap());
+    assert_crash_only_exit(&mut daemon, &fixture).await;
+    actor.mcp.close().await;
+
+    let mut replacement = fixture.daemon().await;
+    let mut again = batch_started_actor(&fixture, "batch-patch-recovery", "src/batch.rs").await;
+    let recovered = again.call(&fixture, "ide.edit", arguments.clone()).await;
+    let recovered = again.settle(&fixture, recovered).await;
+    assert_eq!(recovered["outcome"], "applied", "{recovered}");
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), committed_first);
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap()),
+        inode
+    );
+    assert!(std::fs::read_to_string(&second).unwrap().contains('2'));
+    // A settled replay preserves newer native bytes and refuses a current-source claim.
+    std::fs::write(&first, "// native after recovery\n").unwrap();
+    let native_metadata = std::fs::metadata(&first).unwrap();
+    let second_bytes = std::fs::read(&second).unwrap();
+    let replay = again.call(&fixture, "ide.edit", arguments).await;
+    let replay = again.settle(&fixture, replay).await;
+    assert_eq!(replay["code"], "source_unavailable", "{replay}");
+    assert!(replay.get("source_ref").is_none(), "{replay}");
+    assert_eq!(
+        std::fs::metadata(&first).unwrap().modified().unwrap(),
+        native_metadata.modified().unwrap()
+    );
+    assert_eq!(std::fs::read(&second).unwrap(), second_bytes);
+    assert_eq!(
+        std::fs::read_to_string(&first).unwrap(),
+        "// native after recovery\n"
+    );
+    again.call(&fixture, "ide.stop", json!({})).await;
+    again.mcp.close().await;
+    replacement.kill().await.unwrap();
+    replacement.wait().await.unwrap();
+}
+
+/// A native edit between validation and the second write produces an honest partial receipt.
+/// Repeating the patch preserves those newer bytes and never rewrites its first committed file.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn configured_product_batch_patch_stale_member_keeps_partial_and_native_bytes() {
+    let fixture = batch_edit_fixture("pub fn first() -> i32 { 1 }\n");
+    std::fs::write(
+        fixture.root.join("src/second.rs"),
+        "pub fn second() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    let (fault, _) = fault_flag(&fixture, "batch_edit_before_write_2", true);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = batch_started_actor(&fixture, "batch-patch-partial", "src/batch.rs").await;
+    let arguments = json!({"operation_id":"patch-stale-partial","patch":
+        "*** Begin Patch\n*** Update File: src/batch.rs\n@@\n-pub fn first() -> i32 { 1 }\n+pub fn first() -> i32 { 2 }\n*** Update File: src/second.rs\n@@\n-pub fn second() -> i32 { 1 }\n+pub fn second() -> i32 { 2 }\n*** End Patch"});
+    let partial = actor.call(&fixture, "ide.edit", arguments.clone()).await;
+    let partial = actor.settle(&fixture, partial).await;
+    assert_eq!(partial["outcome"], "partial", "{partial}");
+    assert_eq!(
+        partial["files"][1]["reason"], "changed_after_validation",
+        "{partial}"
+    );
+    let first = fixture.root.join("src/batch.rs");
+    let second = fixture.root.join("src/second.rs");
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap());
+    let native = std::fs::read_to_string(&second).unwrap();
+    assert!(native.ends_with("native\n"));
+    let replay = actor.call(&fixture, "ide.edit", arguments).await;
+    let replay = actor.settle(&fixture, replay).await;
+    assert_eq!(replay["outcome"], "partial", "{replay}");
+    assert_eq!(std::fs::read_to_string(&second).unwrap(), native);
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&first).unwrap()),
+        inode
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Case 1: `old` text that matches nothing refuses the whole batch naming the change and quoting
 /// the closest line, writes nothing, and the same `operation_id` retries once the text is fixed.
 #[tokio::test]
 async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_operation_id() {
     let batch = "pub fn first() -> i32 {\n    1\n}\n\npub fn second() -> i32 {\n    2\n}\n";
     let fixture = batch_edit_fixture(batch);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    configure_prepared_rust_checks(&fixture);
+    let home = provider_home(&fixture);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = batch_started_actor(&fixture, "batch-old-miss", "src/batch.rs").await;
     let read = actor
@@ -10025,9 +13264,9 @@ async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_ope
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 2 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 2 changes refused, nothing written — \
          change 2: old text not found; closest lines 1-3; first difference at line 1: \
-         \"pub fn first() -> i32 {\". Fix the named changes and retry with the same operation_id",
+         \"pub fn first() -> i32 {\"\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -10051,12 +13290,12 @@ async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_ope
     )
     .await;
     let (retried, retried_text) = batch_settle_with_text(&mut actor, &fixture, retried).await;
-    let edit_ref = retried["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&retried_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: lines 1–3 replaced (now 1); change 2: old text at line 5 replaced (now 3–5)\n\
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#@header:1 (L1)  replaced \
+             (3 lines → 1); was:\n    1\tpub fn first() -> i32 {{\n    2\t    1\n    3\t}}\n\
+             \x20 src/batch.rs#second (L3-5)  replaced (3 lines → 3)\n\
              lines after 1 moved -2",
             batch_diagnostics_segment(&retried)
         ),
@@ -10079,7 +13318,8 @@ async fn configured_product_batch_old_ambiguous_lists_both_lines_and_within_retr
     let batch = "fn helper(value: i32) {\n    let _ = value;\n}\n\npub fn alpha() {\n    \
                  helper(0);\n}\n\npub fn beta() {\n    helper(0);\n}\n";
     let fixture = batch_edit_fixture(batch);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    configure_prepared_rust_checks(&fixture);
+    let home = provider_home(&fixture);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = batch_started_actor(&fixture, "batch-old-two", "src/batch.rs").await;
     let read = actor
@@ -10108,9 +13348,9 @@ async fn configured_product_batch_old_ambiguous_lists_both_lines_and_within_retr
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1: old text matches 2 places (lines 6, 10); add \"within\":\"<symbol>\" or \
-         more surrounding lines. Fix the named changes and retry with the same operation_id",
+         more surrounding lines\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -10131,12 +13371,11 @@ async fn configured_product_batch_old_ambiguous_lists_both_lines_and_within_retr
     )
     .await;
     let (scoped, scoped_text) = batch_settle_with_text(&mut actor, &fixture, scoped).await;
-    let edit_ref = scoped["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&scoped_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n1 change applied: \
-             change 1: old text at line 10 replaced (now 10)",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#beta:2 (L10)  replaced \
+             (1 lines → 1)",
             batch_diagnostics_segment(&scoped)
         ),
         "{scoped_text}"
@@ -10185,9 +13424,8 @@ async fn configured_product_batch_overlapping_changes_refuse_naming_both_ranges(
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 2 of 2 changes refused, nothing written — \
-         changes 1 and 2 overlap (base lines 1–2 and 2–3); merge them or narrow the ranges. \
-         Fix the named changes and retry with the same operation_id",
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  2 of 2 changes refused, nothing written — \
+         changes 1 and 2 overlap (base lines 1–2 and 2–3); merge them or narrow the ranges\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -10241,9 +13479,8 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
     assert_eq!(
         batch_without_status_plate(&edit_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: old text at line 2 replaced (now 2); change 2: lines 4 deleted\n\
-             lines after 2 moved -1",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L2)  replaced \
+             (1 lines → 1)\n  src/batch.rs#beta:1  deleted (1 lines); was:\n    4\t\nlines after 2 moved -1",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -10269,7 +13506,10 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
     .await;
     let (moved, moved_text) = batch_settle_with_text(&mut actor, &fixture, moved).await;
     assert_eq!(moved["result"]["outcome"], "stale_source", "{moved}");
-    assert!(moved_text.contains("lines_moved"), "{moved_text}");
+    assert!(
+        moved_text.contains("moved lines after line"),
+        "{moved_text}"
+    );
     let reread = actor
         .call(
             &fixture,
@@ -10299,14 +13539,14 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
     )
     .await;
     let (insert, insert_text) = batch_settle_with_text(&mut actor, &fixture, insert).await;
-    let insert_ref = insert["result"]["source_ref"].as_str().unwrap();
     assert_eq!(insert["result"]["outcome"], "replaced", "{insert}");
     assert_eq!(
         batch_without_status_plate(&insert_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {insert_ref}; {}\n2 changes applied: \
-             change 1: src/batch.rs#beta inserted before #beta (now 5–7); change 2: lines 4–6 \
-             replaced (now 9–11)\nlines after 4 moved +5",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#helper (L5-7)  inserted \
+             (3 lines)\n  src/batch.rs#beta (L9-11)  replaced (3 lines → 3); was:\n    \
+             4\tpub fn beta() -> i32 {{\n    5\t    2\n    6\t}}\n\
+             lines after 4 moved +5",
             batch_diagnostics_segment(&insert)
         ),
         "{insert_text}"
@@ -10352,9 +13592,8 @@ async fn configured_product_batch_cannot_address_a_symbol_an_earlier_change_woul
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 2 changes refused, nothing written — \
-         change 2: no symbol src/batch.rs#gamma; check ide.outline {\"path\":\"src/batch.rs\"}. \
-         Fix the named changes and retry with the same operation_id",
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 2 changes refused, nothing written — \
+         change 2: no symbol src/batch.rs#gamma; check ide.outline {\"path\":\"src/batch.rs\"}\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -10401,9 +13640,8 @@ async fn configured_product_batch_lines_past_end_refuses_naming_the_file_length(
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
-         change 1: lines 9 is past the end of src/batch.rs (7 lines); re-read the file. \
-         Fix the named changes and retry with the same operation_id",
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
+         change 1: lines 9 is past the end of src/batch.rs (7 lines); re-read the file\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -10429,7 +13667,8 @@ async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existin
     std::fs::write(fixture.root.join("src/broken.rs"), broken).unwrap();
     fixture.git(&["add", "--", "src/broken.rs"]);
     fixture.git(&["commit", "--quiet", "-m", "pre-broken fixture"]);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    configure_prepared_rust_checks(&fixture);
+    let home = provider_home(&fixture);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = batch_started_actor(&fixture, "batch-syntax", "src/batch.rs").await;
     let read = actor
@@ -10458,11 +13697,11 @@ async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existin
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1 produced a syntax error at line 5: \"unbalanced delimiters: '(' opened at \
          line 5 is never closed\" \
          (candidate lines 3-7: \"}\\n\\npub fn target( -> i32 {\\n    helper()\\n}\"); candidate \
-         not written. Fix the named changes and retry with the same operation_id",
+         not written\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -10492,24 +13731,35 @@ async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existin
     )
     .await;
     let (applied, applied_text) = batch_settle_with_text(&mut actor, &fixture, applied).await;
-    let broken_edit_ref = applied["result"]["source_ref"].as_str().unwrap();
-    assert_eq!(
-        batch_without_status_plate(&applied_text),
-        format!(
-            "edit: replaced; path src/broken.rs; source_ref {broken_edit_ref}; {}\n1 change \
-             applied: change 1: old text at line 2 replaced (now 2)\nnote: src/broken.rs already \
-             had a syntax error (line 5) before this edit; edit applied",
-            batch_diagnostics_segment(&applied)
-        ),
+    let applied_text = batch_without_status_plate(&applied_text);
+    assert!(
+        applied_text.starts_with("edit: replaced; path src/broken.rs; diagnostics: "),
         "{applied_text}"
     );
+    assert!(applied_text.ends_with("  src/broken.rs:2 (L2)  replaced (1 lines → 1)\nnote: src/broken.rs already had a syntax error (line 5) before this edit; edit applied"), "{applied_text}");
     assert!(
         matches!(
             applied["diagnostics"]["state"].as_str(),
-            Some("not_analysed" | "unknown")
+            Some("not_analysed" | "unknown" | "current_reported")
         ),
         "an undeclared file is never claimed clean: {applied}"
     );
+    if applied["diagnostics"]["state"] == "current_reported" {
+        assert!(
+            applied["diagnostics"]["delta"]
+                .as_str()
+                .unwrap()
+                .contains("project check did not analyse this file"),
+            "{applied}"
+        );
+        assert!(
+            !applied["diagnostics"]["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{applied}"
+        );
+    }
     assert_eq!(
         std::fs::read(fixture.root.join("src/broken.rs")).unwrap(),
         b"pub fn helper() -> i32 {\n    2\n}\n\npub fn target( -> i32 {\n    helper()\n}\n"
@@ -10563,10 +13813,10 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
     assert_eq!(
         batch_without_status_plate(&refused_text),
         format!(
-            "error: edit_refused (edit:refused); 2 of 3 changes refused, nothing written — \
+            "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  2 of 3 changes refused, nothing written — \
              change 2: old text not found; closest lines 1-1; first difference at line 1: \
              \"// {clipped_comment}\"; change 3: no symbol src/batch.rs#nope; check ide.outline \
-             {{\"path\":\"src/batch.rs\"}}. Fix the named changes and retry with the same operation_id"
+             {{\"path\":\"src/batch.rs\"}}\n"
         ),
         "{refused_text}"
     );
@@ -10576,7 +13826,7 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
     );
 
     // Five refusals with full-length excerpts overflow the bound: the reply is clipped at the
-    // bound (never past it) and stays a single actionable line.
+    // bound (never past it), below one bounded Repair line.
     let changes: Vec<Value> = (0..5)
         .map(|number| json!({"old":format!("// {} absent {number}", "x".repeat(40)),"new":"x"}))
         .collect();
@@ -10594,11 +13844,11 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
     .await;
     let (clipped, clipped_text) = batch_settle_with_text(&mut actor, &fixture, clipped).await;
     assert_eq!(clipped["code"], "edit_refused", "{clipped}");
-    let prefix = "error: edit_refused (edit:refused); ";
-    let suffix = ". Fix the named changes and retry with the same operation_id";
+    let prefix = "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  ";
+    let suffix = "\n";
     assert!(
         clipped_text.starts_with(
-            "error: edit_refused (edit:refused); 5 of 5 changes refused, nothing written — \
+            "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  5 of 5 changes refused, nothing written — \
              change 1: old text not found; closest lines 1-1; first difference at line 1: \""
         ),
         "{clipped_text}"
@@ -10659,7 +13909,8 @@ fn batch_python_fixture(interpreter: Option<&str>) -> ProductFixture {
 
 /// Case 8 (Python): the interpreter probe refuses a candidate Python cannot parse, exactly as
 /// the in-process Rust check does, and writes a good one; with no proven checker the same broken
-/// candidate proceeds (`Unchecked`), never blocking the edit.
+/// candidate proceeds (`Unchecked`), never blocking the edit. A valid source outline names the
+/// written function in its landing; an invalid unchecked source retains the physical line address.
 #[tokio::test]
 async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds_unchecked() {
     let interpreter = batch_python_interpreter();
@@ -10681,14 +13932,10 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let read = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"svc/app.py","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"svc/app.py"}))
         .await;
     let read = actor.settle(&fixture, read).await;
-    assert_eq!(read["kind"], "context", "{read}");
+    assert_eq!(read["kind"], "read", "{read}");
     let source_ref = read["detail_ref"].as_str().unwrap();
     let original =
         String::from_utf8(std::fs::read(fixture.root.join("svc/app.py")).unwrap()).unwrap();
@@ -10709,10 +13956,9 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1 produced a syntax error at line 5: \"invalid syntax\" (candidate lines 3-6: \
-         \"\\n\\ndef broken(:\\n    return 2\"); candidate not written. Fix the named changes \
-         and retry with the same operation_id",
+         \"\\n\\ndef broken(:\\n    return 2\"); candidate not written\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -10734,12 +13980,10 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
     .await;
     let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
     assert_eq!(written["result"]["outcome"], "replaced", "{written}");
-    let python_ref = written["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&written_text),
         format!(
-            "edit: replaced; path svc/app.py; source_ref {python_ref}; {}\n1 change applied: \
-             change 1: old text at line 5 replaced (now 5)",
+            "edit: replaced; path svc/app.py; {}\n  svc/app.py#broken:1 (L5)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&written)
         ),
         "{written_text}"
@@ -10767,11 +14011,7 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let read = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"svc/app.py","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"svc/app.py"}))
         .await;
     let read = actor.settle(&fixture, read).await;
     let source_ref = read["detail_ref"].as_str().unwrap();
@@ -10791,7 +14031,7 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
     assert_eq!(unchecked["result"]["outcome"], "replaced", "{unchecked}");
     assert_eq!(
         unchecked["note"].as_str().unwrap_or_default(),
-        "1 change applied: change 1: old text at line 5 replaced (now 5)",
+        "  svc/app.py:5 (L5)  replaced (1 lines → 1)",
         "{unchecked}"
     );
     assert!(
@@ -10851,17 +14091,13 @@ async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     // No TypeScript server launch is accepted, so symbol reads wait for a server that cannot
-    // start; the edit's `old`-text addresses need no outline, and `ide.context` mints the
+    // start; the edit's `old`-text addresses need no outline, and `ide.read` mints the
     // edit-admissible source the same way.
     let read = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"app.ts","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"app.ts"}))
         .await;
     let read = actor.settle(&fixture, read).await;
-    assert_eq!(read["kind"], "context", "{read}");
+    assert_eq!(read["kind"], "read", "{read}");
     let source_ref = read["detail_ref"].as_str().unwrap();
 
     let refused = batch_call_with_text(
@@ -10880,10 +14116,10 @@ async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1 produced a syntax error at line 5: \"Parameter declaration expected.\" \
          (candidate lines 3-7: \"}\\n\\nfunction broken( : number {\\n    return 2;\\n}\"); \
-         candidate not written. Fix the named changes and retry with the same operation_id",
+         candidate not written\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -10905,12 +14141,10 @@ async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
     .await;
     let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
     assert_eq!(written["result"]["outcome"], "replaced", "{written}");
-    let written_ref = written["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&written_text),
         format!(
-            "edit: replaced; path app.ts; source_ref {written_ref}; {}\n1 change applied: \
-             change 1: old text at line 5 replaced (now 5)",
+            "edit: replaced; path app.ts; {}\n  app.ts#renamed:1 (L5)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&written)
         ),
         "{written_text}"
@@ -10967,14 +14201,10 @@ async fn configured_product_batch_typescript_gate_uses_the_configured_package() 
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let read = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"app.ts","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"app.ts"}))
         .await;
     let read = actor.settle(&fixture, read).await;
-    assert_eq!(read["kind"], "context", "{read}");
+    assert_eq!(read["kind"], "read", "{read}");
     let source_ref = read["detail_ref"].as_str().unwrap();
 
     let refused = batch_call_with_text(
@@ -10993,10 +14223,10 @@ async fn configured_product_batch_typescript_gate_uses_the_configured_package() 
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1 produced a syntax error at line 5: \"Parameter declaration expected.\" \
          (candidate lines 3-7: \"}\\n\\nfunction broken( : number {\\n    return 2;\\n}\"); \
-         candidate not written. Fix the named changes and retry with the same operation_id",
+         candidate not written\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -11018,12 +14248,10 @@ async fn configured_product_batch_typescript_gate_uses_the_configured_package() 
     .await;
     let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
     assert_eq!(written["result"]["outcome"], "replaced", "{written}");
-    let written_ref = written["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&written_text),
         format!(
-            "edit: replaced; path app.ts; source_ref {written_ref}; {}\n1 change applied: \
-             change 1: old text at line 5 replaced (now 5)",
+            "edit: replaced; path app.ts; {}\n  app.ts#renamed:1 (L5)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&written)
         ),
         "{written_text}"
@@ -11045,7 +14273,8 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     let batch = "fn helper(value: i32) -> i32 {\n    value + 1\n}\n\npub fn alpha() -> i32 {\n    \
                  helper(1)\n}\n\npub fn beta() -> i32 {\n    helper(2)\n}\n";
     let fixture = batch_edit_fixture(batch);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    configure_prepared_rust_checks(&fixture);
+    let home = provider_home(&fixture);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = batch_started_actor(&fixture, "batch-ranges", "src/batch.rs").await;
     let read = batch_call_with_text(
@@ -11060,11 +14289,9 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     let source_ref = read["detail_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&read_text),
-        format!(
-            "src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {{\n6\t    helper(1)\n7\t}}\n\
-             src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {{\n10\t    helper(2)\n11\t}}\n\
-             source_ref: {source_ref}\n"
-        ),
+        "read: 2 items in 1 files — 2 delivered, 0 unchanged, 0 not included, 0 failed\n\
+         src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {\n6\t    helper(1)\n7\t}\n\
+         src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {\n10\t    helper(2)\n11\t}\n",
         "{read_text}"
     );
 
@@ -11084,12 +14311,12 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     )
     .await;
     let (edit, edit_text) = batch_settle_with_text(&mut actor, &fixture, edit).await;
-    let edit_ref = edit["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&edit_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: lines 6 replaced (now 6); change 2: lines 10 replaced (now 10)",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L6)  replaced \
+             (1 lines → 1); was:\n    6\t    helper(1)\n  src/batch.rs#beta:2 (L10)  \
+             replaced (1 lines → 1); was:\n    10\t    helper(2)",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -11104,11 +14331,11 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     daemon.wait().await.unwrap();
 }
 
-/// Case 10: a batch read over the reply budget names exactly what was not included and the exact
-/// call to fetch it, renders a duplicated address once, and reports an unknown symbol per item
-/// while the other blocks still arrive.
+/// Case 10: two large blocks, an unknown symbol and a duplicate are answered in ONE reply: every
+/// block whole in request order, the failure in place, the duplicate once, with no cut item, no
+/// page and no continuation.
 #[tokio::test]
-async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbol() {
+async fn configured_product_batch_read_delivers_large_blocks_whole() {
     let huge_body: String = (0..380)
         .map(|index| {
             format!(
@@ -11149,38 +14376,32 @@ async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbo
     .await;
     let (read, read_text) = batch_settle_with_text(&mut actor, &fixture, read).await;
     assert_eq!(read["kind"], "read", "{read}");
-    assert_eq!(read["truncated"], true, "{read}");
-    let source_ref = read["detail_ref"].as_str().unwrap();
-    // The delivered block renders with the same numbered gutter as every read.
-    let huge_a_end = 383usize;
-    let width = huge_a_end.to_string().len();
-    let mut expected = format!("src/big.rs#huge_a  (lines 1–{huge_a_end})\n");
-    for number in 1..=huge_a_end {
-        expected.push_str(&format!("{number:>width$}\t{}\n", lines[number - 1]));
-    }
-    expected.push_str(&format!(
-        "no such symbol: src/big.rs#missing — check ide.outline {{\"path\":\"src/big.rs\"}}\n\
-         source_ref: {source_ref}\n\
-         duplicates shown once: src/big.rs#huge_a\n\
-         not included (over the reply budget): src/big.rs#huge_b — call ide.read \
-         {{\"symbols\":[\"src/big.rs#huge_b\"]}}\n\n\
-         Output is incomplete"
-    ));
-    assert_eq!(read_text, expected, "{read_text}");
-    // The cut symbol's body is not in the reply, and the footer's exact call fetches it in full.
-    assert!(!read_text.contains("let other_159"), "{read_text}");
-    let follow = actor
-        .call(
-            &fixture,
-            "ide.read",
-            json!({"symbols":["src/big.rs#huge_b"]}),
-        )
-        .await;
-    let follow = actor.settle(&fixture, follow).await;
-    assert!(
-        follow["text"].as_str().unwrap().contains("let other_159"),
-        "{follow}"
+    assert_eq!(read["truncated"], false, "{read}");
+    assert_eq!(read["continuation"], false, "{read}");
+    let block = |name: &str, start: usize, end: usize| {
+        let count = end - start + 1;
+        let width = count.to_string().len();
+        let mut text = format!("src/big.rs#{name}  ({count} lines; file lines {start}-{end})\n");
+        for local in 1..=count {
+            text.push_str(&format!("{local:>width$}\t{}\n", lines[start + local - 2]));
+        }
+        text
+    };
+    let huge_b_start = lines
+        .iter()
+        .position(|line| *line == "pub fn huge_b() -> i32 {")
+        .expect("fixture declares huge_b")
+        + 1;
+    let expected = format!(
+        "read: 3 items in 1 files — 2 delivered, 0 unchanged, 0 not included, 1 failed\n\
+         {}no such symbol: src/big.rs#missing — check ide.outline {{\"path\":\"src/big.rs\"}}\n\
+         {}duplicates shown once: src/big.rs#huge_a\n",
+        block("huge_a", 1, 383),
+        block("huge_b", huge_b_start, lines.len()),
     );
+    assert_eq!(read["text"].as_str().unwrap(), expected);
+    assert!(read_text.contains(&expected) && !read_text.contains("Cut;"));
+    assert!(read_text.contains("let other_159"), "huge_b arrives whole");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -11193,7 +14414,8 @@ async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbo
 async fn configured_product_batch_legacy_single_change_replies_stay_byte_identical() {
     let batch = "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n";
     let fixture = batch_edit_fixture(batch);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    configure_prepared_rust_checks(&fixture);
+    let home = provider_home(&fixture);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = batch_started_actor(&fixture, "batch-legacy", "src/batch.rs").await;
 
@@ -11211,12 +14433,12 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
     )
     .await;
     let (insert, insert_text) = batch_settle_with_text(&mut actor, &fixture, insert).await;
-    let insert_ref = insert["result"]["source_ref"].as_str().unwrap();
     assert_eq!(insert["operation"], "inserted", "{insert}");
     assert_eq!(
         batch_without_status_plate(&insert_text),
         format!(
-            "edit: inserted; path src/batch.rs; source_ref {insert_ref}; {}\nlines after 4 moved +4",
+            "edit: inserted; path src/batch.rs; {}\n  src/batch.rs#added:1 (L5)  inserted \
+             (1 lines)\nlines after 4 moved +4",
             batch_diagnostics_segment(&insert)
         ),
         "{insert_text}"
@@ -11243,11 +14465,11 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
     )
     .await;
     let (replace, replace_text) = batch_settle_with_text(&mut actor, &fixture, replace).await;
-    let replace_ref = replace["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&replace_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {replace_ref}; {}",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#beta (L9-11)  replaced \
+             (3 lines → 3)",
             batch_diagnostics_segment(&replace)
         ),
         "{replace_text}"
@@ -11280,11 +14502,11 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
     )
     .await;
     let (lines, lines_text) = batch_settle_with_text(&mut actor, &fixture, lines).await;
-    let lines_ref = lines["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&lines_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {lines_ref}; {}",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L2)  replaced \
+             (1 lines → 1); was:\n    2\t    1",
             batch_diagnostics_segment(&lines)
         ),
         "{lines_text}"
@@ -11374,7 +14596,8 @@ async fn configured_product_claude_edit_replies_name_their_operation() {
     std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
     fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
     fixture.git(&["commit", "--quiet", "-m", "claude edit operation fixture"]);
-    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    configure_prepared_rust_checks(&fixture);
+    let home = provider_home(&fixture);
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = ProductActor::new(&fixture, "claude-edit-ops").await;
     let started = actor
@@ -11475,8 +14698,9 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
         .flat_map(|page| page.lines())
         .filter(|line| line.ends_with("target();"))
         .map(|line| {
-            let location = line.split_whitespace().next().unwrap();
-            location.rsplit(':').next().unwrap().parse().unwrap()
+            // `<address> (L<line>)  target();`: the absolute line is the (L..) tag.
+            let tag = line.split_once("(L").unwrap().1;
+            tag.split(')').next().unwrap().parse().unwrap()
         })
         .collect();
     lines.sort_unstable();
@@ -11492,7 +14716,7 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
     let ambiguous = actor.settle(&fixture, ambiguous).await;
     let reference = ambiguous["detail_ref"].as_str().unwrap().to_owned();
     let text = ambiguous["text"].as_str().unwrap();
-    assert!(text.contains("dup matches 22 symbols"), "{text}");
+    assert!(text.contains("\n22 candidates for dup:\n"), "{text}");
     assert!(
         text.contains(&format!("  … 2 more (ide.inspect {reference})\n")),
         "{text}"
@@ -11505,7 +14729,12 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
         rest_text.contains("; complete\ncandidates 21–22 of 22:\n"),
         "{rest_text}"
     );
-    assert_eq!(rest_text.matches("dup\n").count(), 2, "{rest_text}");
+    // Each remaining candidate row is `<address>  fn  <signature>  (lines a–b)`.
+    assert_eq!(
+        rest_text.matches("/dup  fn  pub fn dup()").count(),
+        2,
+        "{rest_text}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -11567,11 +14796,84 @@ async fn product_directory_outline_lists_files_and_rejects_escaping_symlinks() {
     daemon.wait().await.unwrap();
 }
 
+/// `ide.tree` maps the activated worktree without a language server: package descriptions from
+/// a manifest, file descriptions from module docs, zooming in by path, a file refused, and an
+/// escaping symlink refused.
+#[tokio::test]
+async fn product_tree_maps_the_worktree_with_author_descriptions() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::create_dir_all(fixture.root.join("store/src")).unwrap();
+    std::fs::write(
+        fixture.root.join("store/Cargo.toml"),
+        "[package]\nname = \"store\"\ndescription = \"Durable record store. Second sentence.\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("store/src/lib.rs"),
+        "//! Store entry points\npub fn open() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("store/src/journal.rs"),
+        "//! Append-only journal\npub fn append() {}\n",
+    )
+    .unwrap();
+    let outside = fixture.base.join("outside-tree");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, fixture.root.join("escape")).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "project-tree").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"project-tree"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let root = actor.call(&fixture, "ide.tree", json!({})).await;
+    let root = actor.settle(&fixture, root).await;
+    assert_eq!(root["kind"], "outline", "{root}");
+    let text = root["text"].as_str().unwrap();
+    assert!(text.starts_with("tree . · "), "{text}");
+    let store = text
+        .lines()
+        .find(|line| line.starts_with("store/"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(store.ends_with("Durable record store."), "{text}");
+    assert!(!text.contains("escape"), "{text}");
+    let zoomed = actor
+        .call(&fixture, "ide.tree", json!({"path":"store/src"}))
+        .await;
+    let zoomed = actor.settle(&fixture, zoomed).await;
+    let text = zoomed["text"].as_str().unwrap();
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("journal.rs") && line.ends_with("Append-only journal")),
+        "{text}"
+    );
+    let file = actor
+        .call(&fixture, "ide.tree", json!({"path":"store/src/lib.rs"}))
+        .await;
+    let file = actor.settle(&fixture, file).await;
+    assert!(file.to_string().contains("is a file"), "{file}");
+    let escaped = actor
+        .call(&fixture, "ide.tree", json!({"path":"escape"}))
+        .await;
+    assert_eq!(
+        actor.settle(&fixture, escaped).await["code"],
+        "outside_allowed_roots"
+    );
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A missing path answers `no_such_file` naming the requested path, not a bare
 /// `source_unavailable`, for both `ide.outline` and `ide.read` (T163, W6).
 #[tokio::test]
 async fn product_outline_and_read_report_no_such_file() {
     let fixture = ProductFixture::new(json!([]));
+    enable_fake_rust_checks(&fixture, &fixture.base);
     std::fs::write(fixture.root.join("real.rs"), "pub fn present() {}\n").unwrap();
     std::os::unix::fs::symlink("/etc/passwd", fixture.root.join("escape.rs")).unwrap();
     let mut daemon = fixture.daemon().await;
@@ -11608,9 +14910,9 @@ async fn product_outline_and_read_report_no_such_file() {
         json!({"path":"real.rs","lines":"286-334"}),
     )
     .await;
-    assert_eq!(
-        text, "error: source_unavailable (read:line_range); file has 1 lines; requested 286-334",
-        "{past_end}"
+    assert!(
+        text.contains("file has 1 lines; nothing at 286-334") && past_end["code"].is_null(),
+        "a read starting past the end is a success: {past_end} {text}"
     );
     let (unreadable, text) = batch_call_with_text(
         &mut actor,
@@ -11621,9 +14923,9 @@ async fn product_outline_and_read_report_no_such_file() {
     .await;
     assert_eq!(unreadable["code"], "source_unavailable", "{unreadable}");
     assert!(
-        text.contains("read:source_unavailable")
+        text.starts_with("The requested source could not be read safely.")
             && text.contains("escape.rs")
-            && text.contains("Retry ide.read"),
+            && text.contains("Repair: Read it with a native tool."),
         "{text}"
     );
     actor.next += 1;
@@ -11640,7 +14942,7 @@ async fn product_outline_and_read_report_no_such_file() {
     actor.lifecycle(&fixture, "PostToolUse", &call).await;
     assert_eq!(
         missing_outline_path["result"]["content"][0]["text"],
-        "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)",
+        "These arguments do not match the tool schema.\nRepair: Correct the named arguments and repeat this call.\n  ide.outline needs \"path\" (a file or directory relative to the worktree root).\n",
         "{missing_outline_path}"
     );
     actor.next += 1;
@@ -11656,23 +14958,21 @@ async fn product_outline_and_read_report_no_such_file() {
         )
         .await;
     actor.lifecycle(&fixture, "PostToolUse", &call).await;
-    assert_eq!(
-        old_text_edit["result"]["content"][0]["text"],
-        "invalid bounded parameters: \"source_ref\" is required for an old-text change; re-read this file with ide.read and retry with the new source_ref",
+    // symbol-read-edit-v1: an old-text change needs no `source_ref`; the current bytes are the base.
+    assert!(
+        old_text_edit["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("edit: replaced; path real.rs")),
         "{old_text_edit}"
     );
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
 
-/// `ide.context {path}` with no `byte_offset` keeps serving the whole file exactly as before
-/// (real hosts and the acceptance scripts rely on its `source_ref`), now leading with a one-line
-/// hint toward the bounded `ide.outline`/`ide.read` alternative instead of retiring the mode
-/// (T163, W5, revised). `ide.context {kind:"problems"}` and the semantic `byte_offset` query are
-/// unaffected — covered by `managed_context_problems_then_edit_tracks_content` and the
-/// `mode: semantic` product assertions elsewhere in this file.
+/// Reads complete numbered source through the public path form and checks that model prose
+/// omits version references while the typed test-seam detail retains deprecated edit compatibility.
 #[tokio::test]
-async fn product_path_only_context_keeps_serving_with_a_hint() {
+async fn product_path_only_read_serves_numbered_source() {
     let fixture = ProductFixture::new(json!([]));
     std::fs::write(fixture.root.join("tracked.txt"), "hello\n").unwrap();
     let mut daemon = fixture.daemon().await;
@@ -11686,14 +14986,21 @@ async fn product_path_only_context_keeps_serving_with_a_hint() {
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let reply = actor
-        .call(&fixture, "ide.context", json!({"path":"tracked.txt"}))
+        .call(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let reply = actor.settle(&fixture, reply).await;
-    assert_eq!(reply["kind"], "context", "{reply}");
+    assert_eq!(reply["kind"], "read", "{reply}");
     let text = reply["text"].as_str().unwrap_or_default();
+    assert_eq!(
+        text,
+        "tracked.txt  (lines 1)
+1	hello
+note: no code analysis for this format; showing its text only
+"
+    );
     assert!(
-        text.starts_with("hint: ide.outline {\"path\"} gives the skeleton and ide.read {\"path\",\"lines\"} a bounded region; this whole-file view stays for compatibility\n"),
-        "the first line must hint at the bounded alternative: {text}"
+        !text.contains("source_ref") && !text.contains("authority_epoch"),
+        "{text}"
     );
     assert!(
         text.contains("hello"),
@@ -11743,7 +15050,10 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
     let outline = actor.settle(&fixture, outline).await;
     assert_eq!(
         outline["text"],
-        "styles.css  (8 lines, css)\n    2  .btn\n    6  @media (min-width: 40em)\n    7    .card .btn\n  (3 symbols)\n",
+        "1 styles.css#@header\n\
+         2–4 styles.css#.btn  .btn\n\
+         6–8 styles.css#@media (min-width: 40em)  @media (min-width: 40em)\n\
+         7 styles.css#@media (min-width: 40em)/.card .btn  .card .btn\n",
         "{outline}"
     );
 
@@ -11757,7 +15067,7 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
         symbol["text"],
         "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
          definition styles.css#.btn  (lines 2–4)\n\
-         defines: class name btn — also styles.css:7 .card .btn, theme.scss:1 .btn\n\
+         defines: class name btn — also styles.css#@media (min-width: 40em)/.card .btn (L7), theme.scss#.btn (L1)\n\
          usages: 0 indexed in 0 files (src 0, tests 0)\n\
          links: 1 style variable used here\n\
          \x20 --brand  → no indexed declaration\n\
@@ -11777,7 +15087,7 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
     let text = read["text"].as_str().unwrap();
     assert!(
         text.starts_with(
-            "styles.css#@media (min-width: 40em)/.card .btn  (lines 7)\n7\t  .card .btn { padding: 0; }\n"
+            "styles.css#@media (min-width: 40em)/.card .btn  (1 lines; file lines 7-7)\n1\t  .card .btn { padding: 0; }\n"
         ),
         "{read}"
     );
@@ -11863,52 +15173,54 @@ async fn configured_product_links_css_html_and_python_names() {
         symbol(&mut actor, "styles.css#.btn").await,
         "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
          definition styles.css#.btn  (lines 2–4)\n\
-         defines: class name btn — also styles.css:6 .layout .btn, theme.scss:2 .btn\n\
+         defines: class name btn — also styles.css#.layout .btn (L6), theme.scss#.btn (L2)\n\
          usages: 4 indexed in 3 files (src 4, tests 0)\n\
-         \x20 index.html:5      [html] <button class=\"btn btn-primary\">Save</button>\n\
-         \x20 index.html:6      [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
-         \x20 src/Button.tsx:2  [typescript] return <button className=\"btn\">Save</button>;\n\
-         \x20 src/Menu.tsx:3    [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
+         \x20 index.html#main#main:2 (L5)   [html] <button class=\"btn btn-primary\">Save</button>\n\
+         \x20 index.html#main#main:3 (L6)   [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 src/Button.tsx#Button:2 (L2)  [typescript] return <button className=\"btn\">Save</button>;\n\
+         \x20 src/Menu.tsx#Menu:2 (L3)      [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
          \x20 (~ = heuristic match, not proven)\n\
          links: 1 style variable used here\n\
-         \x20 --brand  → theme.scss:1 :root\n\
+         \x20 --brand  → theme.scss#:root (L1)\n\
          unavailable for: python\n\
          callers: unavailable (css has no call hierarchy)\n"
     );
-    assert_eq!(
-        symbol(&mut actor, "##main").await,
-        "symbol: ##main — element id, 1 element, 2 usages in 2 files (css, html)\n\
-         definitions:\n\
-         \x20 index.html:4  [html] <main id=\"main\" class=\"layout\">  (index.html#main#main, lines 4–8)\n\
-         usages: 2 indexed in 2 files (src 2, tests 0)\n\
-         \x20 index.html:6  [html] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
-         \x20 styles.css:7  [css] #main { display: block; }\n\
-         unavailable for: python\n"
+    let main_card = symbol(&mut actor, "##main").await;
+    assert!(
+        main_card.starts_with(
+            "symbol: ##main — element id, 1 element, 2 usages in 2 files (css, html)\ndefinitions:\n"
+        ) && main_card.contains(
+            "  index.html#main#main (L4)  [html] <main id=\"main\" class=\"layout\">  (lines 4–8)\n"
+        ) && main_card.contains(
+            "  index.html#main#main:3 (L6)  [html] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n"
+        ) && main_card
+            .contains("  styles.css##main:1 (L7)      [css] #main { display: block; }\n"),
+        "{main_card}"
     );
     assert_eq!(
         symbol(&mut actor, ".btn").await,
         "symbol: .btn — class name, 3 rules, 4 usages in 3 files (typescript, css, html)\n\
          definitions:\n\
-         \x20 styles.css:2  [css] .btn  (styles.css#.btn, lines 2–4)\n\
-         \x20 styles.css:6  [css] .layout .btn  (styles.css#.layout .btn, lines 6)\n\
-         \x20 theme.scss:2  [css] .btn  (theme.scss#.btn, lines 2–4)\n\
+         \x20 styles.css#.btn (L2)          [css] .btn  (lines 2–4)\n\
+         \x20 styles.css#.layout .btn (L6)  [css] .layout .btn  (lines 6)\n\
+         \x20 theme.scss#.btn (L2)          [css] .btn  (lines 2–4)\n\
          usages: 4 indexed in 3 files (src 4, tests 0)\n\
-         \x20 index.html:5      [html] <button class=\"btn btn-primary\">Save</button>\n\
-         \x20 index.html:6      [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
-         \x20 src/Button.tsx:2  [typescript] return <button className=\"btn\">Save</button>;\n\
-         \x20 src/Menu.tsx:3    [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
+         \x20 index.html#main#main:2 (L5)   [html] <button class=\"btn btn-primary\">Save</button>\n\
+         \x20 index.html#main#main:3 (L6)   [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 src/Button.tsx#Button:2 (L2)  [typescript] return <button className=\"btn\">Save</button>;\n\
+         \x20 src/Menu.tsx#Menu:2 (L3)      [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
          \x20 (~ = heuristic match, not proven)\n\
          unavailable for: python\n"
     );
     assert_eq!(
         symbol(&mut actor, "btn").await,
-        "ambiguous_symbol: btn matches 2 symbols; repeat ide.symbol with one exact path:\n\
-         \x20 app.py#btn\n\
-         \x20 .btn  (class name: 3 rules, 4 usages)\n"
+        "2 candidates for btn:\n\
+         \x20 app.py#btn  fn  def btn()  (lines 1–2)\n\
+         \x20 .btn  (class name: 3 rules, 4 usages)  styles.css#.btn (L2), styles.css#.layout .btn (L6)\n"
     );
     let button = symbol(&mut actor, "src/Button.tsx#Button").await;
     assert!(
-        button.contains("links: 1 class name used here\n  .btn  → styles.css:2 .btn, styles.css:6 .layout .btn (+1 more)\n"),
+        button.contains("links: 1 class name used here\n  .btn  → styles.css#.btn (L2), styles.css#.layout .btn (L6) (+1 more)\n"),
         "{button}"
     );
     let graph = async |actor: &mut ProductActor, requested: &str, direction: &str| {
@@ -11926,16 +15238,16 @@ async fn configured_product_links_css_html_and_python_names() {
     };
     assert_eq!(
         graph(&mut actor, "styles.css#.btn", "callers").await,
-        "graph: callers of styles.css#.btn (depth 2, 5 nodes, 4 edges)\n\
-         \x20 ⇢ index.html#main#main  index.html:4 [html]\n\
-         \x20 ⇢ src/Button.tsx#Button  src/Button.tsx:1 [typescript]\n\
-         \x20   ← src/App.tsx#App  src/App.tsx:2\n\
-         \x20 ⇢ src/Menu.tsx#Menu  src/Menu.tsx:2 [typescript]\n"
+        "graph: callers of styles.css#.btn (L2) (depth 2, 5 nodes, 4 edges)\n\
+         \x20 ⇢ index.html#main#main (L4) [html]\n\
+         \x20 ⇢ src/Button.tsx#Button (L1) [typescript]\n\
+         \x20   ← src/App.tsx#App (L2)\n\
+         \x20 ⇢ src/Menu.tsx#Menu (L2) [typescript]\n"
     );
     assert_eq!(
         graph(&mut actor, "src/Button.tsx#Button", "callees").await,
-        "graph: callees of src/Button.tsx#Button (depth 2, 2 nodes, 1 edges)\n\
-         \x20 ⇢ .btn  styles.css:2 [class name]\n"
+        "graph: callees of src/Button.tsx#Button (L1) (depth 2, 2 nodes, 1 edges)\n\
+         \x20 ⇢ styles.css#.btn (L2) [class name]\n"
     );
     let read = actor
         .call(&fixture, "ide.read", json!({"symbol":".btn"}))
@@ -11957,7 +15269,7 @@ async fn configured_product_links_css_html_and_python_names() {
     assert!(
         after.contains(
             "usages: 3 indexed in 3 files (src 3, tests 0)\n\
-             \x20 index.html:5      [html ~template] <a href=\"#main\""
+             \x20 index.html#main#main:2 (L5)   [html ~template] <a href=\"#main\""
         ) && !after.contains("<button class="),
         "{after}"
     );
@@ -12070,8 +15382,8 @@ async fn product_graph_names_use_sites_the_server_cannot_outline() {
     let graph = actor.settle(&fixture, graph).await;
     assert_eq!(
         graph["text"].as_str().unwrap_or_default(),
-        "graph: callers of frontend/src/Layout.css#.header (depth 2, 2 nodes, 1 edges)\n\
-         \x20 ⇢ frontend/src/Layout.tsx#Layout  frontend/src/Layout.tsx:3 [typescript]\n",
+        "graph: callers of frontend/src/Layout.css#.header (L1) (depth 2, 2 nodes, 1 edges)\n\
+         \x20 ⇢ frontend/src/Layout.tsx#Layout (L3) [typescript]\n",
         "{graph}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
@@ -12207,7 +15519,7 @@ async fn product_index_reads_stay_outside_the_binding_budget() {
             "links: 1 class name used here",
         ),
         ("ide.read", json!({"symbol":".btn"}), ".btn {"),
-        ("ide.outline", json!({"path":"page01.html"}), "(1 symbols)"),
+        ("ide.outline", json!({"path":"page01.html"}), "page01.html#"),
         ("ide.outline", json!({"path":"styles.css"}), ".btn"),
         (
             "ide.symbol",
@@ -12253,7 +15565,7 @@ async fn configured_product_python_request_keeps_the_bindings_live_rust_session(
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     fixture.write_config(json!([
         {
-            "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+            "executable":accepted_program(wrapper.to_str().unwrap(), &real_rust_analyzer_identity()),
             "settings":"rust_cache_priming_disabled_v1",
             "toolchain":toolchain,
             "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
@@ -12391,9 +15703,23 @@ async fn configured_product_symbol_test_uses_the_live_symbol_session() {
             break status;
         }
     };
+    let replay = product_test_replay(&mut actor, &fixture, &result).await;
     assert!(
-        result["text"].as_str().unwrap().contains("checks_is_file"),
-        "{result}"
+        replay["argv"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|args| args == [json!("--exact"), json!("checks_is_file")]),
+        "the full replay retains the exact selected test: {replay}"
+    );
+    assert_eq!(
+        fixture
+            .root
+            .join(replay["cwd"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        fixture.root.canonicalize().unwrap(),
+        "the replay retains this worktree"
     );
     // A bare symbol name resolves through the same workspace-symbol path the symbol card uses
     // (T114 demo defect) instead of answering unknown_symbol for a missing `file#` prefix.
@@ -12425,9 +15751,23 @@ async fn configured_product_symbol_test_uses_the_live_symbol_session() {
             break status;
         }
     };
+    let replay = product_test_replay(&mut actor, &fixture, &result).await;
     assert!(
-        result["text"].as_str().unwrap().contains("checks_is_file"),
-        "{result}"
+        replay["argv"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|args| args == [json!("--exact"), json!("checks_is_file")]),
+        "the full replay retains the exact selected test: {replay}"
+    );
+    assert_eq!(
+        fixture
+            .root
+            .join(replay["cwd"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        fixture.root.canonicalize().unwrap(),
+        "the replay retains this worktree"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
@@ -12517,22 +15857,9 @@ async fn warm_rust_inline_replies(timed: bool) {
         .await;
     assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
 
-    // Warm the analyzer to a server answer: the first outline replies from the lexical
-    // outline while the workspace loads, so warmth is proven by the marker's absence.
-    loop {
-        let reply = actor
-            .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
-            .await;
-        let settled = actor.settle(&fixture, reply).await;
-        let text = settled["text"].as_str().unwrap_or_default();
-        if settled["kind"] == "outline" && !text.contains("outline: from source") {
-            break;
-        }
-        assert!(
-            settled["kind"] == "outline" || settled["code"] == "provider_loading",
-            "{settled}"
-        );
-    }
+    // The measured calls start after an explicit semantic-ready barrier; source outlines
+    // remain synchronous and deliberately do not initialize a provider.
+    batch_wait_semantic_provider(&mut actor, &fixture, "src/lib.rs").await;
     for (tool, params) in [
         ("ide.outline", json!({"path":"src/lib.rs"})),
         (
@@ -12760,7 +16087,11 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
         };
         assert_eq!(
             server_text,
-            render::outline_text(&lexical),
+            render::address_outline_text(
+                &lexical,
+                &agent_ide::lang::address::AddressMap::build(&lexical, &source),
+                None
+            ),
             "{file}: the lexical outline must equal the server's"
         );
         assert!(!server_text.contains("outline: from source"), "{file}");
@@ -12784,7 +16115,12 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
                 .await;
             let read = actor.settle(&fixture, read).await;
             let text = read["text"].as_str().unwrap_or_default();
-            let header = format!("{address}  (lines {})\n", symbol.range);
+            let header = format!(
+                "{address}  ({} lines; file lines {}-{})\n",
+                symbol.range.len(),
+                symbol.range.start,
+                symbol.range.end
+            );
             assert!(
                 text.starts_with(&header),
                 "{file}: {symbol:?} expected {header:?}, got {text}"
@@ -13007,7 +16343,10 @@ async fn configured_product_provider_ensure_panic_fails_the_daemon_crash_only_an
 /// same runtime directory, inspecting the old `detail_ref` answers a settled typed reply at once
 /// (never `pending`), and the replacement serves new calls.
 ///
-/// The parked job is never executed by the failed daemon and never replayed by the replacement.
+/// Two jobs wait on the server: a symbol read of an address the lexical outline does not hold
+/// parks and answers `pending`, and `ide.symbol` answers at once with an `approximate:` card
+/// (symbol-graph-item r2 §4) while its job keeps waiting for the precise answer under the card's
+/// `detail_ref`. Neither job is executed by the failed daemon or replayed by the replacement.
 #[cfg(feature = "test-seams")]
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_NODE environment"]
@@ -13066,12 +16405,30 @@ async fn configured_product_pending_call_and_old_reference_survive_a_crash_only_
         .call(&fixture, "ide.start", json!({"activation_id":"pending-1"}))
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    // The server never becomes ready, so this call parks and answers `pending`.
+    // The server never becomes ready. `server_only` is not in the lexical outline, so its read
+    // parks on the server and answers `pending`.
     let parked = actor
-        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbol":"src/lib.rs#server_only"}),
+        )
         .await;
     assert_eq!(parked["state"], "pending", "{parked}");
     let reference = parked["detail_ref"].as_str().unwrap().to_owned();
+    // `ide.symbol` answers at once from source; its precise job keeps waiting on the server.
+    let approximate = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    assert_eq!(approximate["state"], "complete", "{approximate}");
+    assert!(
+        approximate["text"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("approximate: rust-analyzer is still indexing;"),
+        "{approximate}"
+    );
+    let approximate_reference = approximate["detail_ref"].as_str().unwrap().to_owned();
     std::fs::write(&flag, b"").unwrap();
     let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
         .await
@@ -13092,28 +16449,39 @@ async fn configured_product_pending_call_and_old_reference_survive_a_crash_only_
             &[("AGENT_IDE_TEST_FAULT", &fault)],
         )
         .await;
-    let old = tokio::time::timeout(
-        Duration::from_secs(20),
-        actor.call(&fixture, "ide.inspect", json!({"detail_ref":reference})),
-    )
-    .await
-    .expect("an old reference must not hang the agent");
-    assert_ne!(
-        old["state"], "pending",
-        "the parked job died with the failed daemon and is not replayed: {old}"
-    );
+    for reference in [&reference, &approximate_reference] {
+        let old = tokio::time::timeout(
+            Duration::from_secs(20),
+            actor.call(&fixture, "ide.inspect", json!({"detail_ref":reference})),
+        )
+        .await
+        .expect("an old reference must not hang the agent");
+        assert_ne!(
+            old["state"], "pending",
+            "the parked job died with the failed daemon and is not replayed: {old}"
+        );
+        assert!(
+            !old["text"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("approximate: "),
+            "the approximate card died with the failed daemon: {old}"
+        );
+    }
     let started = actor
         .call(&fixture, "ide.start", json!({"activation_id":"pending-2"}))
         .await;
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
-    // With a live activation on the replacement the old reference is still not a result: it is
-    // refused as the typed `invalid_detail` error, and a fresh read answers.
-    let stale = actor
-        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
-        .await;
-    assert_eq!(stale["state"], "error", "{stale}");
-    assert_eq!(stale["code"], "invalid_detail", "{stale}");
+    // With a live activation on the replacement the old references are still not results: they
+    // are refused as the typed `invalid_detail` error, and a fresh read answers.
+    for reference in [&reference, &approximate_reference] {
+        let stale = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+            .await;
+        assert_eq!(stale["state"], "error", "{stale}");
+        assert_eq!(stale["code"], "invalid_detail", "{stale}");
+    }
     let read = actor
         .call(
             &fixture,
@@ -13130,7 +16498,8 @@ async fn configured_product_pending_call_and_old_reference_survive_a_crash_only_
 
 /// While the registered Rust server is still loading, `ide.outline`, `ide.read` and the
 /// symbol-addressed `ide.edit` answer at once from the lexical outline and say so in one
-/// compact line; `ide.symbol` keeps waiting for the server, and once the server reports ready
+/// compact line; `ide.symbol` answers at once with an `approximate:` card (symbol-graph-item r2
+/// §4) whose precise answer settles once the server is ready, and once the server reports ready
 /// the server path is used again (its own symbol appears, the lexical marker disappears).
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_NODE environment"]
@@ -13259,12 +16628,30 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
         "{read}"
     );
 
-    // `ide.symbol` does not answer from the lexical outline: usages need the server, so the
-    // call stays pending instead of completing like the tools above.
+    // `ide.symbol` answers at once, labelled approximate: usages and callers need the server,
+    // so they are name matches from source until its precise answer settles.
+    let approximate = |reply: &Value| {
+        assert_eq!(reply["state"], "complete", "{reply}");
+        let text = reply["text"].as_str().unwrap_or_default();
+        assert!(
+            text.starts_with("approximate: rust-analyzer is still indexing;")
+                && text.contains(
+                    "the precise answer is retained under its reference; Bridge delivers it automatically"
+                ),
+            "{reply}"
+        );
+    };
     let symbol = actor
         .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
         .await;
-    assert_eq!(symbol["state"], "pending", "{symbol}");
+    approximate(&symbol);
+    assert!(
+        symbol["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("\nsymbol: value"),
+        "{symbol}"
+    );
     tokio::time::sleep(Duration::from_secs(3)).await;
     let still = actor
         .call(
@@ -13273,7 +16660,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
             json!({"symbol":"src/lib.rs#caller"}),
         )
         .await;
-    assert_eq!(still["state"], "pending", "{still}");
+    approximate(&still);
     // A read of that server-only address waits for the server too, and so does the outline of
     // a file the lexical scanner refuses (its park is kept, not dropped).
     let server_only = actor
@@ -13293,12 +16680,12 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     std::fs::write(&ready, "ready").unwrap();
     let settled = actor.settle(&fixture, symbol).await;
     let card = settled["text"].as_str().unwrap_or_default();
-    assert!(card.contains("symbol: value"), "{settled}");
+    assert!(card.starts_with("symbol: value"), "{settled}");
     assert!(!card.contains("outline: from source"), "{settled}");
     let server_only = actor.settle(&fixture, server_only).await;
     let read_text = server_only["text"].as_str().unwrap_or_default();
     assert!(
-        read_text.starts_with("src/lib.rs#server_only  (lines "),
+        read_text.starts_with("src/lib.rs#server_only  ("),
         "{server_only}"
     );
     let refused = actor.settle(&fixture, refused).await;
@@ -13316,9 +16703,16 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
             .await;
         let settled = actor.settle(&fixture, reply).await;
         let text = settled["text"].as_str().unwrap_or_default();
-        // Three symbols for a file with two functions is the server's answer; the lexical
-        // outline of the same file reports two and marks itself lexical.
-        if settled["kind"] == "outline" && text.contains("(3 symbols)") {
+        // The server returns three symbol rows; the lexical outline of these two functions
+        // returns two. Count delivered address rows instead of requiring redundant framing.
+        let symbol_rows = text
+            .lines()
+            .filter(|line| {
+                line.split_once(" src/lib.rs#")
+                    .is_some_and(|(_, unit)| !unit.starts_with('@'))
+            })
+            .count();
+        if settled["kind"] == "outline" && symbol_rows == 3 {
             break settled;
         }
         assert!(
@@ -13537,7 +16931,7 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
     assert_eq!(missing["code"], "provider_unavailable", "{missing}");
     assert_ne!(missing["state"], "pending", "{missing}");
 
-    // Read of a symbol: numbered source, marked unavailable, with its source_ref.
+    // Read of a symbol: numbered source, marked unavailable.
     let read = actor
         .call(&fixture, "ide.read", json!({"symbol":"src/lib.rs#value"}))
         .await;
@@ -13567,9 +16961,10 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
     let refused_text = raw["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_default();
-    assert!(
-        refused_text.contains("the source outline refused this file; use native reads")
-            && !refused_text.contains("still answer from source"),
+    assert_eq!(raw["result"]["isError"], true, "{raw}");
+    assert_eq!(
+        refused_text,
+        "The server cannot answer this request and no source outline is available.\nRepair: Read the source with native tools.",
         "{raw}"
     );
 
@@ -13606,9 +17001,16 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
             .await;
         let settled = actor.settle(&fixture, reply).await;
         let text = settled["text"].as_str().unwrap_or_default();
-        // Three symbols for a file with two functions is the server's answer; the lexical
-        // outline of the same file reports two and marks itself lexical.
-        if settled["kind"] == "outline" && text.contains("(3 symbols)") {
+        // The server returns three symbol rows; the lexical outline of these two functions
+        // returns two. Count delivered address rows instead of requiring redundant framing.
+        let symbol_rows = text
+            .lines()
+            .filter(|line| {
+                line.split_once(" src/lib.rs#")
+                    .is_some_and(|(_, unit)| !unit.starts_with('@'))
+            })
+            .count();
+        if settled["kind"] == "outline" && symbol_rows == 3 {
             break settled;
         }
         assert!(
@@ -13879,10 +17281,10 @@ async fn plain_directory_activates_and_answers_without_git_data() {
     assert_eq!(read["kind"], "read", "{read}");
     assert!(read["text"].as_str().unwrap().contains(".sim"), "{read}");
     let source = actor
-        .call(&fixture, "ide.context", json!({"path":"sim.css"}))
+        .call(&fixture, "ide.read", json!({"path":"sim.css"}))
         .await;
     let source = actor.settle(&fixture, source).await;
-    assert_eq!(source["kind"], "context", "{source}");
+    assert_eq!(source["kind"], "read", "{source}");
     let edit = actor
         .call(
             &fixture,
@@ -13912,11 +17314,11 @@ async fn plain_directory_activates_and_answers_without_git_data() {
     );
     let diff_text = diff["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        diff_text.contains("diff:not_a_git_repository"),
+        diff_text.starts_with("This directory is not a Git repository."),
         "{diff_text}"
     );
     assert!(
-        diff_text.contains("not a git repository: no git data"),
+        diff_text.contains("Repair: Review the files with native tools."),
         "{diff_text}"
     );
     actor.next += 1;
@@ -13936,7 +17338,7 @@ async fn plain_directory_activates_and_answers_without_git_data() {
         task_diff["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("not a git repository: no git data"),
+            .contains("Repair: Review the files with native tools."),
         "{task_diff}"
     );
 
@@ -14106,8 +17508,11 @@ async fn configured_product_resolves_a_new_linked_worktree_after_daemon_start() 
 
     let linked = fixture.base.join("different-parent").join("linked");
     std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
-    let output = std::process::Command::new("/usr/bin/git")
+    let output = std::process::Command::new(fixture_git())
         .env_clear()
+        .env("TMPDIR", std::env::temp_dir())
+        .env("TMP", std::env::temp_dir())
+        .env("TEMP", std::env::temp_dir())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .args(["-C"])
@@ -14158,8 +17563,11 @@ async fn configured_product_same_actor_start_on_another_root_hands_the_activatio
     let linked = |name: &str| {
         let path = fixture.base.join("different-parent").join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let output = std::process::Command::new("/usr/bin/git")
+        let output = std::process::Command::new(fixture_git())
             .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
+            .env("TMP", std::env::temp_dir())
+            .env("TEMP", std::env::temp_dir())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["-C"])
@@ -14336,9 +17744,41 @@ async fn configured_product_activation_reply_includes_the_project_card() {
     assert!(text.contains("\nlayout: src/ 1"), "{text}");
     assert!(text.contains("\ndocs: README.md"), "{text}");
     assert!(
-        text.contains("\nservers: rust not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use · typescript not started; starts on first use"),
+        text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it; its result is retained under its reference and Bridge delivers it"),
         "{text}"
     );
+    // start-index-state §1: the call-signature block ends the reply, after the card and its
+    // servers line, within M030/T006's 700-byte budget, with one example per batch form and stop.
+    let (card, signature) = text
+        .split_once("\n\nBatch call forms (")
+        .unwrap_or_else(|| panic!("no signature block: {text}"));
+    assert!(card.contains("\nservers: "), "{text}");
+    assert!(!card.contains("ide.read {\"items\""), "{text}");
+    let signature = format!("Batch call forms ({signature}");
+    assert!(signature.len() <= 700, "{} bytes", signature.len());
+    assert!(
+        signature.contains("card/direct neighbors; graph = call chains"),
+        "{signature}"
+    );
+    assert!(
+        signature.contains("\"direction\":\"callers\",\"depth\":2"),
+        "{signature}"
+    );
+    for form in [
+        "ide.read {\"items\"",
+        "ide.outline {\"paths\"",
+        "ide.symbol {\"symbols\"",
+        "ide.graph {\"symbols\"",
+        "ide.test {\"targets\"",
+        "ide.edit schema",
+        "ide.inspect {\"detail_refs\"",
+    ] {
+        assert!(signature.contains(form), "{form}: {signature}");
+    }
+    assert!(!signature.contains("wait_ms"), "{signature}");
+    assert!(signature.contains("files (Claude)"), "{signature}");
+    assert!(text.ends_with("End the task with ide.stop."), "{text}");
+    assert!(!signature.contains("poll"), "{signature}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
@@ -14481,25 +17921,17 @@ async fn configured_product_stop_reclaims_only_its_binding_details() {
     let start = second.settle(&fixture, start).await;
     assert_eq!(start["kind"], "activation", "{start}");
     let context = first
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let first_context = first.settle(&fixture, context).await;
-    assert_eq!(first_context["kind"], "context");
+    assert_eq!(first_context["kind"], "read");
     // The store holds 3 results (first: start + context, second: start). The second actor's
     // next call is admitted by evicting its own oldest result, its start.
     let admitted = second
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let admitted = second.settle(&fixture, admitted).await;
-    assert_eq!(admitted["kind"], "context", "{admitted}");
+    assert_eq!(admitted["kind"], "read", "{admitted}");
     let evicted = second
         .call(
             &fixture,
@@ -14515,7 +17947,7 @@ async fn configured_product_stop_reclaims_only_its_binding_details() {
             json!({"detail_ref":first_context["detail_ref"]}),
         )
         .await;
-    assert_eq!(peer_kept["kind"], "context", "{peer_kept}");
+    assert_eq!(peer_kept["kind"], "read", "{peer_kept}");
     let stopped = first.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     let retained = second
@@ -14525,16 +17957,12 @@ async fn configured_product_stop_reclaims_only_its_binding_details() {
             json!({"detail_ref":admitted["detail_ref"]}),
         )
         .await;
-    assert_eq!(retained["kind"], "context", "{retained}");
+    assert_eq!(retained["kind"], "read", "{retained}");
     let context = second
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let context = second.settle(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     first.mcp.close().await;
     second.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -14560,7 +17988,7 @@ async fn configured_product_returns_real_rust_semantic_context() {
         )
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let providers = json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cache"}]);
+        let providers = json!([{"executable":accepted_program(wrapper.to_str().unwrap(), &real_rust_analyzer_identity()),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cache"}]);
         fixture.write_config(providers);
         let mut daemon = fixture.daemon().await;
         let mut actor = ProductActor::new(&fixture, "provider-root").await;
@@ -14576,39 +18004,45 @@ async fn configured_product_returns_real_rust_semantic_context() {
         for (path, symbol) in [("src/lib.rs", "value()")] {
             let bytes = std::fs::read_to_string(fixture.root.join(path)).unwrap();
             let offset = bytes.rfind(symbol).unwrap();
-            let response = actor
-                .call(
-                    &fixture,
-                    "ide.context",
-                    json!({"path":path,"byte_offset":offset}),
-                )
-                .await;
-            let response = actor.settle(&fixture, response).await;
-            if response["kind"] != "context" {
-                actor.mcp.close().await;
-                daemon.kill().await.unwrap();
-                let output = daemon.wait_with_output().await.unwrap();
-                panic!(
-                    "{path}: calls={}: {response}; daemon stderr={}",
-                    actor.next,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            if !response["text"]
-                .as_str()
-                .unwrap()
-                .contains("mode: semantic")
-            {
-                let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
-                let stopped = actor.settle(&fixture, stopped).await;
-                actor.mcp.close().await;
-                daemon.kill().await.unwrap();
-                let output = daemon.wait_with_output().await.unwrap();
-                panic!(
-                    "{response}; cleanup={stopped}; daemon stderr={}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            // A positional card answers at once and terminally: while the server loads it is
+            // lexical (the E-003 cold path), so repeat the call until the server is ready.
+            let deadline = std::time::Instant::now() + Duration::from_secs(150);
+            let response = loop {
+                let response = actor
+                    .call(
+                        &fixture,
+                        "ide.symbol",
+                        json!({"path":path,"byte_offset":offset}),
+                    )
+                    .await;
+                let response = actor.settle(&fixture, response).await;
+                let loading = response["kind"] == "symbol"
+                    && response["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("mode: lexical (semantic provider is still loading");
+                if loading && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                if response["kind"] != "symbol"
+                    || !response["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("mode: semantic")
+                {
+                    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+                    let stopped = actor.settle(&fixture, stopped).await;
+                    actor.mcp.close().await;
+                    daemon.kill().await.unwrap();
+                    let output = daemon.wait_with_output().await.unwrap();
+                    panic!(
+                        "{path}: {response}; cleanup={stopped}; daemon stderr={}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                break response;
+            };
             assert!(
                 response["text"]
                     .as_str()
@@ -14620,7 +18054,7 @@ async fn configured_product_returns_real_rust_semantic_context() {
                 response["text"]
                     .as_str()
                     .unwrap()
-                    .contains("definitions: [{"),
+                    .contains("definitions: 1\n  "),
                 "{response}"
             );
         }
@@ -14635,8 +18069,8 @@ async fn configured_product_returns_real_rust_semantic_context() {
 /// Exercises the accepted exclusive Pyright process through the five-tool Codex product loop.
 ///
 /// The test requires launcher-owned executable and Node identities. It proves a `.py` session
-/// reaches semantic definition/reference and the currently rendered diagnostic state, then proves
-/// a corrected retry is fresh before returning a diff and reaping the owned child.
+/// reaches semantic definition/reference and the currently rendered diagnostic state, explicitly
+/// waiting for the provider's first real error report, then proves a corrected retry is fresh before returning a diff and reaping the owned child.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
@@ -14662,15 +18096,27 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     let start = actor.settle(&fixture, start).await;
     assert_eq!(start["kind"], "activation", "{start}");
     let source = std::fs::read_to_string(&path).unwrap();
-    let response = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
-        )
-        .await;
-    let response = actor.settle(&fixture, response).await;
-    assert_eq!(response["kind"], "context", "{response}");
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let response = loop {
+        let response = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
+            )
+            .await;
+        let response = actor.settle(&fixture, response).await;
+        let text = response["text"].as_str().unwrap_or_default();
+        if text.contains("mode: semantic") && text.contains("diagnostics: 1") {
+            break response;
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "Pyright did not reach semantic error readiness: {response}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(response["kind"], "symbol", "{response}");
     assert!(
         response["text"]
             .as_str()
@@ -14679,14 +18125,17 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
         "{response}"
     );
     let text = response["text"].as_str().unwrap();
-    assert!(text.contains("definitions: [{"), "{response}");
-    assert!(text.contains("references: [{"), "{response}");
-    assert!(text.contains("diagnostic_count: 1"), "{response}");
+    assert_addressed_locations(text, "definitions");
+    assert_addressed_locations(text, "references");
+    assert!(text.contains("diagnostics: 1"), "{response}");
     assert!(
-        text.contains("Type \\\"Literal['bad']\\\" is not assignable to return type \\\"int\\\""),
+        text.contains(r#"Type "Literal['bad']" is not assignable to return type "int""#),
         "{response}"
     );
-    assert!(text.contains("return \"bad\""), "{response}");
+    assert!(
+        text.contains("main.py#value") && !text.contains("return \"bad\""),
+        "{response}"
+    );
     std::fs::write(
         &path,
         "def value() -> int:\n    return 8\n\ndef caller() -> int:\n    return value()\n",
@@ -14696,17 +18145,17 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     let fixed_response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"main.py","byte_offset":fixed.rfind("value()").unwrap()}),
         )
         .await;
     let fixed_response = actor.settle(&fixture, fixed_response).await;
-    assert_eq!(fixed_response["kind"], "context", "{fixed_response}");
+    assert_eq!(fixed_response["kind"], "symbol", "{fixed_response}");
     let fixed_text = fixed_response["text"].as_str().unwrap();
     assert!(fixed_text.contains("mode: semantic"), "{fixed_response}");
-    assert!(fixed_text.contains("return 8"), "{fixed_response}");
+    assert!(fixed_text.contains("main.py#value"), "{fixed_response}");
     assert!(
-        fixed_text.contains("source_sequence: 2"),
+        !fixed_text.contains("source_sequence") && !fixed_text.contains("authority_epoch"),
         "{fixed_response}"
     );
     assert!(
@@ -14772,15 +18221,15 @@ async fn configured_product_pyright_resolves_root_venv_for_nested_python_file() 
     let response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"tools/x.py","byte_offset":6}),
         )
         .await;
     let response = actor.settle(&fixture, response).await;
-    assert_eq!(response["kind"], "context", "{response}");
+    assert_eq!(response["kind"], "symbol", "{response}");
     let text = response["text"].as_str().unwrap();
     assert!(text.contains("mode: semantic"), "{response}");
-    assert!(text.contains("diagnostic_count: 0"), "{response}");
+    assert!(text.contains("diagnostics: 0 (provisional)"), "{response}");
     assert!(!text.contains("reportMissingImports"), "{response}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
@@ -14886,12 +18335,12 @@ async fn configured_product_pyright_reader_borrows_writer_session() {
             let context = actor
                 .call(
                     &fixture,
-                    "ide.context",
+                    "ide.symbol",
                     json!({"path":path,"byte_offset":source.rfind("value()").unwrap()}),
                 )
                 .await;
             let context = actor.settle(&fixture, context).await;
-            assert_eq!(context["kind"], "context", "{context}");
+            assert_eq!(context["kind"], "symbol", "{context}");
             assert!(
                 context["text"].as_str().unwrap().contains("mode: semantic"),
                 "{context}"
@@ -14969,7 +18418,7 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
     assert!(!text.contains("return \"hello\""), "{symbol}");
     assert!(text.contains("usages: 1 in 1 files"), "{symbol}");
     assert!(
-        text.contains("main.py:9  return Greeter(\"world\").method()"),
+        text.contains("main.py#caller:2 (L9)  return Greeter(\"world\").method()"),
         "{symbol}"
     );
     // pyright has no call hierarchy: the card says so instead of printing nothing, and a
@@ -15137,7 +18586,7 @@ async fn configured_product_pyright_semantics_and_checks() {
     let context = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"main.py","byte_offset":source.find("value").unwrap()}),
         )
         .await;
@@ -15176,14 +18625,16 @@ fn python_venv_at(dir: &Path, name: &str) {
 }
 
 /// Adds the real confined-Pyright project check to a fixture's launcher configuration, using the
-/// accepted `AGENT_IDE_NODE` executable and the `dist/pyright.js` CLI module of the
-/// `AGENT_IDE_PYRIGHT` installation, so `ide.context {kind:"problems"}` exercises Python checks.
+/// accepted `AGENT_IDE_NODE` executable and public `index.js` package entry of the
+/// `AGENT_IDE_PYRIGHT` installation. The entry initializes Pyright's package root and bundled
+/// typeshed before dispatching the CLI, so `ide.inspect {kind:"problems"}` checks the same runtime
+/// as the language server.
 fn enable_real_pyright_checks(fixture: &ProductFixture) {
     let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
     let pyright_cli = std::path::Path::new(&pyright)
         .parent()
         .and_then(Path::parent)
-        .map(|bin| bin.join("lib/node_modules/pyright/dist/pyright.js"))
+        .map(|bin| bin.join("lib/node_modules/pyright/index.js"))
         .map(|cli| std::fs::canonicalize(&cli).unwrap_or(cli))
         .expect("the pyright CLI module sits beside the language server");
     assert!(
@@ -15261,12 +18712,12 @@ async fn configured_product_nested_python_packages_are_listed_checked_and_edited
         let problems = actor
             .call(
                 &fixture,
-                "ide.context",
+                "ide.inspect",
                 json!({"kind":"problems","language":"python"}),
             )
             .await;
         let problems = actor.settle(&fixture, problems).await;
-        assert_eq!(problems["kind"], "context", "{problems}");
+        assert_eq!(problems["kind"], "inspect", "{problems}");
         problems_text = problems["text"].as_str().unwrap().to_owned();
         if problems_text.contains("python: ready") || problems_text.contains("python: partial") {
             break;
@@ -15302,6 +18753,7 @@ async fn configured_product_nested_python_packages_are_listed_checked_and_edited
         )
         .await;
     let edit = actor.settle(&fixture, edit).await;
+    let edit = settle_edit_check(&mut actor, &fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     assert_eq!(
         edit["diagnostics"]["state"], "current_clean",
@@ -15316,7 +18768,7 @@ async fn configured_product_nested_python_packages_are_listed_checked_and_edited
 
 /// A nested package with no environment: the project check cannot run for it, so a `.py` edit
 /// that introduces a type error answers the language server's diagnostics for the exact
-/// post-edit source (located, labelled), never `unknown`; `ide.context` locates them too.
+/// post-edit source (located, labelled), never `unknown`; `ide.read` locates them too.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_edit_in_a_package_without_environment_reports_server_diagnostics() {
@@ -15376,6 +18828,7 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
         )
         .await;
     let edit = actor.settle(&fixture, edit).await;
+    let edit = settle_edit_check(&mut actor, &fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     assert_eq!(
         edit["diagnostics"]["state"], "current_reported",
@@ -15385,7 +18838,8 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
     assert!(
         messages.iter().any(|message| {
             let message = message.as_str().unwrap();
-            message.starts_with("libs/contracts/mod.py:2:12 error ")
+            message
+                .starts_with("libs/contracts/mod.py:2:12 libs/contracts/mod.py#value:2 (L2) error ")
                 && message.contains("not assignable")
         }),
         "the type error carries path:line:col severity: {edit}"
@@ -15398,8 +18852,8 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
     let context = actor
         .call(
             &fixture,
-            "ide.context",
-            json!({"path":"libs/contracts/mod.py"}),
+            "ide.inspect",
+            json!({"kind":"diagnostics","path":"libs/contracts/mod.py"}),
         )
         .await;
     let context = actor.settle(&fixture, context).await;
@@ -15407,7 +18861,7 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
         context["text"]
             .as_str()
             .unwrap()
-            .contains("libs/contracts/mod.py:2:12 error "),
+            .contains("libs/contracts/mod.py:2:12 libs/contracts/mod.py#value:2 (L2) error "),
         "context diagnostics carry their location: {context}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -15463,15 +18917,15 @@ async fn configured_product_suffixed_venv_is_discovered_and_used() {
     let response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/svc.py","byte_offset":6}),
         )
         .await;
     let response = actor.settle(&fixture, response).await;
-    assert_eq!(response["kind"], "context", "{response}");
+    assert_eq!(response["kind"], "symbol", "{response}");
     let text = response["text"].as_str().unwrap();
     assert!(text.contains("mode: semantic"), "{response}");
-    assert!(text.contains("diagnostic_count: 0"), "{response}");
+    assert!(text.contains("diagnostics: 0 (provisional)"), "{response}");
     assert!(!text.contains("reportMissingImports"), "{response}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
@@ -15745,20 +19199,25 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
     assert_eq!(started["kind"], "activation", "{started}");
 
     let context = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.py","byte_offset":initial.rfind("value()").unwrap()}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"main.py"}))
         .await;
     let context = actor.settle(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
+    let diagnostics = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"kind":"diagnostics","path":"main.py"}),
+        )
+        .await;
+    let diagnostics = actor.settle(&fixture, diagnostics).await;
+    assert_eq!(diagnostics["kind"], "inspect", "{diagnostics}");
     assert!(
-        context["text"]
+        diagnostics["text"]
             .as_str()
             .unwrap()
-            .contains("diagnostic_count: 1"),
-        "{context}"
+            .contains("diagnostics: 1"),
+        "{diagnostics}"
     );
     let stale_ref = context["detail_ref"].as_str().unwrap().to_owned();
 
@@ -15781,11 +19240,7 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
     assert_eq!(std::fs::read_to_string(&path).unwrap(), intervening);
 
     let current = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.py","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"main.py"}))
         .await;
     let current = actor.settle(&fixture, current).await;
     let reported_source = "def value() -> int:\n    return \"reported-private-bad\"\n\ndef caller() -> int:\n    return value()\n";
@@ -15851,11 +19306,7 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
         .lifecycle(&fixture, "PostToolUse", "acceptance-native-edit")
         .await;
     let refreshed = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.py","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"main.py"}))
         .await;
     let refreshed = actor.settle(&fixture, refreshed).await;
     assert!(
@@ -16026,34 +19477,28 @@ async fn configured_product_returns_real_typescript_family_context_and_reaps() {
         let response = actor
             .call(
                 &fixture,
-                "ide.context",
+                "ide.symbol",
                 json!({"path":path,"byte_offset":source.rfind(occurrence).unwrap()}),
             )
             .await;
         let response = actor.settle(&fixture, response).await;
-        assert_eq!(response["kind"], "context", "{path}: {response}");
+        assert_eq!(response["kind"], "symbol", "{path}: {response}");
         let text = response["text"].as_str().unwrap();
         assert!(text.contains("mode: semantic"), "{path}: {response}");
-        assert!(text.contains("definitions: [{"), "{path}: {response}");
-        assert!(text.contains("references: [{"), "{path}: {response}");
+        assert_addressed_locations(text, "definitions");
+        assert_addressed_locations(text, "references");
         if matches!(path, "fixture.js" | "fixture.ts") {
+            assert!(text.contains("(provisional"), "{path}: {response}");
             assert!(
-                text.contains("diagnostics_freshness: Provisional"),
+                text.contains("diagnostics: at least "),
                 "{path}: {response}"
             );
             assert!(
-                text.contains("diagnostic_readiness: Reported"),
-                "{path}: {response}"
-            );
-            assert!(
-                text.contains("diagnostic_count: at_least_"),
+                text.contains("diagnostics: at least "),
                 "{path}: {response}"
             );
         } else if path == "fixture_clean.ts" {
-            assert!(
-                text.contains("diagnostic_count: unknown"),
-                "{path}: {response}"
-            );
+            assert!(text.contains("diagnostics: unknown"), "{path}: {response}");
         }
     }
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -16130,7 +19575,7 @@ async fn configured_product_typescript_symbol_tools_and_edit() {
     );
     assert!(!text.contains("return \"hello\""), "{symbol}");
     assert!(
-        text.contains("fixture.ts#caller  fixture.ts:4") && text.contains("new Greeter().method()"),
+        text.contains("fixture.ts#caller (L4)") && text.contains("new Greeter().method()"),
         "{symbol}"
     );
     let read = actor
@@ -16181,8 +19626,11 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     )
     .unwrap();
     let child_git = |args: &[&str]| {
-        let output = std::process::Command::new("/usr/bin/git")
+        let output = std::process::Command::new(fixture_git())
             .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
+            .env("TMP", std::env::temp_dir())
+            .env("TEMP", std::env::temp_dir())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .arg("-C")
@@ -16236,12 +19684,12 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     let (root_context, child_context) = tokio::join!(
         root.call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"fixture.ts","byte_offset":root_offset})
         ),
         child.call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"fixture.ts","byte_offset":child_offset})
         )
     );
@@ -16249,24 +19697,36 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
         root.settle(&fixture, root_context),
         child.settle(&fixture, child_context)
     );
-    assert_eq!(root_context["kind"], "context", "{root_context}");
-    assert_eq!(child_context["kind"], "context", "{child_context}");
+    assert_eq!(root_context["kind"], "symbol", "{root_context}");
+    assert_eq!(child_context["kind"], "symbol", "{child_context}");
     let root_text = root_context["text"].as_str().unwrap();
     let child_text = child_context["text"].as_str().unwrap();
     assert!(root_text.contains("mode: semantic"), "{root_context}");
     assert!(child_text.contains("mode: semantic"), "{child_context}");
-    assert!(root_text.contains("definitions: [{") && root_text.contains("references: [{"));
-    assert!(child_text.contains("definitions: [{") && child_text.contains("references: [{"));
-    assert!(root_text.contains("rootValue") && root_text.contains("root diagnostic marker"));
-    assert!(!root_text.contains("child-only"));
+    assert_addressed_locations(root_text, "definitions");
+    assert_addressed_locations(root_text, "references");
+    assert_addressed_locations(child_text, "definitions");
+    assert_addressed_locations(child_text, "references");
+    // The card names the diagnostic by its address and compiler text; it prints no source lines.
     assert!(
-        root_text.contains("diagnostic_count: at_least_"),
+        root_text.contains("rootValue") && root_text.contains("fixture.ts#rootBroken"),
         "{root_context}"
     );
-    assert!(child_text.contains("childValue") && child_text.contains("child-only"));
-    assert!(!child_text.contains("root diagnostic marker"));
+    assert!(!root_text.contains("childValue"), "{root_context}");
     assert!(
-        child_text.contains("diagnostic_count: unknown"),
+        root_text.contains("diagnostics: at least "),
+        "{root_context}"
+    );
+    assert!(
+        child_text.contains("childValue") && child_text.contains("fixture.ts#childUse"),
+        "{child_context}"
+    );
+    assert!(
+        !child_text.contains("rootValue") && !child_text.contains("rootBroken"),
+        "{child_context}"
+    );
+    assert!(
+        child_text.contains("diagnostics: unknown"),
         "{child_context}"
     );
 
@@ -16275,16 +19735,19 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     let child_live = child
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"fixture.ts","byte_offset":child_offset}),
         )
         .await;
     let child_live = child.settle(&fixture, child_live).await;
     let child_live_text = child_live["text"].as_str().unwrap();
     assert!(child_live_text.contains("mode: semantic"), "{child_live}");
-    assert!(child_live_text.contains("child-only"), "{child_live}");
     assert!(
-        child_live_text.contains("diagnostic_count: unknown"),
+        child_live_text.contains("fixture.ts#childUse") && !child_live_text.contains("rootValue"),
+        "{child_live}"
+    );
+    assert!(
+        child_live_text.contains("diagnostics: unknown"),
         "{child_live}"
     );
     let stopped = child.call(&fixture, "ide.stop", json!({})).await;
@@ -16331,28 +19794,19 @@ async fn configured_product_claude_returns_real_typescript_semantic_context_and_
         let context = actor
             .call_claude(
                 &fixture,
-                "ide.context",
+                "ide.symbol",
                 json!({"path":path,"byte_offset":source.rfind("value;").unwrap()}),
             )
             .await;
         let (context, _) = actor.settle_claude(&fixture, context).await;
-        assert_eq!(context["kind"], "context", "{path}: {context}");
+        assert_eq!(context["kind"], "symbol", "{path}: {context}");
         let text = context["text"].as_str().unwrap();
         assert!(text.contains("mode: semantic"), "{path}: {context}");
-        assert!(text.contains("definitions: [{"), "{path}: {context}");
-        assert!(text.contains("references: [{"), "{path}: {context}");
-        assert!(
-            text.contains("diagnostics_freshness: Provisional"),
-            "{path}: {context}"
-        );
-        assert!(
-            text.contains("diagnostic_readiness: Reported"),
-            "{path}: {context}"
-        );
-        assert!(
-            text.contains("diagnostic_count: at_least_"),
-            "{path}: {context}"
-        );
+        assert_addressed_locations(text, "definitions");
+        assert_addressed_locations(text, "references");
+        assert!(text.contains("(provisional"), "{path}: {context}");
+        assert!(text.contains("diagnostics: at least "), "{path}: {context}");
+        assert!(text.contains("diagnostics: at least "), "{path}: {context}");
     }
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
@@ -16399,15 +19853,18 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
-    let context = actor.call(&fixture, "ide.context", json!({"path":"source/utils/normalize.ts","byte_offset":source.rfind("value;").unwrap()})).await;
+    let context = actor.call(&fixture, "ide.symbol", json!({"path":"source/utils/normalize.ts","byte_offset":source.rfind("value;").unwrap()})).await;
     let context = actor.settle(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "symbol", "{context}");
     assert!(
         context["text"].as_str().unwrap().contains("mode: semantic"),
         "{context}"
     );
     assert!(
-        context["text"].as_str().unwrap().contains(source),
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("source/utils/normalize.ts#value"),
         "{context}"
     );
     assert!(context["detail_ref"].as_str().is_some(), "{context}");
@@ -16417,12 +19874,12 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
     let membership = actor
         .call(
             &fixture,
-            "ide.context",
-            json!({"path":"source/utils/normalize.ts","byte_offset":0}),
+            "ide.symbol",
+            json!({"path":"source/utils/normalize.ts","byte_offset":source.rfind("value;").unwrap()}),
         )
         .await;
     let membership = actor.settle(&fixture, membership).await;
-    assert_eq!(membership["kind"], "context", "{membership}");
+    assert_eq!(membership["kind"], "symbol", "{membership}");
     // An empty `node_modules` changes no observed project file, and the tsconfig still lists
     // the document, so the re-observed resolution stays verified and semantic.
     assert!(
@@ -16433,11 +19890,23 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
         "{membership}"
     );
     assert!(
-        membership["text"].as_str().unwrap().contains(source),
+        membership["text"]
+            .as_str()
+            .unwrap()
+            .contains("source/utils/normalize.ts#value"),
         "{membership}"
     );
     assert!(membership["detail_ref"].as_str().is_some(), "{membership}");
 
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"source/utils/normalize.ts"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert!(read["text"].as_str().unwrap().contains("42"), "{read}");
     let edit = actor
         .call(
             &fixture,
@@ -16445,7 +19914,7 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
             json!({
                 "operation_id":"typescript-edit",
                 "path":"source/utils/normalize.ts",
-                "source_ref":context["detail_ref"],
+                "source_ref":read["detail_ref"],
                 "content":source.replace("42", "43")
             }),
         )
@@ -16553,7 +20022,7 @@ async fn configured_product_typescript_vite_directory_include_membership() {
     let outside = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"outside.ts","byte_offset":0}),
         )
         .await;
@@ -16611,12 +20080,12 @@ async fn configured_product_claude_typescript_unverified_membership_falls_back_t
     let context = actor
         .call_claude(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"fixture.ts","byte_offset":source.rfind("value;").unwrap()}),
         )
         .await;
     let (context, _) = actor.settle_claude(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "symbol", "{context}");
     // The compact line names the actual rejection (b2155cc renders the reason), not the
     // generic default.
     assert!(
@@ -16629,14 +20098,17 @@ async fn configured_product_claude_typescript_unverified_membership_falls_back_t
         context["text"]
             .as_str()
             .unwrap()
-            .contains("lexical_matches: [{"),
+            .contains("lexical matches: "),
         "{context}"
     );
     assert!(
-        context["text"].as_str().unwrap().contains(source),
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("fixture.ts#value")
+            && !context["text"].as_str().unwrap().contains(source),
         "{context}"
     );
-    assert!(context["detail_ref"].as_str().is_some(), "{context}");
 
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -16690,22 +20162,34 @@ async fn configured_product_claude_returns_real_pyright_semantic_context_diff_an
     assert!(feedback.is_empty());
 
     let source = std::fs::read_to_string(&path).unwrap();
-    let pending = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
-        )
-        .await;
-    let (context, _) = actor.settle_claude(&fixture, pending).await;
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let context = loop {
+        let pending = actor
+            .call_claude(
+                &fixture,
+                "ide.symbol",
+                json!({"path":"main.py","byte_offset":source.rfind("value()").unwrap()}),
+            )
+            .await;
+        let (context, _) = actor.settle_claude(&fixture, pending).await;
+        let text = context["text"].as_str().unwrap_or_default();
+        if text.contains("mode: semantic") && text.contains("diagnostics: 1") {
+            break context;
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "Claude Pyright did not reach semantic error readiness: {context}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     let text = context["text"].as_str().unwrap();
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "symbol", "{context}");
     assert!(text.contains("mode: semantic"), "{context}");
-    assert!(text.contains("definitions: [{"), "{context}");
-    assert!(text.contains("references: [{"), "{context}");
-    assert!(text.contains("diagnostic_count: 1"), "{context}");
+    assert_addressed_locations(text, "definitions");
+    assert_addressed_locations(text, "references");
+    assert!(text.contains("diagnostics: 1"), "{context}");
     assert!(
-        text.contains("Type \\\"Literal['bad']\\\" is not assignable to return type \\\"int\\\""),
+        text.contains(r#"Type "Literal['bad']" is not assignable to return type "int""#),
         "{context}"
     );
 
@@ -16724,13 +20208,13 @@ async fn configured_product_claude_returns_real_pyright_semantic_context_diff_an
     let pending = actor
         .call_claude(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"main.py","byte_offset":fixed.rfind("value()").unwrap()}),
         )
         .await;
     let (refreshed, _) = actor.settle_claude(&fixture, pending).await;
     let refreshed_text = refreshed["text"].as_str().unwrap();
-    assert!(refreshed_text.contains("return 8"), "{refreshed}");
+    assert!(refreshed_text.contains("main.py#value"), "{refreshed}");
     assert!(
         !refreshed_text.contains("return \\\"bad\\\"")
             && !refreshed_text.contains("Literal['bad']"),
@@ -16809,7 +20293,7 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let providers = json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cross-crate-cache"}]);
+    let providers = json!([{"executable":accepted_program(wrapper.to_str().unwrap(), &real_rust_analyzer_identity()),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cross-crate-cache"}]);
     fixture.write_config(providers);
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "cross-crate-root").await;
@@ -16830,17 +20314,20 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    // The positional query legitimately returns lexical evidence while indexing. This test
+    // proves real cross-crate semantics, so wait for the same existing live-outline barrier.
+    batch_wait_semantic_provider(&mut actor, &fixture, "src/lib.rs").await;
     let bytes = std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap();
     let offset = bytes.rfind("shared_value()").unwrap();
     let response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/lib.rs","byte_offset":offset}),
         )
         .await;
     let response = actor.settle(&fixture, response).await;
-    assert_eq!(response["kind"], "context", "{response}");
+    assert_eq!(response["kind"], "symbol", "{response}");
     let text = response["text"].as_str().unwrap();
     assert!(text.contains("mode: semantic"), "{response}");
     assert!(
@@ -16897,7 +20384,7 @@ async fn configured_product_rust_delete_does_not_report_cached_flycheck_diagnost
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-stale-diagnostics-cache"}]));
+    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(), &real_rust_analyzer_identity()),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-stale-diagnostics-cache"}]));
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "rust-stale-diagnostics").await;
     let started = actor
@@ -16950,7 +20437,8 @@ async fn configured_product_rust_delete_does_not_report_cached_flycheck_diagnost
     assert_eq!(deleted["state"], "edit", "{deleted}");
     assert_eq!(deleted["operation"], "deleted", "{deleted}");
     assert!(
-        !deleted.to_string().contains("cold_probe"),
+        // The change line names the address the deleted symbol had; the diagnostics must not.
+        !deleted["diagnostics"].to_string().contains("cold_probe"),
         "a deleted function's cached flycheck warning must not be current: {deleted}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
@@ -17090,13 +20578,8 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
             "{refused}"
         );
         let text = refused["result"]["content"][0]["text"].as_str().unwrap();
-        let expected_tool = if tool == "ide.edit" {
-            "ide.edit"
-        } else {
-            "ide.test"
-        };
         assert!(
-            text.starts_with(&format!("refused: read_only ({expected_tool});")),
+            text.starts_with("This activation started with read_only: true;"),
             "{index}: {text}"
         );
         assert!(
@@ -17104,7 +20587,7 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
             "{index}: {text}"
         );
         assert!(
-            text.contains("current writer: activation"),
+            text.contains("Current writer: activation"),
             "{index}: {text}"
         );
         assert!(text.contains("last activity"), "{index}: {text}");
@@ -17118,14 +20601,10 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
 
     // The reader must not have disturbed the writer: its context still resolves.
     let live = first
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
         .await;
     let live = first.settle(&fixture, live).await;
-    assert_eq!(live["kind"], "context", "{live}");
+    assert_eq!(live["kind"], "read", "{live}");
 
     // A reader requesting writer mode is refused with the holder facts and the read-only next step.
     let refused_writer = second.call_raw(&fixture, "ide.start", json!({})).await;
@@ -17141,7 +20620,7 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
     assert!(writer_text.contains("since"), "{writer_text}");
     assert!(writer_text.contains("last activity"), "{writer_text}");
     assert!(
-        writer_text.contains("Start with {\"read_only\": true} to read alongside"),
+        writer_text.contains("Repair: Call ide.start with {\"read_only\":true} to read alongside."),
         "{writer_text}"
     );
 
@@ -17225,7 +20704,12 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"slow-fixture-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"slow-fixture-cache"}]));
+    write_fixture_rust_provider(
+        &fixture,
+        &program,
+        "slow-fixture-provider",
+        "slow-fixture-cache",
+    );
     let mut daemon = fixture
         .daemon_with_home(Some(&provider_home(&fixture)))
         .await;
@@ -17249,7 +20733,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     let pending = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
@@ -17273,7 +20757,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
             operator_cargo_home(namespace).to_str().unwrap(),
             namespace.join("target").to_str().unwrap(),
             namespace.join("tmp").to_str().unwrap(),
-            "stable",
+            fixture_toolchain_name().as_str(),
         ]
     );
     // `/bin/sh` sets PWD, SHLVL and _ in the fixture script itself; every other name in the
@@ -17291,6 +20775,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
             "HOME",
             "PATH",
             "RUSTC",
+            "RUSTUP_AUTO_INSTALL",
             "RUSTUP_TOOLCHAIN",
             "TMPDIR",
         ],
@@ -17310,7 +20795,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     daemon.wait().await.unwrap();
 }
 
-/// A provider that exits before it ever answers must fall back to a lexical `ide.context` result
+/// A provider that exits before it ever answers must fall back to a lexical `ide.read` result
 /// almost immediately, never by exhausting the 120s operation budget polling a provider that is
 /// already dead. `context` treats `FailureCode::ProviderUnavailable` as a deliberate lexical fallback rather
 /// than a fatal error, so the settled reply is `state: "complete"` carrying the fallback reason, not
@@ -17319,6 +20804,35 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
 #[tokio::test]
 async fn configured_product_context_settles_promptly_when_provider_exits_before_bind() {
     use std::os::unix::fs::PermissionsExt;
+    /// Re-queries only an explicit Loading positional result within the existing20s bound;
+    /// initialize can finish after an honest lexical reply without an unsolicited second answer.
+    async fn settle_failed_provider(
+        actor: &mut ProductActor,
+        fixture: &ProductFixture,
+        reply: Value,
+    ) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut reply = actor.settle(fixture, reply).await;
+        while reply["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("semantic provider is still loading"))
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "provider failure was not observed: {reply}"
+            );
+            let next = actor
+                .call(
+                    fixture,
+                    "ide.symbol",
+                    json!({"path":"src/lib.rs","byte_offset":48}),
+                )
+                .await;
+            reply = actor.settle(fixture, next).await;
+        }
+        reply
+    }
+
     let fixture = ProductFixture::new(json!([]));
     let program = fixture.base.join("exit-before-bind-provider");
     let marker = fixture.base.join("exit-before-bind-marker");
@@ -17331,8 +20845,11 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(
-        json!([{"executable":accepted_program(program.to_str().unwrap(),"exit-before-bind-fixture-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"exit-before-bind-fixture-cache"}]),
+    write_fixture_rust_provider(
+        &fixture,
+        &program,
+        "exit-before-bind-fixture-provider",
+        "exit-before-bind-fixture-cache",
     );
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "exit-before-bind-root").await;
@@ -17349,7 +20866,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
     let pending = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
@@ -17358,7 +20875,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
         "{pending}"
     );
     let began = tokio::time::Instant::now();
-    let settled = actor.settle(&fixture, pending).await;
+    let settled = settle_failed_provider(&mut actor, &fixture, pending).await;
     let elapsed = began.elapsed();
     assert!(
         elapsed < Duration::from_secs(20),
@@ -17397,7 +20914,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
     let refreshed = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
@@ -17405,7 +20922,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
         matches!(refreshed["state"].as_str(), Some("pending" | "complete")),
         "{refreshed}"
     );
-    let refreshed = actor.settle(&fixture, refreshed).await;
+    let refreshed = settle_failed_provider(&mut actor, &fixture, refreshed).await;
     assert_eq!(refreshed["state"], "complete", "{refreshed}");
     assert!(
         refreshed["text"]
@@ -17440,7 +20957,12 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]));
+    write_fixture_rust_provider(
+        &fixture,
+        &program,
+        "rust-analyzer signal fixture",
+        "signal-rust-cache",
+    );
     let mut daemon = fixture
         .daemon_with_home(Some(&provider_home(&fixture)))
         .await;
@@ -17457,7 +20979,7 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     let pending = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
@@ -17489,7 +21011,7 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
             operator_cargo_home(&namespaces[0]).to_str().unwrap(),
             namespaces[0].join("target").to_str().unwrap(),
             namespaces[0].join("tmp").to_str().unwrap(),
-            "stable",
+            fixture_toolchain_name().as_str(),
         ]
     );
     // SAFETY: signal zero only observes the readiness-marked direct child and changes no state.
@@ -17513,15 +21035,13 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
 }
 
 /// A real background Context job that finishes while its own caller only ever saw `Pending`
-/// leaves a genuinely undelivered new fact: the first eligible native-edit hook must deliver it
-/// once, and a second must not resurrect it. This drives the actual product Worker/dispatcher
-/// entry path end to end (real daemon, real Pyright, real hook binary) — `ide.inspect` is never
-/// called for this detail, so nothing but the job's own completion and the hook can be the source
-/// of delivery.
+/// is never delivered by IDE itself (OUTBOX-r4): neither the first nor a second eligible
+/// native-edit hook carries its result, and the retained answer is read back through the
+/// pending reference. This drives the actual product Worker/dispatcher entry path end to end
+/// (real daemon, real Pyright, real hook binary); only Bridge could deliver it unprompted.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
-async fn configured_product_pending_context_job_completes_and_native_hook_delivers_its_feedback_once()
- {
+async fn configured_product_pending_context_job_completes_and_no_native_hook_delivers_it() {
     use std::os::unix::fs::PermissionsExt;
     let node = std::env::var("AGENT_IDE_NODE").unwrap();
     let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
@@ -17534,7 +21054,7 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     fixture.git(&["add", "--", "app.py"]);
     fixture.git(&["commit", "--quiet", "-m", "python fixture"]);
     // The Node host of Pyright cannot start until this test releases the gate, so the very first
-    // `ide.context` must observe the job still queued (`Pending`) rather than racing a fast real
+    // `ide.read` must observe the job still queued (`Pending`) rather than racing a fast real
     // provider.
     let gate = fixture.base.join("release-provider");
     let wrapper = fixture.base.join("node-gated-provider");
@@ -17587,7 +21107,7 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     let response = actor
         .call(
             &fixture,
-            "ide.context",
+            "ide.symbol",
             json!({"path":"app.py","byte_offset":offset}),
         )
         .await;
@@ -17609,14 +21129,14 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
         .await;
     assert!(first.status.success() && first.stderr.is_empty());
     assert!(
-        !first.stdout.is_empty(),
-        "a completed-but-unretrieved fact must deliver on the first eligible hook: got empty stdout"
+        first.stdout.is_empty(),
+        "no hook carries a completed-but-unretrieved job: {:?}",
+        String::from_utf8_lossy(&first.stdout)
     );
-    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
-    let additional = first["hookSpecificOutput"]["additionalContext"]
+    let reference = response["detail_ref"]
         .as_str()
-        .unwrap();
-    assert!(additional.contains("Provider reported"), "{additional}");
+        .expect("the pending reply names its reference")
+        .to_owned();
 
     actor
         .lifecycle(&fixture, "PreToolUse", "native-edit-2")
@@ -17627,8 +21147,20 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     assert!(second.status.success() && second.stderr.is_empty());
     assert!(
         second.stdout.is_empty(),
-        "the already-delivered fact must not resurrect on a second hook: {:?}",
+        "no second hook carries it either: {:?}",
         String::from_utf8_lossy(&second.stdout)
+    );
+
+    // The reference reads the full answer back, with the provider's diagnostic.
+    let full = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+        .await;
+    assert_eq!(full["state"], "complete", "{full}");
+    assert_eq!(full["kind"], "symbol", "{full}");
+    let text = full["text"].as_str().unwrap();
+    assert!(
+        text.contains("diagnostics: 1 (provisional)") && text.contains("reportReturnType"),
+        "{full}"
     );
 
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -17737,8 +21269,9 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     std::fs::write(
         &proxy,
         format!(
-            "#!/bin/sh\nwhile [ -e {} ]; do sleep 0.05; done\nexec /usr/bin/git \"$@\"\n",
-            gate.display()
+            "#!/bin/sh\nwhile [ -e {} ]; do sleep 0.05; done\nexec {} \"$@\"\n",
+            shell_quote_for_test(&gate),
+            shell_quote_for_test(Path::new(&fixture_git()))
         ),
     )
     .unwrap();
@@ -17887,14 +21420,10 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     // exactness — so it is never silently captured as if the stale recorded revision still
     // described it.
     let observed = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"tracked.txt","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let observed = actor.settle(&fixture, observed).await;
-    assert_eq!(observed["kind"], "context", "{observed}");
+    assert_eq!(observed["kind"], "read", "{observed}");
     std::fs::write(fixture.root.join("tracked.txt"), "unreconciled\n").unwrap();
     let mismatched = actor
         .call(&fixture, "ide.diff", json!({"mode":"head"}))
@@ -18185,7 +21714,11 @@ async fn diff_retention_full_split_page_fits_its_actual_trailer() {
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     for _ in 0..16 {
         let page = actor
-            .call(&fixture, "ide.diff", json!({"paths":["packed.txt"]}))
+            .call(
+                &fixture,
+                "ide.diff",
+                json!({"mode":"head","paths":["packed.txt"]}),
+            )
             .await;
         let page = actor.settle(&fixture, page).await;
         assert_eq!(page["continuation"], true, "{page}");
@@ -18195,7 +21728,7 @@ async fn diff_retention_full_split_page_fits_its_actual_trailer() {
             .call(
                 &fixture,
                 "ide.diff",
-                json!({"paths":["packed.txt"],"provenance":provenance}),
+                json!({"mode":"head","paths":["packed.txt"],"provenance":provenance}),
             )
             .await;
         let page = actor.settle(&fixture, page).await;
@@ -18314,7 +21847,7 @@ async fn diff_oversized_single_hunk_pages_to_completion() {
     fixture.git(&["commit", "--quiet", "-m", "huge"]);
     let body = escape_heavy("hunkmark-huge", 3000);
     std::fs::write(fixture.root.join("huge.txt"), &body).unwrap();
-    let output = std::process::Command::new("/usr/bin/git")
+    let output = std::process::Command::new(fixture_git())
         .args(["diff", "--no-color", "--", "huge.txt"])
         .current_dir(&fixture.root)
         .output()
@@ -18380,7 +21913,7 @@ async fn diff_fallback_pages_large_hunks_and_untracked_text() {
         fixture.root.join("node_modules"),
     )
     .unwrap();
-    let previous = std::process::Command::new("/usr/bin/git")
+    let previous = std::process::Command::new(fixture_git())
         .args(["rev-parse", "HEAD~1"])
         .current_dir(&fixture.root)
         .output()
@@ -18389,7 +21922,7 @@ async fn diff_fallback_pages_large_hunks_and_untracked_text() {
     let previous = String::from_utf8(previous.stdout).unwrap();
     let counter = fixture.base.join("head-counter");
     let proxy = fixture.base.join("unstable-git.sh");
-    std::fs::write(&proxy, format!("#!/bin/sh\ncase \" $* \" in\n *\" rev-parse --verify --quiet HEAD \"*)\n n=$(cat \"{}\" 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > \"{}\"\n if [ $((n%2)) -eq 0 ]; then echo '{}'; exit 0; fi;;\nesac\nexec /usr/bin/git \"$@\"\n", counter.display(), counter.display(), previous.trim())).unwrap();
+    std::fs::write(&proxy, format!("#!/bin/sh\ncase \" $* \" in\n *\" rev-parse --verify --quiet HEAD \"*)\n n=$(cat \"{}\" 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > \"{}\"\n if [ $((n%2)) -eq 0 ]; then echo '{}'; exit 0; fi;;\nesac\nexec {} \"$@\"\n", counter.display(), counter.display(), previous.trim(), shell_quote_for_test(Path::new(&fixture_git())))).unwrap();
     std::fs::set_permissions(&proxy, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
@@ -18500,7 +22033,7 @@ async fn diff_single_line_notice_keeps_later_changes_reachable() {
         .call(
             &fixture,
             "ide.diff",
-            json!({"paths":["src/long.rs","z-last.txt"]}),
+            json!({"mode":"head","paths":["src/long.rs","z-last.txt"]}),
         )
         .await;
     let mut page = actor.settle(&fixture, first).await;
@@ -18631,17 +22164,13 @@ fn page_marker(text: &str) -> (usize, bool, usize, usize, usize) {
     )
 }
 
-/// A Claude Context reads a source file far over the former 64 KiB render cap in one daemon
-/// capture, and the daemon pages the whole composed text across repeated `ide.inspect` calls:
-/// the first continuation call serves page two (not page one again), every page starts with a
-/// contiguous position marker, the pages join to the exact file bytes, the last page states
-/// completion, re-inspecting after it re-serves that last page, and `ide.edit` is refused on the
-/// source reference until every page was delivered (T13B, T16B).
+/// A Claude Read of a source file far over the former 8 KiB source, 64 KiB reply and 144 KiB
+/// IPC caps arrives in ONE reply: no page, no continuation, every numbered byte exact including
+/// UTF-8, and the reference is a whole-file edit base at once (T13B, T16B superseded).
 #[tokio::test]
-async fn claude_context_pagination_delivers_the_whole_source_across_repeated_inspect() {
+async fn claude_large_read_delivers_the_whole_source_in_one_reply() {
     let fixture = ProductFixture::new(json!([]));
-    // ~150 KB of short lines with a multibyte character: over the former 64 KiB cap, over the
-    // 114000-byte live report, and well under the 1 MiB read ceiling.
+    // ~150 KB of short lines with a multibyte character, well under the 1 MiB read ceiling.
     let content: String = (0..3300)
         .map(|line| format!("value_{line:05} = \"caf\u{e9} {line:05} padding padding padding\"\n"))
         .collect();
@@ -18659,91 +22188,19 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
     assert_eq!(started["kind"], "activation", "{started}");
 
     let first_call = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"claude-large.py","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"claude-large.py"}))
         .await;
-    let (page1, _) = actor.settle_claude(&fixture, first_call).await;
-    assert_eq!(page1["kind"], "context", "{page1}");
-    assert_eq!(page1["truncated"], true, "{page1}");
-    assert_eq!(page1["continuation"], true, "{page1}");
-    let reference = page1["detail_ref"]
-        .as_str()
-        .expect("a multi-page Context result must carry a detail_ref")
-        .to_owned();
-    let page1_text = page1["text"].as_str().unwrap().to_owned();
-    assert!(
-        page1_text.contains("coverage: complete registered path"),
-        "{page1_text}"
-    );
-    let (number, last, from, mut end, total) = page_marker(&page1_text);
-    assert_eq!((number, last, from, total), (1, false, 0, content.len()));
-    let mut collected = page1_text
-        .split_once("\n\n")
-        .expect("header ends at the first blank line")
-        .1
-        .to_owned();
-
-    let mut continuation = true;
-    let mut expected_page = 1;
-    let mut last_page = String::new();
-    while continuation {
-        expected_page += 1;
-        assert!(expected_page < 20, "pagination did not terminate");
-        let next = actor
-            .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
-            .await;
-        assert_eq!(next["kind"], "context", "{next}");
-        let text = next["text"].as_str().unwrap();
-        let (number, last, from, to, total) = page_marker(text);
-        assert_eq!(
-            number, expected_page,
-            "the first continuation call must serve page two, never page one again: {text}"
-        );
-        assert_eq!((from, total), (end, content.len()), "{text}");
-        end = to;
-        continuation = next["continuation"].as_bool().unwrap();
-        assert_eq!(last, !continuation, "{text}");
-        assert_eq!(next["truncated"], json!(continuation), "{next}");
-        collected.push_str(text.split_once('\n').unwrap().1);
-        if expected_page == 2 {
-            // Two pages of a longer file are a partial view: an edit built on its source
-            // reference could truncate the file, so it is refused before the last page.
-            let edit = actor
-                .call_claude(
-                    &fixture,
-                    "ide.edit",
-                    json!({"operation_id":"partial-view","path":"claude-large.py",
-                           "source_ref":&reference,"content":"x = 1\n"}),
-                )
-                .await;
-            let (edit, _) = actor.settle_claude(&fixture, edit).await;
-            assert_eq!(edit["result"]["outcome"], "stale_source", "{edit}");
-            assert_eq!(edit["result"]["source_ref"], Value::Null, "{edit}");
-        }
-        if !continuation {
-            assert!(
-                text.lines().next().unwrap().ends_with("; complete"),
-                "{text}"
-            );
-            last_page = text.to_owned();
-        }
-    }
-    assert!(expected_page >= 3, "the fixture must force several pages");
-    assert_eq!(end, content.len(), "the last page must reach the end");
+    let (read, _) = actor.settle_claude(&fixture, first_call).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    assert_eq!(read["truncated"], false, "{read}");
+    assert_eq!(read["continuation"], false, "{read}");
     assert_eq!(
-        collected, content,
-        "pages must join to the exact file bytes"
+        read["text"].as_str().unwrap(),
+        numbered_source("claude-large.py", &content),
+        "one reply carries every numbered source byte, including UTF-8"
     );
-
-    // Terminal behaviour: a further inspect re-serves the same last page, byte-identical.
-    let again = actor
-        .call_claude(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
-        .await;
-    assert_eq!(again["text"].as_str().unwrap(), last_page, "{again}");
-    assert_eq!(again["continuation"], false, "{again}");
+    // A one-page read names no continuation reference: the current text is the edit base.
+    assert!(read["detail_ref"].is_null(), "{}", read["detail_ref"]);
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -18752,7 +22209,7 @@ async fn claude_context_pagination_delivers_the_whole_source_across_repeated_ins
     daemon.wait().await.unwrap();
 }
 
-/// Keeps a Claude Context ref across a problems lookup, native Read hint, and unchanged
+/// Keeps a Claude Read ref across a problems lookup, native Read hint, and unchanged
 /// re-observation; a later byte change refuses the edit before it touches the target.
 /// The Python fixture is near the reported fastapi file size.
 #[tokio::test]
@@ -18771,19 +22228,15 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
     assert_eq!(start["kind"], "activation", "{start}");
 
     let context = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"fastapi/utils.py","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"fastapi/utils.py"}))
         .await;
     let (context, _) = actor.settle_claude(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     assert_eq!(context["continuation"], false, "{context}");
     let problems = actor
-        .call_claude(&fixture, "ide.context", json!({"kind":"problems"}))
+        .call_claude(&fixture, "ide.inspect", json!({"kind":"problems"}))
         .await;
-    assert_eq!(problems["kind"], "context", "{problems}");
+    assert_eq!(problems["kind"], "inspect", "{problems}");
     assert_eq!(problems["detail_ref"], Value::Null, "{problems}");
     assert_eq!(problems["text"], "checks disabled");
     actor.claude_native_post(&fixture, "Read").await;
@@ -18794,7 +22247,7 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
             &fixture,
             "ide.edit",
             json!({"operation_id":"first-edit","path":"fastapi/utils.py",
-                "source_ref":context["detail_ref"],"content":"edited\n"}),
+                "content":"edited\n"}),
         )
         .await;
     let (edit, _) = actor.settle_claude(&fixture, edit).await;
@@ -18802,59 +22255,23 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
     assert_eq!(std::fs::read(&path).unwrap(), b"edited\n");
 
     let older = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"fastapi/utils.py","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"fastapi/utils.py"}))
         .await;
     let (older, _) = actor.settle_claude(&fixture, older).await;
-    let newer = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"fastapi/utils.py","byte_offset":0}),
-        )
-        .await;
-    let (newer, _) = actor.settle_claude(&fixture, newer).await;
-    assert_ne!(older["detail_ref"], newer["detail_ref"]);
+    assert_eq!(older["kind"], "read", "{older}");
     let edit = actor
         .call_claude(
             &fixture,
             "ide.edit",
             json!({
                 "operation_id":"after-reobserve", "path":"fastapi/utils.py",
-                "source_ref":older["detail_ref"], "content":"edited again\n"
+                "content":"edited_again = 1\n"
             }),
         )
         .await;
     let (edit, _) = actor.settle_claude(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
-    assert_eq!(std::fs::read(&path).unwrap(), b"edited again\n");
-
-    let context = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"fastapi/utils.py","byte_offset":0}),
-        )
-        .await;
-    let (context, _) = actor.settle_claude(&fixture, context).await;
-    std::fs::write(&path, "external\n").unwrap();
-    let stale = actor
-        .call_claude(
-            &fixture,
-            "ide.edit",
-            json!({
-                "operation_id":"after-change", "path":"fastapi/utils.py",
-                "source_ref":context["detail_ref"], "content":"must not write\n"
-            }),
-        )
-        .await;
-    let (stale, _) = actor.settle_claude(&fixture, stale).await;
-    assert_eq!(stale["result"]["outcome"], "stale_source", "{stale}");
-    assert_eq!(stale["result"]["source_ref"], Value::Null, "{stale}");
-    assert_eq!(std::fs::read(&path).unwrap(), b"external\n");
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited_again = 1\n");
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -19131,12 +22548,11 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
     let context = claude_operation(
         &mut first,
         &fixture,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
     )
     .await;
-    assert_eq!(context["kind"], "context", "{context}");
-    let source_ref = context["detail_ref"].as_str().unwrap().to_owned();
+    assert_eq!(context["kind"], "read", "{context}");
     let edited = claude_operation(
         &mut first,
         &fixture,
@@ -19144,23 +22560,22 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
         json!({
             "operation_id":"claude-edit-1",
             "path":"tracked.txt",
-            "source_ref":source_ref,
             "content":"claude-edit\n"
         }),
     )
     .await;
     assert_eq!(edited["state"], "edit", "{edited}");
     assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
-    let edited_source_ref = edited["result"]["source_ref"]
-        .as_str()
-        .expect("a successful Claude Edit must retain its post-read detail")
-        .to_owned();
+    assert!(
+        edited["result"]["source_ref"].is_null(),
+        "a Claude edit reply names no file-version reference: {edited}"
+    );
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
         b"claude-edit\n"
     );
-    // The returned Edit source reference is the already-reserved prepare detail, even while
-    // ordinary detail capacity is saturated; a second Claude Edit can consume it directly.
+    // A second Claude edit needs no reference at all, even while ordinary detail capacity is
+    // saturated: the current bytes are its base.
     let chained = claude_operation(
         &mut first,
         &fixture,
@@ -19168,7 +22583,6 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
         json!({
             "operation_id":"claude-edit-2",
             "path":"tracked.txt",
-            "source_ref":edited_source_ref,
             "content":"claude-chain\n"
         }),
     )
@@ -19187,11 +22601,11 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
     let stop_context = claude_operation(
         &mut first,
         &fixture,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
     )
     .await;
-    let stop_source_ref = stop_context["detail_ref"].as_str().unwrap().to_owned();
+    assert_eq!(stop_context["kind"], "read", "{stop_context}");
     let ready = first
         .call_claude(
             &fixture,
@@ -19199,7 +22613,6 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
             json!({
                 "operation_id":"claude-stop-ready",
                 "path":"tracked.txt",
-                "source_ref":stop_source_ref,
                 "content":"claude-stop-ready\n"
             }),
         )
@@ -19283,7 +22696,7 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
         stale_detail["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("host_binding"),
+            .contains("This IDE session is not active.\nRepair: Call ide.start in this project."),
         "{stale_detail}"
     );
 
@@ -19352,7 +22765,7 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
         conflict["text"]
             .as_str()
             .unwrap()
-            .starts_with("refused: read_only (ide.edit);"),
+            .starts_with("This activation started with read_only: true;"),
         "{conflict}"
     );
     if let Some(reference) = detail_ref.as_str() {
@@ -19364,7 +22777,7 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
                 conflict["text"]
                     .as_str()
                     .unwrap()
-                    .starts_with("refused: read_only (ide.edit);"),
+                    .starts_with("This activation started with read_only: true;"),
                 "{conflict}"
             );
         }
@@ -19380,15 +22793,10 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
     }
 
     let context = first
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"tracked.txt","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let (context, _) = first.settle_claude(&fixture, context).await;
-    assert_eq!(context["kind"], "context", "{context}");
-    assert!(context["detail_ref"].is_string(), "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     first.mcp.close().await;
@@ -19416,14 +22824,10 @@ async fn claude_later_binding_diffs_path_edited_under_earlier_grant() {
     assert_eq!(started["kind"], "activation", "{started}");
     let first_epoch = activation_epoch(&started);
     let pending = first
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"tracked.txt","byte_offset":0}),
-        )
+        .call_claude(&fixture, "ide.read", json!({"path":"tracked.txt"}))
         .await;
     let (context, _) = first.settle_claude(&fixture, pending).await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "read", "{context}");
     let pending = first
         .call_claude(
             &fixture,
@@ -19431,7 +22835,6 @@ async fn claude_later_binding_diffs_path_edited_under_earlier_grant() {
             json!({
                 "operation_id":"claude-epoch-first-edit",
                 "path":"tracked.txt",
-                "source_ref":context["detail_ref"],
                 "content":"edited-under-first-grant\n"
             }),
         )
@@ -19477,9 +22880,9 @@ async fn claude_later_binding_diffs_path_edited_under_earlier_grant() {
     daemon.wait().await.unwrap();
 }
 
-/// Proves Claude Context and Diff retrieved through their own tools with a `detail_ref`
+/// Proves Claude Read and Diff retrieved through their own tools with a `detail_ref`
 /// execute on the daemon route, and that a diagnostic already delivered inline inside a retrieved
-/// Context reply is never echoed a second time on the next ordinary native-edit hook.
+/// Symbol reply is never echoed a second time on the next ordinary native-edit hook.
 /// Cross-production identity replacement is covered by the worker's bounded ledger regression;
 /// this test owns the real Claude host surfaces.
 #[tokio::test]
@@ -19526,21 +22929,21 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
         .unwrap();
     let arguments = json!({"path":"app.py","byte_offset":offset});
     let pending = actor
-        .call_claude(&fixture, "ide.context", arguments.clone())
+        .call_claude(&fixture, "ide.symbol", arguments.clone())
         .await;
     let (context, _) = actor
-        .settle_claude_via(&fixture, pending, "ide.context", arguments)
+        .settle_claude_via(&fixture, pending, "ide.symbol", arguments)
         .await;
-    assert_eq!(context["kind"], "context", "{context}");
+    assert_eq!(context["kind"], "symbol", "{context}");
     let context_text = context["text"].as_str().unwrap();
     assert!(context_text.contains("mode: semantic"), "{context_text}");
-    assert!(context_text.contains("return \"bad\""), "{context_text}");
     assert!(
-        context_text.contains("diagnostic_count: 1"),
+        context_text.contains("app.py#value") && !context_text.contains("return \"bad\""),
         "{context_text}"
     );
+    assert!(context_text.contains("diagnostics: 1"), "{context_text}");
     // The diagnostic delta above was already handed to this same caller inline, inside the
-    // retrieved `ide.context` reply. An ordinary native-edit post hook that follows must not echo
+    // retrieved `ide.read` reply. An ordinary native-edit post hook that follows must not echo
     // that already-submitted fact on the second channel: `claude_lifecycle` asserts empty stdout,
     // the same bar every other no-feedback hook in this file is held to.
     actor
@@ -19623,35 +23026,41 @@ fn provider_cache(fixture: &ProductFixture) -> PathBuf {
     provider_home(fixture).join(".agent-ide/providers")
 }
 
-/// Enables project checks with a fake Rust toolchain whose `cargo` replays a fixed JSON stream.
+/// Enables project checks with fake `cargo`/`rustc` and the prepared `rustfmt` executable.
 ///
-/// The fake `cargo` runs under the real Seatbelt runner and reports one error per line of the
-/// worktree's untracked `problems.count` value, so tests change counts without a real compiler.
-/// `allowed_root` is the configured admission root. Returns the redirected daemon home (`AGENT_IDE_HOME`).
+/// Fake `cargo` runs under the real Seatbelt runner and reports one error per line of the
+/// worktree's untracked `problems.count`; fake `rustc` only satisfies toolchain layout, and the
+/// prepared real formatter preserves edit semantics.
+/// `allowed_root` is the configured admission root. Returns redirected `AGENT_IDE_HOME`.
 fn enable_fake_rust_checks(fixture: &ProductFixture, allowed_root: &Path) -> PathBuf {
     enable_fake_rust_checks_holding(fixture, allowed_root, "")
 }
 
-/// The gate file a gate-held fake `cargo` waits on, outside the repository worktree so its
-/// creation never perturbs the scheduler's worktree-input fingerprint (T20B).
+/// The gate file is outside the worktree but inside the check's readable Cargo home, so its
+/// creation neither changes the worktree fingerprint nor disappears inside confinement (T20B).
 const CHECKS_GATE: &str = "checks-gate";
+
+/// Returns the gate location shared by the fixture and the confined fake `cargo`.
+fn checks_gate(fixture: &ProductFixture) -> PathBuf {
+    fixture.base.join("home/.cargo").join(CHECKS_GATE)
+}
 
 /// Hold command that blocks every fake check run at a barrier instead of assuming a wall-clock
 /// window: the test releases [`release_checks_gate`] only after the activation replies have
 /// settled, so the first result provably cannot be consumed by an earlier reply carrier.
 fn hold_checks_at_gate(fixture: &ProductFixture) -> String {
-    let gate = fixture.base.join(CHECKS_GATE);
+    let gate = checks_gate(fixture);
     fixture.guard_gate(&gate);
     format!(
         "while [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.05; done",
         gate.display(),
-        fixture.base.display()
+        gate.parent().unwrap().display()
     )
 }
 
 /// Releases the check barrier: every held fake `cargo` run completes and its result becomes due.
 fn release_checks_gate(fixture: &ProductFixture) {
-    std::fs::write(fixture.base.join(CHECKS_GATE), "go").unwrap();
+    std::fs::write(checks_gate(fixture), "go").unwrap();
 }
 
 /// Counts completed project-check telemetry rows in one daemon's own database; 0 when absent.
@@ -19673,8 +23082,10 @@ async fn completed_check_count(database: &Path) -> usize {
         .count()
 }
 
-/// Same, with a shell command prepended to the fake `cargo` so a test can hold the first check
-/// in its running state long enough to observe a `checking (…)` plate (T22B).
+/// Same, with `hold` prepended to fake `cargo` so a test can hold its first check at a barrier.
+///
+/// An empty `hold` runs immediately; otherwise the supplied fixture shell commands run before
+/// the fixed JSON stream, allowing the caller to observe a live `checking (…)` plate (T22B).
 fn enable_fake_rust_checks_holding(
     fixture: &ProductFixture,
     allowed_root: &Path,
@@ -19684,6 +23095,7 @@ fn enable_fake_rust_checks_holding(
     let toolchain = home.join(".rustup/toolchains/fake");
     std::fs::create_dir_all(toolchain.join("bin")).unwrap();
     std::fs::create_dir_all(home.join(".cargo")).unwrap();
+    let bin = toolchain.join("bin");
     let cargo = toolchain.join("bin/cargo");
     let mut script = String::new();
     if !hold.is_empty() {
@@ -19704,6 +23116,12 @@ printf '{"reason":"build-finished","success":true}\n'
     );
     std::fs::write(&cargo, script).unwrap();
     std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rustc = bin.join("rustc");
+    std::fs::write(&rustc, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rustfmt = bin.join("rustfmt");
+    std::fs::copy(toolchain_bin("rustfmt"), &rustfmt).unwrap();
+    std::fs::set_permissions(&rustfmt, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
     config["allowed_roots"] = json!([allowed_root]);
@@ -19779,18 +23197,18 @@ async fn await_eyes_result(actor: &mut ProductActor, fixture: &ProductFixture) -
     }
 }
 
-/// Reads the `ide.context` problems page for an active Claude actor.
+/// Reads the `ide.inspect` problems page for an active Claude actor.
 async fn eyes_problems(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
     let reply = actor
-        .call_claude(fixture, "ide.context", json!({"kind":"problems"}))
+        .call_claude(fixture, "ide.inspect", json!({"kind":"problems"}))
         .await;
-    assert_eq!(reply["kind"], "context", "{reply}");
+    assert_eq!(reply["kind"], "inspect", "{reply}");
     reply["text"].as_str().unwrap().to_owned()
 }
 
 /// Start schedules a confined check whose first result reaches the next native post-hook once;
 /// unchanged state stays silent, a native edit reruns the check and the block carries the delta,
-/// and `ide.context kind=problems` reports the same counts (EYES-r1 §5–§7).
+/// and `ide.inspect kind=problems` reports the same counts (EYES-r1 §5–§7).
 #[tokio::test]
 async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     let fixture = ProductFixture::new(json!([]));
@@ -19966,22 +23384,24 @@ async fn eyes_codex_legacy_sandbox_metadata_keeps_project_checks_available() {
     daemon.wait().await.unwrap();
 }
 
-/// Reads the `ide.context` problems page for an active Codex actor, with its carried status plate.
+/// Reads the `ide.inspect` problems page for an active Codex actor, with its carried status plate.
+/// A refusal prints the raw envelope, retaining its cause-specific repair text for diagnosis.
 async fn eyes_codex_problems(
     actor: &mut ProductActor,
     fixture: &ProductFixture,
 ) -> (String, Option<String>) {
-    let reply = actor
-        .call(fixture, "ide.context", json!({"kind":"problems"}))
+    let raw = actor
+        .call_raw(fixture, "ide.inspect", json!({"kind":"problems"}))
         .await;
-    assert_eq!(reply["kind"], "context", "{reply}");
+    let reply = &raw["result"]["structuredContent"];
+    assert_eq!(reply["kind"], "inspect", "{raw}");
     (
         reply["text"].as_str().unwrap().to_owned(),
-        carried_status(&reply).map(str::to_owned),
+        carried_status(reply).map(str::to_owned),
     )
 }
 
-/// Polls Codex `ide.context` problems replies until one carries exactly `expected` (T28B).
+/// Polls Codex `ide.inspect` problems replies until one carries exactly `expected` (T28B).
 ///
 /// Intermediate `checking (…)` plates are legitimately delivered once each; only the exact
 /// expected plate satisfies the wait.
@@ -20065,11 +23485,7 @@ async fn eyes_codex_reply_carries_due_plate_and_delta() {
 
     // An `ide.edit` that changes the check inputs is followed by a reply carrying the delta.
     let original = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"problems.count","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"problems.count"}))
         .await;
     let original = actor.settle(&fixture, original).await;
     let edited = actor
@@ -20151,7 +23567,7 @@ async fn eyes_codex_managed_reply_carries_due_plate_after_native_edit() {
                 &mut mcp,
                 next,
                 actor,
-                "ide.context",
+                "ide.inspect",
                 json!({"kind":"problems"}),
                 &state,
             )
@@ -20182,7 +23598,7 @@ async fn eyes_codex_managed_reply_carries_due_plate_after_native_edit() {
             &mut mcp,
             next,
             actor,
-            "ide.context",
+            "ide.inspect",
             json!({"kind":"problems"}),
             &state,
         )
@@ -20318,7 +23734,7 @@ async fn await_eyes_codex_hook_plate(
     }
 }
 
-/// Polls managed `ide.context` problems replies (explicit root session) until one carries exactly
+/// Polls managed `ide.inspect` problems replies (explicit root session) until one carries exactly
 /// `expected` on its reply carrier (T28B), returning the plate.
 async fn await_eyes_codex_managed_root_plate(
     mcp: &mut Mcp,
@@ -20336,7 +23752,7 @@ async fn await_eyes_codex_managed_root_plate(
             *next,
             actor,
             session,
-            "ide.context",
+            "ide.inspect",
             json!({"kind":"problems"}),
             state,
         )
@@ -20425,7 +23841,7 @@ async fn eyes_codex_managed_native_post_delivers_plate_and_delta_without_ide_cal
         next,
         actor,
         session,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
         &state,
     )
@@ -20506,7 +23922,7 @@ async fn eyes_codex_reply_carrier_consumes_the_plate_before_the_native_hook() {
         next,
         actor,
         session,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
         &state,
     )
@@ -20566,7 +23982,7 @@ async fn eyes_codex_concurrent_hook_and_reply_deliver_exactly_one_plate() {
         let hook_run = managed_native_post(&root, session, actor, &race_call, "Bash");
         let state_for_race = state.clone();
         let reply_run = mcp.exchange(
-            json!({"jsonrpc":"2.0","id":next_for_reply,"method":"tools/call","params":{"name":"ide.context",
+            json!({"jsonrpc":"2.0","id":next_for_reply,"method":"tools/call","params":{"name":"ide.inspect",
                 "arguments":{"kind":"problems"},
                 "_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next_for_reply}"),
                 "x-codex-turn-metadata":{"session_id":session},"codex/sandbox-state-meta":state_for_race}}}),
@@ -20607,7 +24023,7 @@ async fn eyes_codex_concurrent_hook_and_reply_deliver_exactly_one_plate() {
         next,
         actor,
         session,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
         &state,
     )
@@ -20801,7 +24217,7 @@ async fn eyes_codex_two_sessions_on_one_repository_deliver_once_across_routes() 
         next,
         actor,
         session_b,
-        "ide.context",
+        "ide.inspect",
         json!({"kind":"problems"}),
         &state,
     )
@@ -20992,7 +24408,7 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     next += 1;
     let invalid = mcp
         .exchange(
-            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context",
+            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read",
             "arguments":{},
             "_meta":{"threadId":actor,"callId":rejected_call,
             "x-codex-turn-metadata":{"session_id":session},"codex/sandbox-state-meta":state}}}),
@@ -21003,7 +24419,7 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
         invalid["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("invalid bounded parameters"),
+            .contains("These arguments do not match the tool schema."),
         "{invalid}"
     );
     let rejected_post = managed_native_phase(
@@ -21051,8 +24467,8 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
         next,
         actor,
         session,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -21077,8 +24493,8 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
         next,
         actor,
         session,
-        "ide.context",
-        json!({"path":"tracked.txt","byte_offset":0}),
+        "ide.read",
+        json!({"path":"tracked.txt"}),
         &state,
     )
     .await;
@@ -21185,6 +24601,265 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     std::fs::remove_dir_all(base).unwrap();
 }
 
+/// OUTBOX-r4 §8.5: `detail_refs` answers several references in order in one reply.
+#[tokio::test]
+async fn outbox_inspect_batches_references_in_order() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-inspect").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"outbox"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let text = |reply: &Value| reply["text"].as_str().unwrap_or_default().to_owned();
+    for (id, word) in [(1, "first"), (2, "second")] {
+        let run = actor
+            .call(
+                &fixture,
+                "ide.test",
+                json!({"command":["/bin/sh","-c",format!("echo {word}")]}),
+            )
+            .await;
+        assert!(text(&run).starts_with(&format!("tests #{id}: ")), "{run}");
+    }
+    let batch = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_refs":["tests #2","tests #1"]}),
+        )
+        .await;
+    let batch = text(&batch);
+    let second_at = batch.find("== tests #2 ==").expect("first section");
+    let first_at = batch.find("== tests #1 ==").expect("second section");
+    assert!(second_at < first_at, "{batch}");
+    assert!(batch.contains("second"), "{batch}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Runs one Claude `Stop` hook for `actor` through the real hook command, allowing the process
+/// up to `wait`; returns its stdout and how long it took.
+async fn claude_stop_hook(
+    fixture: &ProductFixture,
+    actor: &ProductActor,
+    wait: Duration,
+) -> (String, Duration) {
+    let started = tokio::time::Instant::now();
+    let mut child = claude_hook_process(&fixture.runtime, Some(actor.attachment));
+    let payload = json!({"hook_event_name":"Stop",actor.actor_field:actor.actor,
+        "stop_hook_active":false,"last_assistant_message":"done"});
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(payload.to_string().as_bytes())
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(wait, child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success() && output.stderr.is_empty());
+    (String::from_utf8(output.stdout).unwrap(), started.elapsed())
+}
+
+/// Regression: IDE keeps no `Stop` hold. A Claude turn end releases at once with no output, with
+/// nothing requested and with its own test still running; a requested result is never continued
+/// into the turn as a `block` reason (Bridge owns wake).
+#[tokio::test]
+async fn claude_stop_hook_never_holds_or_blocks() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-hold").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"outbox"}))
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let (released, took) = claude_stop_hook(&fixture, &actor, Duration::from_secs(10)).await;
+    assert_eq!(released, "", "nothing requested: the turn ends");
+    assert!(took < Duration::from_secs(3), "{took:?}");
+
+    let run = actor
+        .call_claude(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 8; echo held"]}),
+        )
+        .await;
+    assert!(
+        run["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("tests #1: started")),
+        "{run}"
+    );
+    let (during, took) = claude_stop_hook(&fixture, &actor, Duration::from_secs(10)).await;
+    assert_eq!(
+        during, "",
+        "a run in flight never holds or blocks the turn end"
+    );
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Runs one Claude-path call for `actor` with its native Pre/Post hooks and returns the raw
+/// model text.
+async fn claude_raw_call(
+    fixture: &ProductFixture,
+    actor: &mut ProductActor,
+    name: &str,
+    arguments: Value,
+) -> String {
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    actor.claude_lifecycle(fixture, "PreToolUse", &call).await;
+    let reply = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}}}),
+        )
+        .await;
+    let _ = actor
+        .claude_lifecycle_output(fixture, "PostToolUse", &call)
+        .await;
+    assert_claude_envelope(&reply).to_owned()
+}
+
+/// OUTBOX-r3 §9.1 meets batch-api-v1 §2: a `PreCompact` hook raises the session's context
+/// epoch through the real hook path, so a read the agent received before the compaction is sent
+/// in full again instead of "unchanged since your read".
+#[tokio::test]
+async fn outbox_compaction_clears_the_unchanged_read_memory() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-compaction").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"compaction"}))
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let items = json!({"items":[{"path":"src/lib.rs"}]});
+    let first = claude_raw_call(&fixture, &mut actor, "ide.read", items.clone()).await;
+    assert!(!first.contains("unchanged since your read"), "{first}");
+    let again = claude_raw_call(&fixture, &mut actor, "ide.read", items.clone()).await;
+    assert!(again.contains("unchanged since your read"), "{again}");
+    let mut child = claude_hook_process(&fixture.runtime, Some(actor.attachment));
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(
+            json!({"hook_event_name":"PreCompact",actor.actor_field:actor.actor,
+                "trigger":"manual"})
+            .to_string()
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success() && output.stdout.is_empty());
+    let after = claude_raw_call(&fixture, &mut actor, "ide.read", items).await;
+    assert!(!after.contains("unchanged since your read"), "{after}");
+    assert!(
+        after.contains("1 delivered, 0 unchanged") && after.contains("pub fn value()"),
+        "the compacted session gets the full text again: {after}"
+    );
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A test run that is still running adds nothing to any later reply or plate: no running line, no
+/// elapsed seconds, no instruction. Its outcome is then read explicitly through its handle as the
+/// terminal text of M024-M026-TEST-FACT (counts, the failing test, the rerun line and the output
+/// reference), and a call after it carries nothing about the run.
+#[tokio::test]
+async fn a_running_test_adds_no_plate_line_and_its_handle_reads_the_terminal_text() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "running-no-plate").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"running"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let text = |reply: &Value| reply["text"].as_str().unwrap_or_default().to_owned();
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c",
+                "sleep 14; printf '%s\\n' 'running 1 test' 'test tests::fails ... FAILED' '' 'failures:' '' '---- tests::fails stdout ----' \"thread 'tests::fails' panicked at src/lib.rs:3:5:\" 'boom' '' 'failures:' '    tests::fails' '' 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"]}),
+        )
+        .await;
+    assert!(text(&run).starts_with("tests #1: started"), "{run}");
+    assert!(!text(&run).contains("poll"), "{run}");
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let reply = actor
+            .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
+            .await;
+        let carried = carried_status(&reply).unwrap_or_default();
+        for seen in [carried.to_owned(), text(&reply)] {
+            assert!(
+                !seen.contains("tests #1") && !seen.contains("poll"),
+                "a running test must not show up: {reply}"
+            );
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let fact = loop {
+        let waited = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":"tests #1"}))
+            .await;
+        let fact = text(&waited);
+        if fact.contains("1 failed") {
+            break fact;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run never settled: {fact}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert!(fact.starts_with("tests #1: "), "{fact}");
+    assert!(fact.contains("\n  FAIL tests::fails"), "{fact}");
+    let run_detail_ref = run["detail_ref"].as_str().expect("test result reference");
+    assert_rerun_receipt(&fact, run_detail_ref);
+    assert_eq!(fact.matches("full output: ide.test ").count(), 1, "{fact}");
+    assert!(!fact.contains("poll"), "{fact}");
+    let after = actor
+        .call(&fixture, "ide.inspect", json!({"kind":"problems"}))
+        .await;
+    assert!(
+        !text(&after).contains("tests #1")
+            && !carried_status(&after)
+                .unwrap_or_default()
+                .contains("tests #1"),
+        "the outcome must not repeat: {after}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Claude keeps hook-only plate delivery: `ide.*` replies never carry the plate even while one is
 /// due, the withheld posts stay silent, and the still-due plate reaches the next native post (T28B).
 #[tokio::test]
@@ -21210,13 +24885,13 @@ async fn eyes_claude_method_replies_never_carry_the_plate() {
             .mcp
             .exchange(
                 json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
-                "name":"ide.context","arguments":{"kind":"problems"},
+                "name":"ide.inspect","arguments":{"kind":"problems"},
                 "_meta":{"claudecode/toolUseId":call}}}),
             )
             .await;
         let text = assert_claude_envelope(&reply);
         assert!(!text.starts_with("<agent-ide>"), "{text}");
-        if text.starts_with("complete context: rust: ready; errors: 2") {
+        if text.starts_with("rust: ready; errors: 2") {
             break text.to_owned();
         }
         assert!(
@@ -21225,10 +24900,7 @@ async fn eyes_claude_method_replies_never_carry_the_plate() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
-    assert!(
-        problems.starts_with("complete context: rust: ready; errors: 2"),
-        "{problems}"
-    );
+    assert!(problems.starts_with("rust: ready; errors: 2"), "{problems}");
 
     // The plate was never consumed by a method reply: the next native post hook delivers it.
     let first = await_eyes_result(&mut actor, &fixture).await;
@@ -21271,7 +24943,7 @@ async fn eyes_claude_native_post_delivers_due_first_check_plate_once() {
                 "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}}}),
             )
             .await;
-        (claude_fields(assert_claude_envelope(&reply)), call)
+        (claude_fields(name, assert_claude_envelope(&reply)), call)
     }
 
     let fixture = ProductFixture::new(json!([]));
@@ -21372,7 +25044,7 @@ async fn eyes_absent_configuration_keeps_v02_hook_replies() {
 /// `b/package.json`, `c/package.json`, the layout `~/.config/agent-ide/typescript-bundle`
 /// ships — copied there from the accepted install, while the accepted `tsserver.js` stays in
 /// the installed TypeScript lib with `typescript.js` beside it (the probe's module), and both
-/// host evidence records are the derived ones, as the real entry's are. Panics when a closure
+/// platform binding is derived from the measured bytes, as the real entry's is. Panics when a closure
 /// member or acceptance environment value is missing, because callers are ignored release tests.
 fn accepted_typescript_provider_in_bundle_shape(bundle_root: &Path) -> Value {
     let node = PathBuf::from(std::env::var("AGENT_IDE_NODE").unwrap());
@@ -21421,10 +25093,20 @@ fn accepted_typescript_provider_in_bundle_shape(bundle_root: &Path) -> Value {
     agent_ide::languages::install();
     let unbound: agent_ide::assistance::launcher::ProviderLaunch =
         serde_json::from_value(provider.clone()).unwrap();
-    provider["typescript"]["codex_macos_evidence"] =
-        json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
-    provider["typescript"]["claude_macos_evidence"] =
-        json!(unbound.expected_typescript_claude_macos_evidence().unwrap());
+    if cfg!(target_os = "linux") {
+        provider["typescript"]["codex_macos_evidence"] = Value::Null;
+        provider["typescript"]["claude_macos_evidence"] = Value::Null;
+        provider["typescript"]["linux_operator_bundle"] = json!(
+            unbound
+                .expected_typescript_linux_operator_bundle()
+                .expect("measured Linux TypeScript bundle must match the supported release")
+        );
+    } else {
+        provider["typescript"]["codex_macos_evidence"] =
+            json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
+        provider["typescript"]["claude_macos_evidence"] =
+            json!(unbound.expected_typescript_claude_macos_evidence().unwrap());
+    }
     provider
 }
 
@@ -21488,14 +25170,10 @@ async fn configured_product_batch_typescript_tsx_gate_parses_jsx_in_the_real_lau
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let read = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/details.tsx","byte_offset":0}),
-        )
+        .call(&fixture, "ide.read", json!({"path":"src/details.tsx"}))
         .await;
     let read = actor.settle(&fixture, read).await;
-    assert_eq!(read["kind"], "context", "{read}");
+    assert_eq!(read["kind"], "read", "{read}");
     let source_ref = read["detail_ref"].as_str().unwrap();
 
     // A clean edit to the JSX file must not be told the base already fails to parse: that false
@@ -21574,7 +25252,7 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
     let fixture = ProductFixture::new(json!([]));
     fixture.write_config(json!([
         {"executable":accepted_program("/bin/sh","pyright-fixture"),"settings":"pyright_defaults_v1","toolchain":"node-fixture","node":accepted_program("/bin/sh","node-fixture"),"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"repeat-environment-cache"},
-        {"executable":accepted_program("/bin/sh","rust-analyzer fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"repeat-rust-cache"}
+        {"executable":accepted_program("/bin/sh","rust-analyzer fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":fixture_toolchain_name(),"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"repeat-rust-cache"}
     ]));
     std::fs::write(
         fixture.root.join("pyproject.toml"),
@@ -21659,11 +25337,11 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
         let context = actor
             .call(
                 &fixture,
-                "ide.context",
+                "ide.inspect",
                 json!({"kind":"problems","language":"python"}),
             )
             .await;
-        assert_eq!(context["kind"], "context", "{context}");
+        assert_eq!(context["kind"], "inspect", "{context}");
         let run = actor
             .call(
                 &fixture,
@@ -21694,10 +25372,15 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
     );
     let text = invalid["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("choose one of the listed candidates or \"auto\""),
+        text.contains("Repair: Select one listed project environment with ide.start.")
+            && text.contains(".venv-absent")
+            && text.contains("candidates .venv, .venv-py314"),
         "{text}"
     );
-    assert!(!text.contains("detail_ref"), "{text}");
+    assert!(
+        !batch_without_status_plate(text).contains("detail_ref"),
+        "{text}"
+    );
     let again = actor
         .call(
             &fixture,
@@ -21730,9 +25413,9 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
     daemon.wait().await.unwrap();
 }
 
-/// A repeated start that switches environments while a failed run's long status line is due
-/// still answers with its activation card: the environment notice joins the plate, which
-/// together exceed the feed's 256-byte block yet must not make the facade refuse the reply.
+/// A repeated start that switches environments while a failed run has settled unread still
+/// answers with its activation card: the environment notice leads the plate, and the run's
+/// outcome rides neither the plate nor the reply (Bridge delivers it).
 #[tokio::test]
 async fn configured_product_environment_switch_plate_with_due_test_line_keeps_the_card() {
     use std::os::unix::fs::PermissionsExt;
@@ -21789,7 +25472,7 @@ async fn configured_product_environment_switch_plate_with_due_test_line_keeps_th
         )
         .await;
     assert_eq!(run["kind"], "test", "{run}");
-    // Let the failing run settle without polling it, so its status line stays due.
+    // Let the failing run settle without polling it.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let switched = actor
         .call_raw(
@@ -21808,8 +25491,9 @@ async fn configured_product_environment_switch_plate_with_due_test_line_keeps_th
         text.contains("python: environment now .venv-py314 (was .venv; selected)"),
         "{text}"
     );
+    // OUTBOX-r4: the settled run never rides the plate or the reply of another call.
     assert!(
-        text.contains("tests #1: no test results (exit 1)"),
+        !text.contains("test-finished") && !text.contains("tests #1"),
         "{text}"
     );
     assert!(
@@ -21868,7 +25552,8 @@ async fn claude_start_actor(
     assert_eq!(reply["kind"], "activation", "{agent:?}: {reply}");
 }
 
-/// Reads the fixture's first lines for `agent` and requires that the read succeeded.
+/// Requires fresh fixture text for an authorization check; force bypasses only duplicate-body
+/// suppression, never host binding, source or workspace authority guards.
 async fn claude_read_ok(
     mcp: &mut Mcp,
     project: &Path,
@@ -21883,7 +25568,7 @@ async fn claude_read_ok(
         session,
         agent,
         "ide.read",
-        json!({"path":"src/lib.rs","lines":"1-2"}),
+        json!({"path":"src/lib.rs","lines":"1-2","force":true}),
     )
     .await;
     assert!(
@@ -21919,6 +25604,7 @@ fn add_worktrees(fixture: &ProductFixture, names: &[&str]) -> Vec<PathBuf> {
 #[tokio::test]
 async fn managed_claude_actors_in_three_worktrees_work_side_by_side() {
     let fixture = ProductFixture::new(json!([]));
+    enable_fake_rust_checks(&fixture, &fixture.base);
     let worktrees = add_worktrees(&fixture, &["side-b", "side-c", "side-d"]);
     let (left, right, extra) = (&worktrees[0], &worktrees[1], &worktrees[2]);
     let runtime = managed_claude_runtime_path(&fixture.root);
@@ -22083,7 +25769,7 @@ async fn managed_claude_restart_recovers_each_actor_and_admits_a_new_subagent() 
         &mut next,
         session,
         Some("agent-busy"),
-        "ide.context",
+        "ide.read",
         json!({"path":"busy.txt"}),
     )
     .await;
@@ -22158,7 +25844,7 @@ async fn managed_claude_lost_reply_on_a_live_daemon_keeps_every_actor() {
         json!({"path":"src/lib.rs","lines":"1-2"}),
     )
     .await;
-    assert_eq!(lost["code"], "outcome_unknown:", "{lost}");
+    assert_eq!(lost["code"], "outcome_unknown", "{lost}");
     assert_eq!(
         managed_claude_candidate_attachment(&fixture.root),
         attachment
@@ -22174,6 +25860,7 @@ async fn managed_claude_lost_reply_on_a_live_daemon_keeps_every_actor() {
 #[tokio::test]
 async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
     let fixture = ProductFixture::new(json!([]));
+    configure_prepared_rust_checks(&fixture);
     let runtime = managed_claude_runtime_path(&fixture.root);
     let _guard = SharedClaudeDaemonGuard(runtime);
     let mut mcp = Mcp::start_managed_claude_with_seam(
@@ -22206,7 +25893,7 @@ async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
     let reply = mcp.exchange(request.clone()).await;
     let text = assert_claude_envelope(&reply);
     assert!(
-        text.starts_with("error: outcome_unknown: ide.edit may have reached the IDE and applied")
+        text.starts_with("This edit may have applied; its outcome is unknown.")
             && text.contains("ide.diff"),
         "{text}"
     );
@@ -22219,7 +25906,7 @@ async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
     repeat["id"] = json!(next);
     let text = assert_claude_envelope(&mcp.exchange(repeat).await).to_owned();
     assert!(
-        text.contains("host_binding (replay)") && !text.contains("missing_pre"),
+        text == "This exact call was already processed.\nRepair: Send a new tool call.",
         "{text}"
     );
     claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
@@ -22327,7 +26014,7 @@ async fn managed_claude_stopped_actor_is_never_recovered() {
     let request = json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.stop","arguments":{},"_meta":{"claudecode/toolUseId":call}}});
     let lost_stop = assert_claude_envelope(&mcp.exchange(request.clone()).await).to_owned();
     assert!(
-        lost_stop.starts_with("error: outcome_unknown:"),
+        lost_stop.starts_with("This activation change may have applied; its outcome is unknown."),
         "{lost_stop}"
     );
     next += 1;
@@ -22335,7 +26022,7 @@ async fn managed_claude_stopped_actor_is_never_recovered() {
     repeat["id"] = json!(next);
     let repeated = assert_claude_envelope(&mcp.exchange(repeat).await).to_owned();
     assert!(
-        repeated.contains("host_binding (replay)") && !repeated.contains("missing_pre"),
+        repeated == "This exact call was already processed.\nRepair: Send a new tool call.",
         "{repeated}"
     );
     let done_stop = claude_settled_call(
@@ -22370,6 +26057,126 @@ async fn managed_claude_stopped_actor_is_never_recovered() {
     }
     claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
     mcp.close().await;
+}
+
+/// Runs one hook-paired managed Claude call of root actor `session` and returns its compact text;
+/// a `pending` reply is followed through hook-paired `ide.inspect` calls until it settles (at
+/// most 30 s).
+async fn claude_settled_text(
+    mcp: &mut Mcp,
+    project: &Path,
+    next: &mut usize,
+    session: &str,
+    name: &str,
+    arguments: Value,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let (mut name, mut arguments) = (name.to_owned(), arguments);
+    loop {
+        *next += 1;
+        let call = format!("managed-claude-{next}");
+        let pre = managed_claude_hook(
+            Some(project),
+            managed_claude_event("PreToolUse", session, None, &call),
+        )
+        .await;
+        assert!(pre.status.success(), "managed pre-hook failed");
+        let reply = mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":*next,"method":"tools/call","params":{
+                    "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}
+                }}),
+            )
+            .await;
+        let post = managed_claude_hook(
+            Some(project),
+            managed_claude_event("PostToolUse", session, None, &call),
+        )
+        .await;
+        assert!(post.status.success());
+        let text = assert_claude_envelope(&reply).to_owned();
+        let fields = claude_fields(&name, &text);
+        if fields["state"] != "pending" {
+            return text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "did not settle: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        name = "ide.inspect".to_owned();
+        arguments = json!({"detail_ref": fields["detail_ref"]});
+    }
+}
+
+/// A writer whose Claude session ended without `ide.stop` (its MCP front exited) is taken over by
+/// the next session's `ide.start` on the same worktree, while a live writer is never displaced
+/// (start-index-state r2 §4). A third front keeps the shared daemon alive throughout, as a lead
+/// agent's session does.
+#[tokio::test]
+async fn managed_claude_writer_of_an_ended_session_is_taken_over() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let keeper = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut gone = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut next_session = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut next = 10;
+    let started = claude_settled_text(
+        &mut gone,
+        &fixture.root,
+        &mut next,
+        "gone-session",
+        "ide.start",
+        json!({}),
+    )
+    .await;
+    assert!(started.contains("mode: writer"), "{started}");
+
+    // While the first session's front is attached and it was just heard from, the writer stays.
+    let refused = claude_settled_text(
+        &mut next_session,
+        &fixture.root,
+        &mut next,
+        "next-session",
+        "ide.start",
+        json!({}),
+    )
+    .await;
+    assert!(
+        refused.starts_with("Another agent session owns this worktree's IDE activation.")
+            && refused.contains("actor gone-session")
+            && refused.contains("Repair: Call ide.start with {\"read_only\":true}"),
+        "{refused}"
+    );
+
+    // The first session ends without ide.stop: its front exits and its lease closes.
+    gone.close().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let taken = loop {
+        let text = claude_settled_text(
+            &mut next_session,
+            &fixture.root,
+            &mut next,
+            "next-session",
+            "ide.start",
+            json!({}),
+        )
+        .await;
+        if !text.starts_with("Another agent session owns this worktree")
+            || tokio::time::Instant::now() >= deadline
+        {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        taken.contains("mode: writer; took over the writer from actor gone-session (activation ")
+            && taken.contains("; its session ended); "),
+        "{taken}"
+    );
+    next_session.close().await;
+    keeper.close().await;
 }
 
 /// A daemon without this release's actor capabilities (the 0.10.2 contract) still serves a current
@@ -22470,7 +26277,7 @@ async fn managed_claude_recovery_waits_for_a_late_pre_and_keeps_a_reader() {
     })
     .await
     .unwrap();
-    let read = claude_fields(assert_claude_envelope(&reply));
+    let read = claude_fields("ide.read", assert_claude_envelope(&reply));
     let read =
         settle_managed_claude_start(&mut mcp, &fixture.root, &mut next, session, None, &read).await;
     assert!(claude_text(&read).contains("pub fn value()"), "{read}");
@@ -22485,7 +26292,7 @@ async fn managed_claude_recovery_waits_for_a_late_pre_and_keeps_a_reader() {
     )
     .await;
     assert!(
-        claude_text(&edit).starts_with("refused: read_only (ide.edit)"),
+        claude_text(&edit).starts_with("This activation started with read_only: true;"),
         "{edit}"
     );
     assert!(!fixture.root.join("src/new.rs").exists());
@@ -22764,3 +26571,585 @@ async fn failed_stop_is_retried_by_the_daemon_without_another_call() {
     .expect("the daemon's own retry must revoke the grant without another call");
     actor.mcp.close().await;
 }
+
+/// Public test file of the localized-prepare scenarios: one passing and one failing test, a
+/// helper the failing test needs and an import; the failure panics at line 14.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+const LOCALIZED_TESTS: &str = "\
+use product_fixture::value;
+
+fn expected() -> i32 {
+    8
+}
+
+#[test]
+fn passes() {
+    assert_eq!(value() + 0, 7);
+}
+
+#[test]
+fn fails() {
+    assert_eq!(value(), expected());
+}
+";
+
+/// Public test file whose failure panics inside a helper (line 4), outside every test.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+const HELPER_FAILURE_TESTS: &str = "\
+use product_fixture::value;
+
+fn expected() -> i32 {
+    assert_eq!(value(), 8);
+    8
+}
+
+#[test]
+fn passes() {
+    assert_eq!(value() + 0, 7);
+}
+
+#[test]
+fn fails() {
+    assert_eq!(expected(), 8);
+}
+";
+
+/// Writes and commits `tests/check.rs` with `source` and enables the local index and a public
+/// check of that file through the prepared Cargo toolchain. `providers` replaces the launcher's
+/// language servers. Call before the daemon starts.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+fn localized_prepare_fixture(fixture: &ProductFixture, providers: Value, source: &str) {
+    std::fs::create_dir_all(fixture.root.join("tests")).unwrap();
+    std::fs::write(fixture.root.join("tests/check.rs"), source).unwrap();
+    fixture.git(&["add", "--", "tests/check.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "localized prepare fixture"]);
+    fixture.write_config(providers);
+    configure_prepared_rust_checks(fixture);
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["task_context"] = json!({"enabled":true,
+        "models":{"embedding":null,"jev":null,"max_new_calls":0,"include_threshold":0.5},
+        "indexing":{"enabled":true,"max_new_calls":0,"max_input_bytes":0,"debounce_ms":50},
+        "evidence":{"enabled":true,"target":{"files":["tests/check.rs"]},"budget_ms":30000}});
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+}
+
+/// Starts one activated actor once the background index is published.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+async fn localized_prepare_actor(fixture: &ProductFixture, name: &'static str) -> ProductActor {
+    let mut actor = ProductActor::new(fixture, name).await;
+    let started = actor.call(fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(fixture, started).await["kind"], "activation");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !agent_ide::project::context::ContextIndex::open_existing(&fixture.root)
+        .ok()
+        .flatten()
+        .is_some_and(|index| index.index_report("lexical").ok().flatten().is_some())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background index did not publish"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    actor
+}
+
+/// One prepare call answered directly (never pending), its packet text.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+async fn localized_prepare(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
+    let before = actor.next;
+    let raw = actor
+        .call_raw(
+            fixture,
+            "ide.prepare",
+            json!({"task":"Restore reliable behavior.","token_budget":12000}),
+        )
+        .await;
+    assert_eq!(actor.next, before + 1, "one call");
+    let reply = &raw["result"]["structuredContent"];
+    assert_eq!(reply["state"], "complete", "{raw}");
+    assert_ne!(reply["continuation"], true, "{raw}");
+    let text = reply["text"].as_str().unwrap().to_owned();
+    // Explicit diagnostic output for reviewers; ordinary runs print nothing.
+    if std::env::var_os("AGENT_IDE_TEST_PRINT_PACKETS").is_some() {
+        eprintln!("--- prepare packet ---\n{text}");
+    }
+    text
+}
+
+/// Runtime proof of public test localization (worker path, real public check, the language's
+/// exact source outline): one prepare delivers the failing test with its import and the helper
+/// it names as one bundle, never delivers the passing sibling's numbered body (an outline line
+/// may still name it), writes nothing, and remembers nothing for the left-out sibling — a later
+/// read of it is a full delivery.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn prepare_localizes_the_failing_public_test_with_its_context() {
+    let fixture = ProductFixture::new(json!([]));
+    localized_prepare_fixture(&fixture, json!([]), LOCALIZED_TESTS);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = localized_prepare_actor(&fixture, "localized-prepare").await;
+    let library = std::fs::read(fixture.root.join("src/lib.rs")).unwrap();
+    let text = localized_prepare(&mut actor, &fixture).await;
+    assert!(
+        text.contains("public check") && text.contains("failed 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tests/check.rs: public test context localized"),
+        "{text}"
+    );
+    for kept in [
+        "use product_fixture::value;",
+        "fn expected() -> i32 {",
+        "fn fails() {",
+        "assert_eq!(value(), expected());",
+    ] {
+        assert!(text.contains(kept), "{kept}: {text}");
+    }
+    assert!(
+        text.contains("14\t    assert_eq!(value(), expected());"),
+        "the failing line is delivered as numbered source: {text}"
+    );
+    assert!(
+        !text.contains("assert_eq!(value() + 0, 7);"),
+        "the passing sibling's body is not delivered: {text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/lib.rs")).unwrap(),
+        library,
+        "prepare writes no source"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("tests/check.rs")).unwrap(),
+        LOCALIZED_TESTS
+    );
+    let read = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"items":[{"path":"tests/check.rs","lines":"7-10"}]}),
+    )
+    .await;
+    let (_, read_text) = batch_settle_with_text(&mut actor, &fixture, read).await;
+    let read_text = batch_without_status_plate(&read_text);
+    assert!(
+        read_text.starts_with(
+            "read: 1 items in 1 files — 1 delivered, 0 unchanged, 0 not included, 0 failed\n"
+        ) && read_text.contains("fn passes()"),
+        "the left-out sibling was never read: {read_text}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A configured server that cannot start (held behind a gate the test never opens during the
+/// call) is not waited for: the one call localizes from the language's exact source outline,
+/// answers promptly, and the same session keeps answering ordinary reads.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn prepare_with_a_cold_server_localizes_from_the_exact_source_outline() {
+    use std::os::unix::fs::PermissionsExt;
+    let toolchain_dir = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+        .expect("prepared Rust tests require AGENT_IDE_RUST_TOOLCHAIN_DIR");
+    let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER")
+        .unwrap_or_else(|_| format!("{toolchain_dir}/bin/rust-analyzer"));
+    let toolchain = Path::new(&toolchain_dir)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let fixture = ProductFixture::new(json!([]));
+    let gate = fixture.base.join("release-analyzer");
+    let wrapper = fixture.base.join("gated-rust-analyzer");
+    fixture.guard_gate(&gate);
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nwhile [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.02; done\nexec '{}' \"$@\"\n",
+            gate.display(),
+            fixture.base.display(),
+            analyzer.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let providers = json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(), &real_rust_analyzer_identity()),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-cold-prepare-cache"
+    }]);
+    localized_prepare_fixture(&fixture, providers, LOCALIZED_TESTS);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = localized_prepare_actor(&fixture, "cold-prepare").await;
+    let began = std::time::Instant::now();
+    let text = localized_prepare(&mut actor, &fixture).await;
+    assert!(
+        began.elapsed() < Duration::from_secs(15),
+        "the held server is not waited for"
+    );
+    assert!(
+        text.contains("tests/check.rs: public test context localized")
+            && text.contains("14\t    assert_eq!(value(), expected());")
+            && !text.contains("assert_eq!(value() + 0, 7);"),
+        "{text}"
+    );
+    let read = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"items":[{"path":"src/lib.rs","lines":"1-1"}]}),
+    )
+    .await;
+    let (read, _) = batch_settle_with_text(&mut actor, &fixture, read).await;
+    assert_eq!(read["kind"], "read", "the session is not poisoned: {read}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// The public test file is larger than one whole-file window (trailing comments past 8 KiB), so
+/// retrieval selects only an anchored part of it; one bounded prepare still delivers the import,
+/// the helper and the whole failing test as one bundle, without the sibling body or the padding.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn prepare_localizes_a_partially_selected_failing_test() {
+    let padding: String = (0..200)
+        .map(|index| format!("// padding comment {index:03} padding padding padding padding\n"))
+        .collect();
+    let source = format!("{LOCALIZED_TESTS}{padding}");
+    assert!(source.len() > 8 * 1024);
+    let fixture = ProductFixture::new(json!([]));
+    localized_prepare_fixture(&fixture, json!([]), &source);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = localized_prepare_actor(&fixture, "partial-prepare").await;
+    let began = std::time::Instant::now();
+    let text = localized_prepare(&mut actor, &fixture).await;
+    assert!(
+        began.elapsed() < Duration::from_secs(45),
+        "one bounded call"
+    );
+    assert!(
+        text.contains("tests/check.rs: public test context localized"),
+        "{text}"
+    );
+    for kept in [
+        "use product_fixture::value;",
+        "fn expected() -> i32 {",
+        "14\t    assert_eq!(value(), expected());",
+    ] {
+        assert!(text.contains(kept), "{kept}: {text}");
+    }
+    assert!(!text.contains("assert_eq!(value() + 0, 7);"), "{text}");
+    assert!(!text.contains("padding comment"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("tests/check.rs")).unwrap(),
+        source
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A failure outside every test (inside a helper) has no complete test unit to deliver: the one
+/// call keeps the whole public test file, says so, and writes nothing.
+#[cfg(all(feature = "jev-pilot", feature = "test-seams"))]
+#[tokio::test]
+async fn prepare_keeps_the_whole_test_file_when_the_failure_is_outside_tests() {
+    let fixture = ProductFixture::new(json!([]));
+    localized_prepare_fixture(&fixture, json!([]), HELPER_FAILURE_TESTS);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = localized_prepare_actor(&fixture, "unlocalized-prepare").await;
+    let text = localized_prepare(&mut actor, &fixture).await;
+    assert!(
+        text.contains("public check") && text.contains("failed 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tests/check.rs: test blocks not localized; whole-file candidate retained"),
+        "{text}"
+    );
+    assert!(
+        text.contains("assert_eq!(value() + 0, 7);") && text.contains("assert_eq!(expected(), 8);"),
+        "the whole file is delivered: {text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("tests/check.rs")).unwrap(),
+        HELPER_FAILURE_TESTS
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Writes `lines` numbered filler lines of about 45 bytes each, so a read block's serialized size
+/// follows its line count (about 52 bytes per rendered, JSON-escaped line).
+fn read_fill_filler(tag: &str, lines: usize) -> String {
+    (1..=lines)
+        .map(|line| format!("// {tag} filler line {line:04} padding padding padding\n"))
+        .collect()
+}
+
+/// Starts one actor over `fixture` with `files` committed; no semantic provider is needed for
+/// plain path reads.
+async fn read_fill_actor(
+    fixture: &ProductFixture,
+    name: &'static str,
+    files: &[(&str, String)],
+) -> ProductActor {
+    for (path, content) in files {
+        let target = fixture.root.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, content).unwrap();
+        fixture.git(&["add", "--", path]);
+    }
+    fixture.git(&["commit", "--quiet", "-m", "read fill fixture"]);
+    let mut actor = ProductActor::new(fixture, name).await;
+    let started = actor
+        .call(fixture, "ide.start", json!({"activation_id":name}))
+        .await;
+    assert_eq!(actor.settle(fixture, started).await["kind"], "activation");
+    actor
+}
+
+/// One settled `ide.read {items}` reply: structured value and its body text.
+async fn read_fill_call(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    items: Value,
+) -> (Value, String) {
+    let read = batch_call_with_text(actor, fixture, "ide.read", json!({"items":items})).await;
+    let (read, _) = batch_settle_with_text(actor, fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    let body = read["text"].as_str().expect("read body").to_owned();
+    (read, body)
+}
+
+/// Five items of about 3.4, 7.0, 7.8, 0.9 and 1.5 KB, past the former 8 KiB source reply: every
+/// block is delivered whole in request order with no footer and no page, and every delivered
+/// block is remembered, so a repeat of any of them answers unchanged.
+#[tokio::test]
+async fn configured_product_batch_read_delivers_every_block_whole_in_request_order() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "read-fill-sol",
+        &[
+            ("src/one.rs", read_fill_filler("one", 240)),
+            ("src/three.rs", read_fill_filler("three", 150)),
+            ("src/four.rs", read_fill_filler("four", 17)),
+            ("src/five.rs", read_fill_filler("five", 28)),
+        ],
+    )
+    .await;
+    let items = json!([
+        {"path":"src/one.rs","lines":"1-65"},
+        {"path":"src/one.rs","lines":"100-234"},
+        {"path":"src/three.rs","lines":"1-150"},
+        {"path":"src/four.rs","lines":"1-17"},
+        {"path":"src/five.rs","lines":"1-28"}
+    ]);
+    let (read, body) = read_fill_call(&mut actor, &fixture, items).await;
+    assert!(
+        body.starts_with(
+            "read: 5 items in 4 files — 5 delivered, 0 unchanged, 0 not included, 0 failed\n"
+        ),
+        "{body}"
+    );
+    let delivered: Vec<usize> = [
+        "src/one.rs  (lines 1–65)\n",
+        "src/one.rs  (lines 100–234)\n",
+        "src/three.rs  (lines 1–150)\n",
+        "src/four.rs  (lines 1–17)\n",
+        "src/five.rs  (lines 1–28)\n",
+    ]
+    .iter()
+    .map(|header| {
+        body.find(header)
+            .unwrap_or_else(|| panic!("{header}: {body}"))
+    })
+    .collect();
+    assert!(
+        delivered.windows(2).all(|pair| pair[0] < pair[1]),
+        "request order: {body}"
+    );
+    for line in [
+        "// one filler line 0234",
+        "// three filler line 0150",
+        "// five filler line 0028",
+    ] {
+        assert!(body.contains(line), "{line}: {body}");
+    }
+    assert!(
+        !body.contains("not included (over the reply budget)"),
+        "{body}"
+    );
+    assert_eq!(read["truncated"], false, "{read}");
+    assert_ne!(read["continuation"], true, "no page is opened: {read}");
+
+    // Every delivered block is remembered: a repeat answers unchanged.
+    let (_, repeat) = read_fill_call(
+        &mut actor,
+        &fixture,
+        json!([{"path":"src/one.rs","lines":"100-234"}]),
+    )
+    .await;
+    assert!(
+        repeat.starts_with(
+            "read: 1 items in 1 files — 0 delivered, 1 unchanged, 0 not included, 0 failed\n"
+        ),
+        "{repeat}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Three blocks each far larger than the former source reply and one small block, about 75 KB in
+/// all: every block arrives whole in request order in one reply, with no footer and no page.
+#[tokio::test]
+async fn configured_product_batch_read_delivers_large_and_small_blocks_together() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "read-fill-luna",
+        &[
+            ("src/big_a.rs", read_fill_filler("big_a", 400)),
+            ("src/big_b.rs", read_fill_filler("big_b", 350)),
+            ("src/big_c.rs", read_fill_filler("big_c", 450)),
+            ("src/small.rs", read_fill_filler("small", 40)),
+        ],
+    )
+    .await;
+    let (read, body) = read_fill_call(
+        &mut actor,
+        &fixture,
+        json!([
+            {"path":"src/big_a.rs","lines":"1-400"},
+            {"path":"src/big_b.rs","lines":"1-350"},
+            {"path":"src/big_c.rs","lines":"1-450"},
+            {"path":"src/small.rs","lines":"1-40"}
+        ]),
+    )
+    .await;
+    assert!(
+        body.starts_with(
+            "read: 4 items in 4 files — 4 delivered, 0 unchanged, 0 not included, 0 failed\n\
+             src/big_a.rs  (lines 1–400)\n"
+        ),
+        "{body}"
+    );
+    for line in [
+        "// big_a filler line 0400",
+        "// big_b filler line 0350",
+        "// big_c filler line 0450",
+        "// small filler line 0040",
+    ] {
+        assert_eq!(body.matches(line).count(), 1, "{line}");
+    }
+    assert!(!body.contains("not included (over the reply budget)"));
+    assert_eq!(read["truncated"], false, "{read}");
+    assert_ne!(read["continuation"], true, "no page is opened: {read}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A patch naming more files than one edit may
+/// commit is refused explicitly with its limit and nothing is written, instead of the generic
+/// internal refusal; a patch at the limit still applies every file.
+#[tokio::test]
+async fn configured_product_patch_over_the_file_limit_is_refused_before_any_write() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = read_fill_actor(
+        &fixture,
+        "patch-file-limit",
+        &[("notes/seed.txt", "seed\n".to_owned())],
+    )
+    .await;
+    let patch = |prefix: &str, count: usize| {
+        let mut text = String::from("*** Begin Patch\n");
+        for index in 1..=count {
+            text.push_str(&format!(
+                "*** Add File: notes/{prefix}_{index:02}.txt\n+{prefix} {index}\n"
+            ));
+        }
+        text.push_str("*** End Patch");
+        text
+    };
+    let over = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"patch-over-limit","patch":patch("over", 17)}),
+    )
+    .await;
+    let (over, over_text) = batch_settle_with_text(&mut actor, &fixture, over).await;
+    assert!(
+        !over_text.contains("The IDE could not complete this request."),
+        "an explicit refusal, not the generic internal one: {over_text}"
+    );
+    assert!(
+        over_text.contains("16"),
+        "the refusal names its limit: {over_text}"
+    );
+    assert_ne!(over["state"], "edit_batch", "{over}");
+    assert!(
+        (1..=17).all(|index| !fixture
+            .root
+            .join(format!("notes/over_{index:02}.txt"))
+            .exists()),
+        "nothing is written"
+    );
+
+    let at_limit = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"patch-at-limit","patch":patch("limit", 16)}),
+    )
+    .await;
+    let (at_limit, at_limit_text) = batch_settle_with_text(&mut actor, &fixture, at_limit).await;
+    assert_eq!(at_limit["state"], "edit_batch", "{at_limit}");
+    assert!(
+        batch_without_status_plate(&at_limit_text).starts_with("edit: applied 16 of 16 files"),
+        "{at_limit_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("notes/limit_16.txt")).unwrap(),
+        "limit 16\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Batch forms (batch-api-v1) against the real daemon, sharing this file's fixtures.
+mod batch_api;
+/// Post-review receipt, fallback and usable-accounting regressions.
+mod sr_receipts;
+
+/// Boundary tests of `symbol-read-edit-v1` against the real daemon, sharing this file's fixtures.
+mod symbol_read_edit;

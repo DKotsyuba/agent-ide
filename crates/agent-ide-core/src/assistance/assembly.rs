@@ -79,8 +79,9 @@ impl<T, E> OrCause<T> for Result<T, E> {
     }
 }
 
-/// Closed journal context a call's ingress establishes on its way through [`ProductDispatcher::
-/// handle_tagged`] (QW-4); every field stays empty for a call that never got that far.
+/// Closed per-call context ingress establishes on its way through [`ProductDispatcher::
+/// handle_tagged`] (QW-4): journal facts, retained-result delivery evidence and the optional
+/// restart handoff result. Every field stays empty for a call that never got that far.
 #[derive(Default)]
 struct CallFacts {
     /// The validated host binding the call belongs to.
@@ -90,11 +91,29 @@ struct CallFacts {
     /// Set by the inspection this call performs when it hands a retained terminal result to the
     /// call's caller; this call's own flag, shared with no other inspection.
     delivery: Arc<std::sync::atomic::AtomicBool>,
+    /// Bridge's accepted-or-unknown publication result for this re-activation's
+    /// `lost-after-restart` notice; absent when the call carried no unresolved subjects.
+    lost_handoff: Option<bool>,
 }
 
 /// The closed cause a guard refusal is reported with.
 fn binding_cause(reason: super::host_binding::BindingUnavailable) -> HostBindingCause {
     HostBindingCause::from_binding(reason).unwrap_or(HostBindingCause::InvalidMetadata)
+}
+
+/// Detail of [`outdated_front_refusal`]: a `read:source_unavailable:` detail, whose message every
+/// front's template prints after its fixed sentence.
+pub(crate) const OUTDATED_FRONT_DETAIL: &str = "read:source_unavailable:This IDE front is older than its daemon and cannot receive whole source replies; restart this agent session so the current IDE front loads, then repeat the call.";
+
+/// The refusal a Read, Prepare or Inspect call gets from a front that did not announce
+/// [`crate::app::transport::WHOLE_SOURCE_META`]: `source_unavailable` with
+/// [`OUTDATED_FRONT_DETAIL`], which older fronts decode and render as an actionable error, never
+/// as an executed call with an unknown outcome.
+fn outdated_front_refusal() -> PeerReply {
+    PeerReply::Error {
+        code: super::reply::FailureCode::SourceUnavailable,
+        detail: Some(OUTDATED_FRONT_DETAIL.to_owned()),
+    }
 }
 
 /// Most actor tags one `claudecode/recover` announcement may carry.
@@ -112,6 +131,25 @@ fn actor_tags(tags: &Value) -> Option<Vec<&str>> {
             tag.as_str()
                 .filter(|tag| super::host_binding::valid_actor_tag(tag))
         })
+        .collect()
+}
+
+/// Parses a re-activation's `claudecode/lost` list (OUTBOX-r3 §10): at most
+/// [`super::unresolved::MAX_UNRESOLVED`] one-line subjects of at most
+/// [`super::outbox::MAX_SUBJECT_BYTES`]; anything else is ignored, never refused.
+fn lost_subjects(subjects: &Value) -> Vec<String> {
+    subjects
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|subject| {
+            !subject.is_empty()
+                && subject.len() <= super::outbox::MAX_SUBJECT_BYTES
+                && !subject.chars().any(char::is_control)
+        })
+        .take(super::unresolved::MAX_UNRESOLVED)
+        .map(str::to_owned)
         .collect()
 }
 
@@ -199,12 +237,15 @@ fn log_binding_unavailable(
 ) {
     let method = match tool {
         super::facade::AssistanceTool::Start => errorlog::Method::Start,
+        super::facade::AssistanceTool::Prepare => errorlog::Method::Context,
         super::facade::AssistanceTool::Context => errorlog::Method::Context,
         super::facade::AssistanceTool::Diff => errorlog::Method::Diff,
         super::facade::AssistanceTool::Inspect => errorlog::Method::Inspect,
         super::facade::AssistanceTool::Stop => errorlog::Method::Stop,
         super::facade::AssistanceTool::Edit => errorlog::Method::Edit,
-        super::facade::AssistanceTool::Outline => errorlog::Method::Outline,
+        super::facade::AssistanceTool::Outline | super::facade::AssistanceTool::Tree => {
+            errorlog::Method::Outline
+        }
         super::facade::AssistanceTool::Read => errorlog::Method::Read,
         super::facade::AssistanceTool::Symbol => errorlog::Method::Symbol,
         super::facade::AssistanceTool::Graph => errorlog::Method::Graph,
@@ -261,15 +302,17 @@ fn host_binding_cause(
     HostBindingCause::from_binding(reason)
 }
 
-/// Reports whether one validated context call names the in-memory `kind: "problems"` feed.
+/// Reports whether inspect or the private Context transport names the in-memory problems feed.
 ///
 /// EYES-r2: such calls are answered entirely from the daemon's in-memory problem source for the
 /// caller's bound worktree. On Claude they must short-circuit before foreground-helper routing,
 /// and on managed Codex they skip native read-boundary reconciliation. A call carrying a detail
 /// reference is retrieval of an already-settled result and keeps its existing route.
 fn is_problems_context(method: AssistanceMethod, parameters: &Value) -> bool {
-    method == AssistanceMethod::Context
-        && parameters.get("detail_ref").is_none()
+    matches!(
+        method,
+        AssistanceMethod::Context | AssistanceMethod::Inspect
+    ) && parameters.get("detail_ref").is_none()
         && parameters.get("kind").and_then(Value::as_str) == Some("problems")
 }
 
@@ -294,15 +337,8 @@ async fn due_plate(
     if reserved + crate::feed::MAX_BLOCK_BYTES > super::reply::MAX_FEEDBACK_BYTES {
         return None;
     }
-    if let Some(feed) = feed {
-        return feed.next_block(fingerprint);
-    }
-    let worker = worker?;
-    let line = worker.test_status_line(fingerprint)?;
-    let plate = format!("<agent-ide>\n{line}\n</agent-ide>");
-    (reserved + plate.len() <= super::reply::MAX_FEEDBACK_BYTES
-        && worker.mark_test_status_delivered(fingerprint, &line))
-    .then_some(plate)
+    // A test run's outcome is a session-outbox fact, never a plate line (OUTBOX-r3 §4).
+    feed?.next_block(fingerprint)
 }
 
 /// Leads `plate` with due one-shot git and environment notices when the
@@ -331,83 +367,38 @@ async fn with_git_notice(
 /// Attaches the due status plate to one reply-delivered host's terminal reply (T28B).
 ///
 /// The plate is marked delivered only once it was actually attached: the whole reply is fitted
-/// into the exact final MCP carrier the host reads (`Envelope::WithStructured`), shrinking only
-/// owner text, and a plate that cannot fit beside any (possibly shrunk) body stays due for the
+/// into the exact final MCP carrier the host reads (`content::reply_envelope()`), shrinking only
+/// ordinary owner text. A fitted Diff page stays whole because delivery has accounted for its
+/// complete hunks; a plate that cannot fit beside that page stays due. Other plates stay due for the
 /// next terminal reply. The fitting decision and the delivery record are one atomic feed step.
 fn attach_reply_plate(
     feed: Option<&Arc<ProjectProblemFeed>>,
     fingerprint: &[u8; 32],
     reply: &mut PeerReply,
-    test_status_snapshot: Option<&str>,
 ) -> Option<String> {
     let feed = feed?;
     let mut fitting = reply.clone();
-    let plate =
-        feed.next_block_when_with_test_status(fingerprint, test_status_snapshot, |plate| {
-            loop {
-                if super::content::fits_with_status(
-                    &fitting,
-                    plate,
-                    super::content::Envelope::WithStructured,
-                ) {
-                    return true;
-                }
-                if !fitting.shrink_text() {
-                    return false;
-                }
+    let plate = feed.next_block_when(fingerprint, |plate| {
+        loop {
+            if super::content::fits_with_status(&fitting, plate, super::content::reply_envelope()) {
+                return true;
             }
-        })?;
+            if matches!(
+                fitting,
+                PeerReply::Complete {
+                    kind: super::reply::ResultKind::Diff,
+                    ..
+                }
+            ) {
+                return false;
+            }
+            if !fitting.shrink_text() {
+                return false;
+            }
+        }
+    })?;
     *reply = fitting;
     Some(plate)
-}
-
-/// Attaches one explicit-test status plate when project checks are not configured.
-fn attach_test_plate(
-    worker: &WorkerHandle,
-    binding: &[u8; 32],
-    reply: &mut PeerReply,
-    test_status_snapshot: Option<&str>,
-) -> Option<String> {
-    let current = worker.test_status_line(binding);
-    // The reply's own snapshot wins a completion race, but only while that line is still
-    // undelivered: a repeated status lookup of a finished run must not plate it again.
-    let line = match test_status_snapshot {
-        Some(snapshot) => (current.as_deref() == Some(snapshot)).then(|| snapshot.to_owned()),
-        None => current,
-    }?;
-    let plate = format!("<agent-ide>\n{line}\n</agent-ide>");
-    let mut fitting = reply.clone();
-    loop {
-        if super::content::fits_with_status(
-            &fitting,
-            &plate,
-            super::content::Envelope::WithStructured,
-        ) {
-            if worker.mark_test_status_delivered(binding, &line) {
-                *reply = fitting;
-                return Some(plate);
-            }
-            return None;
-        }
-        if !fitting.shrink_text() {
-            return None;
-        }
-    }
-}
-
-/// Reuses the test status captured in the worker's reply to avoid a completion race before plating.
-fn test_status_snapshot(reply: &PeerReply) -> Option<String> {
-    let PeerReply::Complete {
-        kind: super::reply::ResultKind::Test,
-        text,
-        ..
-    } = reply
-    else {
-        return None;
-    };
-    let line = super::tests::plate_line(text.lines().next()?);
-    (line.starts_with("tests #") && !line.contains("started —") && !line.contains("still running"))
-        .then(|| line.to_owned())
 }
 
 impl std::fmt::Debug for ProductDispatcher {
@@ -450,9 +441,10 @@ impl ProductDispatcher {
         let mut dispatcher = Self::default();
         // Language computations route in process or to each shipped module through one host
         // sharing the daemon's admission; ignored fallback-switch entries are journaled once.
-        let modules = Arc::new(crate::modules::router::ModuleHost::new(
-            dispatcher.admission.clone(),
-        ));
+        let modules = Arc::new(
+            crate::modules::router::ModuleHost::new(dispatcher.admission.clone())
+                .with_launcher(launcher.clone()),
+        );
         for line in modules.ignored_lines() {
             errorlog::record(
                 errorlog::Method::Daemon,
@@ -641,6 +633,7 @@ impl ProductDispatcher {
             "post_failure" => "PostToolUseFailure",
             "permission_denied" => "PermissionDenied",
             "post_batch" => "PostToolBatch",
+            "compaction" => "PreCompact",
             _ => return Err(HostBindingCause::UnsupportedHookPhase),
         };
         let event = (|| {
@@ -722,6 +715,9 @@ impl ProductDispatcher {
                 // call may just have completed an activation or a check, so a due status
                 // plate is still delivered on this post phase (T22B) for hosts whose
                 // replies never carry one.
+                if let Some(worker) = &self.worker {
+                    worker.note_hook(binding.binding_ref());
+                }
                 if settled_plate
                     && let Some(worker) = &self.worker
                     && let Some(block) = with_git_notice(
@@ -741,6 +737,14 @@ impl ProductDispatcher {
                     return Ok(PeerReply::Feedback { text: block });
                 }
                 Ok(PeerReply::HookSettled {})
+            }
+            // OUTBOX-r3 §9.1: a compaction raises the session's compaction counter; it pairs with
+            // no call.
+            BindingStatus::TurnObserved(binding) => {
+                if let Some(worker) = &self.worker {
+                    worker.note_compaction(&binding);
+                }
+                Ok(PeerReply::HookObserved {})
             }
             BindingStatus::NativeObserved(binding) => {
                 if let Some(worker) = &self.worker {
@@ -769,6 +773,7 @@ impl ProductDispatcher {
                             object.get("tool_file").and_then(|value| value.as_str()),
                         );
                     }
+                    worker.note_hook(&binding);
                     let feedback = if feed.is_some_and(|feed| feed.is_read_restricted(&fingerprint))
                     {
                         None
@@ -905,12 +910,14 @@ impl ProductDispatcher {
                     AssistanceMethod::Edit => super::facade::AssistanceTool::Edit,
                     AssistanceMethod::Outline => super::facade::AssistanceTool::Outline,
                     AssistanceMethod::Read => super::facade::AssistanceTool::Read,
+                    AssistanceMethod::Prepare => super::facade::AssistanceTool::Prepare,
                     AssistanceMethod::Symbol => super::facade::AssistanceTool::Symbol,
                     AssistanceMethod::Graph => super::facade::AssistanceTool::Graph,
+                    AssistanceMethod::Tree => super::facade::AssistanceTool::Tree,
                     AssistanceMethod::Test => super::facade::AssistanceTool::Test,
                     AssistanceMethod::HookSubmit => return Err(HostBindingCause::InvalidMetadata),
                 };
-                let call = super::facade::validate_call(
+                let call = super::facade::validate_normalized_call(
                     tool,
                     object
                         .get("parameters")
@@ -918,6 +925,16 @@ impl ProductDispatcher {
                         .clone(),
                 )
                 .or_cause(HostBindingCause::InvalidParameters)?;
+                // A front that cannot decode whole-source replies (one older than this daemon) is
+                // refused before anything executes, so no read memory or edit base records a reply
+                // it could not receive. The refusal is a code and detail older fronts already
+                // render, naming the restart that fixes it rather than inviting a repeat.
+                if method.method().delivers_source()
+                    && meta.get(crate::app::transport::WHOLE_SOURCE_META)
+                        != Some(&Value::Bool(true))
+                {
+                    return Ok(outdated_front_refusal());
+                }
                 if self
                     .worker
                     .as_ref()
@@ -1261,6 +1278,11 @@ impl ProductDispatcher {
                 // and touches no worktree state, like `ide.stop`'s own.
                 let stopped = stopped(&invocation);
                 facts.binding = Some(invocation.binding_ref().clone());
+                // A current managed Claude front learns the actor of every call, so it can remember
+                // per actor the work it relays unresolved (OUTBOX-r3 §10).
+                if recover.is_some() && tag.is_none() {
+                    *tag = Some(invocation.binding_ref().actor_tag());
+                }
                 facts.role = self
                     .worker
                     .as_ref()
@@ -1279,9 +1301,26 @@ impl ProductDispatcher {
                     && !stopped
                     && matches!(
                         method.method(),
+                        AssistanceMethod::Edit | AssistanceMethod::Test
+                    )
+                    && let Some(ticket) = meta.get(super::bridge::ROUTE_META)
+                {
+                    worker.note_bridge_route(
+                        invocation.binding_ref(),
+                        method.correlation_id(),
+                        ticket,
+                    );
+                }
+                if self.managed_codex
+                    && !stopped
+                    && matches!(
+                        method.method(),
                         AssistanceMethod::Context
                             | AssistanceMethod::Diff
                             | AssistanceMethod::Inspect
+                            | AssistanceMethod::Read
+                            | AssistanceMethod::Prepare
+                            | AssistanceMethod::Symbol
                     )
                     && !is_problems_context(method.method(), call.parameters())
                 {
@@ -1292,30 +1331,36 @@ impl ProductDispatcher {
                     // capture, not a new read boundary, so it must not invalidate itself first.
                     worker.managed_read_boundary(
                         invocation.binding_ref().clone(),
-                        method.method() != AssistanceMethod::Inspect
+                        (method.method() != AssistanceMethod::Inspect
+                            || call.parameters().get("kind").and_then(Value::as_str)
+                                == Some("diagnostics"))
                             && call.parameters().get("detail_ref").is_none(),
                     );
+                }
+                // The process that carried this validated call is the binding's carrier
+                // (stale-writer takeover evidence; never identity).
+                if let Some(pid) = method.carrier()
+                    && let Ok(mut bindings) = self.bindings.lock()
+                {
+                    bindings.note_carrier(invocation.binding_ref(), pid);
                 }
                 let fingerprint = invocation.binding_ref().fingerprint();
                 let mut reply = match method.method() {
                     AssistanceMethod::Stop => {
                         worker.stop(invocation, method.opaque_attachment()).await
                     }
-                    AssistanceMethod::Inspect => {
-                        let inspection = worker.inspect(
-                            invocation.binding_ref().clone(),
-                            call.parameters()["detail_ref"]
-                                .as_str()
-                                .or_cause(HostBindingCause::InvalidParameters)?
-                                .to_owned(),
-                            method.opaque_attachment(),
-                            None,
-                        );
+                    AssistanceMethod::Inspect if call.parameters().get("kind").is_none() => {
+                        // OUTBOX-r3 §8.5: one reference or several.
                         worker
-                            .with_delivery(facts.delivery.clone(), inspection)
+                            .inspect_call(
+                                invocation.binding_ref().clone(),
+                                call.parameters(),
+                                method.opaque_attachment(),
+                                facts.delivery.clone(),
+                            )
                             .await
                     }
-                    AssistanceMethod::Context
+                    AssistanceMethod::Context | AssistanceMethod::Inspect
                         if is_problems_context(method.method(), call.parameters()) =>
                     {
                         worker
@@ -1339,6 +1384,23 @@ impl ProductDispatcher {
                             .await
                     }
                 };
+                // OUTBOX-r4 §10: a re-activation after a daemon replacement names what its front
+                // relayed unresolved before; the private result is true only after Bridge accepts
+                // custody or reports an uncertain effect for the `lost-after-restart` fact.
+                if reactivation
+                    && matches!(
+                        reply,
+                        PeerReply::Complete {
+                            kind: super::reply::ResultKind::Activation,
+                            ..
+                        }
+                    )
+                    && let (Some(binding), Some(lost)) =
+                        (facts.binding.as_ref(), meta.get("claudecode/lost"))
+                {
+                    facts.lost_handoff =
+                        Some(worker.queue_lost(binding, &lost_subjects(lost)).await);
+                }
                 // T28B/T29B: reply-carrying hosts lead every terminal `ide.*` reply with the due
                 // plate. Every such call first reconciles the bound worktree's inputs (free while
                 // unchanged, T20B) — for managed Codex this stays even though hooks may now
@@ -1352,32 +1414,19 @@ impl ProductDispatcher {
                     && !stopped
                 {
                     let _ = worker.git_notice(&fingerprint).await;
-                    let test_status = test_status_snapshot(&reply);
                     if let Some(feed) = worker.project_feed() {
                         feed.changed(&fingerprint);
                     }
                     if !matches!(reply, PeerReply::Pending { .. }) {
-                        *status = match worker.project_feed() {
-                            Some(feed) => attach_reply_plate(
-                                Some(feed),
-                                &fingerprint,
-                                &mut reply,
-                                test_status.as_deref(),
-                            ),
-                            None => attach_test_plate(
-                                worker,
-                                &fingerprint,
-                                &mut reply,
-                                test_status.as_deref(),
-                            ),
-                        };
+                        *status =
+                            attach_reply_plate(worker.project_feed(), &fingerprint, &mut reply);
                         // The facade decodes a carried plate up to the hook feedback ceiling.
                         *status = with_git_notice(worker, &fingerprint, status.take(), |plate| {
                             plate.len() <= super::reply::MAX_FEEDBACK_BYTES
                                 && super::content::fits_with_status(
                                     &reply,
                                     plate,
-                                    super::content::Envelope::WithStructured,
+                                    super::content::reply_envelope(),
                                 )
                         })
                         .await;
@@ -1408,6 +1457,19 @@ impl AssistanceDispatcher for ProductDispatcher {
             .map_or_else(crate::app::observation::ChecksPage::unavailable, |feed| {
                 feed.observe(common_dir, cursor)
             })
+    }
+
+    /// Records that process `pid` attached a client lease (stale-writer takeover evidence).
+    fn carrier_opened(&self, pid: u32) {
+        if let Ok(mut bindings) = self.bindings.lock() {
+            bindings.carrier_opened(pid);
+        }
+    }
+    /// Records that a client lease of process `pid` ended (stale-writer takeover evidence).
+    fn carrier_closed(&self, pid: u32) {
+        if let Ok(mut bindings) = self.bindings.lock() {
+            bindings.carrier_closed(pid);
+        }
     }
     /// Gives a managed Claude MCP its own target on this repository's shared daemon.
     fn register_claude_candidate(&self, candidate: &Path) -> Option<String> {
@@ -1511,8 +1573,10 @@ impl AssistanceDispatcher for ProductDispatcher {
                     AssistanceMethod::Edit => Some(super::facade::AssistanceTool::Edit),
                     AssistanceMethod::Outline => Some(super::facade::AssistanceTool::Outline),
                     AssistanceMethod::Read => Some(super::facade::AssistanceTool::Read),
+                    AssistanceMethod::Prepare => Some(super::facade::AssistanceTool::Prepare),
                     AssistanceMethod::Symbol => Some(super::facade::AssistanceTool::Symbol),
                     AssistanceMethod::Graph => Some(super::facade::AssistanceTool::Graph),
+                    AssistanceMethod::Tree => Some(super::facade::AssistanceTool::Tree),
                     AssistanceMethod::Test => Some(super::facade::AssistanceTool::Test),
                     AssistanceMethod::HookSubmit => None,
                 };
@@ -1600,21 +1664,32 @@ impl AssistanceDispatcher for ProductDispatcher {
                     }
                 }
             }
-            // A carried status plate (T28B) rides on top of the closed reply in the wrapped wire
-            // form; without one the encoding stays byte-identical to earlier releases.
-            let reply = match &status {
-                Some(plate) => PeerReply::encode_with_status(&result, plate),
-                None => result.encode(),
+            // A carried status plate (T28B) or restart-loss handoff result rides beside the closed
+            // reply in the private wrapper; without either the encoding stays byte-identical to
+            // earlier releases.
+            let reply = match (&status, facts.lost_handoff) {
+                (None, None) => result.encode(),
+                (status, lost_handoff) => {
+                    PeerReply::encode_delivered(&result, status.as_deref(), lost_handoff)
+                }
             }
             .ok_or(AssistanceDispatchUnavailable)?;
             // Only a front that sent `claudecode/recover` receives a tag, so older fronts keep
             // decoding byte-identical replies.
             // An empty tag (an identity query whose call no actor owns) is sent as `null`: the
             // wrapper itself tells the front that this daemon answers identity queries.
+            // The wrapper keeps the method's own reply bound, so Read and Prepare source stays whole.
+            let wrapper_bytes = match &request {
+                AssistanceDispatch::MethodDispatch(method) => {
+                    crate::app::method_reply_bounds(method.method(), crate::app::MAX_V2_FRAME_BYTES)
+                        .1
+                }
+                AssistanceDispatch::HookSubmit(_) => crate::app::MAX_ASSISTANCE_JSON_BYTES,
+            };
             let reply = match tag {
                 Some(tag) => OpaqueJson::from_value(
                     &json!({"actor": (!tag.is_empty()).then_some(tag), "reply": serde_json::from_str::<Value>(reply.as_str()).ok()}),
-                    crate::app::MAX_ASSISTANCE_JSON_BYTES,
+                    wrapper_bytes,
                 )
                 .ok_or(AssistanceDispatchUnavailable)?,
                 None => reply,
@@ -1829,6 +1904,82 @@ async fn ingress_exits_name_a_typed_cause() {
         ))
         .await,
         HostBindingCause::InvalidParameters
+    );
+}
+
+/// A front that did not announce `agent-ide/whole-source` (one older than this daemon) gets an
+/// actionable `source_unavailable` refusal for Read, Prepare and Inspect before anything executes;
+/// with the announcement the call proceeds to ordinary binding. The key is ignored, like every
+/// unread host-metadata key, by methods without whole-source replies, which is also why an older
+/// daemon accepts a current front's envelopes unchanged.
+#[tokio::test]
+async fn whole_source_calls_need_the_front_announcement() {
+    use crate::app::transport::{MethodDispatch, OpaqueJson, WHOLE_SOURCE_META};
+
+    let dispatcher = ProductDispatcher::default();
+    let reply_of = |name: AssistanceMethod, parameters: Value, announced: bool| {
+        let dispatcher = &dispatcher;
+        async move {
+            let mut meta = json!({"claudecode/toolUseId":"call"});
+            if announced {
+                meta[WHOLE_SOURCE_META] = json!(true);
+            }
+            let request = AssistanceDispatch::MethodDispatch(
+                MethodDispatch::new(
+                    "request",
+                    "call",
+                    "attachment",
+                    name,
+                    OpaqueJson::from_value(
+                        &json!({"parameters":parameters,"host_meta":meta}),
+                        64 * 1024,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            let reply = match dispatcher.dispatch(request).await.unwrap() {
+                AssistanceDispatchReply::HookSubmit(reply)
+                | AssistanceDispatchReply::MethodDispatch(reply) => reply,
+            };
+            PeerReply::decode(reply.as_str()).unwrap()
+        }
+    };
+    let refused = PeerReply::Error {
+        code: super::reply::FailureCode::SourceUnavailable,
+        detail: Some(OUTDATED_FRONT_DETAIL.to_owned()),
+    };
+    for (name, parameters) in [
+        (AssistanceMethod::Read, json!({"path":"a.rs"})),
+        (AssistanceMethod::Prepare, json!({"task":"fix it"})),
+        (AssistanceMethod::Inspect, json!({"detail_ref":"ref-1"})),
+    ] {
+        assert_eq!(
+            reply_of(name, parameters.clone(), false).await,
+            refused,
+            "{name:?}"
+        );
+        assert_ne!(reply_of(name, parameters, true).await, refused, "{name:?}");
+    }
+    // Methods without whole-source replies ignore the key: the same answer with or without it.
+    let plain = reply_of(AssistanceMethod::Context, json!({}), false).await;
+    assert_ne!(plain, refused);
+    assert_eq!(
+        reply_of(AssistanceMethod::Context, json!({}), true).await,
+        plain
+    );
+    // The refusal is rendered by the shared template every front version carries: an error that
+    // names the restart, never a repeat of an executed call.
+    let rendered =
+        super::content::render_with_status(refused, None, super::content::Envelope::TextOnly)
+            .unwrap();
+    assert_eq!(rendered.is_error, Some(true));
+    let text = rendered.content[0].as_text().unwrap().text.clone();
+    assert!(
+        text.contains("Read it with a native tool.")
+            && text.contains("This IDE front is older than its daemon")
+            && text.contains("restart this agent session"),
+        "{text}"
     );
 }
 

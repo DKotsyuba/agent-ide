@@ -827,7 +827,41 @@ async fn peer_initialize(peer: &mut tokio::io::DuplexStream, sync: bool) {
     write_peer_frame(peer,json!({"jsonrpc":"2.0","id":request["id"],"result":{"capabilities":{"textDocumentSync":if sync {1}else{0}},"serverInfo":{"name":"fake-server","version":"test"}}})).await;
 }
 
+/// Dropping a held initialize aborts its owned protocol driver and closes both pipes. Receiving
+/// the actual initialize request proves the driver reached the checkpoint before cancellation.
+#[tokio::test]
+async fn dropped_live_initialize_closes_the_owned_driver_pipes() {
+    let (client, mut peer) = tokio::io::duplex(1 << 16);
+    let (input, output) = tokio::io::split(client);
+    let mut opening = Box::pin(LiveSession::open(
+        input,
+        output,
+        tree(),
+        1,
+        ViewGeneration::default(),
+        plain_settings(),
+        Duration::from_secs(30),
+    ));
+    tokio::select! {
+        result = &mut opening => panic!("initialize unexpectedly settled: {}", result.is_ok()),
+        request = read_peer_frame(&mut peer) => assert_eq!(request["method"], "initialize"),
+    }
+    drop(opening);
+    let mut remainder = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut remainder))
+        .await
+        .expect("the cancelled initialize must not detach its pipe-owning driver")
+        .unwrap();
+    assert!(remainder.is_empty());
+    assert!(
+        peer.write_all(b"response after cancellation")
+            .await
+            .is_err()
+    );
+}
+
 /// EOF and malformed input after initialize remain transport errors even when the operation returns Ok.
+
 #[tokio::test]
 async fn post_initialize_transport_failures_are_not_swallowed() {
     for malformed in [false, true] {
@@ -1394,9 +1428,9 @@ async fn module_session_fences_sources_and_reports_its_fault() {
     );
 }
 
-/// A module-hosted session keeps its profile's status barrier across the boundary: readiness is
-/// asked of the module (which answers its provider's barrier), and a module that cannot answer
-/// is a gone transport.
+/// Every module-hosted session asks the module for readiness, including profiles without a
+/// native status notification: module hello may precede actual provider initialization. A module
+/// that cannot answer is a gone transport, never a fabricated Ready state.
 #[tokio::test]
 async fn module_session_asks_the_module_for_readiness() {
     use crate::modules::{
@@ -1410,7 +1444,7 @@ async fn module_session_asks_the_module_for_readiness() {
         toolchain: 3,
         view: 4,
     };
-    let open = |module: FakeModule| async move {
+    let open = |module: FakeModule, status: bool| async move {
         let (channel, _) = in_memory(
             module,
             offer(ModuleId::bundled("alpha"), "1.0", Role::Analyzer, 1),
@@ -1423,27 +1457,34 @@ async fn module_session_asks_the_module_for_readiness() {
             tree(),
             1,
             generation,
-            status_settings(),
+            if status {
+                status_settings()
+            } else {
+                plain_settings()
+            },
             Duration::from_secs(5),
         )
         .unwrap()
     };
-    let mut live = open(FakeModule::new(ModuleId::bundled("alpha"), "1.0")).await;
-    assert!(live.session.provider_readiness().is_unknown());
-    assert_eq!(live.wait_ready(Duration::from_secs(2)).await, Ok(()));
-    assert!(
-        live.session.provider_readiness().is_ready(),
-        "the module's answer is this session's barrier state"
-    );
-    let mut live = open(
-        FakeModule::new(ModuleId::bundled("alpha"), "1.0")
-            .with_fault(Capability::Semantic, Fault::Stall),
-    )
-    .await;
-    assert_eq!(
-        live.wait_ready(Duration::from_millis(200)).await,
-        Err(ReadinessError::Gone)
-    );
+    for status in [true, false] {
+        let mut live = open(FakeModule::new(ModuleId::bundled("alpha"), "1.0"), status).await;
+        assert!(live.session.provider_readiness().is_unknown());
+        assert_eq!(live.wait_ready(Duration::from_secs(2)).await, Ok(()));
+        assert!(
+            live.session.provider_readiness().is_ready(),
+            "the module's answer is this session's barrier state"
+        );
+        let mut live = open(
+            FakeModule::new(ModuleId::bundled("alpha"), "1.0")
+                .with_fault(Capability::Semantic, Fault::Stall),
+            status,
+        )
+        .await;
+        assert_eq!(
+            live.wait_ready(Duration::from_millis(200)).await,
+            Err(ReadinessError::Gone)
+        );
+    }
 }
 
 /// A well-framed but ill-typed module result is the module's typed fault (decode, malformed):

@@ -510,6 +510,7 @@ fn fresh_state(settings: &ProviderSettings, generation: ViewGeneration) -> Arc<M
 /// The child process stays with the caller; this owns the pipes' driver and the negotiated
 /// `Session`. Readiness is awaited per request with [`LiveSession::wait_ready`], never at open,
 /// so a slow workspace load (a large project on a status-gated server) does not block the handshake.
+/// Dropping this owner aborts the driver; it never transfers child-process/reap responsibility.
 pub struct LiveSession {
     /// Negotiated exclusive client; requests reset their budget per call.
     pub session: Session,
@@ -517,10 +518,20 @@ pub struct LiveSession {
     driver: tokio::task::JoinHandle<Result<(), async_lsp::Error>>,
 }
 
+impl Drop for LiveSession {
+    /// Stops the owned transport driver if initialization or a retained session is dropped.
+    /// Process ownership stays with the caller, which must still kill/reap its admitted child.
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+
 impl LiveSession {
     /// Performs initialize/initialized on the given pipes and returns a long-lived session.
     ///
-    /// `request_timeout` bounds every later request; the session itself has no lifetime deadline.
+    /// `request_timeout` bounds initialization and every later request; the session itself has no
+    /// lifetime deadline. Cancelling this future aborts the pipe-owning driver; callers still own
+    /// and must kill/reap any admitted process behind those pipes.
     pub async fn open<R, W>(
         input: R,
         output: W,
@@ -589,14 +600,15 @@ impl LiveSession {
 
     /// Waits up to `budget` for the provider to become usable: a profile with a
     /// [`SessionProfile::status_method`] waits for its reported quiescence, every other provider is
-    /// usable right after the handshake.
+    /// usable right after the handshake. Module sessions always ask their existing readiness
+    /// barrier because module hello can precede the hosted provider's initialize.
     pub async fn wait_ready(&mut self, budget: Duration) -> Result<(), ReadinessError> {
-        if self.session.settings.profile().status_method().is_none() {
-            return Ok(());
-        }
-        // A module hosts the provider: its status barrier is asked across the boundary.
+        // A module may still be initializing even when its native profile has no status event.
         if self.session.module.is_some() {
             return self.session.module_readiness(budget).await;
+        }
+        if self.session.settings.profile().status_method().is_none() {
+            return Ok(());
         }
         let mut ready = self
             .session
@@ -897,6 +909,28 @@ impl Session {
         let _ = wait_for_matching_diagnostics(&self.state, deadline).await;
     }
 
+    /// Synchronizes one already-authorized edit source and returns only the current diagnostic
+    /// snapshot, without waiting for a push or issuing definition/reference requests. Module
+    /// sessions use the existing Diagnostics query within `budget`; native sessions' File context
+    /// only sends document notifications. Unknown, stale and unversioned evidence stays unknown.
+    pub async fn edit_diagnostics(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+        budget: Duration,
+    ) -> io::Result<crate::intelligence::server::ProviderContext> {
+        if self.module.is_some() {
+            return self
+                .module_edit_diagnostics(observation, bytes, budget)
+                .await;
+        }
+        let result = self.context(observation, bytes, ContextQuery::File).await?;
+        Ok(crate::intelligence::server::ProviderContext {
+            context: result,
+            diagnostics: self.diagnostics(),
+        })
+    }
+
     /// Synchronizes exact observation bytes, then requests advertised definition/reference methods.
     /// Path-only queries return file text; use `ide.symbol` or `ide.read {symbol}` for semantic operations.
     /// Unsupported or failed semantic operations return lexical context over the same bytes.
@@ -1036,10 +1070,18 @@ impl Session {
         Ok(result)
     }
 
-    /// Synchronizes the source and returns the provider's document symbols (nested form).
+    /// Synchronizes the source and returns the provider's document symbols (nested form), with
+    /// every column in UTF-16 code units whatever position encoding the provider negotiated (see
+    /// [`context::utf16_symbols`]), so a language's `normalize` slices the source the same way for
+    /// every provider.
     ///
     /// Flat responses become childless top-level symbols; container names are only hints and may
     /// be ambiguous, so the fallback does not invent a hierarchy or selection range.
+    ///
+    /// # Errors
+    ///
+    /// A module session (it answers `module_outline`), bytes that do not match `observation`, a
+    /// failed synchronization and a failed request.
     pub async fn document_symbols(
         &mut self,
         observation: &SourceObservation,
@@ -1056,7 +1098,7 @@ impl Session {
                 partial_result_params: Default::default(),
             })
             .await?;
-        Ok(match reply {
+        let mut symbols = match reply {
             Some(lsp::DocumentSymbolResponse::Nested(symbols)) => symbols,
             Some(lsp::DocumentSymbolResponse::Flat(symbols)) => symbols
                 .into_iter()
@@ -1075,7 +1117,10 @@ impl Session {
                 })
                 .collect(),
             None => Vec::new(),
-        })
+        };
+        let text = context::observed_text(observation, bytes)?;
+        context::utf16_symbols(text, &mut symbols, &self.capabilities().position_encoding);
+        Ok(symbols)
     }
 
     /// Hover text at a byte offset: the provider's signature/documentation rendering, if any.

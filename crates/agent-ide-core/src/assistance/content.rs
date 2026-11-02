@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use rmcp::model::{CallToolResult, ContentBlock};
 
-use super::reply::{FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, PeerReply, ResultKind};
+use super::reply::{
+    EditBatchOutcome, FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, PeerReply, ResultKind,
+};
 use crate::changes::edit::EditOutcome;
 
 /// Build-embedded MiniJinja source projecting every closed [`PeerReply`] state into its compact
@@ -15,24 +17,38 @@ const REPLY_TEMPLATE: &str = include_str!("../../../../assets/mcp/reply.jinja");
 /// Selects whether a projected [`CallToolResult`] also carries the duplicate typed
 /// `structuredContent` copy alongside the compact `content` text block.
 ///
-/// The Codex host reads only `structuredContent`, so its acceptance evidence needs
-/// [`Self::WithStructured`]. The Claude host instead hands `structuredContent` straight to its
-/// model in place of `content`, defeating the compact renderer (T14B); the managed Claude MCP
-/// therefore projects [`Self::TextOnly`], so the model sees only the deterministic compact text.
+/// Both hosts show the model `structuredContent` in place of `content` when it is present, which
+/// defeats the compact renderer and doubles the reply bytes. Every production reply therefore
+/// uses [`Self::TextOnly`] (harness-reply-v1 R1); [`Self::WithStructured`] is reachable only
+/// through the `AGENT_IDE_TEST_STRUCTURED_REPLIES` test seam (see [`reply_envelope`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Envelope {
     /// Omits `structuredContent` entirely; the compact `content` text is the only carrier.
     TextOnly,
     /// Carries both the compact `content` text and the complete typed `structuredContent` copy.
+    /// Selected only by the test seam, so the product tests keep the typed reply as their oracle.
     WithStructured,
+}
+
+/// Returns the envelope every non-Claude reply is sized and carried in.
+///
+/// Always [`Envelope::TextOnly`] (harness-reply-v1 R1), for recognized and unrecognized hosts
+/// alike. Only a `test-seams` build with `AGENT_IDE_TEST_STRUCTURED_REPLIES=1` (set for the
+/// workspace tests by `.cargo/config.toml`) selects [`Envelope::WithStructured`]; a release build
+/// never reads the seam.
+pub(crate) fn reply_envelope() -> Envelope {
+    match crate::test_seams::var("AGENT_IDE_TEST_STRUCTURED_REPLIES").as_deref() {
+        Some("1") => Envelope::WithStructured,
+        _ => Envelope::TextOnly,
+    }
 }
 
 /// Renders one validated reply and shrinks only owner text until the final MCP envelope fits.
 ///
 /// The returned result contains exactly one text content block and, when `envelope` is
 /// [`Envelope::WithStructured`], the complete serialized reply in `structured_content`. Only
-/// [`PeerReply::Error`] and [`PeerReply::InvalidParameters`] set `is_error`; invalid serialization or a non-shrinkable oversized result
-/// returns `None` without partially emitting identifiers.
+/// the replies [`reports_failure`] names set `is_error`; invalid serialization or a non-shrinkable
+/// oversized result returns `None` without partially emitting identifiers.
 ///
 /// `status` is the optional due status plate (T28B): the complete `<agent-ide>` plate text, which
 /// prefixes the compact content text, separated by one newline, and is the leading `status` string
@@ -57,7 +73,7 @@ pub(crate) fn render_with_call(
 ) -> Option<CallToolResult> {
     loop {
         let rendered = project(&reply, status, envelope, tool_name, test_status_id)?;
-        if call_tool_result_fits(&rendered) {
+        if reply_fits(&reply, &rendered) {
             return Some(rendered);
         }
         if !reply.shrink_text() {
@@ -71,8 +87,7 @@ pub(crate) fn render_with_call(
 /// This predicate never shrinks text. Diff pagination measures whole hunks, exact line parts,
 /// oversized-line notices and the actual continuation trailer before advancing its cursor.
 pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
-    project(reply, None, envelope, None, None)
-        .is_some_and(|rendered| call_tool_result_fits(&rendered))
+    project(reply, None, envelope, None, None).is_some_and(|rendered| reply_fits(reply, &rendered))
 }
 
 /// Reports whether one unchanged reply fits the final MCP carrier with `status` attached whole.
@@ -82,7 +97,16 @@ pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
 /// call that cuts it.
 pub(crate) fn fits_with_status(reply: &PeerReply, status: &str, envelope: Envelope) -> bool {
     project(reply, Some(status), envelope, None, None)
-        .is_some_and(|rendered| call_tool_result_fits(&rendered))
+        .is_some_and(|rendered| reply_fits(reply, &rendered))
+}
+
+/// Exact text-only MCP serialization size, excluding a later optional status plate.
+/// A measurement for private preparation diagnostics only; it never limits delivery.
+#[cfg(feature = "jev-pilot")]
+pub(crate) fn prepare_carrier_bytes(reply: &PeerReply) -> Option<usize> {
+    project(reply, None, Envelope::TextOnly, None, None)
+        .and_then(|value| serde_json::to_vec(&value).ok())
+        .map(|bytes| bytes.len())
 }
 
 /// Projects one unchanged reply into compact content plus, per `envelope`, the complete typed
@@ -91,7 +115,7 @@ pub(crate) fn fits_with_status(reply: &PeerReply, status: &str, envelope: Envelo
 /// Serialization or template failure returns `None` regardless of `envelope`, so a value this
 /// renderer cannot faithfully represent never silently drops its structured copy. A tagged
 /// execution-profile refusal keeps the public structured `code` string stable; the closed cause
-/// tag is passed to the template only, so it appears solely in compact text; likewise an error's
+/// tag selects natural compact wording without being printed; likewise an error's
 /// `detail` reaches the template as `resolution_detail` and is removed from the structured copy.
 /// Projection performs no I/O, host inspection, diagnostics inference, or model call.
 fn project(
@@ -119,6 +143,7 @@ fn project(
     context["environment_key"] = serde_json::Value::String(String::new());
     context["environment_selector"] = serde_json::Value::String(String::new());
     context["environment_example"] = serde_json::Value::String(String::new());
+    context["refusal_excerpt"] = serde_json::Value::String(String::new());
     context["tool_name"] = serde_json::Value::String(tool_name.unwrap_or_default().to_owned());
     context["test_status_id"] =
         test_status_id.map_or(serde_json::Value::Null, serde_json::Value::from);
@@ -127,6 +152,18 @@ fn project(
         context["resolution_detail"] = serde_json::Value::String(detail.to_owned());
         context["resolution_message"] =
             serde_json::Value::String(resolution_message(detail).to_owned());
+        if matches!(
+            reply,
+            PeerReply::Error {
+                code: FailureCode::EditRefused,
+                ..
+            }
+        ) {
+            // Authorized producer text stays exact inside the separately quoted current-text
+            // excerpt; labels outside that excerpt still pass display_safe below.
+            context["refusal_excerpt"] =
+                serde_json::Value::String(resolution_message(detail).to_owned());
+        }
         if let Some((key, selector)) = environment_refusal(detail) {
             context["environment_key"] = serde_json::Value::String(key.clone());
             context["environment_selector"] = serde_json::Value::String(selector.to_owned());
@@ -135,9 +172,38 @@ fn project(
                 serde_json::Value::String(key.clone())
             ));
         }
+        if let Some(selection) = detail.strip_prefix("environment:") {
+            context["refusal_excerpt"] = serde_json::Value::String(display_safe(selection.trim()));
+        }
+        if let Some(ancestor) = detail
+            .strip_prefix("start:root_absent; nearest existing ancestor below an allowed root: ")
+        {
+            context["refusal_excerpt"] = serde_json::Value::String(ancestor.to_owned());
+        }
         if let Some(fields) = structured.as_object_mut() {
             fields.remove("detail");
         }
+    }
+    if let PeerReply::Unavailable {
+        cause: Some(super::reply::HostBindingCause::TakenOver { reason }),
+        ..
+    } = reply
+    {
+        // The takeover's fixed reason phrase completes the `taken_over` sentence.
+        context["resolution_message"] = serde_json::Value::String(reason.clone());
+    }
+    if let PeerReply::Unavailable {
+        cause:
+            Some(
+                super::reply::HostBindingCause::ProjectMoved { bound, asked }
+                | super::reply::HostBindingCause::OtherRepository { bound, asked },
+            ),
+        ..
+    } = reply
+    {
+        context["resolution_message"] = serde_json::Value::String(format!(
+            "Bound repository: {bound}; requested root: {asked}"
+        ));
     }
     if let PeerReply::Unavailable { .. } = reply {
         // The public structured shape keeps its historical fields; the closed cause reaches the
@@ -182,10 +248,8 @@ fn project(
         None => reply_text,
     };
     let content = vec![ContentBlock::text(text)];
-    let mut rendered = if matches!(
-        reply,
-        PeerReply::Error { .. } | PeerReply::InvalidParameters { .. }
-    ) {
+    let failed = reports_failure(reply);
+    let mut rendered = if failed {
         CallToolResult::error(content)
     } else {
         CallToolResult::success(content)
@@ -193,12 +257,43 @@ fn project(
     if matches!(envelope, Envelope::WithStructured) {
         rendered.structured_content = Some(structured);
     }
-    rendered.is_error = matches!(
-        reply,
-        PeerReply::Error { .. } | PeerReply::InvalidParameters { .. }
-    )
-    .then_some(true);
+    rendered.is_error = failed.then_some(true);
     Some(rendered)
+}
+
+/// Whether a one-file edit `outcome` is not a write the call asked for: everything but a created,
+/// replaced or unchanged file.
+fn edit_outcome_failed(outcome: EditOutcome) -> bool {
+    !matches!(
+        outcome,
+        EditOutcome::Created | EditOutcome::Replaced | EditOutcome::Unchanged
+    )
+}
+
+/// Whether `reply` tells the model its call did not do what it asked, so the MCP result is an
+/// error: a closed failure, rejected parameters, or an edit that was refused, cancelled, left
+/// unknown or applied only in part (everything but a created, replaced or unchanged file, and a
+/// fully applied multi-file edit). A call that ran and answered a question, an unavailable
+/// session plate or a pending result is not a failure.
+fn reports_failure(reply: &PeerReply) -> bool {
+    match reply {
+        PeerReply::Complete {
+            kind: super::reply::ResultKind::Test,
+            text,
+            ..
+        } => text
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("tests #"))
+            .and_then(|line| line.split_once(": "))
+            .is_some_and(|(id, status)| {
+                id.parse::<u64>().is_ok() && status.starts_with("environment unavailable (exit 78)")
+            }),
+        PeerReply::Error { .. } | PeerReply::InvalidParameters { .. } => true,
+        PeerReply::Edit { result, .. } => edit_outcome_failed(result.outcome),
+        PeerReply::EditBatch { outcome, .. } => *outcome != EditBatchOutcome::Applied,
+        _ => false,
+    }
 }
 
 /// Escapes every untrusted label the template interpolates into reply text (SAFE-02): paths,
@@ -254,7 +349,7 @@ fn escape_untrusted_labels(context: &mut serde_json::Value) {
 /// Renders one untrusted label as visible single-line text: newline, carriage return, tab and
 /// the remaining control characters become their escapes, and bidirectional format marks become
 /// explicit `\u` escapes instead of silently reordering the line.
-fn display_safe(label: &str) -> String {
+pub(crate) fn display_safe(label: &str) -> String {
     let mut escaped = String::with_capacity(label.len());
     for character in label.chars() {
         match character {
@@ -324,6 +419,70 @@ fn environment() -> &'static Environment<'static> {
     ENVIRONMENT.get_or_init(|| reply_environment(Some(RENDER_FUEL)))
 }
 
+/// Formats the typed template mapper's refusal as one <=160-byte head, exactly one
+/// <=120-byte Repair line and an optional <=60-line/4096-byte producer excerpt. Head and
+/// repair are escaped single-line labels; excerpt rows are quoted as data without parsing
+/// away current source, effect or stale-safety information. Performs no I/O or inference.
+fn refusal_text(head: String, repair: String, excerpt: Option<String>) -> String {
+    let head = super::reply::bounded_utf8_prefix(&display_safe(&head), 160);
+    let repair = super::reply::bounded_utf8_prefix(&display_safe(&repair), 112);
+    let mut text = format!("{head}\nRepair: {repair}");
+    if let Some(excerpt) = excerpt.filter(|text| !text.is_empty()) {
+        let quoted = excerpt
+            .lines()
+            .take(60)
+            .map(|line| format!("  {line}\n"))
+            .collect::<String>();
+        text.push('\n');
+        text.push_str(&super::reply::bounded_utf8_prefix(&quoted, 4096));
+    }
+    text
+}
+
+/// Like [`refusal_text`] for a stale-edit refusal whose producer may supply its own note.
+///
+/// With no note (or an empty one) `head` and `repair` are used as given. A note of the form
+/// `"<sentence>. Repair: <step>"` becomes the head (first letter capitalised, closed with
+/// `; nothing was written.`) and the Repair line; a note without a `Repair:` part becomes the
+/// head and keeps the default `repair`. Performs no I/O.
+fn refusal_note(head: String, repair: String, note: Option<String>) -> String {
+    let Some(note) = note.filter(|note| !note.trim().is_empty()) else {
+        return refusal_text(head, repair, None);
+    };
+    let (sentence, step) = match note.split_once("Repair:") {
+        Some((sentence, step)) => (sentence, step.trim().trim_end_matches('.').to_owned()),
+        None => (note.as_str(), repair),
+    };
+    let sentence = sentence.trim().trim_end_matches('.');
+    let mut letters = sentence.chars();
+    let sentence = letters
+        .next()
+        .map(|first| first.to_uppercase().chain(letters).collect::<String>())
+        .unwrap_or_default();
+    refusal_text(format!("{sentence}; nothing was written."), step, None)
+}
+
+/// Longest path label, in bytes, that a refusal head carries after its effect sentence.
+const PATH_LABEL_BYTES: usize = 60;
+
+/// Shortens a worktree-relative path for a refusal head, keeping its tail.
+///
+/// A path of at most [`PATH_LABEL_BYTES`] bytes is returned unchanged; a longer one becomes `…`
+/// plus the longest suffix that fits, cut at a UTF-8 boundary, because the file name and its
+/// nearest directories identify the target best. The head formatter places the label after the
+/// reason and effect sentence, so a long label can never push those facts past the 160-byte cut.
+/// Performs no I/O.
+fn path_label(path: String) -> String {
+    if path.len() <= PATH_LABEL_BYTES {
+        return path;
+    }
+    let mut start = path.len() - (PATH_LABEL_BYTES - '…'.len_utf8());
+    while !path.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &path[start..])
+}
+
 /// VM-instruction budget for one reply render; a render that exceeds it fails into the
 /// presentation-degraded fallback instead of looping. Keeps tenfold headroom over the costliest
 /// real render (the final error fallbacks walk every `elif` of `reply.jinja`, so each added error
@@ -336,12 +495,17 @@ const RENDER_RECURSION_LIMIT: usize = 16;
 /// the helpers `reply.jinja` actually uses are registered, so an added template construct fails
 /// loudly here instead of silently widening the engine (JINJA-02).
 ///
-/// Registered set: filter `join`; tests `defined`, `mapping`, `startingwith`, `endingwith`.
+/// Registered set: filter `join`; bounded refusal formatters (`refusal`, `refusal_note`) and the
+/// `path_label` shortener; tests `defined`, `mapping`,
+/// `startingwith`, `endingwith`. The formatter receives data, never template source.
 fn reply_environment(fuel: Option<u64>) -> Environment<'static> {
     let mut environment = Environment::empty();
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
     environment.set_auto_escape_callback(|_| AutoEscape::None);
     environment.add_filter("join", minijinja::filters::join);
+    environment.add_function("refusal", refusal_text);
+    environment.add_function("refusal_note", refusal_note);
+    environment.add_function("path_label", path_label);
     environment.add_test("defined", minijinja::tests::is_defined);
     environment.add_test("mapping", minijinja::tests::is_mapping);
     environment.add_test("startingwith", minijinja::tests::is_startingwith);
@@ -371,7 +535,20 @@ fn render_text(context: &serde_json::Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// Checks the complete carrier against the transport ceiling, status and framing included.
+/// Read and Prepare source ([`PeerReply::delivers_source`]) is exempt: it only has to serialize,
+/// so requested source is never cut, paged or omitted for size. A host that clips long tool
+/// output does so outside this product. Serialization failure refuses the reply without cutting
+/// source or state.
+fn reply_fits(reply: &PeerReply, rendered: &CallToolResult) -> bool {
+    if reply.delivers_source() {
+        return serde_json::to_vec(rendered).is_ok();
+    }
+    call_tool_result_fits(rendered)
+}
+
 /// Returns whether the serialized final MCP carrier stays below the Assistance reply ceiling.
+/// Read and Prepare source never consults it ([`reply_fits`]).
 pub(crate) fn call_tool_result_fits(rendered: &CallToolResult) -> bool {
     serde_json::to_vec(rendered).is_ok_and(|bytes| bytes.len() <= MAX_REPLY_BYTES - MCP_RESERVE)
 }
@@ -438,8 +615,13 @@ impl PresentationReceipt {
     }
 
     /// Renders the small fixed-wording fallback from the receipt; `is_error` keeps the value the normal
-    /// projection of the same reply would set, so a confirmed mutation stays success-shaped.
+    /// projection of the same reply would set ([`reports_failure`]), so a confirmed mutation stays
+    /// success-shaped and a refused or unknown one stays an error.
     pub(crate) fn degraded(self) -> CallToolResult {
+        let failed = match &self {
+            Self::Edit { outcome, .. } => edit_outcome_failed(*outcome),
+            Self::Stop | Self::Activation => false,
+        };
         let text = match self {
             Self::Edit {
                 outcome,
@@ -459,28 +641,104 @@ impl PresentationReceipt {
                     _ => "No write occurred.",
                 };
                 let diagnostics = detail_ref.as_ref().map_or_else(String::new, |reference| {
-                    format!(" Diagnostics pending: ide.inspect with detail_ref {reference}")
+                    format!(" Diagnostics pending; result retained under {reference}; Bridge delivers it automatically.")
                 });
                 format!(
                     "edit: {word}; path {path}; operation_id {operation_id}\n\
                      Presentation degraded (presentation_failed). {recovery}{diagnostics}"
                 )
             }
-            Self::Stop => "complete stop: presentation degraded (presentation_failed)\n\
-                 Workspace authority is released; native edits remain on disk"
-                .to_owned(),
+            Self::Stop => {
+                "presentation degraded (presentation_failed); the workspace is released".to_owned()
+            }
             Self::Activation => {
-                "complete activation: presentation degraded (presentation_failed)\n\
-                 The workspace is active; repeat ide.start with the same activation_id for the project card"
+                "presentation degraded (presentation_failed); the workspace is active, repeat \
+                 ide.start with the same activation_id for the project card"
                     .to_owned()
             }
         };
-        CallToolResult::success(vec![ContentBlock::text(text)])
+        let content = vec![ContentBlock::text(text)];
+        if failed {
+            CallToolResult::error(content)
+        } else {
+            CallToolResult::success(content)
+        }
     }
 }
 
 #[cfg(test)]
+mod refusal_table;
+
+#[cfg(test)]
 mod tests {
+
+    /// A retained environment refusal uses the business-refusal envelope in every host mode.
+    #[test]
+    fn test_environment_refusal_sets_is_error() {
+        for envelope in [Envelope::TextOnly, Envelope::WithStructured] {
+            let reply = PeerReply::Complete {
+                kind: ResultKind::Test,
+                text: "tests #4: environment unavailable (exit 78), 0 s — incompatible Node".into(),
+                detail_ref: Some("test-ref".into()),
+                truncated: false,
+                continuation: false,
+            };
+            assert_eq!(
+                render_with_status(reply, None, envelope).unwrap().is_error,
+                Some(true)
+            );
+        }
+    }
+
+    /// Read and Prepare source reaches the final carrier whole past every former ceiling (8 KiB,
+    /// 38 000 B, 64 KiB, 144 KiB, 160 KiB) and at several MiB, with JSON escaping, Unicode and a
+    /// status plate; the text is never shrunk. Other result kinds keep the transport ceiling.
+    #[test]
+    fn source_replies_are_never_cut_for_size() {
+        let plate = "<agent-ide>checking</agent-ide>";
+        // Quotes, backslashes and newlines grow when serialized; multibyte characters test UTF-8.
+        let unit = "\"é🦀\\\n";
+        for kind in [ResultKind::Read, ResultKind::Prepare] {
+            for size in [
+                8 * 1024 + 1,
+                38_001,
+                64 * 1024 + 1,
+                144 * 1024 + 1,
+                160 * 1024 + 1,
+                3 * 1024 * 1024,
+            ] {
+                let text = unit.repeat(size / unit.len() + 1);
+                let reply = PeerReply::Complete {
+                    kind,
+                    text: text.clone(),
+                    detail_ref: Some("source-ref".into()),
+                    truncated: false,
+                    continuation: false,
+                };
+                for envelope in [Envelope::TextOnly, Envelope::WithStructured] {
+                    assert!(fits(&reply, envelope), "{kind:?} {size} {envelope:?}");
+                    assert!(fits_with_status(&reply, plate, envelope));
+                    let rendered =
+                        render_with_status(reply.clone(), Some(plate), envelope).unwrap();
+                    let shown = text_of(&rendered);
+                    assert!(
+                        shown.starts_with(plate) && shown.ends_with(&text),
+                        "{kind:?} {size}"
+                    );
+                }
+                let mut exact = reply;
+                assert!(!exact.shrink_text());
+            }
+        }
+        let context = PeerReply::Complete {
+            kind: ResultKind::Context,
+            text: "x".repeat(MAX_REPLY_BYTES),
+            detail_ref: Some("context-ref".into()),
+            truncated: false,
+            continuation: false,
+        };
+        assert!(!fits(&context, Envelope::TextOnly));
+    }
     use super::*;
     use crate::assistance::reply::{EditDiagnostics, MissingPeer, ResultKind};
     use crate::changes::edit::{EditOutcome, EditReceiptError, EditResult};
@@ -550,6 +808,7 @@ mod tests {
             serde_json::json!({
                 "state": "unavailable", "reason": "host_binding",
                 "cause_tag": "project_moved: bound to /a, asked /b",
+                "resolution_message": "Bound repository: /a; requested root: /b",
                 "tool_name": "ide.test", "test_status_id": 7
             }),
         ];
@@ -629,12 +888,12 @@ mod tests {
         let rendered = render(reply, Envelope::WithStructured).unwrap();
         let text = text_of(&rendered);
         assert!(
-            text.starts_with("edit: renamed; path src/lib.rs; source_ref source-after-edit"),
+            text.starts_with("edit: renamed; path src/lib.rs; diagnostics: current_clean"),
             "{text}"
         );
         assert!(
             text.contains(
-                "diagnostics: current_clean. Next: use ide.diff\n\
+                "diagnostics: current_clean\n\
                  renamed c → cee; 3 sites in 2 files: src/lib.rs (2), tests/x.rs (1)"
             ),
             "{text}"
@@ -642,7 +901,84 @@ mod tests {
         assert_eq!(rendered.structured_content, Some(expected));
     }
 
-    /// An `edit_refused` refusal renders its stage, the per-change sentences and the retry step.
+    /// Generic refusals obey r5 budgets through the production renderer, preserve isError and
+    /// typed outcomes, and expose no internal inspect/start/diff reason labels in model text.
+    #[test]
+    fn generic_refusals_have_one_bounded_repair_and_preserve_outcomes() {
+        for (code, detail) in [
+            (FailureCode::InvalidDetail, "inspect:detail_expired"),
+            (
+                FailureCode::WorkspaceActivation,
+                "start:worktree_unresolved:identity_read",
+            ),
+            (FailureCode::Capacity, "diff:too_large"),
+            (FailureCode::Internal, "daemon:internal"),
+            (
+                FailureCode::SourceTooLarge {
+                    size: u64::MAX,
+                    ceiling: 4096,
+                },
+                "read:source_too_large",
+            ),
+        ] {
+            let reply = PeerReply::Error {
+                code,
+                detail: Some(detail.to_owned()),
+            };
+            let mut expected = serde_json::to_value(&reply).unwrap();
+            expected.as_object_mut().unwrap().remove("detail");
+            let result = render(reply, Envelope::WithStructured).unwrap();
+            let text = text_of(&result);
+            let lines = text.lines().collect::<Vec<_>>();
+            assert!(lines[0].len() <= 160, "{text}");
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.starts_with("Repair:"))
+                    .count(),
+                1,
+                "{text}"
+            );
+            assert!(
+                lines[1].starts_with("Repair:") && lines[1].len() <= 120,
+                "{text}"
+            );
+            assert!(
+                !text.contains(detail)
+                    && !lines[1].contains(" or ")
+                    && !lines[1].contains("once")
+                    && !lines[0].starts_with("error:")
+                    && !lines[0].starts_with("unavailable:"),
+                "{text}"
+            );
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(result.structured_content, Some(expected));
+        }
+        let rendered = render(
+            PeerReply::Error {
+                code: FailureCode::EditRefused,
+                detail: Some(format!(
+                    "edit:refused: Current unit:\n{}",
+                    "1\tλ\n".repeat(100)
+                )),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let text = text_of(&rendered);
+        let excerpt = text.splitn(3, '\n').nth(2).unwrap();
+        assert!(
+            excerpt.len() <= 4096 && excerpt.lines().count() <= 60,
+            "{text}"
+        );
+        assert!(excerpt.contains("1\tλ"), "current unit was lost: {text}");
+        let bounded = refusal_text("λ".repeat(300), "λ".repeat(300), None);
+        let lines = bounded.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0].len(), 160);
+        assert_eq!(lines[1].len(), 120);
+    }
+
+    /// An edit refusal retains its per-change/current-text data under one repair line.
     #[test]
     fn edit_refused_names_its_changes_and_the_same_operation_id() {
         let reply = PeerReply::Error {
@@ -659,11 +995,10 @@ mod tests {
         let text = text_of(&rendered);
         assert_eq!(
             text,
-            "error: edit_refused (edit:refused); 2 of 3 changes refused, nothing written — \
+            "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  2 of 3 changes refused, nothing written — \
              change 2: old text not found; closest line 214: \"        let total = \
              lang::line_count(&source);\"; change 3: old text matches 2 places (lines 40, 88); \
-             add \"within\":\"src/x.rs#Owner/name\" or more surrounding lines. Fix the named \
-             changes and retry with the same operation_id"
+             add \"within\":\"src/x.rs#Owner/name\" or more surrounding lines\n"
         );
         // The structured copy keeps the closed code and drops the detail payload.
         let structured = rendered.structured_content.unwrap();
@@ -728,7 +1063,9 @@ mod tests {
         }
     }
 
-    /// Covers every non-edit state and result kind with one compact structured projection.
+    /// Covers every non-edit state and result kind with one compact projection; refusals have
+    /// a bounded natural head and repair while the structured oracle retains its closed tags.
+    /// Feedback and complete bodies arrive byte-exactly rather than being replaced by an ack.
     #[test]
     fn every_reply_state_has_one_compact_text_block_and_equal_structured_content() {
         let replies = vec![
@@ -784,13 +1121,34 @@ mod tests {
         ];
         for reply in replies {
             let expected = serde_json::to_value(&reply).unwrap();
-            let rendered = render(reply, Envelope::WithStructured).unwrap();
+            let rendered = render(reply, Envelope::WithStructured)
+                .unwrap_or_else(|| panic!("missing projection for {expected:?}"));
             let text = text_of(&rendered);
             assert!(!text.starts_with('{') && !text.contains("\"state\""));
-            for field in ["reason", "code"] {
-                if let Some(value) = expected[field].as_str() {
-                    assert!(text.contains(value));
-                }
+            if matches!(expected["state"].as_str(), Some("feedback" | "complete")) {
+                assert_eq!(Some(text), expected["text"].as_str(), "{expected:?}");
+            }
+            if matches!(
+                expected["state"].as_str(),
+                Some("unavailable" | "error" | "invalid_parameters")
+            ) {
+                let lines = text.lines().collect::<Vec<_>>();
+                assert!(lines[0].len() <= 160, "{text}");
+                assert!(
+                    lines[1].starts_with("Repair:") && lines[1].len() <= 120,
+                    "{text}"
+                );
+                assert_eq!(
+                    lines
+                        .iter()
+                        .filter(|line| line.starts_with("Repair:"))
+                        .count(),
+                    1
+                );
+                assert!(
+                    !text.starts_with("error:") && !text.starts_with("unavailable:"),
+                    "{text}"
+                );
             }
             assert_eq!(rendered.structured_content, Some(expected.clone()));
             assert_eq!(
@@ -822,7 +1180,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "unavailable: host_binding (inactive_binding); this session's IDE activation has stopped; read run 7 with ide.inspect {\"detail_ref\":\"tests #7\"}, or call ide.start to run tests again"
+            "This IDE activation has stopped.\nRepair: Call ide.start {\"read_only\":true}, then ide.test {\"result\":7}."
         );
         let other = render_with_call(
             PeerReply::Unavailable {
@@ -837,8 +1195,43 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&other),
-            "unavailable: host_binding (inactive_binding); this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools"
+            "This IDE session is not active.\nRepair: Call ide.start in this project."
         );
+    }
+
+    /// A session displaced by a stale-writer takeover is told why and how to start again, in the
+    /// exact start-index-state r2 §4c words.
+    #[test]
+    fn taken_over_names_the_reason_and_the_read_only_restart() {
+        use crate::assistance::host_binding::TakeoverReason;
+        for (reason, why) in [
+            (
+                TakeoverReason::SessionEnded,
+                "after this session's IDE connection closed",
+            ),
+            (
+                TakeoverReason::Inactive { minutes: 31 },
+                "after 31 min without activity",
+            ),
+        ] {
+            let cause = crate::assistance::reply::HostBindingCause::from_binding(
+                crate::assistance::host_binding::BindingUnavailable::TakenOver(reason),
+            );
+            let rendered = render(
+                PeerReply::Unavailable {
+                    reason: MissingPeer::HostBinding,
+                    cause,
+                },
+                Envelope::TextOnly,
+            )
+            .unwrap();
+            assert_eq!(
+                text_of(&rendered),
+                format!(
+                    "Another session took over this activation.\nRepair: Call ide.start with {{\"read_only\":true}} while that session writes.\n  {why}\n"
+                )
+            );
+        }
     }
 
     /// Every host-binding cause names its closed tag in compact text without changing the public
@@ -876,58 +1269,56 @@ mod tests {
             let tag = cause.cause_tag();
             let expected = match tag.as_str() {
                 "outside_allowed_roots" => {
-                    "the session project is outside the directories the IDE may open. Call ide.start with an allowed root, or continue with native tools"
+                    "This project is outside the directories the IDE may open.\nRepair: Call ide.start with an allowed root."
                 }
                 "hooks_not_delivered" => {
-                    "the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
+                    "The IDE received no host event for this session.\nRepair: Call ide.start in this project."
                 }
                 "invalid_metadata" => {
-                    "the host sent malformed call metadata. Send a new tool call, or continue with native tools"
+                    "The host sent malformed call metadata.\nRepair: Send a new tool call."
                 }
                 "missing_field" => {
-                    "required host call metadata is missing. Send a new tool call, or continue with native tools"
+                    "Required host call metadata is missing.\nRepair: Send a new tool call."
                 }
                 "invalid_field" => {
-                    "host call metadata contains an invalid field. Send a new tool call, or continue with native tools"
+                    "Host call metadata contains an invalid field.\nRepair: Send a new tool call."
                 }
                 "invalid_attachment" => {
-                    "the host attachment does not identify this call. Repeat the call, or continue with native tools"
+                    "The host attachment does not identify this call.\nRepair: Repeat the call as a new tool invocation."
                 }
                 "unsupported_hook_phase" => {
-                    "the host reported an unsupported tool-call phase. Repeat the call, or continue with native tools"
+                    "The host reported an unsupported tool-call phase.\nRepair: Repeat the call as a new tool invocation."
                 }
                 "missing_pre" => {
-                    "the host's before-tool event for this call did not reach the daemon. Repeat the call once, or continue with native tools"
+                    "The host's before-tool event did not reach the IDE.\nRepair: Repeat the call."
                 }
-                "replay" => {
-                    "this exact call was already processed. Send it as a new tool call, or continue with native tools"
-                }
+                "replay" => "This exact call was already processed.\nRepair: Send a new tool call.",
                 "mismatch" => {
-                    "the host event did not match this call. Repeat the call, or continue with native tools"
+                    "The host event did not match this call.\nRepair: Repeat the call as a new tool invocation."
                 }
                 "missing_invocation" => {
-                    "the host's completion event arrived before its tool call was validated. Send a new tool call, or continue with native tools"
+                    "The host's completion event arrived before call validation.\nRepair: Send a new tool call."
                 }
                 "inactive_binding" => {
-                    "this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools"
+                    "This IDE session is not active.\nRepair: Call ide.start in this project."
                 }
                 "never_activated" => {
-                    "no IDE activation in this session yet. Call ide.start, then repeat this call, or continue with native tools"
+                    "This session has no IDE activation yet.\nRepair: Call ide.start in this project."
                 }
                 "recovery_needed" => {
-                    "the IDE restarted and this session's activation is not restored yet. Call ide.start, then repeat this call, or continue with native tools"
+                    "The IDE restarted; this activation has not been restored.\nRepair: Call ide.start in this project."
                 }
                 "capacity_exceeded" => {
-                    "the daemon's session table is full. Call ide.stop, then ide.start, or continue with native tools"
+                    "The IDE's bounded session table is full.\nRepair: Continue this work with native tools."
                 }
                 "host_unrecognized" => {
-                    "this host did not identify the call in a supported format. Continue with native tools"
+                    "This host did not identify the call in a supported format.\nRepair: Continue this work with native tools."
                 }
                 other if other.starts_with("other_repository:") => {
-                    "other agents of this session may still work in the bound repository, so this start was refused and nothing moved. Start under the bound repository, work in the other repository from a session started there, or continue with native tools"
+                    "Other agents still use the bound repository; nothing moved.\nRepair: Call ide.start under the bound repository.\n  Bound repository: /private/tmp/ai-r-move; requested root: /Users/pluto/projects/other-repository\n"
                 }
                 moved if moved.starts_with("project_moved:") => {
-                    "the IDE could not move to the requested root. Call ide.start under the session's current root, or continue with native tools"
+                    "The IDE could not move to the requested root.\nRepair: Call ide.start under this session's current root.\n  Bound repository: /private/tmp/ai-r-move; requested root: /Users/pluto/projects/agent-worktree\n"
                 }
                 _ => panic!("unrecognized host-binding cause: {tag}"),
             };
@@ -939,10 +1330,7 @@ mod tests {
                 Envelope::WithStructured,
             )
             .unwrap();
-            assert_eq!(
-                text_of(&rendered),
-                format!("unavailable: host_binding ({tag}); {expected}")
-            );
+            assert_eq!(text_of(&rendered), expected);
             assert_eq!(
                 rendered.structured_content,
                 Some(serde_json::json!({"state":"unavailable","reason":"host_binding"}))
@@ -959,7 +1347,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "unavailable: host_binding; continue with native tools"
+            "The host could not bind this IDE call.\nRepair: Repeat the call as a new tool invocation."
         );
     }
 
@@ -969,47 +1357,47 @@ mod tests {
         for (detail, expected) in [
             (
                 "diff:unsupported_entry",
-                "error: source_unavailable (diff:unsupported_entry); Git evidence for this comparison became unusable. Call ide.diff again",
+                "Git evidence for this comparison became unusable.\nRepair: Call ide.diff again.",
             ),
             (
                 "inspect:source_changed",
-                "error: source_unavailable (inspect:source_changed); the source changed since this result was captured. Call ide.context again for fresh bytes",
+                "The source changed since this result was captured.\nRepair: Read the requested unit again with ide.read.",
             ),
             (
                 "inspect:source_changed:\"src/main.rs\"",
-                "error: source_unavailable (inspect:source_changed); \"src/main.rs\" changed since this result was captured. Call ide.context with this path again for fresh bytes",
+                "The source changed since this result was captured.\nRepair: Read the requested unit again with ide.read.\n  \"src/main.rs\"\n",
             ),
             (
                 "inspect:source_changed:\"src/main.rs\"",
-                "error: source_unavailable (inspect:source_changed); \"src/main.rs\" changed since this result was captured. Call ide.context with this path again for fresh bytes",
+                "The source changed since this result was captured.\nRepair: Read the requested unit again with ide.read.\n  \"src/main.rs\"\n",
             ),
             (
                 "context:source_changed",
-                "error: source_unavailable (context:source_changed); the source changed since it was read. Re-read it with ide.context, then retry with the new source_ref",
+                "The source changed since this result was captured.\nRepair: Read the requested unit again with ide.read.",
             ),
             (
                 "context:source_changed:\"src/main.rs\"",
-                "error: source_unavailable (context:source_changed); \"src/main.rs\" changed since it was read. Re-read it with ide.context, then retry with the new source_ref",
+                "The source changed since this result was captured.\nRepair: Read the requested unit again with ide.read.\n  \"src/main.rs\"\n",
             ),
             (
                 "context:observation_failed:\"src/main.rs\"",
-                "error: source_unavailable (context:observation_failed); \"src/main.rs\" could not be read through the confined reader. Retry ide.context, or continue with native tools",
+                "The requested source could not be read safely.\nRepair: Read it with a native tool.\n  \"src/main.rs\"\n",
             ),
             (
                 "read:line_range:file has 249 lines; requested 286-334",
-                "error: source_unavailable (read:line_range); file has 249 lines; requested 286-334",
+                "The requested range is unavailable.\nRepair: Read a valid range with ide.read.\n  file has 249 lines; requested 286-334\n",
             ),
             (
                 "read:not_text:assets/logo.png",
-                "error: source_unavailable (read:not_text); assets/logo.png is not a readable text file (binary, not UTF-8 or unreadable), so ide.read cannot show it. Inspect it with a native tool such as `file` or `xxd`",
+                "This file is not readable text.\nRepair: Inspect it with a native file tool.\n  assets/logo.png\n",
             ),
             (
                 "read:source_unavailable:src/main.rs",
-                "error: source_unavailable (read:source_unavailable); src/main.rs could not be read at that path. Retry ide.read, or continue with native tools",
+                "The requested source could not be read safely.\nRepair: Read it with a native tool.\n  src/main.rs\n",
             ),
             (
                 "diff:activation_commit_unknown; use mode: head",
-                "error: source_unavailable (diff:activation_commit_unknown); the start commit of this activation is unknown, so the task view is unavailable; use ide.diff {\"mode\": \"head\"}",
+                "The activation's start commit is unknown; the task diff is unavailable.\nRepair: Call ide.diff with {\"mode\":\"head\"}.",
             ),
         ] {
             let rendered = render(
@@ -1032,7 +1420,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "error: source_unavailable (context:source_unavailable); the requested source could not be read. Retry ide.context, or continue with native tools"
+            "The requested source could not be read safely.\nRepair: Read it with a native tool."
         );
     }
 
@@ -1050,7 +1438,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it"
+            "This path does not exist in the worktree.\nRepair: Correct the path and repeat this call.\n  src/assistance/host_bindng.rs\n"
         );
         let for_read = render(
             PeerReply::Error {
@@ -1062,7 +1450,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&for_read),
-            "error: no_such_file: src/missing.rs (read:no_such_file); this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it"
+            "This path does not exist in the worktree.\nRepair: Correct the path and repeat this call.\n  src/missing.rs\n"
         );
     }
 
@@ -1079,7 +1467,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "error: unsupported_file: Cargo.toml (outline:unsupported_file); no IDE language reads this file type, so it has no outline or symbols. Read its text with ide.read `path` and `lines` or `ranges`, or with native tools"
+            "No registered language outlines this file type.\nRepair: Read the file with a native tool.\n  Cargo.toml\n"
         );
         assert_eq!(
             rendered.structured_content.unwrap()["code"]["unsupported_file"],
@@ -1100,10 +1488,10 @@ mod tests {
         .unwrap();
         let text = text_of(&expired);
         assert!(
-            text.starts_with("error: invalid_detail (inspect:detail_unknown);"),
+            text.starts_with("This result reference was never issued.\nRepair: Repeat the original IDE call to get a fresh result."),
             "{text}"
         );
-        assert!(text.contains("repeat the original ide.* call"), "{text}");
+        assert!(text.contains("Repeat the original IDE call"), "{text}");
         assert_eq!(expired.is_error, Some(true));
     }
 
@@ -1113,15 +1501,15 @@ mod tests {
         for (detail, expected) in [
             (
                 "inspect:detail_unknown",
-                "error: invalid_detail (inspect:detail_unknown); this detail_ref was never issued; repeat the original ide.* call to get a fresh one, or continue with native tools",
+                "This result reference was never issued.\nRepair: Repeat the original IDE call to get a fresh result.",
             ),
             (
                 "inspect:detail_expired",
-                "error: invalid_detail (inspect:detail_expired); this detail_ref has expired; repeat the original ide.* call to get a fresh one, or continue with native tools",
+                "This result reference has expired.\nRepair: Repeat the original IDE call to get a fresh result.",
             ),
             (
                 "inspect:detail_mismatch",
-                "error: invalid_detail (inspect:detail_mismatch); this detail_ref was issued for different arguments. Repeat the original call with its exact arguments, or make a fresh ide.* call",
+                "This result reference belongs to different arguments.\nRepair: Repeat the original call with its exact arguments.",
             ),
         ] {
             let rendered = render(
@@ -1149,8 +1537,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&conflict),
-            "error: invalid_detail (start:activation_conflict); this activation_id was used \
-             with another root; use a new activation_id"
+            "This activation_id was already used with another root.\nRepair: Call ide.start with a new activation_id."
         );
     }
 
@@ -1174,7 +1561,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("not handed over automatically"), "{text}");
-        assert!(text.contains("call ide.stop there"), "{text}");
+        assert!(text.contains("Call ide.stop there"), "{text}");
     }
 
     /// Start stages keep distinct causes and recovery instructions in the compact reply.
@@ -1183,19 +1570,19 @@ mod tests {
         for (detail, expected) in [
             (
                 "start:worktree_held_by_another_actor",
-                "another agent session owns this worktree's IDE activation",
+                "Another agent session owns this worktree's IDE activation",
             ),
             (
                 "start:worktree_held_by_this_actor",
-                "another session for this actor owns this worktree",
+                "Another session for this actor owns this worktree",
             ),
             (
                 "start:actor_owns_another_worktree",
-                "this actor's IDE activation is attached to another worktree",
+                "This actor's IDE activation is attached to another worktree",
             ),
             (
                 "start:provider_cache_namespace_conflict",
-                "another active session owns the language-server cache",
+                "Another active session owns the language-server cache",
             ),
             (
                 "start:git_discovery_failed: not a Git worktree",
@@ -1203,11 +1590,11 @@ mod tests {
             ),
             (
                 "start:worktree_unresolved: could not be resolved",
-                "the worktree could not be resolved",
+                "The worktree could not be resolved",
             ),
             (
                 "start:durable_state: activation state failed",
-                "saved workspace state could not be read",
+                "Saved workspace state could not be read",
             ),
         ] {
             let rendered = render(
@@ -1258,8 +1645,8 @@ mod tests {
             "task-7",
             "since 2026-10-04T10:00:00Z",
             "last activity 2026-10-04T10:01:00Z",
-            "Start with {\"read_only\": true} to read alongside",
-            "wait for the writer to stop",
+            "Call ide.start with {\"read_only\":true} to read alongside",
+            "The slot frees when that session ends or after 30 min without activity",
         ] {
             assert!(held.contains(fact), "missing {fact:?}: {held}");
         }
@@ -1303,11 +1690,11 @@ mod tests {
                 serde_json::Value::String(key.to_owned())
             );
             for fact in [
-                &format!("environment selector {selector} for {key} is outside"),
+                &format!("Selector: {selector}; project key: {key}"),
                 "inside the worktree",
                 "not a base interpreter",
-                &format!("ide.start with environment {example}"),
-                "allowed_roots",
+                &format!("environment {example}"),
+                "allowed roots",
             ] {
                 assert!(line.contains(fact), "missing {fact:?}: {line}");
             }
@@ -1322,7 +1709,7 @@ mod tests {
             Envelope::TextOnly,
         )
         .unwrap();
-        assert!(text_of(&ordinary).contains("the requested project root is outside"));
+        assert!(text_of(&ordinary).contains("The requested root is outside"));
     }
 
     /// Edit and test refusals share the exact read-only response shape and current-writer field.
@@ -1341,14 +1728,14 @@ mod tests {
             .unwrap();
             let line = text_of(&rendered);
             assert!(
-                line.starts_with(&format!("refused: read_only ({tool});")),
+                line.starts_with("This activation started with read_only: true;"),
                 "{line}"
             );
             assert!(line.contains("started with read_only: true"), "{line}");
-            assert!(line.contains("call ide.start without read_only"), "{line}");
+            assert!(line.contains("Call ide.start without read_only"), "{line}");
             assert!(line.contains("one writer per worktree"), "{line}");
             assert!(
-                line.contains("current writer: activation task-7, since"),
+                line.contains("Current writer: activation task-7, since"),
                 "{line}"
             );
         }
@@ -1360,7 +1747,7 @@ mod tests {
             Envelope::TextOnly,
         )
         .unwrap();
-        assert!(text_of(&none).ends_with("current writer: none"));
+        assert!(text_of(&none).ends_with("Current writer: none\n"));
     }
 
     /// Capacity failures identify the capture, queue, result-store or protected actor resource
@@ -1377,7 +1764,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&large_diff),
-            "error: capacity (diff:too_large); the source, patch or path capture budget is full; narrow ide.diff with paths or review it with native git"
+            "This diff exceeds a bounded capture or reply envelope limit.\nRepair: Call ide.diff with narrower paths."
         );
         let staged = render(
             PeerReply::Error {
@@ -1389,7 +1776,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&staged),
-            "error: capacity (inspect:detail_unknown); the IDE's bounded queue or result store is full. Wait for pending work, or call ide.stop and ide.start"
+            "The IDE's bounded queue or result store is full.\nRepair: Continue this operation with native tools."
         );
         for (stage, recovery) in [
             ("worker:queue_full", "request queue"),
@@ -1409,7 +1796,17 @@ mod tests {
                 Envelope::WithStructured,
             )
             .unwrap();
-            assert!(text_of(&reply).contains(recovery), "{}", text_of(&reply));
+            let text = text_of(&reply);
+            assert!(text.contains(recovery), "{text}");
+            // One concrete Repair action: exactly one line, within budget, never a two-step.
+            let lines = text.lines().collect::<Vec<_>>();
+            assert!(lines[0].len() <= 160 && lines[1].len() <= 120, "{text}");
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with("Repair: ")).count(),
+                1,
+                "{text}"
+            );
+            assert!(!text.contains("; otherwise"), "{text}");
         }
         let bare = render(
             PeerReply::Error {
@@ -1421,7 +1818,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "error: capacity (worker:capacity); the IDE's bounded queue or result store is full. Wait for pending work, or call ide.stop and ide.start"
+            "The IDE's bounded queue or result store is full.\nRepair: Continue this operation with native tools."
         );
     }
 
@@ -1431,113 +1828,123 @@ mod tests {
         for (code, detail, expected) in [
             (
                 FailureCode::UnknownSymbol,
+                "symbol:region: src/lib.rs:3 is file-level code at src/lib.rs#@imports, not a symbol; read it with ide.read",
+                "No symbol matches the requested address.\nRepair: List the file's addresses with ide.outline.\n  src/lib.rs:3 is file-level code at src/lib.rs#@imports, not a symbol; read it with ide.read\n",
+            ),
+            (
+                FailureCode::UnknownSymbol,
+                "symbol:line_past_end: src/lib.rs:99 is past the end of the file",
+                "No symbol matches the requested address.\nRepair: List the file's addresses with ide.outline.\n  src/lib.rs:99 is past the end of the file\n",
+            ),
+            (
+                FailureCode::UnknownSymbol,
                 "edit:range_past_end: line 17 is past the end of src/a.rs (3 lines)",
-                "error: unknown_symbol (edit:range_past_end); line 17 is past the end of src/a.rs (3 lines). Re-read the range with ide.read and retry with a fresh source_ref",
+                "No symbol matches the requested address.\nRepair: List the file's addresses with ide.outline.\n  line 17 is past the end of src/a.rs (3 lines)\n",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "outline:provider_unavailable ext=md",
-                "error: provider_unavailable (outline:no_server); no language server is configured for .md files in this project. Continue with native tools",
+                "No language server is configured for .md files in this project.\nRepair: Continue this operation with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable ext=md (provider: no server for this file type)",
-                "error: provider_unavailable (symbol:no_server); no language server is configured for .md files in this project. Continue with native tools",
+                "No language server is configured for .md files in this project.\nRepair: Continue this operation with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "edit:rename_no_edits:foo",
-                "error: provider_unavailable (edit:rename_no_edits); the language server returned no edits for symbol foo. Check it with ide.symbol, then retry",
+                "The language server returned no edits for this rename.\nRepair: Check the requested symbol with ide.symbol.\n  foo\n",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "edit:rename_request_failed:foo",
-                "error: provider_unavailable (edit:rename_request_failed); the language server failed to rename symbol foo. Check it with ide.symbol, then retry",
+                "The language server failed to process this rename.\nRepair: Check the requested symbol with ide.symbol.\n  foo\n",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "edit:rename_unsupported_edits:foo",
-                "error: provider_unavailable (edit:rename_unsupported_edits); the language server returned edits the IDE cannot safely apply for symbol foo. Continue with native tools",
+                "The language server returned rename edits the IDE cannot safely apply.\nRepair: Use native tools for this rename.\n  foo\n",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "test:selection_unavailable",
-                "error: provider_unavailable (test:selection_unavailable); tests could not be selected from these arguments. Use ide.test with a pattern or path",
+                "Tests could not be selected from these arguments.\nRepair: Call ide.test with a pattern.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "read:provider_unavailable ext=gamma",
-                "error: provider_unavailable (read:no_server); no language server is configured for .gamma files in this project. Continue with native tools",
+                "No language server is configured for .gamma files in this project.\nRepair: Continue this operation with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable ext=delta",
-                "error: provider_unavailable (symbol:no_server); no language server is configured for .delta files in this project. Continue with native tools",
+                "No language server is configured for .delta files in this project.\nRepair: Continue this operation with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "context:provider_unavailable ext=epsilon",
-                "error: provider_unavailable (context:no_server); no language server is configured for .epsilon files in this project. Continue with native tools",
+                "No language server is configured for .epsilon files in this project.\nRepair: Continue this operation with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable (fixtureserver: workspace load failed; outline and read answer from source)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: workspace load failed; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "The server cannot answer semantic requests; source outline and read remain available.\nRepair: Read the definition with ide.read.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "read:provider_unavailable (fixtureserver: transport gone; outline and read answer from source)",
-                "error: provider_unavailable (read:provider_unavailable (fixtureserver: transport gone; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "The server cannot answer semantic requests; source outline and read remain available.\nRepair: Read the definition with ide.read.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable (fixtureserver: references request failed; outline and read answer from source)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: references request failed; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "The server cannot answer semantic requests; source outline and read remain available.\nRepair: Read the definition with ide.read.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "outline:provider_unavailable (fixtureserver: documentSymbols request failed; use native reads)",
-                "error: provider_unavailable (outline:provider_unavailable (fixtureserver: documentSymbols request failed; use native reads)); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "The server cannot answer this request and no source outline is available.\nRepair: Read the source with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable (fixtureserver-plain: workspace load failed; use native reads)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver-plain: workspace load failed; use native reads)); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "The server cannot answer this request and no source outline is available.\nRepair: Read the source with native tools.",
             ),
             (
                 FailureCode::InvalidDetail,
                 "test:unknown_run:42",
-                "error: invalid_detail (test:unknown_run); run #42 is unknown or expired. Start a new run with ide.test",
+                "This test run is unknown or expired.\nRepair: Start a new run with ide.test.",
             ),
             (
                 FailureCode::Capacity,
                 "stop:busy",
-                "error: capacity (stop:busy); the IDE's state store stayed busy, so this stop is not recorded yet and its grant is still held. The IDE keeps retrying it itself; nothing more is needed",
+                "This stop is not recorded; its grant remains held while the IDE retries.\nRepair: Continue this work with native tools.",
             ),
             (
                 FailureCode::Capacity,
                 "stop:store_full",
-                "error: capacity (stop:store_full); the IDE's state store for this repository is full, so this stop cannot be recorded and its grant stays held. The IDE keeps retrying, but a full store only clears when every IDE session of this repository ends and it restarts; continue with native tools",
+                "This stop is not recorded; its grant remains held while the IDE retries.\nRepair: Continue this work with native tools.\n  The full state store clears only when every IDE session of this repository ends and the IDE restarts.\n",
             ),
             (
                 FailureCode::Deadline,
                 "stop:store_deadline",
-                "error: deadline (stop:store_deadline); recording this stop took too long and may still complete. The IDE keeps retrying it with the same operation id, so nothing more is needed",
+                "Recording this stop took too long and may still complete; the IDE retries with the same operation id.\nRepair: Continue this work with native tools.",
             ),
             (
                 FailureCode::WorkspaceAuthority,
                 "stop:store_unavailable",
-                "error: workspace_authority (stop:store_unavailable); the IDE's state store could not record this stop, so its grant is still held. The IDE keeps retrying it itself; continue with native tools",
+                "This stop is not recorded; its grant remains held while the IDE retries.\nRepair: Continue this work with native tools.",
             ),
             (
                 FailureCode::WorkspaceAuthority,
                 "stop:authority",
-                "error: workspace_authority (stop:authority); this stop conflicts with the recorded activation. Call ide.start to see the current binding, then repeat ide.stop",
+                "This stop conflicts with the recorded activation.\nRepair: Call ide.start to see the current binding.",
             ),
             (
                 FailureCode::Deadline,
                 "stop:deadline",
-                "error: deadline (stop:deadline); stopping exceeded 800 ms and cleanup may still be running. Call ide.start to check the session before editing, or continue with native tools",
+                "Stopping exceeded its time limit; cleanup may still be running.\nRepair: Call ide.start to check the session before editing.",
             ),
         ] {
             let rendered = render(
@@ -1592,7 +1999,10 @@ mod tests {
             .unwrap();
             assert_eq!(
                 text_of(&rendered),
-                format!("error: execution_profile ({tag}); {message}. Continue with native tools")
+                format!(
+                    "{}.\nRepair: Continue with native tools.",
+                    message[..1].to_uppercase() + &message[1..]
+                )
             );
             assert_eq!(
                 rendered.structured_content.unwrap()["code"],
@@ -1616,7 +2026,10 @@ mod tests {
         let rendered = render(reply, Envelope::WithStructured).unwrap();
         let text = text_of(&rendered);
         assert!(call_tool_result_fits(&rendered), "{text}");
-        assert!(text.contains("resolution_unverified") && text.contains("ide.context"));
+        assert!(
+            text.contains("could not verify project membership")
+                && text.contains("Repair: Read the project problems")
+        );
         assert!(text.contains("tsconfig.json") && text.contains("src/outside.ts"));
         assert!(!text.contains("native"));
         assert_eq!(rendered.structured_content, Some(expected));
@@ -1649,7 +2062,26 @@ mod tests {
             let expected = serde_json::to_value(&reply).unwrap();
             let rendered = render(reply, Envelope::WithStructured).unwrap();
             let text = text_of(&rendered);
-            assert!(text.starts_with(&format!("edit: {}", outcome.as_str())));
+            let refused = !matches!(
+                outcome,
+                EditOutcome::Created | EditOutcome::Replaced | EditOutcome::Unchanged
+            );
+            if refused {
+                // harness-reply-v1 R5: a head, one Repair line, no internal outcome label.
+                let lines = text.lines().collect::<Vec<_>>();
+                assert!(lines.len() == 2 && lines[0].len() <= 160, "{text}");
+                assert!(
+                    lines[1].starts_with("Repair: ") && lines[1].len() <= 120,
+                    "{text}"
+                );
+                assert!(!text.contains(outcome.as_str()), "{text}");
+                assert!(
+                    !lines[1].contains(" or ") && !text.contains("otherwise"),
+                    "{text}"
+                );
+            } else {
+                assert!(text.starts_with(&format!("edit: {}", outcome.as_str())));
+            }
             assert!(text.contains("src/lib.rs"));
             assert!(!text.contains("private-operation-id"));
             if !matches!(
@@ -1662,11 +2094,65 @@ mod tests {
                 assert!(!text.contains("operation_id"));
             }
             assert_eq!(rendered.structured_content, Some(expected));
-            assert_eq!(rendered.is_error, None);
+            // Only a file that was created, replaced or found unchanged is a success; every
+            // refusal, cancellation and unknown outcome is an MCP error.
+            let written = matches!(
+                outcome,
+                EditOutcome::Created | EditOutcome::Replaced | EditOutcome::Unchanged
+            );
+            assert_eq!(rendered.is_error, (!written).then_some(true), "{outcome:?}");
             if outcome == EditOutcome::OutcomeUnknown {
-                assert!(text.contains("do not replay") && text.contains("native tools"));
+                assert!(text.contains("do not repeat this edit") && text.contains("native tools"));
+            }
+            if refused && outcome != EditOutcome::OutcomeUnknown {
+                assert!(text.starts_with("Nothing was written; "), "{text}");
             }
         }
+    }
+
+    /// A valid 203-byte path never costs a durable edit refusal its effect sentence: the effect
+    /// leads the head, the path label is shortened to its tail and the head stays within 160 B.
+    #[test]
+    fn long_paths_keep_the_effect_of_every_durable_edit_refusal() {
+        let path = format!("{}/{}.rs", "a".repeat(100), "b".repeat(99));
+        assert_eq!(path.len(), 203);
+        for outcome in [
+            EditOutcome::StaleSource,
+            EditOutcome::ConflictingDuplicate,
+            EditOutcome::UnsafeTarget,
+            EditOutcome::CancelledNoEffect,
+            EditOutcome::DeadlineNoEffect,
+            EditOutcome::CapacityNoEffect,
+            EditOutcome::OutcomeUnknown,
+            EditOutcome::UnavailableBeforeDispatch,
+        ] {
+            let reply = PeerReply::Edit {
+                result: EditResult::new("op".into(), path.clone(), outcome, None).unwrap(),
+                diagnostics: EditDiagnostics::Unknown {},
+                note: None,
+                operation: None,
+            };
+            let rendered = render(reply, Envelope::TextOnly).unwrap();
+            let text = text_of(&rendered);
+            let lines = text.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 2, "{text}");
+            assert!(lines[0].len() <= 160, "{text}");
+            assert!(
+                lines[1].starts_with("Repair: ") && lines[1].len() <= 120,
+                "{text}"
+            );
+            let effect = if outcome == EditOutcome::OutcomeUnknown {
+                "may or may not have been written"
+            } else {
+                "Nothing was written; "
+            };
+            assert!(text.contains(effect), "{text}");
+            assert!(lines[0].ends_with(&path[path.len() - 50..]), "{text}");
+            assert!(!lines[0].contains(&path), "{text}");
+        }
+        assert_eq!(path_label("src/lib.rs".into()), "src/lib.rs");
+        assert_eq!(path_label(path).len(), PATH_LABEL_BYTES);
+        assert_eq!(path_label("é".repeat(40)).chars().count(), 29);
     }
 
     /// Renders same-response diagnostics into one non-JSON block with the matching typed result.
@@ -1680,20 +2166,22 @@ mod tests {
                     truncated: false,
                 },
                 "current_reported",
-                "ide.edit",
+                // The reported problems follow the first line; no file-version reference.
+                "cannot find value `missing`",
             ),
             (
                 EditDiagnostics::CurrentClean { project_errors: 0 },
                 "current_clean",
-                "ide.diff",
+                "current_clean",
             ),
-            (EditDiagnostics::Unknown {}, "unknown", "ide.context"),
+            (EditDiagnostics::Unknown {}, "unknown", "ide.inspect"),
             (
                 EditDiagnostics::Pending {
                     detail_ref: "diagnostic-detail".into(),
                 },
                 "pending",
-                "ide.inspect",
+                // OUTBOX-r4 §8.7: the check stays retained and Bridge delivery is conditional.
+                "result retained under diagnostic-detail; Bridge delivers it automatically",
             ),
         ];
         for (diagnostics, state, next_tool) in cases {
@@ -1738,20 +2226,18 @@ mod tests {
         assert!(
             text.ends_with(
                 "diagnostics: current_clean for this file; the project check reports 7 errors in \
-                 other files. Next: use ide.context with kind problems"
+                 other files (ide.inspect {\"kind\":\"problems\"})"
             ),
             "{text}"
         );
         let passing = successful_edit_reply(EditDiagnostics::CurrentClean { project_errors: 0 });
         let rendered = render(passing, Envelope::TextOnly).unwrap();
         let text = text_of(&rendered);
-        assert!(
-            text.ends_with("diagnostics: current_clean. Next: use ide.diff"),
-            "{text}"
-        );
+        assert!(text.ends_with("diagnostics: current_clean"), "{text}");
     }
 
-    /// Names the changed file or incomplete read and directs the caller to the newest usable reference.
+    /// A stale write names the file changed during application, confirms no write occurred,
+    /// and directs the caller to repeat the call without teaching file-version references.
     #[test]
     fn stale_edit_text_explains_why_no_write_occurred() {
         let reply = PeerReply::Edit {
@@ -1762,12 +2248,29 @@ mod tests {
         };
         let rendered = render(reply, Envelope::TextOnly).unwrap();
         let text = text_of(&rendered);
-        assert!(text.contains("No write occurred"));
-        assert!(text.contains("this file changed or the source_ref missed part of its read"));
-        assert!(
-            text.contains("Re-read with ide.read and inspect every page before retrying")
-                && !text.contains("newest source_ref"),
-            "{text}"
+        // symbol-read-edit-v1 §3.2 rule 6: a write that found the file changed answers with the
+        // contract sentence and a repeat-the-call repair, and mentions no file-version reference.
+        assert_eq!(
+            text,
+            "Nothing was written; the file changed while the edit was applied: src/lib.rs\nRepair: Repeat the call."
+        );
+        assert!(!text.contains("source_ref"), "{text}");
+    }
+
+    /// A stale deprecated `source_ref` names itself and says to send the edit without it.
+    #[test]
+    fn stale_source_ref_note_replaces_the_changed_while_applied_sentence() {
+        let reply = PeerReply::Edit {
+            result: edit_result(EditOutcome::StaleSource).unwrap(),
+            diagnostics: EditDiagnostics::Unknown {},
+            note: Some("the supplied source_ref does not match this file's current text. Repair: Send the edit without source_ref".into()),
+            operation: None,
+        };
+        let rendered = render(reply, Envelope::TextOnly).unwrap();
+        let text = text_of(&rendered);
+        assert_eq!(
+            text,
+            "The supplied source_ref does not match this file's current text; nothing was written.\nRepair: Send the edit without source_ref"
         );
     }
 
@@ -1822,12 +2325,10 @@ mod tests {
         }
     }
 
-    /// Closes the T14B gap where a Claude reader, which never sees `structuredContent`, would have
-    /// no way to learn the `source_ref` a later `ide.edit` needs: unlike Diff, Context's
-    /// `detail_ref` names the exact same-binding source an `ide.edit` `source_ref` must match, so
-    /// it belongs in the compact text whenever it is `Some`, truncated or not, continuation or not.
+    /// Edits need no file-version reference, so a Context reply never teaches one: it is the
+    /// bare text, plus a single cut trailer when the text is incomplete.
     #[test]
-    fn context_text_always_carries_its_edit_source_ref() {
+    fn context_text_never_carries_a_source_ref() {
         for (truncated, continuation) in [(false, false), (true, false)] {
             let rendered = render(
                 PeerReply::Complete {
@@ -1842,9 +2343,10 @@ mod tests {
             .unwrap();
             let text = text_of(&rendered);
             assert!(
-                text.contains("source_ref live-source-detail") && text.contains("ide.edit"),
+                !text.contains("source_ref") && !text.contains("live-source-detail"),
                 "{text}"
             );
+            assert_eq!(text.contains("Cut;"), truncated, "{text}");
         }
     }
 
@@ -1863,7 +2365,38 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&rendered);
-        assert_eq!(text, "complete context: beta: unavailable:env_missing");
+        assert_eq!(text, "beta: unavailable:env_missing");
+    }
+
+    /// Page hints select the actual implemented originating read/graph/test tool; compatibility
+    /// context pages retain inspect instead of advertising the removed public context call.
+    #[test]
+    fn continuation_hints_use_the_originating_domain() {
+        for (kind, tool) in [
+            (ResultKind::Read, "ide.read"),
+            (ResultKind::Graph, "ide.graph"),
+            (ResultKind::Test, "ide.test"),
+            (ResultKind::Context, "ide.inspect"),
+        ] {
+            let result = render(
+                PeerReply::Complete {
+                    kind,
+                    text: "body".into(),
+                    detail_ref: Some("next".into()),
+                    truncated: true,
+                    continuation: true,
+                },
+                Envelope::TextOnly,
+            )
+            .unwrap();
+            assert!(
+                text_of(&result).ends_with(&format!(
+                    "Cut; {tool} {{\"detail_ref\":\"next\"}} continues"
+                )),
+                "{}",
+                text_of(&result)
+            );
+        }
     }
 
     /// Keeps a page's final source newline separate from the continuation instruction.
@@ -1882,7 +2415,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "complete context: page 1; bytes 0-2 of 4\n\nx\n\nOutput is truncated; use ide.inspect with detail_ref next-page before editing"
+            "page 1; bytes 0-2 of 4\n\nx\n\nCut; ide.inspect {\"detail_ref\":\"next-page\"} continues"
         );
         let without_trailing_newline = render(
             PeerReply::Complete {
@@ -1897,7 +2430,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&without_trailing_newline),
-            "complete context: x\nOutput is truncated; use ide.inspect with detail_ref next-page before editing"
+            "x\nCut; ide.inspect {\"detail_ref\":\"next-page\"} continues"
         );
     }
 
@@ -1938,12 +2471,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            text_of(&context).contains("incomplete") && !text_of(&context).contains("ide.inspect")
+            text_of(&context).contains("nothing more to fetch")
+                && !text_of(&context).contains("ide.inspect")
         );
         assert!(
-            text_of(&diff).contains("stop or review") && !text_of(&diff).contains("ide.inspect")
+            text_of(&diff).contains("nothing more to fetch")
+                && !text_of(&diff).contains("ide.inspect")
         );
-        assert!(text_of(&paged).contains("ide.inspect with detail_ref page-detail"));
+        assert!(text_of(&paged).contains("ide.inspect {\"detail_ref\":\"page-detail\"}"));
     }
 
     /// Sends duplicate-edit recovery through the IDE context path with a fresh operation identity.
@@ -1961,7 +2496,7 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&rendered);
-        assert!(text.contains("use ide.context") && text.contains("new operation_id"));
+        assert!(text.contains("with ide.read") && text.contains("new operation_id"));
         assert!(!text.contains("native tools"));
     }
 
@@ -2023,7 +2558,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            text_of(&rendered).starts_with(&format!("{plate}\ncomplete context: alpha: ready")),
+            text_of(&rendered).starts_with(&format!("{plate}\nalpha: ready")),
             "{}",
             text_of(&rendered)
         );
@@ -2062,7 +2597,7 @@ mod tests {
         };
         assert!(call_tool_result_fits(&rendered));
         assert!(
-            text_of(&rendered).starts_with(&format!("{plate}\ncomplete context:")),
+            text_of(&rendered).starts_with(&format!("{plate}\n")),
             "{}",
             text_of(&rendered)
         );
@@ -2085,8 +2620,8 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&newline_path);
-        assert!(text.contains("no_such_file: src/li\\ng.rs"), "{text}");
-        assert!(!text.contains('\n'), "{text}");
+        assert_eq!(text.lines().nth(2), Some("  src/li\\ng.rs"), "{text}");
+        assert_eq!(text.lines().count(), 3, "{text}");
         assert_eq!(
             newline_path.structured_content.unwrap()["code"]["no_such_file"],
             "src/li\ng.rs"
@@ -2173,7 +2708,8 @@ mod tests {
             text_of(&rendered),
             "edit: renamed; path src/lib.rs; operation_id private-operation-id\n\
              Presentation degraded (presentation_failed). Do not repeat the mutation to repair \
-             this response. Diagnostics pending: ide.inspect with detail_ref diag-detail"
+             this response. Diagnostics pending; result retained under diag-detail; Bridge \
+             delivers it automatically."
         );
         assert_ne!(rendered.is_error, Some(true));
 
@@ -2189,7 +2725,7 @@ mod tests {
             "edit: outcome_unknown; path src/lib.rs; operation_id private-operation-id"
         ));
         assert!(text.contains("do not replay this operation"), "{text}");
-        assert_ne!(rendered.is_error, Some(true));
+        assert_eq!(rendered.is_error, Some(true));
 
         let refused = PeerReply::Edit {
             result: edit_result(EditOutcome::StaleSource).unwrap(),
@@ -2200,6 +2736,7 @@ mod tests {
         let refused_degraded = PresentationReceipt::of(&refused).unwrap().degraded();
         let text = text_of(&refused_degraded);
         assert!(text.contains("No write occurred."), "{text}");
+        assert_eq!(refused_degraded.is_error, Some(true));
 
         // Reads carry no receipt: their loss is the requested answer, not an unreported effect.
         assert!(
@@ -2226,10 +2763,31 @@ mod tests {
         .unwrap();
         let text = text_of(&result);
         assert!(
-            text.contains("choose one of the listed candidates or \"auto\""),
+            text.contains("Repair: Select one listed project environment with ide.start."),
+            "{text}"
+        );
+        assert!(
+            text.contains("alpha: candidate absent; candidates one, two"),
             "{text}"
         );
         assert!(!text.contains("detail_ref"), "{text}");
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    /// A valid operation blocked by preparation names native recovery, not argument repair or
+    /// a guessed package-manager command, and remains an MCP business refusal.
+    #[test]
+    fn configured_environment_refusal_names_native_recovery() {
+        let result = render(PeerReply::Error {code: FailureCode::ProviderUnavailable, detail: Some("environment: accepted compiler changed; configure the launcher or use native cargo".into())}, Envelope::TextOnly).unwrap();
+        let text = text_of(&result);
+        assert!(
+            text.contains("accepted compiler changed") && text.contains("native"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("TestTargetUnsupported") && !text.contains("Select one listed"),
+            "{text}"
+        );
         assert_eq!(result.is_error, Some(true));
     }
 }

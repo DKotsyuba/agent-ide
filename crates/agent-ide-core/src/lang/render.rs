@@ -20,6 +20,9 @@ pub const MAX_DOC_CHARS: usize = 600;
 pub const MAX_GRAPH_NODES: usize = 60;
 /// Maximum unique edges retained by one call graph.
 pub const MAX_GRAPH_EDGES: usize = 120;
+/// Usage-row tag of a site that builds a value of the struct, enum or class (a lexical rule; the
+/// `~` makes the card print its heuristic-match legend). The card's usages line counts them.
+pub const CONSTRUCTION_TAG: &str = "construction ~";
 
 /// Direction in which one call-graph edge is rendered from its parent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -36,6 +39,15 @@ impl GraphDirection {
         match self {
             Self::Callers => "←",
             Self::Callees => "→",
+        }
+    }
+
+    /// Returns the plural noun of this direction's section, `callers` or `callees`, as printed
+    /// in an `unavailable (<cause>)` line.
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Callers => "callers",
+            Self::Callees => "callees",
         }
     }
 }
@@ -81,6 +93,13 @@ pub struct CallGraph {
     pub collapsed_tests: std::collections::BTreeMap<(usize, GraphDirection), usize>,
     /// Set when adding a node or edge reached the fixed graph ceiling.
     pub capped: bool,
+    /// Call-hierarchy requests that failed, keyed by the queried node index and direction, with
+    /// the cause rendered in parentheses. A failed request is reported where it happened and is
+    /// never rendered as an absence of calls.
+    pub faults: std::collections::BTreeMap<(usize, GraphDirection), String>,
+    /// Tagged symbol addresses (`file#unit (L123)`) by node `(file, line)`; a node with one is
+    /// printed as that address in place of its raw path and `file:line`.
+    pub addresses: LocationAddresses,
 }
 
 impl CallGraph {
@@ -91,7 +110,47 @@ impl CallGraph {
             edges: Vec::new(),
             collapsed_tests: Default::default(),
             capped: false,
+            faults: Default::default(),
+            addresses: Default::default(),
         }
+    }
+
+    /// The node as the graph names it: its tagged address when resolved, else the raw path.
+    fn node_name(&self, node: &GraphNode) -> String {
+        match self.addresses.get(&(node.file.clone(), node.line)) {
+            Some(address) => address.clone(),
+            None => node.path.clone(),
+        }
+    }
+
+    /// Records that the `direction` call-hierarchy request of node `node` failed with `cause`
+    /// (for example `incoming calls request failed`). The first cause recorded for one node and
+    /// direction is kept; recording never adds a node or an edge.
+    pub fn note_fault(&mut self, node: usize, direction: GraphDirection, cause: String) {
+        self.faults.entry((node, direction)).or_insert(cause);
+    }
+
+    /// The cause when the root has no answer at all for `directions`: every listed direction's
+    /// request faulted and no edge of those directions leaves the root (a cross-language link
+    /// edge is an answer). Several distinct causes are joined with `; `. `None` when any listed
+    /// direction answered or `directions` is empty.
+    pub fn root_unavailable(&self, directions: &[GraphDirection]) -> Option<String> {
+        if directions.is_empty()
+            || self
+                .edges
+                .iter()
+                .any(|edge| edge.from == 0 && directions.contains(&edge.direction))
+        {
+            return None;
+        }
+        let mut causes: Vec<&str> = Vec::new();
+        for direction in directions {
+            let cause = self.faults.get(&(0, *direction))?;
+            if !causes.contains(&cause.as_str()) {
+                causes.push(cause);
+            }
+        }
+        Some(causes.join("; "))
     }
 
     /// Adds a unique node, returning its index; returns `None` after the 60-node ceiling.
@@ -120,6 +179,13 @@ impl CallGraph {
 }
 
 /// Renders a depth-limited graph as an indented tree; repeated nodes are marked `(seen)`.
+///
+/// A failed call-hierarchy request is never rendered as an absence of calls:
+/// - when the root has no answer for any selected direction, the whole reply is the single line
+///   `graph: <subject> of <root> unavailable (<cause>)`;
+/// - a root direction that faulted while another answered prints `<noun>: unavailable (<cause>)`
+///   before that direction's rows;
+/// - a deeper node whose request faulted ends its row with `(<noun> unavailable: <cause>)`.
 pub fn call_graph_text(graph: &CallGraph, direction: &str, depth: u8) -> String {
     let root = &graph.nodes[0];
     let subject = match direction {
@@ -127,23 +193,30 @@ pub fn call_graph_text(graph: &CallGraph, direction: &str, depth: u8) -> String 
         "callees" => "callees",
         _ => "callers",
     };
+    let directions: &[GraphDirection] = match direction {
+        "both" => &[GraphDirection::Callers, GraphDirection::Callees],
+        "callees" => &[GraphDirection::Callees],
+        _ => &[GraphDirection::Callers],
+    };
+    if let Some(cause) = graph.root_unavailable(directions) {
+        return format!(
+            "graph: {subject} of {} unavailable ({cause})\n",
+            graph.node_name(root)
+        );
+    }
     let mut out = format!(
         "graph: {subject} of {} (depth {depth}, {} nodes, {} edges)\n",
-        root.path,
+        graph.node_name(root),
         graph.nodes.len(),
         graph.edges.len()
     );
     let mut seen = vec![false; graph.nodes.len()];
     seen[0] = true;
-    let directions = if direction == "both" {
-        [Some(GraphDirection::Callers), Some(GraphDirection::Callees)]
-    } else if direction == "callees" {
-        [Some(GraphDirection::Callees), None]
-    } else {
-        [Some(GraphDirection::Callers), None]
-    };
-    for selected in directions.into_iter().flatten() {
-        render_graph_children(graph, 0, selected, 1, depth, &mut seen, &mut out);
+    for selected in directions {
+        if let Some(cause) = graph.faults.get(&(0, *selected)) {
+            out.push_str(&format!("{}: unavailable ({cause})\n", selected.noun()));
+        }
+        render_graph_children(graph, 0, *selected, 1, depth, &mut seen, &mut out);
     }
     if graph.capped {
         out.push_str("… capped at 60 nodes or 120 edges\n");
@@ -175,9 +248,14 @@ fn render_graph_children(
         out.push_str(&format!(
             "{}{arrow} {}",
             "  ".repeat(level as usize),
-            node.path
+            graph.node_name(node)
         ));
-        if !node.file.is_empty() {
+        // A resolved address already carries the file and the absolute line.
+        if !node.file.is_empty()
+            && !graph
+                .addresses
+                .contains_key(&(node.file.clone(), node.line))
+        {
             out.push_str(&format!("  {}:{}", node.file, node.line));
         }
         if let Some(tag) = &node.tag {
@@ -191,6 +269,8 @@ fn render_graph_children(
         }
         if already_seen {
             out.push_str(" (seen)");
+        } else if let Some(cause) = graph.faults.get(&(edge.to, direction)) {
+            out.push_str(&format!(" ({} unavailable: {cause})", direction.noun()));
         }
         out.push('\n');
         if !already_seen {
@@ -273,6 +353,70 @@ mod graph_tests {
         );
         assert!(graph.capped);
         assert!(call_graph_text(&graph, "callers", 1).contains("… capped at 60 nodes"));
+    }
+
+    /// A failed call-hierarchy request is reported where it happened, never as missing calls: a
+    /// root with no answer is one `unavailable` line, a root direction that faulted beside one
+    /// that answered prints its own line, and a deeper node carries the cause on its row.
+    #[test]
+    fn call_graph_reports_faulted_requests_as_unavailable() {
+        let node = |path: &str, line: u32| GraphNode {
+            path: path.to_owned(),
+            file: "src/lib.rs".to_owned(),
+            line,
+            is_test: false,
+            tag: None,
+        };
+        let mut graph = CallGraph::new(node("root", 1));
+        graph.note_fault(
+            0,
+            GraphDirection::Callers,
+            "incoming calls request failed".into(),
+        );
+        assert_eq!(
+            call_graph_text(&graph, "callers", 2),
+            "graph: callers of root unavailable (incoming calls request failed)\n"
+        );
+
+        // Callees answered, callers did not: the graph renders with the callers line.
+        let callee = graph.add_node(node("callee", 5)).unwrap();
+        graph.add_edge(GraphEdge {
+            from: 0,
+            to: callee,
+            direction: GraphDirection::Callees,
+            link: false,
+        });
+        graph.note_fault(
+            callee,
+            GraphDirection::Callees,
+            "outgoing calls request failed".into(),
+        );
+        let text = call_graph_text(&graph, "both", 2);
+        assert!(
+            text.starts_with("graph: callers and callees of root (depth 2, 2 nodes, 1 edges)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("callers: unavailable (incoming calls request failed)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "→ callee  src/lib.rs:5 (callees unavailable: outgoing calls request failed)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            graph
+                .root_unavailable(&[GraphDirection::Callers, GraphDirection::Callees])
+                .is_none()
+        );
+        assert_eq!(
+            graph
+                .root_unavailable(&[GraphDirection::Callers])
+                .as_deref(),
+            Some("incoming calls request failed")
+        );
     }
 
     /// Keeps callers before callees for a two-sided graph and marks a repeated test node.
@@ -379,6 +523,151 @@ mod graph_tests {
         assert!(text.contains("(depth 2, 4 nodes, 3 edges)"), "{text}");
         assert_eq!(text.matches("[test]").count(), 2, "{text}");
     }
+}
+
+/// One candidate row of a bare-name answer: `<address>  <kind>  <signature>  (lines a–b)`.
+pub fn candidate_row(unit: &super::address::Unit) -> String {
+    let kind = match unit.kind {
+        super::address::UnitKind::Symbol(kind) => kind.name(),
+        super::address::UnitKind::Region(_) => "region",
+    };
+    format!(
+        "{}  {kind}  {}  (lines {})",
+        unit.address, unit.signature, unit.span
+    )
+}
+
+/// Kind filter of [`address_outline_text`]: the selected symbol kinds, whether regions show, and
+/// the caller's raw list for the footer.
+pub struct OutlineFilter<'a> {
+    /// Selected closed kind names that parsed.
+    pub kinds: &'a [SymbolKind],
+    /// The list named `region`, so file-level regions are shown.
+    pub regions: bool,
+    /// The raw comma list, printed back unchanged.
+    pub requested: &'a str,
+}
+
+/// Renders a file as one row per unit in file order, regions included:
+/// `<first>–<last> <address>  <signature>  // <doc>` (regions have no signature; blank `@after`
+/// regions are skipped; a test module is one row ending `[N tests collapsed]`). `filter` limits
+/// symbols to the selected kinds (a container of a selected member stays for context, tests stay
+/// whole) and hides regions unless it asks for them. Complete unfiltered delivery has no
+/// redundant file header or total footer; a kind filter keeps its cut summary, collapsed test
+/// rows keep their own counts, and an empty delivery names the file explicitly. The address
+/// still ends at two spaces so signatures containing spaces cannot become part of the address.
+/// This pure renderer performs no I/O; the caller appends source-fallback provenance separately.
+pub fn address_outline_text(
+    outline: &Outline,
+    map: &super::address::AddressMap,
+    filter: Option<&OutlineFilter<'_>>,
+) -> String {
+    use super::address::UnitKind;
+
+    let units = map.units();
+    // Parent of each unit by depth, then keep flags propagated from selected kinds upward.
+    let mut parent = vec![None; units.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, unit) in units.iter().enumerate() {
+        while stack
+            .last()
+            .is_some_and(|&top| units[top].depth >= unit.depth)
+        {
+            stack.pop();
+        }
+        parent[i] = stack.last().copied();
+        stack.push(i);
+    }
+    let mut keep: Vec<bool> = units
+        .iter()
+        .map(|unit| match (filter, unit.kind) {
+            (None, _) => true,
+            (Some(f), UnitKind::Region(_)) => f.regions,
+            (Some(f), UnitKind::Symbol(kind)) => {
+                kind == SymbolKind::Test || f.kinds.contains(&kind)
+            }
+        })
+        .collect();
+    for i in (0..units.len()).rev() {
+        if keep[i]
+            && let Some(p) = parent[i]
+            && matches!(units[p].kind, UnitKind::Symbol(_))
+        {
+            keep[p] = true;
+        }
+    }
+    let mut out = String::new();
+    let (mut symbols, mut regions, mut tests, mut total) = (0usize, 0usize, 0usize, 0usize);
+    let mut collapsed_until = 0u32;
+    for (i, unit) in units.iter().enumerate() {
+        if unit.span.start <= collapsed_until && matches!(unit.kind, UnitKind::Symbol(_)) {
+            continue;
+        }
+        match unit.kind {
+            UnitKind::Region(_) => {
+                if unit.blank {
+                    continue;
+                }
+                if keep[i] {
+                    regions += 1;
+                    out.push_str(&format!("{} {}\n", unit.span, unit.address));
+                }
+            }
+            UnitKind::Symbol(SymbolKind::Test) => {
+                // A test module or function: count it and its members, print one collapsed line.
+                let members = units
+                    .iter()
+                    .filter(|other| {
+                        matches!(other.kind, UnitKind::Symbol(_))
+                            && other.span.start >= unit.span.start
+                            && other.span.end <= unit.span.end
+                    })
+                    .count();
+                collapsed_until = unit.span.end;
+                tests += members;
+                out.push_str(&format!(
+                    "{} {}  {} [{members} tests collapsed]\n",
+                    unit.span, unit.address, unit.signature
+                ));
+            }
+            UnitKind::Symbol(_) => {
+                total += 1;
+                if keep[i] {
+                    symbols += 1;
+                    let doc = unit
+                        .doc
+                        .as_deref()
+                        .map(|doc| first_line(doc, 72))
+                        .filter(|doc| !doc.is_empty())
+                        .map(|doc| format!("  // {doc}"))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "{} {}  {}{doc}\n",
+                        unit.span, unit.address, unit.signature
+                    ));
+                }
+            }
+        }
+    }
+    let region_note = if regions > 0 {
+        format!(", {regions} regions")
+    } else {
+        String::new()
+    };
+    if out.is_empty() {
+        out.push_str(&format!("outline: {}: no rows\n", outline.file.display()));
+    }
+    if let Some(f) = filter {
+        out.push_str(&format!(
+            "  ({total} symbols; showing {symbols}{region_note} by kinds {}",
+            f.requested
+        ));
+        if tests > 0 {
+            out.push_str(&format!("; {tests} tests collapsed"));
+        }
+        out.push_str(")\n");
+    }
+    out
 }
 
 /// Renders a file skeleton: one declaration line per symbol, members indented, tests collapsed.
@@ -525,6 +814,452 @@ pub async fn directory_outline(root: &Path, directory: &Path) -> std::io::Result
     Ok(out)
 }
 
+/// Most bytes one project map answer carries (about 8,000 tokens); later entries are cut with an
+/// explicit count and a narrowing hint, never paged.
+pub const TREE_MAX_BYTES: usize = 32 * 1024;
+/// Deepest directory level a project map expands.
+pub const TREE_MAX_DEPTH: usize = 4;
+/// Longest one-line description a project map shows.
+const TREE_DESCRIPTION_CHARS: usize = 120;
+
+/// One directory of a project map: its listed subdirectories and files.
+struct TreeDir {
+    name: String,
+    relative: std::path::PathBuf,
+    dirs: Vec<TreeDir>,
+    files: Vec<String>,
+    /// Regular files at any depth below, with the same exclusions as the listing.
+    file_count: usize,
+}
+
+/// Whether a directory entry is left out of project listings: hidden names and build, dependency
+/// and cache directories.
+fn skipped_entry(name: &str) -> bool {
+    name.starts_with('.') || matches!(name, "target" | "node_modules" | "__pycache__")
+}
+
+/// Whether a Git-ignored path is this path or one of its ancestors.
+fn ignored_path(path: &Path, ignored: &std::collections::BTreeSet<std::path::PathBuf>) -> bool {
+    path.ancestors().any(|ancestor| ignored.contains(ancestor))
+}
+
+/// Plain directories permit files directly; Git trees admit only files observed in the snapshot.
+fn allowed_file(
+    path: &Path,
+    allowed: &Option<std::collections::BTreeSet<std::path::PathBuf>>,
+) -> bool {
+    allowed
+        .as_ref()
+        .is_none_or(|allowed| allowed.contains(path))
+}
+
+/// A tracked file remains visible even when an ignored untracked sibling collapses its directory.
+fn ignored_entry(
+    path: &Path,
+    directory: bool,
+    ignored: &std::collections::BTreeSet<std::path::PathBuf>,
+    allowed: &Option<std::collections::BTreeSet<std::path::PathBuf>>,
+) -> bool {
+    ignored_path(path, ignored)
+        && !allowed.as_ref().is_some_and(|files| {
+            files.contains(path)
+                || (directory
+                    && files
+                        .range(path.to_path_buf()..)
+                        .next()
+                        .is_some_and(|file| file.starts_with(path)))
+        })
+}
+
+/// Reads `directory` (relative to `root`) into a [`TreeDir`] whose subdirectories are expanded
+/// `depth - 1` more levels; files are kept by name, sorted, and every directory counts its files.
+/// Entries Git ignores (`ignored`, relative paths) are left out like hidden and build entries.
+fn read_tree(
+    root: &Path,
+    relative: &Path,
+    depth: usize,
+    ignored: &std::collections::BTreeSet<std::path::PathBuf>,
+    allowed: &Option<std::collections::BTreeSet<std::path::PathBuf>>,
+) -> std::io::Result<TreeDir> {
+    let absolute = root.join(relative);
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let mut file_count = 0;
+    for entry in std::fs::read_dir(&absolute)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child = relative.join(&name);
+        if skipped_entry(&name) {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if ignored_entry(&child, kind.is_dir(), ignored, allowed) {
+            continue;
+        }
+        if kind.is_dir() {
+            let dir = if depth > 1 {
+                read_tree(root, &child, depth - 1, ignored, allowed)?
+            } else {
+                TreeDir {
+                    name: name.clone(),
+                    file_count: count_tree_files(root, &child, ignored, allowed)?,
+                    relative: child,
+                    dirs: Vec::new(),
+                    files: Vec::new(),
+                }
+            };
+            file_count += dir.file_count;
+            dirs.push(TreeDir { name, ..dir });
+        } else if kind.is_file() && allowed_file(&child, allowed) {
+            file_count += 1;
+            files.push(name);
+        }
+    }
+    dirs.sort_by(|a, b| a.name.cmp(&b.name));
+    files.sort();
+    Ok(TreeDir {
+        name: relative
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        relative: relative.to_path_buf(),
+        dirs,
+        files,
+        file_count,
+    })
+}
+
+/// Counts the regular files below `relative`, with the same exclusions as [`read_tree`].
+fn count_tree_files(
+    root: &Path,
+    relative: &Path,
+    ignored: &std::collections::BTreeSet<std::path::PathBuf>,
+    allowed: &Option<std::collections::BTreeSet<std::path::PathBuf>>,
+) -> std::io::Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(root.join(relative))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child = relative.join(&name);
+        if skipped_entry(&name) {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if ignored_entry(&child, kind.is_dir(), ignored, allowed) {
+            continue;
+        }
+        if kind.is_dir() {
+            count += count_tree_files(root, &child, ignored, allowed)?;
+        } else if kind.is_file() && allowed_file(&child, allowed) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// The first sentence of `text`, on one line and at most [`TREE_DESCRIPTION_CHARS`] characters.
+fn first_sentence(text: &str) -> Option<String> {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let end = line
+        .match_indices(". ")
+        .map(|(index, _)| index + 1)
+        .next()
+        .unwrap_or(line.len());
+    let sentence = line[..end].trim();
+    (!sentence.is_empty()).then(|| clip(sentence, TREE_DESCRIPTION_CHARS))
+}
+
+/// The first paragraph of a `README.md` in `directory`, skipping headings, badges and fences.
+fn readme_description(directory: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(directory.join("README.md")).ok()?;
+    let mut paragraph = String::new();
+    for line in text.lines().take(80) {
+        let line = line.trim();
+        if line.is_empty() {
+            if paragraph.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if line.starts_with('#')
+            || line.starts_with("```")
+            || line.starts_with("[!")
+            || line.starts_with("![")
+            || line.starts_with('<')
+        {
+            if paragraph.is_empty() {
+                continue;
+            }
+            break;
+        }
+        paragraph.push(' ');
+        paragraph.push_str(line);
+    }
+    first_sentence(&paragraph)
+}
+
+/// The author's description of `directory` as a package, first found: a manifest's description,
+/// the module documentation of a package root file, then a `README.md` first paragraph. Every
+/// source is existing text; nothing is generated.
+async fn directory_description(
+    root: &Path,
+    relative: &Path,
+    ignored: &std::collections::BTreeSet<std::path::PathBuf>,
+    allowed: &Option<std::collections::BTreeSet<std::path::PathBuf>>,
+) -> std::io::Result<Option<String>> {
+    let directory = root.join(relative);
+    let languages = crate::lang::registered();
+    for language in languages {
+        let manifests = language.support().manifest_description_files();
+        // A callback without declared inputs cannot establish an ignore-safe read boundary.
+        let mut safe = !manifests.is_empty();
+        for file in manifests {
+            let relative_file = Path::new(file);
+            if relative_file.is_absolute()
+                || !relative_file
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                safe = false;
+                break;
+            }
+            let path = relative.join(relative_file);
+            if ignored_entry(&path, false, ignored, allowed) || !allowed_file(&path, allowed) {
+                safe = false;
+                break;
+            }
+            match std::fs::symlink_metadata(root.join(&path)) {
+                Ok(metadata)
+                    if metadata.is_file()
+                        && std::fs::canonicalize(root.join(&path)).is_ok_and(|canonical| {
+                            canonical.starts_with(root)
+                                && canonical.strip_prefix(root).is_ok_and(|path| {
+                                    !ignored_entry(path, false, ignored, allowed)
+                                        && allowed_file(path, allowed)
+                                })
+                        }) => {}
+                _ => {
+                    safe = false;
+                    break;
+                }
+            }
+        }
+        if safe
+            && let Some(text) = language.support().manifest_description(&directory)
+            && let Some(sentence) = first_sentence(&text)
+        {
+            return Ok(Some(sentence));
+        }
+    }
+    for language in languages {
+        for file in language.support().package_doc_files() {
+            let relative_file = relative.join(file);
+            let path = root.join(&relative_file);
+            if ignored_entry(&relative_file, false, ignored, allowed)
+                || !allowed_file(&relative_file, allowed)
+                || !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
+                || !std::fs::canonicalize(&path).is_ok_and(|canonical| {
+                    canonical.starts_with(root)
+                        && canonical.strip_prefix(root).is_ok_and(|path| {
+                            !ignored_entry(path, false, ignored, allowed)
+                                && allowed_file(path, allowed)
+                        })
+                })
+            {
+                continue;
+            }
+            let Ok((_, prefix)) = read_file_lines_and_prefix(&path) else {
+                continue;
+            };
+            if let Some(doc) = first_file_doc(root, &path, &prefix)
+                .await
+                .map_err(std::io::Error::other)?
+                && let Some(sentence) = first_sentence(&doc)
+            {
+                return Ok(Some(sentence));
+            }
+        }
+    }
+    let readme = relative.join("README.md");
+    if ignored_entry(&readme, false, ignored, allowed)
+        || !allowed_file(&readme, allowed)
+        || !std::fs::symlink_metadata(root.join(&readme)).is_ok_and(|metadata| metadata.is_file())
+    {
+        Ok(None)
+    } else {
+        Ok(readme_description(&directory))
+    }
+}
+
+/// Writes one aligned project-map entry: `name`, a right-aligned measure and a description.
+fn tree_line(
+    out: &mut String,
+    indent: usize,
+    name: &str,
+    width: usize,
+    measure: &str,
+    doc: Option<&str>,
+) {
+    let pad = width.saturating_sub(name.chars().count());
+    out.push_str(&" ".repeat(indent * 2));
+    out.push_str(name);
+    out.push_str(&" ".repeat(pad + 2));
+    out.push_str(measure);
+    if let Some(doc) = doc {
+        out.push_str("  ");
+        out.push_str(doc);
+    }
+    let kept = out.trim_end_matches(' ').len();
+    out.truncate(kept);
+    out.push('\n');
+}
+
+/// Renders the project map of `directory` (relative to `root`, empty for the root): its
+/// subdirectories expanded `depth` levels with recursive file counts and descriptions, then the
+/// files of `directory` itself with line counts and their module documentation's first sentence.
+/// Deeper files are counted, not listed. The answer stays within [`TREE_MAX_BYTES`]; entries
+/// past it are cut with a count and a narrowing hint. Hidden names, build, dependency and cache
+/// directories, Git-ignored paths and symlinks are left out; nothing is followed outside `root`.
+pub async fn project_tree(root: &Path, directory: &Path, depth: usize) -> std::io::Result<String> {
+    let canonical_root = root.canonicalize()?;
+    let root = canonical_root.as_path();
+    let snapshot = crate::project::structure::tree_git_snapshot_for_operator(root)?;
+    let current = |path: &Path| crate::project::structure::path_ignored(root, path);
+    project_tree_with_ignored(root, directory, depth, snapshot, &current).await
+}
+
+/// Renders with this session's launcher Git, failing closed when repository ignores cannot be read.
+pub(crate) async fn project_tree_for_session(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    git: &crate::assistance::launcher::AcceptedExecutable,
+    plain: bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> std::io::Result<String> {
+    let snapshot = crate::project::structure::tree_git_snapshot_for_session(
+        root,
+        git,
+        plain,
+        Some(cancelled),
+    )?;
+    let current = |path: &Path| {
+        crate::project::structure::path_ignored_for_session(root, path, git, plain, cancelled)
+    };
+    project_tree_with_ignored(root, directory, depth, snapshot, &current).await
+}
+
+/// Renders only after the caller has established the complete ignore list.
+async fn project_tree_with_ignored(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    snapshot: crate::project::structure::TreeGitSnapshot,
+    current_ignored: &(dyn Fn(&Path) -> std::io::Result<bool> + Sync),
+) -> std::io::Result<String> {
+    let depth = depth.clamp(1, TREE_MAX_DEPTH);
+    let ignored = snapshot.ignored;
+    let allowed = snapshot.allowed;
+    let ignored_directory = ignored_path(directory, &ignored)
+        || (!directory.as_os_str().is_empty() && current_ignored(directory)?);
+    let has_allowed_descendant = allowed.as_ref().is_some_and(|files| {
+        files
+            .range(directory.to_path_buf()..)
+            .next()
+            .is_some_and(|file| file.starts_with(directory))
+    });
+    if ignored_directory && !has_allowed_descendant {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "directory is Git-ignored",
+        ));
+    }
+    let tree = read_tree(root, directory, depth, &ignored, &allowed)?;
+    let shown = if directory.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        directory.display().to_string()
+    };
+    let mut out = format!("tree {shown} · {} files · depth {depth}\n", tree.file_count);
+    let mut omitted = 0usize;
+    let mut first_omitted: Option<String> = None;
+    // Directories, breadth by level so a cut keeps the shallow overview.
+    let mut lines: Vec<(usize, &TreeDir)> = Vec::new();
+    fn walk<'a>(dir: &'a TreeDir, indent: usize, lines: &mut Vec<(usize, &'a TreeDir)>) {
+        for child in &dir.dirs {
+            lines.push((indent, child));
+            walk(child, indent + 1, lines);
+        }
+    }
+    walk(&tree, 0, &mut lines);
+    let width = lines
+        .iter()
+        .map(|(indent, dir)| dir.name.chars().count() + 1 + indent * 2)
+        .chain(tree.files.iter().map(|name| name.chars().count()))
+        .max()
+        .unwrap_or(0)
+        .min(36);
+    for (indent, dir) in &lines {
+        if out.len() >= TREE_MAX_BYTES {
+            omitted += 1;
+            first_omitted.get_or_insert_with(|| dir.relative.display().to_string());
+            continue;
+        }
+        let doc = directory_description(root, &dir.relative, &ignored, &allowed).await?;
+        let label = format!("{}/", dir.name);
+        let measure = format!(
+            "{:>4} {}",
+            dir.file_count,
+            if dir.file_count == 1 {
+                "file "
+            } else {
+                "files"
+            }
+        );
+        tree_line(
+            &mut out,
+            *indent,
+            &label,
+            width.saturating_sub(indent * 2),
+            &measure,
+            doc.as_deref(),
+        );
+    }
+    for name in &tree.files {
+        if out.len() >= TREE_MAX_BYTES {
+            omitted += 1;
+            first_omitted.get_or_insert_with(|| directory.join(name).display().to_string());
+            continue;
+        }
+        let path = root.join(directory).join(name);
+        let (line_count, prefix) = read_file_lines_and_prefix(&path)?;
+        let doc = first_file_doc(root, &path, &prefix)
+            .await
+            .map_err(std::io::Error::other)?
+            .and_then(|doc| first_sentence(&doc));
+        tree_line(
+            &mut out,
+            0,
+            name,
+            width,
+            &format!("{line_count:>4} lines"),
+            doc.as_deref(),
+        );
+    }
+    if omitted > 0 {
+        let hint = first_omitted.unwrap_or_default();
+        out.push_str(&format!(
+            "… {omitted} more entries; narrow with ide.tree {{\"path\":\"{hint}\"}} or a smaller depth\n"
+        ));
+    } else if let Some((_, dir)) = lines.iter().find(|(indent, _)| *indent == 0) {
+        out.push_str(&format!(
+            "zoom in: ide.tree {{\"path\":\"{}\"}}\n",
+            dir.relative.display()
+        ));
+    }
+    Ok(out)
+}
+
 /// Counts file lines in constant memory and retains only the first 4 KiB for documentation.
 fn read_file_lines_and_prefix(path: &Path) -> std::io::Result<(u32, Vec<u8>)> {
     use std::io::Read;
@@ -665,10 +1400,22 @@ pub struct Usage {
     pub tag: Option<String>,
 }
 
+/// Printed locations by `(file, line)`: the tagged address `file#unit:N (L123)` that replaces
+/// `file:line` in a row when the location resolved.
+pub type LocationAddresses = std::collections::BTreeMap<(String, u32), String>;
+
+/// A row's location text: the resolved address with its absolute line, else `file:line`.
+fn location_text(addresses: &LocationAddresses, file: &str, line: u32) -> String {
+    addresses
+        .get(&(file.to_owned(), line))
+        .cloned()
+        .unwrap_or_else(|| format!("{file}:{line}"))
+}
+
 impl Usage {
     /// The row as printed, with its location padded to `width`.
-    fn row(&self, width: usize) -> String {
-        let location = format!("{}:{}", self.file, self.line);
+    fn row(&self, width: usize, addresses: &LocationAddresses) -> String {
+        let location = location_text(addresses, &self.file, self.line);
         match &self.tag {
             Some(tag) => format!("  {location:<width$}  {tag} {}\n", self.text),
             None => format!("  {location:<width$}  {}\n", self.text),
@@ -727,6 +1474,10 @@ pub struct SymbolCard {
     /// Lines printed after the usages as they are (`links:` section, `unavailable for:`, index
     /// state).
     pub links: Vec<String>,
+    /// Tagged position addresses of usage rows, replacing `file:line` where resolved.
+    pub usage_addresses: LocationAddresses,
+    /// Tagged symbol addresses of caller and callee rows, replacing `file:line` where resolved.
+    pub call_addresses: LocationAddresses,
 }
 
 /// Renders the card with the fixed ceilings.
@@ -778,8 +1529,17 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             .map(|usage| usage.file.as_str())
             .collect::<std::collections::BTreeSet<_>>()
             .len();
+        let constructions = match card
+            .usages
+            .iter()
+            .filter(|usage| usage.tag.as_deref() == Some(CONSTRUCTION_TAG))
+            .count()
+        {
+            0 => String::new(),
+            count => format!("; {count} constructions"),
+        };
         out.push_str(&format!(
-            "usages: {} {counted} {} files (src {}, tests {}{dropped})\n",
+            "usages: {} {counted} {} files (src {}, tests {}{dropped}{constructions})\n",
             card.usages.len(),
             files,
             src.len(),
@@ -789,11 +1549,11 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             .usages
             .iter()
             .take(MAX_USAGE_LINES)
-            .map(|usage| usage.file.len() + 1 + usage.line.to_string().len())
+            .map(|usage| location_text(&card.usage_addresses, &usage.file, usage.line).len())
             .max()
             .unwrap_or(0);
         for usage in src.iter().chain(tests.iter()).take(MAX_USAGE_LINES) {
-            out.push_str(&usage.row(width));
+            out.push_str(&usage.row(width, &card.usage_addresses));
         }
         let hidden = card.usages.len().saturating_sub(MAX_USAGE_LINES);
         if hidden > 0 {
@@ -828,7 +1588,7 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             card.callers_note.as_deref().unwrap_or_default()
         ));
     } else {
-        render_calls(&mut out, "callers", &card.callers);
+        render_calls(&mut out, "callers", &card.callers, &card.call_addresses);
     }
     if card.callees_note.is_some() && card.callees.is_empty() {
         out.push_str(&format!(
@@ -836,7 +1596,7 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             card.callees_note.as_deref().unwrap_or_default()
         ));
     } else {
-        render_calls(&mut out, "callees", &card.callees);
+        render_calls(&mut out, "callees", &card.callees, &card.call_addresses);
     }
     if card.history_unavailable {
         out.push_str(&format!(
@@ -868,22 +1628,26 @@ pub fn hidden_usages_text(card: &SymbolCard) -> Option<String> {
     let mut out = format!("usages {}–{total} of {total}:\n", MAX_USAGE_LINES + 1);
     let width = hidden
         .iter()
-        .map(|usage| usage.file.len() + 1 + usage.line.to_string().len())
+        .map(|usage| location_text(&card.usage_addresses, &usage.file, usage.line).len())
         .max()
         .unwrap_or(0);
     for usage in hidden {
-        out.push_str(&usage.row(width));
+        out.push_str(&usage.row(width, &card.usage_addresses));
     }
     Some(out)
 }
 
-fn render_calls(out: &mut String, label: &str, calls: &[Call]) {
+fn render_calls(out: &mut String, label: &str, calls: &[Call], addresses: &LocationAddresses) {
     if calls.is_empty() {
         return;
     }
     out.push_str(&format!("{label}: {}\n", calls.len()));
     for call in calls.iter().take(MAX_CALL_LINES) {
-        out.push_str(&format!("  {}  {}:{}\n", call.name, call.file, call.line));
+        match addresses.get(&(call.file.clone(), call.line)) {
+            // The symbol address names the node and carries its file and absolute line.
+            Some(address) => out.push_str(&format!("  {address}\n")),
+            None => out.push_str(&format!("  {}  {}:{}\n", call.name, call.file, call.line)),
+        }
     }
     if calls.len() > MAX_CALL_LINES {
         out.push_str(&format!("  … {} more\n", calls.len() - MAX_CALL_LINES));
@@ -927,9 +1691,264 @@ pub fn clip(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Session Git ignores literal metacharacter directories and never reveals paths on Git failure.
+    #[tokio::test]
+    async fn session_tree_uses_literal_ignore_paths_and_refuses_changed_git() {
+        use crate::assistance::launcher::AcceptedExecutable;
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new("tree-literal-git");
+        let git = std::env::var_os("AGENT_IDE_TEST_GIT").map_or_else(
+            || std::path::PathBuf::from("/usr/bin/git"),
+            std::path::PathBuf::from,
+        );
+        assert!(git.is_absolute());
+        assert!(
+            std::process::Command::new(&git)
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let dir = root.join("literal[ab]*");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(root.join(":(literal)*")).unwrap();
+        std::fs::write(root.join(":(literal)*/visible.txt"), "visible\n").unwrap();
+        std::fs::write(root.join(":(literal)*/hidden.secret"), "private\n").unwrap();
+        std::fs::write(
+            root.join(".gitignore"),
+            "*.secret\nprivate-dir/\ntracked-dir/\npkg/README.md\nempty/README.md\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("hidden.secret"), "private\n").unwrap();
+        std::fs::write(dir.join("visible.txt"), "visible\n").unwrap();
+        std::fs::create_dir(root.join("private-dir")).unwrap();
+        std::fs::write(root.join("private-dir/secret.txt"), "private\n").unwrap();
+        std::fs::create_dir(root.join("tracked-dir")).unwrap();
+        std::fs::write(root.join("tracked-dir/kept.txt"), "tracked\n").unwrap();
+        std::fs::write(root.join("tracked-dir/untracked.txt"), "ignored\n").unwrap();
+        assert!(
+            std::process::Command::new(&git)
+                .args(["add", "-f", "tracked-dir/kept.txt"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::create_dir(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/README.md"), "PRIVATE README SENTINEL.\n").unwrap();
+        std::fs::write(root.join("pkg/visible.txt"), "visible\n").unwrap();
+        std::fs::write(
+            root.join("pkg/manifest.alpha"),
+            "description: ALLOWED MANIFEST SENTINEL.\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        let accepted = AcceptedExecutable::from_path(git, "test-git").unwrap();
+        let snapshot =
+            crate::project::structure::tree_git_snapshot_for_session(&root, &accepted, false, None)
+                .unwrap();
+        std::fs::write(root.join("empty/new.secret"), "AFTER SNAPSHOT SECRET\n").unwrap();
+        std::fs::write(root.join("empty/README.md"), "AFTER SNAPSHOT README.\n").unwrap();
+        let current = |path: &std::path::Path| {
+            crate::project::structure::path_ignored_for_session(
+                &root,
+                path,
+                &accepted,
+                false,
+                &|| false,
+            )
+        };
+        let prior = super::project_tree_with_ignored(
+            &root,
+            std::path::Path::new(""),
+            2,
+            snapshot,
+            &current,
+        )
+        .await
+        .unwrap();
+        assert!(prior.contains("empty/"), "{prior}");
+        assert!(
+            !prior.contains("new.secret") && !prior.contains("AFTER SNAPSHOT"),
+            "{prior}"
+        );
+        let result = super::project_tree_for_session(
+            &root,
+            std::path::Path::new("literal[ab]*"),
+            1,
+            &accepted,
+            false,
+            &|| false,
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("visible.txt"), "{result}");
+        assert!(!result.contains("hidden.secret"), "{result}");
+        let colon = super::project_tree_for_session(
+            &root,
+            std::path::Path::new(":(literal)*"),
+            1,
+            &accepted,
+            false,
+            &|| false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            colon.contains("visible.txt") && !colon.contains("hidden.secret"),
+            "{colon}"
+        );
+        let tracked = super::project_tree_for_session(
+            &root,
+            std::path::Path::new("tracked-dir"),
+            1,
+            &accepted,
+            false,
+            &|| false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            tracked.contains("kept.txt") && !tracked.contains("untracked.txt"),
+            "{tracked}"
+        );
+        assert!(
+            super::project_tree_for_session(
+                &root,
+                std::path::Path::new("private-dir"),
+                1,
+                &accepted,
+                false,
+                &|| false,
+            )
+            .await
+            .is_err()
+        );
+        let whole = super::project_tree_for_session(
+            &root,
+            std::path::Path::new(""),
+            2,
+            &accepted,
+            false,
+            &|| false,
+        )
+        .await
+        .unwrap();
+        assert!(!whole.contains("PRIVATE README SENTINEL"), "{whole}");
+        assert!(whole.contains("ALLOWED MANIFEST SENTINEL"), "{whole}");
+        let mut changed = accepted.clone();
+        changed.blake3 = "0".repeat(64);
+        assert!(
+            super::project_tree_for_session(
+                &root,
+                std::path::Path::new("literal[ab]*"),
+                1,
+                &changed,
+                false,
+                &|| false,
+            )
+            .await
+            .is_err()
+        );
+        let plain = super::project_tree_for_session(
+            &root,
+            std::path::Path::new("literal[ab]*"),
+            1,
+            &changed,
+            true,
+            &|| false,
+        )
+        .await
+        .unwrap();
+        assert!(plain.contains("hidden.secret"));
+    }
     use super::*;
     use crate::lang::SymbolPath;
     use std::path::PathBuf;
+
+    /// A project map lists subdirectories with recursive file counts and the first description
+    /// found (manifest, package root file doc, README), then the directory's own files with line
+    /// counts and doc sentences; hidden and build directories are left out.
+    #[tokio::test]
+    async fn project_tree_maps_directories_and_files_with_author_descriptions() {
+        crate::lang::testing::install();
+        let root = crate::scratch::ScratchDir::new("project-tree");
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "core/manifest.alpha",
+            "name: core\ndescription: Core engine. Extra words.\n",
+        );
+        write("core/src/a.alpha", "#!doc Alpha source\nline\n");
+        write("util/pkg.alpha", "#!doc Helper package for parsing\n");
+        write(
+            "docs/README.md",
+            "# Docs\n\nUser guides and references. More text.\n",
+        );
+        write("plain/x.txt", "x\n");
+        write("target/skip.alpha", "x\n");
+        write(".hidden/skip.alpha", "x\n");
+        write("main.alpha", "#!doc Entry point\none\ntwo\n");
+        let text = project_tree(&root, Path::new(""), 2).await.unwrap();
+        assert!(text.starts_with("tree . · 6 files · depth 2\n"), "{text}");
+        let line = |prefix: &str| {
+            text.lines()
+                .find(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("{prefix}: {text}"))
+                .to_owned()
+        };
+        assert!(line("core/").contains("2 files") && line("core/").ends_with("Core engine."));
+        assert!(line("src/").starts_with("  src/"), "{text}");
+        assert!(
+            line("util/").ends_with("Helper package for parsing"),
+            "{text}"
+        );
+        assert!(
+            line("docs/").ends_with("User guides and references."),
+            "{text}"
+        );
+        assert!(line("plain/").ends_with("1 file"), "{text}");
+        assert!(
+            line("main.alpha").contains("3 lines") && line("main.alpha").ends_with("Entry point")
+        );
+        assert!(
+            !text.contains("target") && !text.contains(".hidden"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("zoom in: ide.tree {\"path\":\"core\"}\n"),
+            "{text}"
+        );
+        let below = project_tree(&root, Path::new("core"), 1).await.unwrap();
+        assert!(
+            below.starts_with("tree core · 2 files · depth 1\n"),
+            "{below}"
+        );
+        assert!(
+            below.contains("src/") && !below.contains("a.alpha"),
+            "{below}"
+        );
+    }
+
+    /// Operator preview of a real project's map: `PROJECT_TREE_ROOT` and optional
+    /// `PROJECT_TREE_PATH`/`PROJECT_TREE_DEPTH`; prints the map and its time.
+    #[tokio::test]
+    #[ignore = "operator preview of a real project"]
+    async fn project_tree_preview() {
+        let root = PathBuf::from(std::env::var("PROJECT_TREE_ROOT").unwrap());
+        let path = std::env::var("PROJECT_TREE_PATH").unwrap_or_default();
+        let depth = std::env::var("PROJECT_TREE_DEPTH")
+            .ok()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(2);
+        let started = std::time::Instant::now();
+        let text = project_tree(&root, Path::new(&path), depth).await.unwrap();
+        eprintln!("{text}--- {} bytes in {:?}", text.len(), started.elapsed());
+    }
 
     #[tokio::test]
     async fn directory_outline_lists_docs_and_counts_child_files() {
@@ -1018,6 +2037,60 @@ mod tests {
         assert_eq!(
             text,
             "a.rs  (20 lines, alpha)\n    1  pub fn Foo()\n    3    pub fn bar()\n   16  mod tests [2 tests collapsed]\n  (4 symbols; showing 2 by kinds method; tests collapsed: 2)\n"
+        );
+    }
+
+    /// Complete addressed outlines retain all source facts without header/count repetition;
+    /// filters and empty files still explain their exceptional delivery.
+    #[test]
+    fn address_outline_omits_redundant_framing_and_preserves_unit_rows() {
+        let doc = "Returns the fixed qualification value, without side effects.";
+        let source = format!(
+            "//! Qualification fixture.\n\n/// {doc}\npub fn value() -> i32 {{\n    7\n}}\n"
+        );
+        let mut value = symbol("value", SymbolKind::Function, 3, 6, Some(doc));
+        value.signature = "pub fn value() -> i32".into();
+        let outline = Outline {
+            file: PathBuf::from("src/lib.rs"),
+            language: crate::lang::testing::ALPHA,
+            line_count: 6,
+            symbols: vec![value],
+        };
+        let map = super::super::address::AddressMap::build(&outline, &source);
+        let text = address_outline_text(&outline, &map, None);
+        assert_eq!(
+            text,
+            format!(
+                "1–2 src/lib.rs#@header\n3–6 src/lib.rs#value  pub fn value() -> i32  // {doc}\n"
+            )
+        );
+        // Same successful source-fallback sample as the recorded E002 protocol measurement:
+        // addresses and regions now fit below its 213-byte total, provenance included.
+        let provenance =
+            "outline: from source, exact (test-analyzer unavailable; no need to repeat)\n";
+        assert!(text.len() + provenance.len() < 213);
+        let filter = OutlineFilter {
+            kinds: &[],
+            regions: true,
+            requested: "region",
+        };
+        let filtered = address_outline_text(&outline, &map, Some(&filter));
+        assert!(filtered.starts_with("1–2 src/lib.rs#@header\n"));
+        assert!(!filtered.contains("pub fn value"));
+        assert!(filtered.contains("showing 0, 1 regions by kinds region"));
+        let empty = Outline {
+            file: PathBuf::from("empty.rs"),
+            language: crate::lang::testing::ALPHA,
+            line_count: 0,
+            symbols: vec![],
+        };
+        assert_eq!(
+            address_outline_text(
+                &empty,
+                &super::super::address::AddressMap::build(&empty, ""),
+                None
+            ),
+            "outline: empty.rs: no rows\n"
         );
     }
 
@@ -1114,6 +2187,39 @@ mod tests {
         assert_eq!(hidden_usages_text(&card), None);
     }
 
+    /// Construction rows are counted on the usages line and print their tag and the heuristic
+    /// legend; a card without them keeps the 0.10.8 line.
+    #[test]
+    fn symbol_card_counts_construction_sites() {
+        let usage = |line: u32, tag: Option<&str>| Usage {
+            file: "src/a.rs".into(),
+            line,
+            text: "let s = Store::new();".into(),
+            is_test: false,
+            tag: tag.map(str::to_owned),
+        };
+        let mut card = SymbolCard {
+            heading: "Store — struct, src/a.rs#Store (lines 1–3)".into(),
+            usages: vec![usage(7, Some(CONSTRUCTION_TAG)), usage(9, None)],
+            ..Default::default()
+        };
+        let text = symbol_card_text(&card);
+        assert!(
+            text.contains("usages: 2 in 1 files (src 2, tests 0; 1 constructions)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("src/a.rs:7  construction ~ let s = Store::new();"),
+            "{text}"
+        );
+        assert!(text.contains("(~ = heuristic match, not proven)"), "{text}");
+        card.usages[0].tag = None;
+        assert!(
+            symbol_card_text(&card).contains("usages: 2 in 1 files (src 2, tests 0)\n"),
+            "{text}"
+        );
+    }
+
     /// A callers note replaces an empty callers list, and an explicitly answered zero prints
     /// the `usages:` line instead of omitting it.
     #[test]
@@ -1138,7 +2244,7 @@ mod tests {
         for note in [
             "unavailable (prepare call hierarchy request failed)",
             "unavailable (incoming calls request failed)",
-            "unavailable (callers are not available yet because the language server is still indexing; repeat ide.symbol later)",
+            "unavailable (fake-server still indexing)",
         ] {
             card.callers_note = Some(note.to_owned());
             assert!(

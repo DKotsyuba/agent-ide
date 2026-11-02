@@ -9,7 +9,7 @@ use agent_ide::{
         GitScope, MAX_GIT_STDERR_BYTES, MAX_GIT_STDOUT_BYTES, RawGitEvidence,
     },
 };
-use support::{GIT, GitFixture, Runner, authority_for, capture_with_authority, collect};
+use support::{GitFixture, Runner, authority_for, capture_with_authority, collect, git_program};
 
 /// A different mode/root/epoch/identity yields no payload or references, and old epochs are stale.
 #[tokio::test]
@@ -193,7 +193,7 @@ fn object_and_raw_evidence_boundaries_reject_ambiguous_inputs() {
         GitReadQuery::UnstagedDiff,
     ] {
         assert!(matches!(
-            GitReadIntent::new(&authority, GIT.into(), query),
+            GitReadIntent::new(&authority, git_program().into(), query),
             Err(GitError::SnapshotRequired)
         ));
     }
@@ -350,7 +350,7 @@ async fn cursor_expansion_rejects_reference_reuse_across_generations_and_modes()
     fixture.write(b"unstaged.txt", b"replacement working change\n");
     let changed = collect_snapshot(
         &authority,
-        std::path::Path::new(GIT),
+        std::path::Path::new(git_program()),
         DiffMode::Head,
         1,
         snapshot.operation_reference(),
@@ -374,7 +374,7 @@ async fn cursor_expansion_rejects_reference_reuse_across_generations_and_modes()
     );
     let newer = collect_snapshot(
         &authority,
-        std::path::Path::new(GIT),
+        std::path::Path::new(git_program()),
         DiffMode::Head,
         2,
         snapshot.operation_reference(),

@@ -5,8 +5,9 @@
 //! The executable is measured once at daemon start ([`ModuleExecutable::current`]); every spawn
 //! re-measures the file and refuses a mismatch (`incompatible`, which blocks the slot until the
 //! inputs change). Stop gives the module a moment to exit on its own, then tears its owned
-//! process group down (TERM, 1 s, KILL) and reaps it within 5 s; only a proven reap releases the
-//! admission slot.
+//! process group down and reaps it within 5 s; only a proven reap releases the admission slot.
+//! On Linux, once the leader has exited, remaining group members receive TERM and then KILL
+//! without a grace period. Otherwise the TERM-to-KILL grace is 1 s.
 
 use std::{
     collections::BTreeMap,
@@ -207,14 +208,24 @@ impl Launcher for ExecutionLauncher {
     }
 
     /// Waits up to `EXIT_GRACE` for a voluntary exit (without reaping), then tears the owned
-    /// group down and reaps; a proven reap releases the admission slot.
+    /// group down and reaps; a proven reap releases the admission slot. On Linux an observed
+    /// exited leader permits immediate escalation against any remaining group members while its
+    /// unreaped PID still pins the group; an unobserved exit retains the normal TERM grace.
     async fn reap(&mut self, process: Self::Process) -> Result<(), Cause> {
         let until = tokio::time::Instant::now() + EXIT_GRACE;
         while !process.exited() && tokio::time::Instant::now() < until {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        #[cfg(target_os = "linux")]
+        let grace = if process.exited() {
+            Duration::ZERO
+        } else {
+            TERM_GRACE
+        };
+        #[cfg(not(target_os = "linux"))]
+        let grace = TERM_GRACE;
         let reaped = process
-            .cancel_and_reap(TERM_GRACE, REAP_DEADLINE)
+            .cancel_and_reap(grace, REAP_DEADLINE)
             .await
             .map_err(|_| Cause::ReapUnverified)?;
         self.admission
@@ -250,5 +261,106 @@ mod env_tests {
             "declared and set only"
         );
         assert!(module_env("env-test-undeclared").is_empty());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_reap_tests {
+    use super::*;
+    use crate::execution::AdmissionLimits;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+    /// Starts a real owned process with the same admission and reap path as a module.
+    fn fixture(script: &str) -> (ExecutionLauncher, OwnedProtocolChild) {
+        let executable = Arc::new(ModuleExecutable::pin(Path::new("/bin/sh")).unwrap());
+        let admission = Arc::new(Mutex::new(
+            AdmissionController::new(AdmissionLimits {
+                total_running: 1,
+                per_owner_running: 1,
+                per_owner_queued: 1,
+                total_queued: 1,
+                interactive_burst: 1,
+            })
+            .unwrap(),
+        ));
+        let owner = OwnerId::new("module-reap-test").unwrap();
+        let lease = match admission
+            .lock()
+            .unwrap()
+            .submit(owner.clone(), AdmissionClass::Interactive)
+        {
+            Admission::Granted(lease) => lease,
+            _ => panic!("fixture admission"),
+        };
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Job,
+            executable.path.clone(),
+            vec!["-c".into(), script.into()],
+            PathBuf::from("/"),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let child =
+            OwnedProtocolChild::spawn_module(&command, lease, &executable.digest, 64).unwrap();
+        let launcher = ExecutionLauncher::new(
+            executable,
+            admission,
+            owner,
+            "fixture",
+            Role::Analyzer,
+            PathBuf::from("/"),
+            String::new(),
+        );
+        (launcher, child)
+    }
+
+    /// Waits for WNOWAIT evidence without allowing the leader's PID to be reused.
+    async fn await_exit(child: &OwnedProtocolChild) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !child.exited() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fixture leader exited");
+    }
+
+    /// An already exited module settles before the service stop deadline.
+    #[tokio::test]
+    async fn exited_module_reaps_without_zombie_group_delay() {
+        let (mut launcher, child) = fixture("exit 0");
+        await_exit(&child).await;
+        tokio::time::timeout(Duration::from_millis(700), launcher.reap(child))
+            .await
+            .expect("exited module reap should be prompt")
+            .unwrap();
+        assert_eq!(launcher.admission.lock().unwrap().running_count(), 0);
+    }
+
+    /// A TERM-resistant child remains in the pinned group and loses its output pipe on KILL.
+    #[tokio::test]
+    async fn exited_module_kills_term_resistant_descendant() {
+        let (mut launcher, mut child) = fixture(
+            "/bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\"; while :; do /bin/sleep 1; done' & exit 0",
+        );
+        let (stdin, stdout) = child.take_pipes().unwrap();
+        drop(stdin);
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), stdout.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let descendant: u32 = line.trim().parse().unwrap();
+        assert_ne!(descendant, 0);
+        await_exit(&child).await;
+        tokio::time::timeout(Duration::from_millis(700), launcher.reap(child))
+            .await
+            .expect("descendant cleanup should be prompt")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), stdout.read_to_end(&mut Vec::new()))
+            .await
+            .expect("descendant retained its output pipe")
+            .unwrap();
     }
 }

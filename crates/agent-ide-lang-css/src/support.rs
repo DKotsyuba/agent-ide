@@ -77,6 +77,16 @@ impl LanguageSupport for CssSupport {
         place(source, outline, anchor, where_, "  ", |_| true)
     }
 
+    /// Style sheet regions: `@charset` header, `@import`/`@use`/`@forward` imports.
+    fn region_rules(&self) -> &'static agent_ide_core::lang::regions::RegionRules {
+        &agent_ide_core::lang::regions::RegionRules {
+            header_prefixes: &["@charset"],
+            import_prefixes: &["@import", "@use", "@forward"],
+            semicolon_imports: true,
+            ..agent_ide_core::lang::regions::GENERIC_RULES
+        }
+    }
+
     /// Style sheets are never tests.
     fn is_test_file(&self, _file: &Path) -> bool {
         false

@@ -85,6 +85,8 @@ pub fn analyzer_offer(
         limits: Limits::default(),
         requested_caps: vec![Capability::Semantic, Capability::Outline],
         config: ModuleConfig {
+            read_denies: Vec::new(),
+            test_workers: None,
             worktree: Some(worktree.worktree_path().to_path_buf()),
             provider: Some(json!({
                 "grant": ProviderGrant {

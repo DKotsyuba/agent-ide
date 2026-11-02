@@ -1,4 +1,4 @@
-//! Safe collection of the Claude hook key hints `/private/tmp/ai-k-<16 hex>`.
+//! Safe collection of Claude hook key hints `ai-k-<16 hex>` below the configured temporary parent.
 //!
 //! A managed Claude MCP leaves one hint directory per candidate worktree (`key`, the rendezvous
 //! key the hook must not run `git` to find, and `candidate-attachment`). Nothing ever removed
@@ -26,7 +26,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// The temporary root the hint and runtime directories live in (its canonical path).
+/// Legacy macOS parent used when no nonempty operator override is supplied.
 pub const TMP_ROOT: &str = "/private/tmp";
 /// Name prefix of a key hint directory.
 pub const KEY_CACHE_PREFIX: &str = "ai-k-";
@@ -40,6 +40,108 @@ pub const RUNTIME_PREFIX: &str = "ai-r-";
 pub const STALE_AFTER: Duration = Duration::from_secs(86_400);
 /// Longest `key` file read, as written by the publisher.
 const KEY_BYTES: u64 = 4096;
+
+/// Resolves the existing canonical parent shared by Claude runtimes, hint writers and collectors.
+///
+/// Nonempty `AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT` selects an absolute normalized operator path;
+/// unset or empty values use the platform parent. Every MCP, hook and daemon must inherit the same
+/// value. Invalid or unresolved overrides fail closed without falling back to another parent.
+/// This creates nothing; private child ownership, no-follow and locking checks remain unchanged.
+/// Choose a short parent to fit Unix socket path limits.
+pub fn effective_root() -> std::io::Result<PathBuf> {
+    crate::test_seams::shared_runtime_root()
+}
+
+/// Resolves the operator-selected parent without consulting the feature-gated test selector.
+pub(crate) fn configured_root() -> std::io::Result<PathBuf> {
+    resolve_root(std::env::var_os("AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT"))
+}
+
+/// Resolves one injected operator value with the same validation used by [`effective_root`].
+/// Empty or absent values select the legacy parent; relative/traversing paths and filesystem
+/// canonicalization errors and non-directory results return an error without creating anything
+/// or selecting another root. Symlinks are resolved first; a symlink to a file is also rejected.
+fn resolve_root(value: Option<std::ffi::OsString>) -> std::io::Result<PathBuf> {
+    let Some(parent) = value.filter(|value| !value.is_empty()).map(PathBuf::from) else {
+        return platform_root();
+    };
+    if !parent.is_absolute()
+        || !parent
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Claude rendezvous parent must be absolute and normalized",
+        ));
+    }
+    let parent = fs::canonicalize(parent)?;
+    if !fs::metadata(&parent)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "Claude rendezvous parent must be a directory",
+        ));
+    }
+    Ok(parent)
+}
+
+/// Resolves the stable shared parent without creating state or consulting per-process TMPDIR.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn platform_root() -> std::io::Result<PathBuf> {
+    fs::canonicalize(TMP_ROOT)
+}
+
+/// Uses the per-user Linux runtime directory, or the effective home when none is available.
+#[cfg(target_os = "linux")]
+pub(crate) fn platform_root() -> std::io::Result<PathBuf> {
+    // SAFETY: geteuid only returns the identity of this process.
+    let uid = unsafe { libc::geteuid() };
+    linux_platform_root(
+        &PathBuf::from(format!("/run/user/{uid}")),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        crate::userhome::user_home(),
+    )
+}
+
+/// Validates Linux runtime ownership before using it; a supplied invalid XDG root fails closed.
+#[cfg(target_os = "linux")]
+fn linux_platform_root(
+    conventional: &Path,
+    xdg: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> std::io::Result<PathBuf> {
+    if let Ok(root) = private_runtime_parent(conventional) {
+        return Ok(root);
+    }
+    if let Some(path) = xdg.filter(|value| !value.is_empty()) {
+        return private_runtime_parent(Path::new(&path));
+    }
+    let home = home.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let home = fs::canonicalize(home)?;
+    if !fs::metadata(&home)?.is_dir() {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory));
+    }
+    Ok(home)
+}
+
+/// Accepts only an existing private directory owned by this effective user.
+#[cfg(target_os = "linux")]
+fn private_runtime_parent(path: &Path) -> std::io::Result<PathBuf> {
+    if !path.is_absolute()
+        || !path
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    // SAFETY: geteuid only returns the identity of this process.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    fs::canonicalize(path)
+}
 
 /// Returns the full BLAKE3 digest, as hex, of one canonical rendezvous key's raw path bytes.
 pub fn rendezvous_identity(key: &Path) -> String {

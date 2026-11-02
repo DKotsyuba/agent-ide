@@ -1,22 +1,24 @@
 {
   "name": "agent-ide",
-  "version": "0.10.8",
-  "description": "Agent IDE coding-companion skill exposing the bounded ide.start/context/diff/inspect/stop/edit/outline/read/symbol/graph/test workflow for active-session source edits.",
+  "version": "0.10.9",
+  "description": "Batch related ide.* discovery, source reads, atomic multi-file edits and tests; automatic Bridge completion.",
   "author": {
     "name": "DKotsyuba"
   },
   "homepage": "https://github.com/DKotsyuba/agent-ide",
   "repository": "https://github.com/DKotsyuba/agent-ide",
-  "skills": "./skills/",
+  "skills": "./skills/codex/",
   "interface": {
     "displayName": "Agent IDE",
-    "shortDescription": "Bounded ide.* workflow for active-session source edits",
-    "longDescription": "Loads the agent-ide skill so a coder subagent uses the eleven bounded ide.* tools (start, context, diff, inspect, stop, edit, outline, read, symbol, graph, test) when the Agent IDE MCP tools are active, with fail-open native fallback when they are not.",
+    "shortDescription": "Batch related code work with ide.*",
+    "longDescription": "Collect related targets; batch outline paths, symbol/graph roots, read items, multi-file patches, test targets and aggregate diff paths. Retrieve known details together. Reuse code/results; end idle turns for Bridge completion.",
     "developerName": "DKotsyuba",
     "category": "Development",
-    "capabilities": ["Interactive"],
+    "capabilities": [
+      "Interactive"
+    ],
     "defaultPrompt": [
-      "Use $agent-ide while editing this worktree."
+      "Use $agent-ide: batch related discovery, reads, multi-file edits and tests; reuse results and end idle turns for Bridge completion."
     ]
   }
 }

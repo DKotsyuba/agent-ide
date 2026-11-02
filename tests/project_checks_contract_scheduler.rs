@@ -10,7 +10,7 @@ use agent_ide::checks::{
 use agent_ide::execution::seatbelt::ReadDeny;
 use agent_ide::retention::{Fate, Reason, Report, sweep_with};
 use std::collections::VecDeque;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -537,7 +537,7 @@ async fn scheduler_shutdown_cancels_a_long_running_check_promptly() {
     );
 
     scheduler.trigger("repo", &worktree);
-    advance(Duration::from_millis(20)).await;
+    settle_until(|| checker.live() == 1, Duration::from_millis(10)).await;
     assert_eq!(checker.live(), 1, "check should be running before shutdown");
 
     let started = tokio::time::Instant::now();
@@ -578,7 +578,7 @@ async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_reposito
     );
 
     scheduler.trigger("shared-repo", &worktree_a);
-    advance(Duration::from_millis(30)).await;
+    settle_until(|| checker.calls().len() == 1, Duration::from_millis(10)).await;
     assert_eq!(checker.calls().len(), 1);
     assert_eq!(
         scheduler.cache_clone_outcome(&worktree_a, agent_ide::languages::RUST),
@@ -623,6 +623,7 @@ async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_reposito
 }
 
 /// Without the sibling source's retention lease the clone is skipped and the check builds cold.
+/// Waits for real fingerprint-thread completion independently of the paused debounce clock.
 #[tokio::test(start_paused = true)]
 async fn scheduler_skips_the_sibling_clone_when_the_source_lease_is_unavailable() {
     agent_ide::languages::install();
@@ -637,7 +638,7 @@ async fn scheduler_skips_the_sibling_clone_when_the_source_lease_is_unavailable(
         cache_root.path(),
     );
     scheduler.trigger("no-lease-repo", &worktree_a);
-    advance(Duration::from_millis(30)).await;
+    settle_until(|| checker.calls().len() == 1, Duration::from_millis(10)).await;
     assert_eq!(checker.calls().len(), 1);
     let target_a = checker.calls()[0].cache_dir.join("target");
     std::fs::create_dir_all(&target_a).unwrap();
@@ -655,6 +656,15 @@ async fn scheduler_skips_the_sibling_clone_when_the_source_lease_is_unavailable(
 
     scheduler.trigger("no-lease-repo", &worktree_b);
     advance(Duration::from_millis(30)).await;
+    // The cold path still awaits a blocking fingerprint task: virtual debounce time alone
+    // does not synchronize its OS-thread completion. Match the real-I/O wait above.
+    for _ in 0..200 {
+        if checker.calls().len() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert_eq!(checker.calls().len(), 2, "the check still runs, cold");
     assert_eq!(
         scheduler.cache_clone_outcome(&worktree_b, agent_ide::languages::RUST),
@@ -805,6 +815,10 @@ async fn scheduler_check_lease_keeps_retention_off_a_running_check_until_it_comp
     let home_dir = scratch_dir("retention-home");
     let home = std::fs::canonicalize(&home_dir).unwrap();
     let worktree = scratch_worktree("retention-worktree", agent_ide::languages::PYTHON);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(home.join("checks"))
+        .unwrap();
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
@@ -815,7 +829,7 @@ async fn scheduler_check_lease_keeps_retention_off_a_running_check_until_it_comp
     let nobody = || Some(Vec::new());
 
     scheduler.trigger("repo", &worktree);
-    advance(Duration::from_millis(20)).await;
+    settle_until(|| checker.live() == 1, Duration::from_millis(10)).await;
     assert_eq!(checker.live(), 1, "the check is running");
     let language_dir = checker.calls()[0].cache_dir.clone();
     let dir = worktree_cache_dir(&language_dir);
@@ -842,6 +856,10 @@ async fn scheduler_cancelled_check_keeps_its_lease_for_the_process_lifetime() {
     let home_dir = scratch_dir("retention-cancel-home");
     let home = std::fs::canonicalize(&home_dir).unwrap();
     let worktree = scratch_worktree("retention-cancel-worktree", agent_ide::languages::PYTHON);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(home.join("checks"))
+        .unwrap();
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),

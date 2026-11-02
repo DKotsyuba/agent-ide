@@ -1,5 +1,5 @@
 #!/bin/sh
-# Inspects a downloaded release bundle and executes only its packaged macOS arm64 binary.
+# Inspects a downloaded release bundle and executes only its packaged host-matching binary.
 #
 # Thin wrapper: the checks live in `cargo xtask package verify ARCHIVE` (xtask/src/release.rs) —
 # the directory SHA256SUMS, the release manifest binding when one sits next to the archive, the

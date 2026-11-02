@@ -13,7 +13,7 @@
 )]
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
@@ -25,6 +25,65 @@ use tokio::{
     net::UnixStream,
     process::{Child, ChildStdin, ChildStdout, Command},
 };
+
+/// Selects the current public tool for one source/position/problem query without rewriting it.
+/// A `kind` query uses Inspect, `byte_offset` uses positional Symbol, and a file query uses Read.
+/// This is only construction of test inputs: Session dispatch never aliases a removed tool.
+pub fn source_query_tool(arguments: &Value) -> &'static str {
+    if arguments.get("kind").is_some() {
+        "ide.inspect"
+    } else if arguments.get("byte_offset").is_some() {
+        "ide.symbol"
+    } else {
+        "ide.read"
+    }
+}
+
+/// Pairs an owned query with its actual current public tool for a parity request vector.
+/// The JSON bytes stay unchanged and are consumed once; no runtime call or legacy alias occurs.
+pub fn source_query(arguments: Value) -> (&'static str, Value) {
+    (source_query_tool(&arguments), arguments)
+}
+
+/// Recovers one complete owner-authorized test replay JSON receipt through public output pages.
+///
+/// `first_reference` must be the exact `<run>/replay/output/1` reference printed by that run's
+/// terminal preview. The helper reads with `ide.test {"output": reference}`, strips only page
+/// position markers, follows at most 20 total pages, and parses the concatenated JSON.
+/// It never reruns the test; an invalid, unavailable, or incomplete page panics the owning test.
+pub async fn recover_test_replay(
+    session: &mut Session,
+    fixture: &Fixture,
+    first_reference: &str,
+) -> Value {
+    assert!(
+        first_reference.ends_with("/replay/output/1"),
+        "test replay starts at page one: {first_reference}"
+    );
+    let mut reference = first_reference.to_owned();
+    let mut recovered = String::new();
+    let mut pages = 0;
+    loop {
+        let reply = session
+            .call(fixture, "ide.test", json!({"output":reference}))
+            .await;
+        assert_eq!(reply["state"], "complete", "{reply}");
+        assert_eq!(reply["kind"], "test", "{reply}");
+        let text = reply["text"].as_str().unwrap_or_default();
+        let body = text
+            .split_once('\n')
+            .filter(|(marker, _)| marker.starts_with("page "))
+            .map_or(text, |(_, body)| body);
+        recovered.push_str(body);
+        if reply["continuation"] != true {
+            break;
+        }
+        reference = reply["detail_ref"].as_str().unwrap().to_owned();
+        pages += 1;
+        assert!(pages < 20, "bounded test replay continuation");
+    }
+    serde_json::from_str(&recovered).expect("complete test replay is valid JSON")
+}
 
 /// The fallback switch the harness flips.
 pub const LANGUAGE_MODE: &str = "AGENT_IDE_LANGUAGE_MODE";
@@ -44,17 +103,177 @@ pub fn binary() -> PathBuf {
     )
 }
 
+/// Returns the test-selected absolute Git path, or the original system default.
+fn git_program() -> &'static Path {
+    static GIT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    GIT.get_or_init(|| {
+        let path = std::env::var_os("AGENT_IDE_TEST_GIT")
+            .map_or_else(|| PathBuf::from("/usr/bin/git"), PathBuf::from);
+        assert!(path.is_absolute(), "AGENT_IDE_TEST_GIT must be absolute");
+        assert!(path.to_str().is_some(), "AGENT_IDE_TEST_GIT must be UTF-8");
+        path
+    })
+}
+
 /// One exact process: PID plus kernel start time, so a reused PID never matches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessIdentity {
     /// Process id.
     pub pid: libc::pid_t,
-    /// Kernel start time (seconds, microseconds).
+    /// Kernel start time (seconds/microseconds on macOS; boot ticks on Linux).
     started: (u64, u64),
+}
+
+/// The normalized zombie state reported by the platform process reader.
+#[cfg(target_os = "linux")]
+pub const PROCESS_ZOMBIE: u32 = 5;
+/// The normalized stopped state reported by the platform process reader.
+#[cfg(target_os = "linux")]
+pub const PROCESS_STOPPED: u32 = 4;
+
+/// The platform's zombie value in the process-state result.
+fn zombie_state() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        libc::SZOMB
+    }
+    #[cfg(target_os = "linux")]
+    {
+        PROCESS_ZOMBIE
+    }
+}
+
+/// Parses Linux proc stat's parent, run state and start ticks, including names containing `)`.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat(stat: &str) -> Option<(libc::pid_t, u32, u64)> {
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+    let state = match fields.next()? {
+        "Z" | "X" | "x" => PROCESS_ZOMBIE,
+        "T" | "t" => PROCESS_STOPPED,
+        _ => 0,
+    };
+    let parent = fields.next()?.parse().ok()?;
+    let start = fields.nth(17)?.parse().ok()?;
+    Some((parent, state, start))
+}
+
+/// A process can disappear before procfs is opened or while its stat file is being read.
+#[cfg(target_os = "linux")]
+fn proc_error_is_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Returns Linux process start ticks, parent and state; absent processes return `None` and an
+/// unreadable or malformed record fails the assertion rather than silently dropping a process.
+#[cfg(target_os = "linux")]
+pub fn linux_process_info(pid: libc::pid_t) -> Option<((u64, u64), libc::pid_t, u32)> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if proc_error_is_gone(&error) => return None,
+        Err(error) => panic!("cannot inspect process {pid}: {error}"),
+    };
+    let (parent, state, start) = parse_proc_stat(&stat).expect("kernel process stat is valid");
+    Some(((start, 0), parent, state))
+}
+
+/// Lists procfs PIDs; each caller rechecks the child's parent and kernel start identity.
+#[cfg(target_os = "linux")]
+pub fn linux_process_ids() -> Vec<libc::pid_t> {
+    std::fs::read_dir("/proc")
+        .expect("procfs must be readable for process ownership assertions")
+        .map(|entry| entry.expect("procfs listing must be complete"))
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .filter(|pid| *pid > 0)
+        .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_process_tests {
+    use super::*;
+
+    /// A vanished task is not an inspection error; permissions and other errors remain visible.
+    #[test]
+    fn procfs_disappearance_errors_are_distinct_from_access_failures() {
+        assert!(proc_error_is_gone(&std::io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+        assert!(proc_error_is_gone(&std::io::Error::from_raw_os_error(
+            libc::ESRCH
+        )));
+        assert!(!proc_error_is_gone(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+    }
+
+    /// Process names can include spaces and closing parentheses without shifting stat fields.
+    #[test]
+    fn proc_stat_preserves_parent_state_and_start_ticks() {
+        assert_eq!(
+            parse_proc_stat("10 (a ) b) T 42 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123 20"),
+            Some((42, PROCESS_STOPPED, 123))
+        );
+        assert!(parse_proc_stat("10 (broken) S 1").is_none());
+    }
+
+    /// A real owned child is discovered, observed stopped and zombie, then disappears on reap.
+    #[test]
+    fn linux_child_identity_tracks_stop_exit_and_reap() {
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Owned(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "read line"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id() as libc::pid_t;
+        let (identity, parent, _) = ProcessIdentity::of(pid).expect("child is visible");
+        assert_eq!(parent, std::process::id() as libc::pid_t);
+        assert!(ProcessIdentity::children_of(parent).contains(&identity));
+        let reused = ProcessIdentity {
+            started: (identity.started.0.wrapping_add(1), 0),
+            ..identity
+        };
+        assert!(!reused.exists());
+        // SAFETY: this PID belongs to the still-unreaped child held above.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline
+            && ProcessIdentity::of(pid).is_some_and(|(_, _, state)| state != PROCESS_STOPPED)
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(ProcessIdentity::of(pid).unwrap().2, PROCESS_STOPPED);
+        // SAFETY: the stopped, unreaped child still owns this PID.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+        drop(child.0.stdin.take());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline
+            && ProcessIdentity::of(pid).is_some_and(|(_, _, state)| state != PROCESS_ZOMBIE)
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(ProcessIdentity::of(pid).unwrap().2, PROCESS_ZOMBIE);
+        assert!(identity.exists());
+        assert!(!identity.running());
+        child.0.wait().unwrap();
+        assert!(!identity.exists());
+    }
 }
 
 impl ProcessIdentity {
     /// The identity, parent and run state of `pid`, or `None` once it is gone.
+    #[cfg(target_os = "macos")]
     pub fn of(pid: libc::pid_t) -> Option<(Self, libc::pid_t, u32)> {
         // SAFETY: an all-zero `proc_bsdinfo` is a valid plain-data value for the kernel to fill.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -79,6 +298,13 @@ impl ProcessIdentity {
         ))
     }
 
+    /// Reads the identity, parent and state of one Linux process from procfs.
+    #[cfg(target_os = "linux")]
+    pub fn of(pid: libc::pid_t) -> Option<(Self, libc::pid_t, u32)> {
+        let (started, parent, state) = linux_process_info(pid)?;
+        Some((Self { pid, started }, parent, state))
+    }
+
     /// Whether the kernel still lists this exact process (a zombie included).
     pub fn exists(self) -> bool {
         Self::of(self.pid).is_some_and(|(now, _, _)| now == self)
@@ -86,10 +312,11 @@ impl ProcessIdentity {
 
     /// Whether this exact process still runs (not a zombie).
     fn running(self) -> bool {
-        Self::of(self.pid).is_some_and(|(now, _, state)| now == self && state != libc::SZOMB)
+        Self::of(self.pid).is_some_and(|(now, _, state)| now == self && state != zombie_state())
     }
 
     /// The live direct children of `parent`; call it only while `parent` is provably ours.
+    #[cfg(target_os = "macos")]
     pub fn children_of(parent: libc::pid_t) -> Vec<Self> {
         let mut pids = vec![0 as libc::pid_t; 1024];
         let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
@@ -98,6 +325,17 @@ impl ProcessIdentity {
         pids.into_iter()
             .take(usize::try_from(listed).unwrap_or(0))
             .filter(|pid| *pid > 0)
+            .filter_map(Self::of)
+            .filter(|(_, ppid, _)| *ppid == parent)
+            .map(|(identity, _, _)| identity)
+            .collect()
+    }
+
+    /// Lists direct Linux children by rechecking procfs parent and start identity.
+    #[cfg(target_os = "linux")]
+    pub fn children_of(parent: libc::pid_t) -> Vec<Self> {
+        linux_process_ids()
+            .into_iter()
             .filter_map(Self::of)
             .filter(|(_, ppid, _)| *ppid == parent)
             .map(|(identity, _, _)| identity)
@@ -121,6 +359,16 @@ impl ProcessIdentity {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         !self.exists()
+    }
+
+    /// Waits up to five seconds for this generation to exit; a zombie is exited but not reaped.
+    /// Idle module owners may retain it until the next demand tears down its group safely.
+    pub async fn exited(self) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while self.running() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        !self.running()
     }
 
     /// `SIGTERM`, then `SIGKILL` after five seconds, to every still-running process of `owned`;
@@ -186,11 +434,11 @@ impl Fixture {
         fixture.git(&["config", "user.name", "Parity Fixture"]);
         fixture.git(&["add", "--", "."]);
         fixture.git(&["commit", "--quiet", "-m", "fixture"]);
-        let git = std::fs::read("/usr/bin/git").unwrap();
+        let git = std::fs::read(git_program()).unwrap();
         let config = json!({"version":1,"limits":{"queued":16,"details":64,"operation_ms":120000,"output_bytes":1_048_576},
             "allowed_roots":[fixture.base],
             "targets":[{"attachment":ATTACHMENT,"candidate":fixture.root,
-                "git":{"path":"/usr/bin/git","identity":"fixture-git","blake3":blake3::hash(&git).to_hex().to_string()},
+                "git":{"path":git_program(),"identity":"fixture-git","blake3":blake3::hash(&git).to_hex().to_string()},
                 "providers":providers}]});
         std::fs::write(&fixture.config, config.to_string()).unwrap();
         fixture
@@ -198,7 +446,7 @@ impl Fixture {
 
     /// Runs fixture Git with user and system configuration excluded.
     pub fn git(&self, args: &[&str]) {
-        let output = std::process::Command::new("/usr/bin/git")
+        let output = std::process::Command::new(git_program())
             .env_clear()
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -235,8 +483,18 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Starts a daemon on `fixture` with `env` and waits for its endpoint.
+    /// Starts a daemon on `fixture` with `env` and waits for its endpoint. When `TS_DUMP` is
+    /// set, retains daemon stderr in that directory even if the daemon aborts after startup.
     pub async fn start(fixture: &Fixture, env: &[(&str, &str)]) -> Self {
+        let stderr_path = std::env::var_os("TS_DUMP").map(|directory| {
+            PathBuf::from(directory).join(format!(
+                "daemon-{}.stderr",
+                fixture.base.file_name().unwrap().to_string_lossy()
+            ))
+        });
+        let stderr = stderr_path.as_ref().map_or_else(Stdio::piped, |path| {
+            Stdio::from(std::fs::File::create(path).unwrap())
+        });
         let mut command = Command::new(binary());
         command
             .env_remove(LANGUAGE_MODE)
@@ -247,7 +505,7 @@ impl Daemon {
             .env("AGENT_IDE_LAUNCHER_CONFIG", &fixture.config)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(stderr)
             .kill_on_drop(true);
         let mut daemon = Self {
             child: command.spawn().unwrap(),
@@ -263,13 +521,11 @@ impl Daemon {
                 }
                 if let Some(status) = daemon.child.try_wait().unwrap() {
                     let mut stderr = String::new();
-                    let _ = daemon
-                        .child
-                        .stderr
-                        .take()
-                        .unwrap()
-                        .read_to_string(&mut stderr)
-                        .await;
+                    if let Some(mut pipe) = daemon.child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr).await;
+                    } else if let Some(path) = &stderr_path {
+                        stderr = std::fs::read_to_string(path).unwrap();
+                    }
                     panic!("daemon exited with {status}: {stderr}");
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -563,10 +819,14 @@ impl Session {
         panic!("{tool} did not settle: {reply}");
     }
 
-    /// One correlated tool call without settling.
+    /// One correlated tool call without settling; a missing or non-object structured result panics
+    /// with the tool, arguments, and raw RPC response instead of manufacturing a null reply. For
+    /// the TS backend's `src/index.js` edit, `TS_DUMP` also retains current bytes and that raw
+    /// response before the panic so an unknown outcome can be inspected after fixture teardown.
     async fn call_once(&mut self, fixture: &Fixture, tool: &str, arguments: Value) -> Value {
         let id = CALL.fetch_add(1, Ordering::Relaxed) + 1;
         let call = format!("call-{id}");
+        let request_arguments = arguments.clone();
         self.hook(fixture, "PreToolUse", &call).await;
         let reply = self
             .exchange(
@@ -576,7 +836,34 @@ impl Session {
             )
             .await;
         self.hook(fixture, "PostToolUse", &call).await;
-        let mut structured = reply["result"]["structuredContent"].clone();
+        let Some(mut structured) = reply
+            .pointer("/result/structuredContent")
+            .filter(|value| value.is_object())
+            .cloned()
+        else {
+            if tool == "ide.edit"
+                && request_arguments["symbol"]
+                    .as_str()
+                    .is_some_and(|symbol| symbol.starts_with("src/index.js#"))
+                && let Some(directory) = std::env::var_os("TS_DUMP").map(PathBuf::from)
+            {
+                let _ = std::fs::create_dir_all(&directory);
+                let fixture_name = fixture.base.file_name().map_or_else(
+                    || "fixture".to_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                let stem = format!("node-unknown-{fixture_name}");
+                let _ = std::fs::copy(
+                    fixture.root.join("src/index.js"),
+                    directory.join(format!("{stem}-src-index.js")),
+                );
+                let _ = std::fs::write(
+                    directory.join(format!("{stem}-reply.json")),
+                    reply.to_string(),
+                );
+            }
+            panic!("tool `{tool}` returned no structured object for {request_arguments}: {reply}");
+        };
         // An error reply carries its message as content text only; keep it comparable.
         if let Some(object) = structured.as_object_mut()
             && !object.contains_key("text")
@@ -687,6 +974,7 @@ const METADATA_LABELS: &[&str] = &[
     "rerun:",
     "full output:",
     "Output is",
+    "Cut;",
     "Diagnostics are",
     "project:",
     "Detail:",

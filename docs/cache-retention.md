@@ -2,8 +2,17 @@
 
 Agent IDE keeps per-user state below `~/.agent-ide` (the real home from the password database,
 or `AGENT_IDE_HOME`; a substituted `$HOME` never moves it). Every daemon on the machine shares it.
-This note is the policy for removing what is no longer needed, automatically and without ever
-removing something a live process uses. The code is `crates/agent-ide-core/src/retention.rs`.
+This note describes retention and the conditions under which the product removes unused state.
+The code is `crates/agent-ide-core/src/retention.rs`.
+
+On Linux, `/proc` may omit processes in other PID namespaces that share this state. The current
+implementation cannot prove global process absence, so automatic sweeps and `cache prune` pause
+cache, installed-release and trash removal; Claude hint cleanup also pauses. `cache status` reports
+unknown visibility rather than proving the state unused. Budgets are targets, not hard limits:
+retained state can grow beyond them and consume additional disk. Namespace-local process snapshots
+remain useful for observation but do not authorize cleanup. A different build cannot replace an
+existing release of the same version; use a new version. Fresh and identical installs still work.
+Linux remains an unqualified candidate.
 
 ## Caches
 
@@ -265,9 +274,9 @@ taken as participating. Both need deliberate manual action.
 
 - `agent-ide cache status` — dry run: per-cache totals and budgets, every entry the policy would
   remove with its reason and size, entries protected because they are in use, and whether
-  eviction is paused by legacy processes (with their pids and executables). Removes nothing.
+  eviction is paused by legacy processes or unknown global visibility. Removes nothing.
 - `agent-ide cache prune` — runs the same sweep now (ignoring the hourly stamp, still honoring
-  every lock and rule), prints what it removed and records each removal in the error log of the
+  every lock and rule); unknown global visibility pauses removal. It prints what it removed and records each removal in the error log of the
   current directory's repository (the log `agent-ide errors` reads there).
 - Every removal by a daemon is recorded in that daemon's error log
   (`~/.agent-ide/logs/<repo>/events.jsonl`, read with `agent-ide errors --all`) as method

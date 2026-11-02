@@ -37,7 +37,7 @@ pub enum LauncherError {
 }
 
 /// An operator-accepted executable path and immutable measured identity.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, serde::Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedExecutable {
     /// Absolute normalized executable selected by the trusted launcher, never a model parameter.
@@ -190,6 +190,9 @@ pub struct ProviderLaunch {
     pub cache_namespace: String,
     /// The server's decoded declaration fields; its concrete type belongs to the server.
     options: Arc<dyn Any + Send + Sync>,
+    /// Original validated own-language declaration fields, retained for immutable per-request
+    /// module configuration. Never rendered as a model reply, diagnostic or log entry.
+    declaration: serde_json::Value,
     /// Whether the declaration carries a field that only another registered server accepts.
     foreign_fields: bool,
 }
@@ -205,6 +208,13 @@ impl ProviderLaunch {
     /// Returns the server's decoded declaration fields when they are a `T`.
     pub fn options<T: Any>(&self) -> Option<&T> {
         self.options.downcast_ref::<T>()
+    }
+
+    /// Copies the accepted declaration for a language-owned resolver in this exact request.
+    /// Includes accepted executable identity and validated language option fields; it grants no
+    /// execution/read authority and must never be exposed as user-facing metadata.
+    pub fn module_declaration(&self) -> serde_json::Value {
+        self.declaration.clone()
     }
 }
 
@@ -329,6 +339,14 @@ impl<'de> Deserialize<'de> for ProviderLaunch {
                 foreign_fields = true;
             }
         }
+        let mut declaration = serde_json::json!({
+            "executable": raw.executable, "settings": raw.settings,
+            "toolchain": raw.toolchain, "trust": raw.trust, "cache_namespace": raw.cache_namespace,
+        });
+        declaration
+            .as_object_mut()
+            .expect("declaration is an object")
+            .extend(fields.clone());
         let options = own.parse_options(fields).map_err(D::Error::custom)?;
         Ok(Self {
             executable: raw.executable,
@@ -337,6 +355,7 @@ impl<'de> Deserialize<'de> for ProviderLaunch {
             trust: raw.trust,
             cache_namespace: raw.cache_namespace,
             options,
+            declaration,
             foreign_fields,
         })
     }
@@ -548,6 +567,18 @@ struct RawConfig {
     /// Confined background project-check declarations; absent disables project checks.
     #[serde(default)]
     project_checks: Option<ProjectChecksConfig>,
+    /// Optional explicit protected Bridge deployment; absence preserves legacy delivery.
+    #[serde(default)]
+    bridge: Option<super::bridge::BridgeConfig>,
+    /// Optional restart-only experimental helper input; malformed helper fields disable only it.
+    #[serde(default)]
+    jev_pilot: Option<Value>,
+    /// Restart-only task-context settings; absent disables indexing and model requests.
+    #[serde(default)]
+    task_context: Option<Value>,
+    /// Optional engine-level test concurrency; reloaded on daemon restart.
+    #[serde(default)]
+    test_execution: Option<crate::execution::test_workers::TestExecutionConfig>,
 }
 
 /// One validated trusted target; metadata alone never creates one of these values.
@@ -572,6 +603,14 @@ pub struct LauncherConfig {
     allowed_roots: Vec<PathBuf>,
     /// Validated project-check declarations; `None` disables project checks.
     project_checks: Option<ProjectChecksConfig>,
+    /// Optional protected Bridge deployment shared by the managed front and daemon.
+    bridge: Option<super::bridge::BridgeConfig>,
+    /// Untrusted helper-shaped configuration, validated separately without failing core startup.
+    jev_pilot: Option<Value>,
+    /// Trusted task-context configuration, validated when explicitly requested.
+    task_context: Option<Value>,
+    /// Optional engine-level test concurrency; reloaded on daemon restart.
+    test_execution: Option<crate::execution::test_workers::TestExecutionConfig>,
     /// Retired settings identifiers whose provider entries were dropped, each once.
     retired: Vec<&'static RetiredSettings>,
 }
@@ -661,6 +700,9 @@ impl LauncherConfig {
         if let Some(checks) = &raw.project_checks {
             checks.validate()?;
         }
+        if raw.bridge.as_ref().is_some_and(|bridge| !bridge.validate()) {
+            return Err(LauncherError::Rejected);
+        }
         if raw.version != 1 || raw.targets.len() > 64 {
             return Err(LauncherError::Rejected);
         }
@@ -714,12 +756,29 @@ impl LauncherConfig {
             limits: raw.limits,
             allowed_roots: raw.allowed_roots,
             project_checks: raw.project_checks,
+            bridge: raw.bridge,
+            jev_pilot: raw.jev_pilot,
+            task_context: raw.task_context,
+            test_execution: raw.test_execution,
             retired,
         })
     }
     /// The retired settings identifiers this file still declares; their entries were ignored.
     pub fn retired_settings(&self) -> &[&'static RetiredSettings] {
         &self.retired
+    }
+    /// Returns explicit restart-only Bridge configuration; no runtime discovery or I/O.
+    pub fn bridge(&self) -> Option<&super::bridge::BridgeConfig> {
+        self.bridge.as_ref()
+    }
+    /// Returns restart-only optional helper input; reading this value performs no credential I/O.
+    pub fn task_context(&self) -> Option<&Value> {
+        self.task_context.as_ref()
+    }
+
+    /// Returns the optional legacy helper configuration.
+    pub fn jev_pilot(&self) -> Option<&Value> {
+        self.jev_pilot.as_ref()
     }
     /// Verifies each immutable configured executable once before the worker becomes visible.
     /// Duplicate paths share verification; conflicting fingerprints and cancellation fail closed.
@@ -788,6 +847,115 @@ impl LauncherConfig {
     /// Returns the validated project-check declarations; `None` disables project checks.
     pub fn project_checks(&self) -> Option<&ProjectChecksConfig> {
         self.project_checks.as_ref()
+    }
+
+    /// Builds immutable current language configuration for an already admitted `worktree` and
+    /// its selected `target`. Only this target's accepted provider and this launcher's raw check
+    /// section enter the request; no ambient compiler path substitutes for either. Worktree
+    /// admission and executable verification remain the caller/execution owner's responsibility.
+    pub fn module_config(
+        &self,
+        language: Language,
+        worktree: &Path,
+        target: &LaunchTarget,
+    ) -> crate::modules::contract::ModuleConfig {
+        self.language_context(
+            language,
+            Some(worktree),
+            target
+                .providers
+                .iter()
+                .find(|provider| provider.language == language)
+                .map(ProviderLaunch::module_declaration),
+        )
+    }
+
+    /// Supplies exact accepted provider facts alongside this launcher's matching check section.
+    /// Used by a live backend that already holds its accepted launch, without choosing a target.
+    pub fn provider_module_config(
+        &self,
+        provider: &ProviderLaunch,
+        worktree: &Path,
+    ) -> crate::modules::contract::ModuleConfig {
+        self.language_context(
+            provider.language,
+            Some(worktree),
+            Some(provider.module_declaration()),
+        )
+    }
+
+    /// Immutable context for a check factory shared by worktrees. Provider facts are retained
+    /// only when every configured declaration of this language agrees; absent or conflicting
+    /// provider evidence stays unknown. Each check supplies its actual admitted worktree later.
+    pub fn check_module_config(
+        &self,
+        language: Language,
+    ) -> crate::modules::contract::ModuleConfig {
+        let mut declarations = self
+            .targets
+            .values()
+            .flat_map(|target| target.providers.iter())
+            .filter(|provider| provider.language == language)
+            .map(ProviderLaunch::module_declaration);
+        let first = declarations.next();
+        let provider = first.filter(|first| declarations.all(|next| &next == first));
+        self.language_context(language, None, provider)
+    }
+
+    /// Current context outside an individual job (cards/notices/check planning). Exact candidate
+    /// roots or the documented sole managed template supply provider facts; ambiguous targets
+    /// retain no invented provider. Callers with a selected job target use `module_config` instead.
+    pub fn worktree_module_config(
+        &self,
+        language: Language,
+        worktree: &Path,
+    ) -> crate::modules::contract::ModuleConfig {
+        let matching: Vec<_> = self
+            .targets
+            .values()
+            .filter(|target| {
+                target
+                    .candidate
+                    .canonicalize()
+                    .unwrap_or_else(|_| target.candidate.clone())
+                    .starts_with(worktree)
+            })
+            .collect();
+        match matching.as_slice() {
+            [target] => self.module_config(language, worktree, target),
+            [] if self.sole_target().is_some() => {
+                self.module_config(language, worktree, self.sole_target().unwrap())
+            }
+            _ => {
+                let mut config = self.check_module_config(language);
+                config.worktree = Some(worktree.to_path_buf());
+                config
+            }
+        }
+    }
+
+    /// Builds bounded language-owned request data without adding authority or ambient tool facts.
+    fn language_context(
+        &self,
+        language: Language,
+        worktree: Option<&Path>,
+        provider: Option<serde_json::Value>,
+    ) -> crate::modules::contract::ModuleConfig {
+        crate::modules::contract::ModuleConfig {
+            read_denies: Vec::new(),
+            test_workers: self
+                .test_execution
+                .as_ref()
+                .map(|config| config.workers.resolve()),
+            worktree: worktree.map(Path::to_path_buf),
+            provider,
+            checks: self
+                .project_checks()
+                .and_then(|checks| checks.raw_section(language))
+                .cloned(),
+            env: crate::modules::launch::module_env(language.name()),
+            home: crate::userhome::user_home(),
+        }
     }
 
     /// Iterates the configured private attachments for runtime-bound fallback authentication.

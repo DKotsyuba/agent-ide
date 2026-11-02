@@ -134,6 +134,30 @@ pub(super) fn cache_root(runtime: &std::path::Path) -> std::path::PathBuf {
 }
 
 impl Providers {
+    /// Waits only for an already-owned session; never starts, removes or replaces a backend.
+    #[cfg(feature = "jev-pilot")]
+    pub(super) async fn wait_existing_session(
+        &mut self,
+        binding: &BindingRef,
+        path: &Path,
+        budget: Duration,
+    ) -> bool {
+        let Some(server) = self.session_server(path) else {
+            return false;
+        };
+        let Ok(index) = self.slot_of(server) else {
+            return false;
+        };
+        let Some(live) = self.slots[index]
+            .backend
+            .as_mut()
+            .and_then(|backend| backend.live_session(binding))
+        else {
+            return false;
+        };
+        live.wait_ready(budget).await.is_ok()
+    }
+
     /// Creates fixed finite provider bookkeeping and one idle backend per server without launching
     /// processes.
     pub(super) fn new(cache_root: std::path::PathBuf) -> Self {
@@ -741,6 +765,67 @@ impl Worker<'_> {
             .and_then(|backend| backend.live_session(&binding))
             .ok_or(FailureCode::Internal)?;
         Ok(live)
+    }
+
+    /// What the session of `server` serving `binding` says right now, without starting, retiring
+    /// or waiting for anything. The serving session is the binding's own, or the one of the
+    /// writer (or reading owner) a reader borrows from. `None` when no live session is open
+    /// (never started, or released); `Some(Err(WorkspaceError))` for a session marked failed;
+    /// otherwise its zero-budget readiness (`Ok` ready, `Loading`, `WorkspaceError` or `Gone`).
+    /// Used for the start card's servers line; it never marks the session's health.
+    pub(super) async fn session_readiness(
+        &mut self,
+        binding: &BindingRef,
+        server: &'static dyn LanguageServer,
+    ) -> Option<Result<(), ReadinessError>> {
+        let owner = self
+            .session_owner_of(binding)
+            .unwrap_or_else(|| binding.clone());
+        let index = self.providers.slot_of(server).ok()?;
+        if self.providers.failed.contains_key(&(owner.clone(), index)) {
+            return Some(Err(ReadinessError::WorkspaceError));
+        }
+        let live = self.providers.slots[index]
+            .backend
+            .as_mut()?
+            .live_session(&owner)?;
+        Some(live.wait_ready(Duration::ZERO).await)
+    }
+
+    /// Reads an edit snapshot only from the binding's already-owned, alive session. This never
+    /// opens/replaces a provider or borrows another owner's source authority. File synchronization
+    /// enqueues document notifications without waiting for diagnostic pushes; `budget` bounds the
+    /// existing module query. Missing sessions yield `None`; authorization/request failures retain
+    /// their closed I/O error so the job can settle its accepted diagnostic obligation honestly.
+    pub(super) async fn owned_edit_diagnostics(
+        &mut self,
+        binding: &BindingRef,
+        authority: &AuthorityStamp,
+        observed: &SourceObservation,
+        bytes: &[u8],
+        budget: Duration,
+    ) -> std::io::Result<Option<ProviderContext>> {
+        let Some(index) = self
+            .session_server(observed.path())
+            .and_then(|server| self.providers.slot_of(server).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(live) = self.providers.slots[index]
+            .backend
+            .as_mut()
+            .and_then(|backend| backend.live_session(binding))
+            .filter(|live| live.is_alive())
+        else {
+            return Ok(None);
+        };
+        live.session
+            .authorize_source(authority, observed)
+            .map_err(|_| std::io::Error::other("provider source authority changed"))?;
+        live.session
+            .edit_diagnostics(observed, bytes, budget)
+            .await
+            .map(Some)
     }
 
     /// Returns the language server whose live session answers `path`, for capability checks.
@@ -1446,6 +1531,17 @@ fn provider_cache_key(
 }
 
 impl ProviderHost for Worker<'_> {
+    /// Copies this exact accepted provider and the current launcher's matching check facts.
+    fn module_config(
+        &self,
+        launch: &ProviderLaunch,
+        worktree: &Path,
+    ) -> crate::modules::contract::ModuleConfig {
+        self.shared
+            .launcher
+            .provider_module_config(launch, worktree)
+    }
+
     /// Delegates to the worker's boot-fenced authority check.
     fn authority<'a>(
         &'a self,

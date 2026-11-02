@@ -16,7 +16,7 @@ host_adapter = true
 
 [compatibility]
 supported_protocol_revisions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
-candidate_targets = ["aarch64-apple-darwin"]
+candidate_targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 qualified_targets = ["aarch64-apple-darwin"]
 qualified_hosts = ["claude-code", "codex"]
 

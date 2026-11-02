@@ -39,6 +39,10 @@ use crate::profile::{
     TypeScriptWorktree,
 };
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "backend_linux_tests.rs"]
+mod linux_tests;
+
 /// Failure detail when TypeScript project inputs no longer match the snapshot a session was
 /// started from; the next request observes them afresh.
 pub const TYPESCRIPT_INPUTS_CHANGED: &str =
@@ -142,10 +146,12 @@ pub struct AcceptedTypeScriptBundleV1 {
     pub typescript_version: String,
     /// Strictly sorted complete loaded runtime closure excluding bridge and `tsserver.js`.
     pub closure: Vec<AcceptedTypeScriptFileV1>,
-    /// Exact compiled Codex macOS release record required to enable this provider for Codex.
-    pub codex_macos_evidence: String,
+    /// Exact compiled Codex macOS release record, required for macOS execution.
+    pub codex_macos_evidence: Option<String>,
     /// Optional separate Claude macOS record; `None` keeps the provider unavailable to Claude.
     pub claude_macos_evidence: Option<String>,
+    /// Linux operator's full bundle fingerprint; this is not a platform qualification record.
+    pub linux_operator_bundle: Option<String>,
 }
 
 impl AcceptedTypeScriptBundleV1 {
@@ -156,11 +162,17 @@ impl AcceptedTypeScriptBundleV1 {
             || !identifier(&self.typescript_version)
             || self.closure.is_empty()
             || self.closure.len() > 64
-            || !identifier(&self.codex_macos_evidence)
+            || self
+                .codex_macos_evidence
+                .as_deref()
+                .is_some_and(|value| !identifier(value))
             || self
                 .claude_macos_evidence
                 .as_deref()
                 .is_some_and(|evidence| !identifier(evidence))
+            || self.linux_operator_bundle.as_deref().is_some_and(|value| {
+                value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
         {
             return Err(LauncherError::Rejected);
         }
@@ -193,6 +205,9 @@ pub struct TypeScriptLaunchOptions {
 /// TypeScript-specific queries on a provider declaration: the compiled release records it must
 /// match and the immutable bundle it declares.
 pub trait TypeScriptLaunch {
+    /// Fingerprints a structurally supported Linux operator declaration without reading files.
+    /// The caller must separately verify the declared files before execution.
+    fn expected_typescript_linux_operator_bundle(&self) -> Option<String>;
     /// Derives the only Codex macOS record accepted for this exact declared TypeScript bundle, or
     /// `None` for any other provider, release, malformed bundle, or absent Node. Performs no
     /// filesystem read and grants no execution authority.
@@ -215,6 +230,78 @@ pub trait TypeScriptLaunch {
 }
 
 impl TypeScriptLaunch for ProviderLaunch {
+    fn expected_typescript_linux_operator_bundle(&self) -> Option<String> {
+        let options = self.options::<TypeScriptLaunchOptions>()?;
+        let node = options.node.as_ref()?;
+        let bundle = options.typescript.as_ref()?;
+        if self.language != crate::LANGUAGE
+            || node.validate().is_err()
+            || self.executable.validate().is_err()
+            || bundle.validate().is_err()
+            || self.toolchain != node.identity
+            || node.identity != TYPESCRIPT_NODE_VERSION_V1
+            || self.executable.identity != TYPESCRIPT_BRIDGE_VERSION_V1
+            || !self
+                .executable
+                .blake3
+                .eq_ignore_ascii_case(TYPESCRIPT_BRIDGE_BLAKE3_V1)
+            || bundle.bridge_bytes != TYPESCRIPT_BRIDGE_BYTES_V1
+            || bundle.bridge_version != TYPESCRIPT_BRIDGE_VERSION_V1
+            || bundle.typescript_version != TYPESCRIPT_VERSION_V1
+            || !bundle
+                .tsserver
+                .blake3
+                .eq_ignore_ascii_case(TYPESCRIPT_TSSERVER_BLAKE3_V1)
+            || bundle.tsserver.bytes != TYPESCRIPT_TSSERVER_BYTES_V1
+            || bundle
+                .tsserver
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some("tsserver.js")
+            || bundle.closure.len() != TYPESCRIPT_CLOSURE_V1.len()
+            || TYPESCRIPT_CLOSURE_V1.iter().any(|(name, digest, bytes)| {
+                bundle
+                    .closure
+                    .iter()
+                    .filter(|file| {
+                        file.path.file_name().and_then(|value| value.to_str()) == Some(*name)
+                            && file.blake3.eq_ignore_ascii_case(digest)
+                            && file.bytes == *bytes
+                    })
+                    .count()
+                    != 1
+            })
+        {
+            return None;
+        }
+        let mut hash = blake3::Hasher::new();
+        evidence_frame(&mut hash, b"typescript-linux-operator-bundle-v1");
+        for value in [
+            self.toolchain.as_bytes(),
+            node.path.as_os_str().as_encoded_bytes(),
+            node.identity.as_bytes(),
+            node.blake3.as_bytes(),
+            self.executable.path.as_os_str().as_encoded_bytes(),
+            self.executable.identity.as_bytes(),
+            self.executable.blake3.as_bytes(),
+            bundle.bridge_version.as_bytes(),
+            bundle.tsserver.path.as_os_str().as_encoded_bytes(),
+            bundle.tsserver.blake3.as_bytes(),
+            bundle.typescript_version.as_bytes(),
+        ] {
+            evidence_frame(&mut hash, value);
+        }
+        evidence_frame(&mut hash, &bundle.bridge_bytes.to_le_bytes());
+        evidence_frame(&mut hash, &bundle.tsserver.bytes.to_le_bytes());
+        for file in &bundle.closure {
+            evidence_frame(&mut hash, file.path.as_os_str().as_encoded_bytes());
+            evidence_frame(&mut hash, file.blake3.as_bytes());
+            evidence_frame(&mut hash, &file.bytes.to_le_bytes());
+        }
+        Some(hash.finalize().to_hex().to_string())
+    }
+
     /// Derives the only Codex macOS record accepted for this exact declared TypeScript bundle.
     ///
     /// The public release prefix is accepted only with Node 24.4.0, TypeScript Language Server
@@ -330,7 +417,9 @@ impl TypeScriptLaunch for ProviderLaunch {
             .is_some_and(|expected| {
                 self.options::<TypeScriptLaunchOptions>()
                     .and_then(|options| options.typescript.as_ref())
-                    .is_some_and(|bundle| bundle.codex_macos_evidence == expected)
+                    .is_some_and(|bundle| {
+                        bundle.codex_macos_evidence.as_deref() == Some(expected.as_str())
+                    })
             })
     }
 
@@ -366,6 +455,36 @@ fn evidence_frame(hash: &mut blake3::Hasher, value: &[u8]) {
     hash.update(value);
 }
 
+/// Checks the operator's Linux binding; it is distinct from host qualification evidence.
+#[cfg(target_os = "linux")]
+fn runtime_accepted(launch: &ProviderLaunch) -> bool {
+    let Some(bundle) = launch
+        .options::<TypeScriptLaunchOptions>()
+        .and_then(|options| options.typescript.as_ref())
+    else {
+        return false;
+    };
+    bundle.codex_macos_evidence.is_none()
+        && bundle.claude_macos_evidence.is_none()
+        && launch
+            .expected_typescript_linux_operator_bundle()
+            .is_some_and(|expected| {
+                bundle.linux_operator_bundle.as_deref() == Some(expected.as_str())
+            })
+}
+
+/// Keeps the compiled macOS host records and their original acceptance semantics.
+#[cfg(not(target_os = "linux"))]
+fn runtime_accepted(launch: &ProviderLaunch) -> bool {
+    launch.typescript_codex_accepted()
+        && !launch
+            .options::<TypeScriptLaunchOptions>()
+            .and_then(|options| options.typescript.as_ref())
+            .is_some_and(|bundle| {
+                bundle.claude_macos_evidence.is_some() && !launch.typescript_claude_accepted()
+            })
+}
+
 /// The TypeScript language server bridge integration.
 pub struct TypeScriptServer;
 
@@ -395,9 +514,7 @@ impl LanguageServer for TypeScriptServer {
         Ok(Arc::new(options))
     }
 
-    /// Requires a valid Node whose identity is the toolchain, a valid bundle whose bridge version
-    /// is the executable identity, an accepted Codex record, and — when declared — an accepted
-    /// Claude record.
+    /// Requires matching Node and bridge identities and the platform's explicit bundle acceptance.
     fn validate_launch(&self, launch: &ProviderLaunch) -> bool {
         let Some(options) = launch.options::<TypeScriptLaunchOptions>() else {
             return false;
@@ -409,10 +526,7 @@ impl LanguageServer for TypeScriptServer {
             && options.typescript.as_ref().is_some_and(|bundle| {
                 bundle.validate().is_ok() && launch.executable.identity == bundle.bridge_version
             })
-            && launch.typescript_codex_accepted()
-            && !options.typescript.as_ref().is_some_and(|bundle| {
-                bundle.claude_macos_evidence.is_some() && !launch.typescript_claude_accepted()
-            })
+            && runtime_accepted(launch)
     }
 
     /// The declared Node executable.
@@ -721,7 +835,7 @@ impl TypeScriptBackend {
         launch: &ProviderLaunch,
         source: &SourceObservation,
     ) -> Result<(), FailureCode> {
-        if !launch.typescript_codex_accepted() {
+        if !runtime_accepted(launch) {
             return Err(FailureCode::ExecutionProfile);
         }
         let binding = job.binding().clone();

@@ -6,11 +6,14 @@
 
 use agent_ide_core::lang::{Language, LanguageDescriptor};
 
+#[cfg(test)]
+mod address_tests;
 pub mod backend;
 pub mod checks;
 pub mod environment;
 pub mod module;
 pub mod profile;
+mod source_outline;
 pub mod support;
 
 /// Registration descriptor of the Python language.

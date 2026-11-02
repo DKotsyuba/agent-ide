@@ -1,0 +1,435 @@
+[
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Batch paths; paged changes since last diff. mode: whole comparison; provenance:true adds identity.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "detail_ref": {
+          "type": "string"
+        },
+        "mode": {
+          "description": "Whole comparison: uncommitted, staged, unstaged or since activation.",
+          "enum": [
+            "head",
+            "staged",
+            "unstaged",
+            "task"
+          ],
+          "type": "string"
+        },
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "provenance": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.diff"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Atomic multi-file edit: batch production and test changes in one apply_patch `patch` (*** Begin Patch, *** Add File or *** Update File, *** End Patch); delete and move are unsupported. Absolute file headers inside the worktree are accepted; outside paths refuse. At the inline wait limit the reply is edit_progress: requested and committed files, stage and detail_ref; the project check reports separately.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "description": "Retry key; never applied twice.",
+          "type": "string"
+        },
+        "patch": {
+          "description": "A Codex apply_patch body (Add File, Update File), applied atomically. Use it alone.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "patch"
+      ],
+      "type": "object"
+    },
+    "name": "ide.edit"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Call trees for a batch of symbols: callers (impact), callees (dependencies) or both; depth 2\nusually suffices (1–3); tests:true expands test nodes.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "default": 2,
+          "type": "integer"
+        },
+        "detail_ref": {
+          "type": "string"
+        },
+        "direction": {
+          "default": "callers",
+          "enum": [
+            "callers",
+            "callees",
+            "both"
+          ],
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Address or bare name.",
+          "type": "string"
+        },
+        "symbols": {
+          "description": "Up to 8.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tests": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.graph"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Batch detail_refs or one detail_ref; kind:diagnostics+path or kind:problems. No check run; unknown is not clean.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "detail_ref": {
+          "type": "string"
+        },
+        "detail_refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "description": "Exclusive query mode; omit for retained references.",
+          "enum": [
+            "problems",
+            "diagnostics"
+          ],
+          "type": "string"
+        },
+        "language": {
+          "description": "Only with kind:problems; omit for diagnostics.",
+          "enum": [
+            "rust",
+            "python",
+            "typescript"
+          ],
+          "type": "string"
+        },
+        "offset": {
+          "description": "Only with kind:problems; continue from next_offset.",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Only with kind:diagnostics.",
+          "type": "string"
+        },
+        "wait_s": {
+          "description": "Only with detail_ref(s): completion seconds.",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.inspect"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Batch paths/glob: symbol and region addresses, signatures and docs, no bodies.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "glob": {
+          "description": "`*`, `?`, `**`; up to 24 files.",
+          "type": "string"
+        },
+        "kinds": {
+          "description": "Comma list of kinds to keep; `region` adds @header, @imports.",
+          "type": "string"
+        },
+        "path": {
+          "description": "One file, or a directory listing.",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Up to 24 files.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.outline"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Batch items: {symbol} or {path, lines:\"1-80\"}. Addresses: file#Type/f, #@imports, path:line, …:3-5. Current source, every item whole; unchanged acknowledged, force:true resends.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "detail_ref": {
+          "type": "string"
+        },
+        "force": {
+          "type": "boolean"
+        },
+        "items": {
+          "description": "Up to 32.",
+          "items": {
+            "properties": {
+              "lines": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "symbol": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.read"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Activate once per task; returns project card and batch call forms.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "activation_id": {
+          "type": "string"
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Per language, or `python:<root>`: a start-card candidate, a path or `auto`.",
+          "type": "object"
+        },
+        "read_only": {
+          "description": "Reader; default: the one writer.",
+          "type": "boolean"
+        },
+        "root": {
+          "description": "Absolute; default: the host's project directory.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.start"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "End activation once, at task end; keeps edits, lists retained tests and running commands.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "activation_id": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.stop"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Batch symbols: definition, docs, usages, immediate neighbors; deeper chains: ide.graph. path+byte_offset resolves a UTF-8 use-site.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "byte_offset": {
+          "type": "integer"
+        },
+        "callees": {
+          "default": 0,
+          "description": "0–3; 0 omits.",
+          "type": "integer"
+        },
+        "callers": {
+          "default": 1,
+          "description": "0–3; 0 omits.",
+          "type": "integer"
+        },
+        "history": {
+          "description": "Last commits touching it.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Only with byte_offset.",
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Address or bare name.",
+          "type": "string"
+        },
+        "symbols": {
+          "description": "Up to 8.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "usages": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.symbol"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": false
+    },
+    "description": "Batch up to 8 targets at project root; budget_s bounds runtime. Read result:N/history:true, cancel:N, or output:\"<ref>/output/N\".",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "budget_s": {
+          "default": 120,
+          "description": "Seconds before the run is stopped; at most 600.",
+          "type": "integer"
+        },
+        "cancel": {
+          "type": "integer"
+        },
+        "command": {
+          "description": "One argv (16 KiB total); may set cwd and env.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "description": "Worktree-relative.",
+          "type": "string"
+        },
+        "detail_ref": {
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "history": {
+          "enum": [
+            true
+          ],
+          "type": "boolean"
+        },
+        "output": {
+          "description": "Restore retained /output/N after context loss; exclusive, read-only.",
+          "type": "string"
+        },
+        "result": {
+          "type": "integer"
+        },
+        "targets": {
+          "description": "Up to 8.",
+          "items": {
+            "properties": {
+              "command": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "path": {
+                "type": "string"
+              },
+              "pattern": {
+                "type": "string"
+              },
+              "symbol": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.test"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Project map: call first in an unfamiliar repo. One call lists directories and files with sizes and the authors' one-line purpose, replacing rounds of ls/find/rg. No source bodies; path zooms in.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "description": "Levels; default 2 at root, 1 below.",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Directory to zoom into; default: project root.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.tree"
+  }
+]

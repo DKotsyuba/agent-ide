@@ -5,6 +5,7 @@
 //! which would briefly extend other tests' leases if they shared the process.
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
@@ -40,7 +41,8 @@ fn fate_of(report: &Report, dir: &Path) -> Option<Fate> {
 }
 
 /// Child-process half of the cross-process test: holds a lease on `<home>\n<worktree>` from the
-/// environment, prints `held`, and keeps it until stdin closes. A no-op in normal runs.
+/// environment, prints `held` on its own line even after libtest's single-thread prefix,
+/// and keeps it until stdin closes. A no-op in normal runs.
 #[test]
 fn lease_holder_helper() {
     let Some(spec) = std::env::var_os(HOLDER_ENV) else {
@@ -49,7 +51,7 @@ fn lease_holder_helper() {
     let spec = spec.into_string().unwrap();
     let (home, worktree) = spec.split_once('\n').unwrap();
     let _lease = Lease::acquire(Path::new(home), Path::new(worktree)).expect("child lease");
-    println!("held");
+    println!("\nheld");
     let mut sink = String::new();
     let _ = std::io::stdin().read_line(&mut sink);
 }
@@ -59,6 +61,10 @@ fn lease_holder_helper() {
 fn a_lease_held_by_another_process_keeps_the_cache_until_it_exits() {
     let home = scratch("home");
     let worktree = scratch("worktree");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(home.join("checks"))
+        .unwrap();
     let dir = home
         .join("checks")
         .join("0123456789abcdef")
@@ -89,13 +95,26 @@ fn a_lease_held_by_another_process_keeps_the_cache_until_it_exits() {
     let nobody = || Some(Vec::new());
 
     let report = sweep_with(&home, true, later, &nobody);
-    assert_eq!(fate_of(&report, &dir), Some(Fate::InUse));
+    assert_eq!(fate_of(&report, &dir), Some(Fate::InUse), "{report:?}");
     assert!(dir.exists());
+
+    #[cfg(target_os = "linux")]
+    {
+        let report = sweep_with(
+            &home,
+            true,
+            later,
+            &agent_ide::retention::global_process_snapshot,
+        );
+        assert!(report.paused(), "{report:?}");
+        assert_eq!(fate_of(&report, &dir), Some(Fate::Paused), "{report:?}");
+        assert!(dir.exists());
+    }
 
     drop(child.stdin.take());
     assert!(child.wait().unwrap().success());
     let report = sweep_with(&home, true, later, &nobody);
-    assert_eq!(fate_of(&report, &dir), Some(Fate::Removed));
+    assert_eq!(fate_of(&report, &dir), Some(Fate::Removed), "{report:?}");
     assert!(!dir.exists());
 }
 
@@ -133,6 +152,7 @@ fn status_view_of_a_copied_build(name: &str, strip_proof: bool) -> (bool, bool) 
     std::fs::create_dir_all(build.parent().unwrap()).unwrap();
     std::fs::write(&build, bytes).unwrap();
     std::fs::set_permissions(&build, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    #[cfg(target_os = "macos")]
     if strip_proof {
         // Editing a signed Mach-O invalidates its signature; the kernel would kill the copy.
         let signed = Command::new("/usr/bin/codesign")
@@ -187,6 +207,11 @@ fn status_view_of_a_copied_build(name: &str, strip_proof: bool) -> (bool, bool) 
     let output = output.unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(
+        text.contains("eviction of checks/telemetry/providers paused: complete process visibility is unavailable"),
+        "{text}"
+    );
     let pid = format!("  pid {pid} ");
     // Section by section: the build group, then the paused group, each indented under a header.
     let mut section = "";
@@ -209,6 +234,7 @@ fn status_view_of_a_copied_build(name: &str, strip_proof: bool) -> (bool, bool) 
 /// The real product binary, run from a copy at a distinct development path (not this test's own
 /// inode, not under `standalone/releases`), is listed by `cache status` as a lease-taking build
 /// that does not pause eviction; the same copy with its lease proof erased pauses eviction.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_copied_product_build_is_proven_by_its_executable_and_an_unproven_one_pauses() {
     assert_eq!(
@@ -218,6 +244,20 @@ fn a_copied_product_build_is_proven_by_its_executable_and_an_unproven_one_pauses
     assert_eq!(
         status_view_of_a_copied_build("unproven-build", true),
         (false, true)
+    );
+}
+
+/// On Linux incomplete global process visibility pauses eviction without listing individual builds.
+#[cfg(target_os = "linux")]
+#[test]
+fn copied_builds_pause_when_global_process_visibility_is_unavailable() {
+    assert_eq!(
+        status_view_of_a_copied_build("proven-build", false),
+        (false, false)
+    );
+    assert_eq!(
+        status_view_of_a_copied_build("unproven-build", true),
+        (false, false)
     );
 }
 

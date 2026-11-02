@@ -17,6 +17,8 @@ use std::{
 
 use async_lsp::lsp_types as lsp;
 
+/// Symbol addresses (`file#Type/method:N`), regions and the line partition.
+pub mod address;
 /// Line and brace helpers shared by the support modules of brace-delimited languages.
 pub mod brace;
 pub mod edits;
@@ -24,6 +26,8 @@ pub mod environment;
 /// Cross-language name facts: namespaces, facts, the fact sink and the `NameFacts` seam.
 pub mod names;
 pub mod path;
+/// File-level region scanner and its per-language rules.
+pub mod regions;
 pub mod render;
 /// Line, indentation and project-fact helpers shared by language support modules.
 pub mod text;
@@ -489,6 +493,10 @@ pub enum TestTarget {
     },
     /// Every test in one file or module.
     File(PathBuf),
+    /// Every test in several files or modules of one language, as ONE runner invocation; a
+    /// language whose runner cannot take them together answers [`LangError::Unsupported`] and
+    /// the caller runs each as a [`Self::File`] target.
+    Files(Vec<PathBuf>),
     /// A raw filter passed to the language's test runner.
     Pattern(String),
 }
@@ -637,6 +645,9 @@ pub enum LangError {
     Unparseable(String),
     /// The project has no runner or command for the request.
     Unsupported(String),
+    /// The target shape is valid but its configured project environment cannot run it. No child
+    /// has started; the message explains preparation/native recovery rather than argument repair.
+    Environment(String),
 }
 
 impl fmt::Display for LangError {
@@ -646,6 +657,7 @@ impl fmt::Display for LangError {
             Self::NotAContainer(path) => write!(f, "{path} has no members"),
             Self::Unparseable(reason) => write!(f, "unparseable source: {reason}"),
             Self::Unsupported(reason) => write!(f, "unsupported: {reason}"),
+            Self::Environment(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -662,8 +674,11 @@ pub trait LanguageSupport: Send + Sync {
     fn detect(&self, root: &Path) -> Option<LanguageProject>;
 
     /// Turns the server's document symbols for `file` into header-inclusive, path-addressed
-    /// symbols. `source` is the exact text the symbols were computed from. Test modules and test
-    /// functions get [`SymbolKind::Test`] so outlines can collapse them.
+    /// symbols. `source` is the exact text the symbols were computed from. Every column is in
+    /// UTF-16 code units, LSP's default, whatever the provider negotiated: the session converts
+    /// its answer ([`crate::intelligence::context::utf16_symbols`]) and a source outline builds
+    /// its symbols the same way. Test modules and test functions get [`SymbolKind::Test`] so
+    /// outlines can collapse them.
     fn normalize(&self, file: &Path, source: &str, symbols: Vec<lsp::DocumentSymbol>) -> Outline;
 
     /// Computes where `where_` relative to `anchor` lands, with the indentation the neighbours use.
@@ -675,8 +690,23 @@ pub trait LanguageSupport: Send + Sync {
         where_: InsertWhere,
     ) -> Result<InsertSite, LangError>;
 
+    /// Static facts the region scanner needs (comment markers, import and header statements,
+    /// block shape); see `symbol-address-v1` section 5. The default is the generic `//`, `/* */`
+    /// rule set with no imports.
+    fn region_rules(&self) -> &'static regions::RegionRules {
+        &regions::GENERIC_RULES
+    }
+
     /// Whether `file` is a test file by the language's conventions (`tests/`, `test_*.py`, `*.test.ts`).
     fn is_test_file(&self, file: &Path) -> bool;
+
+    /// Configuration families that decide how this language's test files compile and run, each
+    /// a list of alternative file names in preference order (`vitest.config.ts`, …;
+    /// `tsconfig.json`). Preparation delivers, for every delivered test file, the nearest
+    /// ancestor directory's first existing member of each family. The default declares none.
+    fn test_toolchain_configs(&self) -> &'static [&'static [&'static str]] {
+        &[]
+    }
 
     /// Builds the runner command for a target, run from the project root.
     fn test_selection(
@@ -684,6 +714,35 @@ pub trait LanguageSupport: Send + Sync {
         project: &LanguageProject,
         target: &TestTarget,
     ) -> Result<TestSelection, LangError>;
+
+    /// Declares the engine-specific setting for an IDE-selected test worker count.
+    /// Unclaimed commands retain their exact behavior; this never installs runner plugins.
+    fn test_worker_setting(
+        &self,
+        _argv: &[String],
+        _workers: std::num::NonZeroU16,
+    ) -> Option<crate::execution::test_workers::WorkerSetting> {
+        None
+    }
+
+    /// Resolves a command and applies only its language-declared test concurrency setting.
+    /// A missing count preserves the existing environment and command byte for byte.
+    fn configured_test_command_argv(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        argv: &[String],
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Result<Option<environment::CommandEnv>, LangError> {
+        let env = self.configured_command_argv(worktree, cwd, argv, config)?;
+        match config
+            .test_workers
+            .and_then(|workers| self.test_worker_setting(argv, workers))
+        {
+            Some(setting) => Ok(Some(setting.apply(argv, env))),
+            None => Ok(env),
+        }
+    }
 
     /// Parses runner output into counts and the first failures; never infers success from silence.
     fn parse_test_output(&self, stdout: &str, stderr: &str) -> TestReport;
@@ -695,6 +754,23 @@ pub trait LanguageSupport: Send + Sync {
     /// candidate that is not on disk yet. `file` is the relative path the text belongs to (formatters
     /// pick their config and language from it). `None` when the project has no formatter for it.
     fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>>;
+
+    /// Plans the formatter and its actual child cwd from the existing target-file context,
+    /// before activation/admission. The default preserves the old argv and worktree cwd.
+    /// Languages may select a contained project cwd or return an Environment refusal; the
+    /// authoritative worktree is never changed by the returned directory.
+    fn configured_format_stdin_command(
+        &self,
+        worktree: &Path,
+        project: &LanguageProject,
+        file: &Path,
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Result<Option<(Vec<String>, PathBuf)>, LangError> {
+        let _ = config;
+        Ok(self
+            .format_stdin_command(project, file)
+            .map(|argv| (argv, worktree.to_path_buf())))
+    }
 
     /// In-process structural check when this module has a parser available.
     /// Bounded like the lexical outline: a text the checker refuses to attempt is [`SyntaxVerdict::Unchecked`],
@@ -720,6 +796,46 @@ pub trait LanguageSupport: Send + Sync {
         configured: Option<&ProbePrograms>,
     ) -> Option<Vec<String>> {
         let _ = (project, root, file, configured);
+        None
+    }
+
+    /// Optional stdin-only source-outline probe using the same admitted programs as syntax checks.
+    /// Nonempty 1-based anchors request contextual spans instead of an outline. It must parse
+    /// supplied text without loading project configuration or resolving imports.
+    fn source_outline_probe_command(
+        &self,
+        project: &LanguageProject,
+        root: &Path,
+        file: &Path,
+        configured: Option<&ProbePrograms>,
+        anchors: &[u32],
+    ) -> Option<Vec<String>> {
+        let _ = (project, root, file, configured, anchors);
+        None
+    }
+
+    /// Validates a source-only probe answer against the exact input text; no semantic claims.
+    /// Invalid, truncated or unsupported answers return `None` and preserve the caller's fallback.
+    fn source_outline_probe_result(
+        &self,
+        file: &Path,
+        source: &str,
+        output: &str,
+    ) -> Option<Outline> {
+        let _ = (file, source, output);
+        None
+    }
+
+    /// Validates a source-context probe against source and 1-based failure anchors.
+    /// Returns complete selected line spans, or `None` to preserve the original selection.
+    fn source_context_probe_result(
+        &self,
+        file: &Path,
+        source: &str,
+        output: &str,
+        anchors: &[u32],
+    ) -> Option<Vec<LineRange>> {
+        let _ = (file, source, output, anchors);
         None
     }
 
@@ -759,6 +875,33 @@ pub trait LanguageSupport: Send + Sync {
         Vec::new()
     }
 
+    /// Resolves environments against the current accepted launcher facts of this request.
+    /// `config.worktree` is the admitted boundary; provider/check sections remain language-owned
+    /// opaque declarations. Implementations must not replace absent facts with ambient tool
+    /// guesses, run managers or enlarge read authority. Missing/incompatible preparation is a
+    /// resolution with no chosen candidate and an actionable cause. The default preserves
+    /// existing file-based resolution for languages that need no configured tools.
+    fn configured_environments(
+        &self,
+        worktree: &Path,
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Vec<environment::ResolvedEnv> {
+        let _ = config;
+        self.environments(worktree)
+    }
+
+    /// Detects project facts under this computation's read policy. Languages with guarded native
+    /// inputs override this before their existing detector reads files; unknown/refused discovery
+    /// returns no project, while environment resolution retains its actionable refusal.
+    fn configured_detect(
+        &self,
+        root: &Path,
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Option<LanguageProject> {
+        let _ = config;
+        self.detect(root)
+    }
+
     /// Accepts or refuses `selector` for the project `root` (relative to `worktree`) before it
     /// is stored. `Err` carries the cause and the way out: an unknown candidate with the
     /// candidates, or a project pin that overrides any selection. Admission of absolute paths
@@ -786,12 +929,109 @@ pub trait LanguageSupport: Send + Sync {
             })
     }
 
+    /// Plans activation for `program` in `cwd` under this request's current accepted config.
+    /// `None` means the language does not claim the program. An authoritative incompatible,
+    /// missing or denied environment must return `Environment` with its cause/native recovery,
+    /// rather than silently selecting ambient tools. Resolve before command/effect admission;
+    /// A preparation refusal uses `LangError::Environment`, separating native recovery from
+    /// unsupported argument shapes. A successful activation never authorizes changing an
+    /// already admitted specification.
+    /// The default preserves existing activation for unaffected languages.
+    fn configured_command_env(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        program: &str,
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Result<Option<environment::CommandEnv>, LangError> {
+        let _ = config;
+        Ok(self.command_env(worktree, cwd, program))
+    }
+
+    /// Resolves activation with the actual argv, so a language can honor explicit project
+    /// selectors before admission. The default preserves the existing program-only hook;
+    /// empty argv is unclaimed. Arguments convey no execution or read authority.
+    fn configured_command_argv(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        argv: &[String],
+        config: &crate::modules::contract::ModuleConfig,
+    ) -> Result<Option<environment::CommandEnv>, LangError> {
+        match argv.first() {
+            Some(program) => self.configured_command_env(worktree, cwd, program, config),
+            None => Ok(None),
+        }
+    }
+
     /// First module documentation line of a file's `text` (a directory outline shows it next to
     /// the file), or `None` (the default) when the language has no module-doc convention or the
     /// file has none.
     fn file_doc(&self, text: &str) -> Option<String> {
         let _ = text;
         None
+    }
+
+    /// Files, relative to a directory, whose module documentation describes that directory as a
+    /// package (a project map shows it next to the directory), in preference order. The default
+    /// declares none.
+    fn package_doc_files(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Exact relative files `manifest_description` may read; an empty list disables that read in
+    /// ignore-aware project trees. Implementations must declare every file they inspect.
+    fn manifest_description_files(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The description this language's package manifest in `directory` declares, read from the
+    /// file as plain text, or `None` (the default) when there is no manifest, no description or
+    /// the manifest cannot be read.
+    fn manifest_description(&self, directory: &Path) -> Option<String> {
+        let _ = directory;
+        None
+    }
+
+    /// Collects requested source-only details from the same immutable bytes. Languages may
+    /// reuse one parser tree; disabled consumers are not invoked. Missing results are unavailable.
+    fn source_details(
+        &self,
+        file: &Path,
+        source: &str,
+        imports: bool,
+        outline: bool,
+    ) -> (Option<Vec<LineRange>>, Option<Outline>) {
+        (
+            imports
+                .then(|| self.source_import_spans(file, source))
+                .flatten(),
+            outline
+                .then(|| self.outline_from_source(file, source))
+                .flatten(),
+        )
+    }
+
+    /// Returns syntax-backed import statement spans for operator collection. No imports are
+    /// executed or resolved; `None` is unavailable, distinct from an available empty list.
+    fn source_import_spans(&self, file: &Path, source: &str) -> Option<Vec<LineRange>> {
+        let _ = file;
+        Some(regions::import_spans(
+            &source.lines().collect::<Vec<_>>(),
+            self.region_rules(),
+        ))
+    }
+
+    /// Specifier-content byte ranges of imports proven type-only from this exact source.
+    /// Pure syntax only: no file reads or import resolution. The empty default leaves every
+    /// reference runtime-or-unknown; callers must not infer erasure from missing metadata.
+    fn source_type_only_references(
+        &self,
+        file: &Path,
+        source: &str,
+    ) -> Vec<std::ops::Range<usize>> {
+        let _ = (file, source);
+        Vec::new()
     }
 
     /// Outline computed from the text alone; `None` (the default) keeps outlines server-backed.
@@ -905,6 +1145,37 @@ pub fn kind_of(kind: lsp::SymbolKind) -> SymbolKind {
     }
 }
 
+/// The basic string value of `key` inside the `[section]` table of a TOML manifest, read line
+/// by line without a TOML parser: `key = "value"` or `key = 'value'` on one line. Escapes and
+/// multi-line strings are not interpreted and yield `None`, never a partial value.
+pub fn toml_section_string(text: &str, section: &str, key: &str) -> Option<String> {
+    let header = format!("[{section}]");
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            inside = line == header;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+        let value = value.trim();
+        let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let inner = value.strip_prefix(quote)?;
+        let end = inner.find(quote)?;
+        let inner = &inner[..end];
+        return (!inner.contains('\\') && !value.starts_with("\"\"\"")).then(|| inner.to_owned());
+    }
+    None
+}
+
 /// Neutral languages for unit tests of language-independent code.
 ///
 /// They carry identity, ordering, extensions and a root-marker presence rule but no real
@@ -922,6 +1193,30 @@ pub(crate) mod testing {
     struct Support(&'static str);
 
     impl LanguageSupport for Support {
+        /// Beta fixture lines starting with `!types ` mark their ref tokens as type-only.
+        fn source_type_only_references(
+            &self,
+            _file: &Path,
+            source: &str,
+        ) -> Vec<std::ops::Range<usize>> {
+            let mut ranges = Vec::new();
+            if self.0 != "beta" {
+                return ranges;
+            }
+            let mut offset = 0;
+            for line in source.split_inclusive('\n') {
+                if line.starts_with("!types ") {
+                    for (start, _) in line.match_indices("ref:") {
+                        let end = line[start..]
+                            .find(char::is_whitespace)
+                            .map_or(line.len(), |end| start + end);
+                        ranges.push(offset + start..offset + end);
+                    }
+                }
+                offset += line.len();
+            }
+            ranges
+        }
         /// The stubbed language.
         fn language(&self) -> Language {
             Language::by_id(self.0)
@@ -932,12 +1227,14 @@ pub(crate) mod testing {
                 })
                 .expect("a test language")
         }
-        /// Detects marker-based environment fixtures and a root `fmt.toml` project whose only
-        /// command is the stdin formatter below, so core tests can exercise a formatting edit
-        /// without a real toolchain.
+        /// Detects marker-based environment fixtures, a root `fmt.toml` project whose only
+        /// command is the stdin formatter below (so core tests can exercise a formatting edit
+        /// without a real toolchain), and an epsilon project marked by a root `epsilon.toml` (so
+        /// the start card lists the fixture server's language).
         fn detect(&self, root: &Path) -> Option<LanguageProject> {
             ((self.0 == "gamma" && root.join("fmt.toml").exists())
-                || (self.0 == "alpha" && root.join("env.fixture").exists()))
+                || (self.0 == "alpha" && root.join("env.fixture").exists())
+                || (self.0 == "epsilon" && root.join("epsilon.toml").exists()))
             .then(|| LanguageProject {
                 language: self.language(),
                 manifests: vec![PathBuf::from("fmt.toml")],
@@ -1044,10 +1341,64 @@ pub(crate) mod testing {
             })
         }
 
+        /// The Gamma fixture projects its explicit launcher path and its test-only interpreter
+        /// activation so admission tests distinguish identity, unchanged, substituted and ambient
+        /// programs. Others retain their unchanged activation; this creates no production tool
+        /// qualification.
+        fn configured_command_env(
+            &self,
+            worktree: &Path,
+            cwd: &Path,
+            program: &str,
+            config: &crate::modules::contract::ModuleConfig,
+        ) -> Result<Option<environment::CommandEnv>, LangError> {
+            if self.0 == "gamma" && program == "node" {
+                return Ok(config
+                    .checks
+                    .as_ref()
+                    .and_then(|checks| checks.get("node"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|path| environment::CommandEnv {
+                        argv_prefix: vec![path.into()],
+                        ..Default::default()
+                    }));
+            }
+            if self.0 == "gamma"
+                && let Some(checks) = config.checks.as_ref()
+                && checks
+                    .get("interpreter")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(program)
+            {
+                let prefix = match checks
+                    .get("interpreter_prefix")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("identity") => vec![Path::new(program).as_os_str().to_os_string()],
+                    Some("substitute") => {
+                        vec![
+                            Path::new(program)
+                                .with_file_name("substituted-program")
+                                .into_os_string(),
+                        ]
+                    }
+                    _ => Vec::new(),
+                };
+                return Ok(Some(environment::CommandEnv {
+                    argv_prefix: prefix,
+                    path_prefix: Path::new(program).parent().map(Path::to_path_buf),
+                    vars: Vec::new(),
+                }));
+            }
+            Ok(self.command_env(worktree, cwd, program))
+        }
+
         /// An outline with no symbols, except for epsilon: it keeps each top-level server symbol
         /// the way epsilon's source outline reads a `sym <name>` … `end` block (kind `Other`,
         /// signature `sym <name>`, the lines of its range), as the opt-in contract of
-        /// [`LanguageSupport::outline_while_loading`] requires.
+        /// [`LanguageSupport::outline_while_loading`] requires. A server `STRUCT` symbol becomes
+        /// kind `Struct` and an `OBJECT` symbol kind `Impl` (the scripted `structImpl` session's
+        /// declaration and its impl block, which share one address).
         fn normalize(
             &self,
             file: &Path,
@@ -1065,7 +1416,11 @@ pub(crate) mod testing {
                                 Some(file.to_path_buf()),
                                 vec![symbol.name.clone()],
                             ),
-                            kind: SymbolKind::Other,
+                            kind: match symbol.kind {
+                                lsp::SymbolKind::STRUCT => SymbolKind::Struct,
+                                lsp::SymbolKind::OBJECT => SymbolKind::Impl,
+                                _ => SymbolKind::Other,
+                            },
                             signature: format!("sym {}", symbol.name),
                             name: symbol.name,
                             range,
@@ -1095,6 +1450,10 @@ pub(crate) mod testing {
         ) -> Result<InsertSite, LangError> {
             Err(LangError::UnknownSymbol(anchor.clone()))
         }
+        /// A runner family (`runner.config`, else `runner.base`) and a `types.config` family.
+        fn test_toolchain_configs(&self) -> &'static [&'static [&'static str]] {
+            &[&["runner.config", "runner.base"], &["types.config"]]
+        }
         /// Files named `test_*` are tests.
         fn is_test_file(&self, file: &Path) -> bool {
             file.file_name()
@@ -1116,6 +1475,32 @@ pub(crate) mod testing {
                 failed: stdout.lines().filter(|line| *line == "fail").count() as u32,
                 ..TestReport::default()
             }
+        }
+        /// `pkg.alpha` (then `pkg.beta`, …) documents its directory as a package.
+        fn package_doc_files(&self) -> &'static [&'static str] {
+            match self.0 {
+                "alpha" => &["pkg.alpha"],
+                _ => &[],
+            }
+        }
+        /// Exact manifest used by the synthetic alpha language.
+        fn manifest_description_files(&self) -> &'static [&'static str] {
+            if self.0 == "alpha" {
+                &["manifest.alpha"]
+            } else {
+                &[]
+            }
+        }
+        /// An alpha manifest is a `manifest.alpha` whose `description:` line is the description.
+        fn manifest_description(&self, directory: &Path) -> Option<String> {
+            if self.0 != "alpha" {
+                return None;
+            }
+            std::fs::read_to_string(directory.join("manifest.alpha"))
+                .ok()?
+                .lines()
+                .find_map(|line| line.strip_prefix("description:"))
+                .map(|value| value.trim().to_owned())
         }
         /// A leading `#!doc ` line is the module documentation.
         fn file_doc(&self, text: &str) -> Option<String> {
@@ -1477,7 +1862,10 @@ pub(crate) mod testing {
     /// document symbols (one function, `a`), an empty reference list and an empty workspace-symbol
     /// list, and fails every call-hierarchy request with an error reply, so tests can drive the
     /// worker's real exchange-failure paths. `failing` additionally names requests
-    /// (`"documentSymbol"`, `"references"`, `"workspaceSymbol"`) that fail with an error reply.
+    /// (`"documentSymbol"`, `"references"`, `"workspaceSymbol"`) that fail with an error reply,
+    /// `"structImpl"` makes document symbols answer a struct `a` and its impl block `a` instead
+    /// of the function (see [`fixture_struct_impl_symbols`]), and `"loading"` opens a session
+    /// that never reports readiness, so it stays loading (a warming server).
     ///
     /// The latest call for a binding wins, but only for the next session opened for it: a session
     /// that already exists keeps its script until it is released.
@@ -1492,10 +1880,19 @@ pub(crate) mod testing {
     }
 
     /// Profile of the scripted fixture session: accepts any server, opens `.epsilon` as `epsilon`.
+    /// `loading` names a readiness notification the scripted server never sends, so the session
+    /// stays loading.
     #[derive(Debug)]
-    struct FixtureProfile;
+    struct FixtureProfile {
+        /// Whether the session waits for a readiness notification that never comes.
+        loading: bool,
+    }
 
     impl crate::intelligence::session::SessionProfile for FixtureProfile {
+        /// `fixture/status` for a loading session (never sent), else none: usable at once.
+        fn status_method(&self) -> Option<&'static str> {
+            self.loading.then_some("fixture/status")
+        }
         /// An empty configuration object.
         fn workspace_configuration(&self) -> serde_json::Value {
             serde_json::json!({})
@@ -1525,6 +1922,19 @@ pub(crate) mod testing {
             selection_range: lsp::Range::new(lsp::Position::new(0, 4), lsp::Position::new(0, 5)),
             children: None,
         }]
+    }
+
+    /// The document symbols of a scripted `structImpl` session: a struct `a` over both lines of
+    /// `sym a\nend\n` and an impl block `a` over the same lines, which normalize to one address
+    /// with kinds `Struct` and `Impl`, the shape a language server gives a type and its impl block.
+    #[allow(deprecated)]
+    pub(crate) fn fixture_struct_impl_symbols() -> Vec<async_lsp::lsp_types::DocumentSymbol> {
+        use async_lsp::lsp_types as lsp;
+        let mut declaration = fixture_document_symbols().remove(0);
+        declaration.kind = lsp::SymbolKind::STRUCT;
+        let mut implementation = declaration.clone();
+        implementation.kind = lsp::SymbolKind::OBJECT;
+        vec![declaration, implementation]
     }
 
     /// Opens a live session against a scripted in-process language server (see
@@ -1571,7 +1981,11 @@ pub(crate) mod testing {
                     ));
                 }
                 Ok(Some(lsp::DocumentSymbolResponse::Nested(
-                    fixture_document_symbols(),
+                    if failing.contains(&"structImpl") {
+                        fixture_struct_impl_symbols()
+                    } else {
+                        fixture_document_symbols()
+                    },
                 )))
             });
             router.request::<request::References, _>(move |_, _| async move {
@@ -1606,7 +2020,9 @@ pub(crate) mod testing {
             source.worktree().clone(),
             source.authority_epoch(),
             crate::intelligence::freshness::ViewGeneration::default(),
-            crate::intelligence::session::ProviderSettings::new(FixtureProfile),
+            crate::intelligence::session::ProviderSettings::new(FixtureProfile {
+                loading: failing.contains(&"loading"),
+            }),
             std::time::Duration::from_secs(5),
         )
         .await

@@ -2,7 +2,7 @@
 
 Each Agent IDE release publishes one `aarch64-apple-darwin` archive plus `install.sh`,
 `SHA256SUMS`, `release-manifest.json` and `acceptance.json`. macOS arm64 is the only claimed platform; Linux remains explicitly `not_tested`
-and has no release artifact.
+and has no published release artifact. Local packaging accepts Linux x86_64 and aarch64 ELF executables; these candidate archives are not release-qualified.
 
 Publication and installation are separate boundaries: a green publication workflow does not
 prove a production cutover, and a local install never publishes to GitHub.
@@ -30,6 +30,15 @@ own manifest (`metadata.json`, `SHA256SUMS`, `COMPLETE`). It keeps immutable ver
 plugin under `~/.local/share/agent-ide/plugin/<version>` with a `plugin/current` symlink, and
 places a managed launcher shim at `~/.local/bin/agent-ide`. Repeating the command updates;
 the same version is a no-op; an existing version is never overwritten with different bytes.
+
+Linux local installs keep the same fail-closed rule for `self-install --replace` and retired
+release cleanup as cache retention: namespace-local `/proc` cannot prove that a shared release
+has no running users. Install a new version instead; byte-identical refreshes remain supported.
+An `ETXTBSY` write-open guard is insufficient to lift this restriction, even on ext4: it excludes
+execution of one inode, but another writer can replace the executable's directory entry while
+that guard remains open. The install lock is advisory, and a pinned directory or quarantine
+rename does not exclude that replacement. Unknown process visibility therefore preserves the
+release rather than relying on a check that can race its deletion.
 
 `install.sh --version X.Y.Z` pins a published release; omitting the version uses the latest
 stable GitHub Release. To pin a version or choose directories, download `install.sh` and run:
@@ -114,22 +123,29 @@ release_root="$(mktemp -d)"
 version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
 cargo build --locked --release --bin agent-ide
 scripts/package-release.sh target/release/agent-ide "v$version" "$release_root"
-tar -xzf "$release_root/agent-ide-v$version-aarch64-apple-darwin.tar.gz" -C "$release_root"
+archive="$(find "$release_root" -name "agent-ide-v$version-*.tar.gz" -print)"
+cargo xtask package verify "$archive"
+tar -xzf "$archive" -C "$release_root"
 "$release_root/agent-ide-v$version/agent-ide" self-install --release "$release_root/agent-ide-v$version" --version "$version"
 ```
 
-`package-release.sh` (a thin wrapper over `cargo xtask package`) verifies that the tag matches the plugin manifest versions and produces
+`package-release.sh` (a thin wrapper over `cargo xtask package`) identifies the executable format and architecture, verifies that the tag matches the plugin manifest versions and produces
 the bundle (`agent-ide`, plugin manifests, marketplace catalogs, hooks, skill, this guide,
 `metadata.json`, `SHA256SUMS`, `COMPLETE`) plus the tarball and its `SHA256SUMS`; it writes only
 those two files, so the tarball is extracted before `self-install` runs the installer's own code
 path on that local bundle. The release workflow verifies the tag against the Cargo version before
-packaging. The temporary build directory may be removed after installation. Use a new version for
+packaging. Linux archive names use `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`; the ELF header checks OS ABI and CPU architecture, not the installed libc or kernel compatibility. The temporary build directory may be removed after installation. Use a new version for
 changed source: the installer never overwrites an existing version with different bytes (source
-builds may pass `self-install --replace` — `scripts/install-local.sh` does — to rebuild a
-same-version release; it refuses while a live process, a running front or daemon, executes from
-that release directory). A scratch install that names `--home` or `--prefix` without `--bin-dir`
+builds on macOS may pass `self-install --replace` — `scripts/install-local.sh` does — to rebuild a
+same-version release only when no live process executes from it). Linux refuses replacement of a
+different same-version build because namespace-local process listings cannot prove global absence.
+Fresh installs and identical reinstalls still work; use a new version for changed Linux source. A scratch install that names `--home` or `--prefix` without `--bin-dir`
 and `--share-dir` puts the launcher in `<home or prefix>/bin` and the plugin root in
 `<home or prefix>/share/agent-ide`, never in `~/.local`.
+
+Linux retention also pauses cache, release, trash and Claude hint cleanup while process visibility
+across PID namespaces is unknown; retained state can exceed its budgets and consume additional disk.
+See [cache retention](cache-retention.md) for the limits.
 
 For a development install without a release bundle, `scripts/install-local.sh [--prefix DIR]
 [--no-build]` builds this checkout, packages and extracts the sealed bundle, and installs it
@@ -152,8 +168,9 @@ user home):
   The bundle is staged in a temporary directory and renamed into place. Re-running the installer
   while `plugin/current` already selects the same version is refresh-only: the release and plugin
   directories stay untouched and only the launcher shim is rewritten (`self-install` reports
-  `action:"refreshed"`); the script passes `--replace`, so a same-version release with different
-  bytes is rebuilt instead of refused.
+  `action:"refreshed"`). The script passes `--replace`: a different same-version release can be
+  rebuilt on macOS after the process check, but Linux refuses it because global process visibility
+  is unknown; use a new version instead.
 - `<prefix>/share/agent-ide/plugin/current` — a symlink to the just-installed version directory,
   swapped atomically (staged as `.current-next-<pid>-<unique>`, then renamed over the link).
 

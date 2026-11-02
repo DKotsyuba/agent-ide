@@ -20,7 +20,7 @@ use std::{
 };
 
 use super::{
-    contract::{Capability, ModuleUnavailable},
+    contract::{Capability, ModuleConfig, ModuleUnavailable},
     mode::Mode,
     payload::{
         AnalysisScopeRequest, AnalyzeSource, AnchorBatch, CheckSelectionAnswer, CommandEnvAnswer,
@@ -41,6 +41,18 @@ use crate::lang::{
 /// The daemon's module routing, installed once at startup.
 static HOST: OnceLock<Arc<ModuleHost>> = OnceLock::new();
 
+/// Immutable current facts for an operation without a selected job target. Daemon callers with
+/// a target pass its explicit launcher context instead. An absent host supplies no tool proof.
+pub fn module_config(language: Language, worktree: &Path) -> ModuleConfig {
+    HOST.get().map_or_else(
+        || ModuleConfig {
+            worktree: Some(worktree.to_path_buf()),
+            ..Default::default()
+        },
+        |host| host.module_config(language, worktree),
+    )
+}
+
 /// Installs the daemon's module routing; later calls keep the first host.
 pub fn install(host: Arc<ModuleHost>) {
     let _ = HOST.set(host);
@@ -59,15 +71,13 @@ pub fn checker(
     section: &serde_json::Value,
     runner: Arc<dyn crate::checks::runner::ConfinedRunner>,
     timeout: std::time::Duration,
+    config: &ModuleConfig,
 ) -> Option<Arc<dyn crate::checks::Checker>> {
     let host = module(language)?.clone();
-    Some(Arc::new(super::checker::ModuleChecker::new(
-        language,
-        host,
-        section.clone(),
-        runner,
-        timeout,
-    )))
+    Some(Arc::new(
+        super::checker::ModuleChecker::new(language, host, section.clone(), runner, timeout)
+            .with_config(config.clone()),
+    ))
 }
 
 /// The daemon's modes line for `languages` ([`ModuleHost::modes_line`]); `None` without a host
@@ -82,6 +92,15 @@ pub fn module_executable(
     language: Language,
 ) -> Option<Routed<Arc<super::launch::ModuleExecutable>>> {
     Some(module(language)?.executable(language))
+}
+
+/// Stops and reaps every module slot of `worktree` after its last workspace grant was revoked.
+/// Callers must preserve slots while another actor still owns a grant there. An absent host is
+/// harmless; the host retains its existing quarantine and admission on unproven cleanup.
+pub async fn stop_worktree(worktree: &Path) {
+    if let Some(host) = HOST.get() {
+        host.stop_worktree(worktree).await;
+    }
 }
 
 /// Where `language` computes in this process.
@@ -383,16 +402,23 @@ fn field<T>(value: Field<T>, default: T) -> T {
     }
 }
 
-/// `LanguageSupport::detect`.
-pub async fn detect(language: Language, root: &Path) -> Routed<Option<LanguageProject>> {
+/// `LanguageSupport::detect` with the stored selections, which the module applies before
+/// reading manifests: a detected environment (and the commands planned from it) always reflects
+/// the current `ide.start environment` choice, not the instance's last-seen one.
+pub async fn detect(
+    language: Language,
+    root: &Path,
+    config: &ModuleConfig,
+) -> Routed<Option<LanguageProject>> {
     match module(language) {
         None => {
             let root = root.to_path_buf();
-            Ok(
-                tokio::task::spawn_blocking(move || language.support().detect(&root))
-                    .await
-                    .unwrap_or(None),
-            )
+            let config = config.clone();
+            Ok(tokio::task::spawn_blocking(move || {
+                language.support().configured_detect(&root, &config)
+            })
+            .await
+            .unwrap_or(None))
         }
         Some(host) => {
             host.request::<DetectAnswer>(
@@ -400,7 +426,9 @@ pub async fn detect(language: Language, root: &Path) -> Routed<Option<LanguagePr
                 root,
                 Capability::Project,
                 encode(&ProjectQuery::Detect {
+                    config: config.clone(),
                     root: root.to_path_buf(),
+                    selections: environment::selections(root, language),
                 }),
                 Vec::new(),
             )
@@ -413,15 +441,19 @@ pub async fn detect(language: Language, root: &Path) -> Routed<Option<LanguagePr
 pub async fn environments(
     language: Language,
     worktree: &Path,
+    config: &ModuleConfig,
 ) -> Routed<Vec<environment::ResolvedEnv>> {
     match module(language) {
         None => {
             let worktree = worktree.to_path_buf();
-            Ok(
-                tokio::task::spawn_blocking(move || language.support().environments(&worktree))
-                    .await
-                    .unwrap_or_default(),
-            )
+            let config = config.clone();
+            Ok(tokio::task::spawn_blocking(move || {
+                language
+                    .support()
+                    .configured_environments(&worktree, &config)
+            })
+            .await
+            .unwrap_or_default())
         }
         Some(host) => {
             host.request::<EnvironmentsAnswer>(
@@ -429,6 +461,7 @@ pub async fn environments(
                 worktree,
                 Capability::Project,
                 encode(&ProjectQuery::Environments {
+                    config: config.clone(),
                     worktree: worktree.to_path_buf(),
                     selections: environment::selections(worktree, language),
                 }),
@@ -471,15 +504,35 @@ pub async fn command_env(
     worktree: &Path,
     cwd: &Path,
     program: &str,
-) -> Routed<Option<environment::CommandEnv>> {
+    config: &ModuleConfig,
+) -> Routed<CommandEnvAnswer> {
+    command_env_argv(language, worktree, cwd, &[program.to_owned()], config).await
+}
+
+/// Current command activation with actual argv; existing program-only callers remain valid.
+/// The module sees selectors before planning, never a mutation of an admitted specification.
+pub async fn command_env_argv(
+    language: Language,
+    worktree: &Path,
+    cwd: &Path,
+    argv: &[String],
+    config: &ModuleConfig,
+) -> Routed<CommandEnvAnswer> {
+    let Some(program) = argv.first() else {
+        return Ok(Ok(None));
+    };
     match module(language) {
-        None => Ok(language.support().command_env(worktree, cwd, program)),
+        None => Ok(language
+            .support()
+            .configured_test_command_argv(worktree, cwd, argv, config)),
         Some(host) => {
             host.request::<CommandEnvAnswer>(
                 language,
                 worktree,
                 Capability::Project,
                 encode(&ProjectQuery::CommandEnv {
+                    args: argv[1..].to_vec(),
+                    config: config.clone(),
                     worktree: worktree.to_path_buf(),
                     cwd: cwd.to_path_buf(),
                     program: program.to_owned(),
@@ -684,6 +737,7 @@ pub async fn test_run(
     project: &LanguageProject,
     target: &TestTarget,
     budget: std::time::Duration,
+    config: &ModuleConfig,
 ) -> Routed<Result<PlannedRun, LangError>> {
     let Some(host) = module(language) else {
         return Ok(language
@@ -701,6 +755,7 @@ pub async fn test_run(
             worktree,
             Capability::TestPlan,
             encode(&TestPlanQuery::Run {
+                config: config.clone(),
                 project: Box::new(project.clone()),
                 target: target.clone(),
             }),
@@ -710,7 +765,8 @@ pub async fn test_run(
     let Ok(run) = run else {
         return Ok(Err(run.unwrap_err()));
     };
-    let (command, start) = plan_admitted(language, worktree, &run.effect, budget)?;
+    let (command, start) =
+        plan_admitted_configured(language, worktree, &run.effect, budget, config)?;
     Ok(Ok(PlannedRun {
         tests: run.tests,
         command,
@@ -722,12 +778,35 @@ pub async fn test_run(
 /// class `test` is considered (anything else is refused before any other check); a declared home
 /// tool that is not installed fails to start exactly as the in-process command would, naming the
 /// program; otherwise the core-admitted expansion.
+#[cfg(test)]
 fn plan_admitted(
     language: Language,
     worktree: &Path,
     effect: &EffectRequest,
     budget: std::time::Duration,
 ) -> Routed<(Vec<String>, PlannedStart)> {
+    plan_admitted_configured(language, worktree, effect, budget, &ModuleConfig::default())
+}
+
+/// Expands a selected test under its actual per-request resolved environment and read policy.
+fn plan_admitted_configured(
+    language: Language,
+    worktree: &Path,
+    effect: &EffectRequest,
+    budget: std::time::Duration,
+    config: &ModuleConfig,
+) -> Routed<(Vec<String>, PlannedStart)> {
+    // The module may echo only this invocation's trusted worker setting, never arbitrary
+    // extra runner arguments through an environment recipe parameter.
+    if let Some(value) = effect.params.get("test_workers") {
+        let valid = config.test_workers.is_some_and(|count| {
+            matches!(value, super::payload::Param::Token(value)
+                if value == &count.to_string() || value == &format!("-n {count}"))
+        });
+        if !valid {
+            return Err(policy_refused(language));
+        }
+    }
     let tests: Vec<super::payload::EffectRecipe> = super::recipe::declared(language.name())
         .iter()
         .filter(|recipe| recipe.class == super::payload::RunClass::Test)
@@ -745,12 +824,14 @@ fn plan_admitted(
             PlannedStart::MissingTool(name.to_owned()),
         ));
     }
-    let spec = admitted(
+    let spec = admitted_with(
         language,
-        worktree,
+        (worktree, worktree),
         effect,
         super::payload::RunClass::Test,
         budget,
+        &[],
+        config,
     )?;
     Ok((
         shown_command(tool.map(|(name, _)| name), &spec),
@@ -881,8 +962,15 @@ pub fn tool_path() -> String {
 /// the language's declared recipes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StdinRun {
-    /// Run as the in-process path always has (formatter PATH, daemon environment).
-    Argv(Vec<String>),
+    /// Native argv with its language-resolved environment, applied before job admission.
+    Argv {
+        /// Actual child directory selected before admission; worktree authority stays separate.
+        cwd: PathBuf,
+        /// Program and arguments from the language's formatter or probe planner.
+        argv: Vec<String>,
+        /// Current project activation; absent when the language does not claim this program.
+        environment: Option<environment::CommandEnv>,
+    },
     /// Run exactly this core-built specification.
     Spec(crate::checks::runner::RunSpec),
 }
@@ -895,17 +983,20 @@ pub enum StdinRun {
 fn stdin_run(
     language: Language,
     worktree: &Path,
+    cwd: &Path,
     effect: Option<EffectRequest>,
     configured: &[&Path],
+    config: &ModuleConfig,
 ) -> Routed<Option<StdinRun>> {
     match effect {
         Some(effect) => admitted_with(
             language,
-            worktree,
+            (worktree, cwd),
             &effect,
             super::payload::RunClass::Interactive,
             std::time::Duration::from_secs(10),
             configured,
+            config,
         )
         .map(|spec| Some(StdinRun::Spec(spec))),
         None => Ok(None),
@@ -914,6 +1005,7 @@ fn stdin_run(
 
 /// Expands `effect` under the core's interactive admission (see [`stdin_run`]) with `timeout`; a
 /// request outside the language's declared recipes of `class` is refused as `policy_refused`.
+#[cfg(test)]
 fn admitted(
     language: Language,
     worktree: &Path,
@@ -921,19 +1013,31 @@ fn admitted(
     class: super::payload::RunClass,
     timeout: std::time::Duration,
 ) -> Routed<crate::checks::runner::RunSpec> {
-    admitted_with(language, worktree, effect, class, timeout, &[])
+    admitted_with(
+        language,
+        (worktree, worktree),
+        effect,
+        class,
+        timeout,
+        &[],
+        &ModuleConfig::default(),
+    )
 }
 
-/// [`admitted`] with `configured`: operator-declared programs of the launcher configuration (a
-/// probe's Node and package), admitted as roots beside the declared install roots.
+/// Recipe admission with `configured`: operator-declared programs of the launcher configuration (a
+/// probe's Node and package), plus the current config's host-resolved environment roots, admitted
+/// beside the declared install roots. `scope` keeps the authoritative worktree separate from the
+/// actual child cwd throughout expansion; host read denies remain in force for every root.
 fn admitted_with(
     language: Language,
-    worktree: &Path,
+    scope: (&Path, &Path),
     effect: &EffectRequest,
     class: super::payload::RunClass,
     timeout: std::time::Duration,
     configured: &[&Path],
+    config: &ModuleConfig,
 ) -> Routed<crate::checks::runner::RunSpec> {
+    let (worktree, cwd) = scope;
     let refused = || policy_refused(language);
     if !super::recipe::declared(language.name())
         .iter()
@@ -943,19 +1047,88 @@ fn admitted_with(
     }
     let recipes = super::recipe::declared(language.name());
     let path = tool_path();
-    let programs: Vec<(String, PathBuf)> = recipes
+    let recipe = recipes
         .iter()
-        .flat_map(|recipe| recipe.executables.iter())
-        .filter_map(|slot| match slot.source {
-            super::payload::SlotSource::HomeTool(name) => Some((
-                name.to_owned(),
-                crate::execution::job::executable_on(name, worktree, &path)?,
-            )),
-            super::payload::SlotSource::Launcher(_) => None,
-        })
-        .collect();
+        .find(|recipe| recipe.id == effect.recipe)
+        .ok_or_else(refused)?;
+    let mut programs = Vec::new();
+    for slot in recipe.executables.iter().filter(|slot| {
+        effect.params.values().any(
+            |param| matches!(param, super::payload::Param::Executable(name) if name == slot.name),
+        )
+    }) {
+        let (name, program) = match slot.source {
+            super::payload::SlotSource::HomeTool(name) => {
+                let Some(program) = crate::execution::job::executable_on(name, worktree, &path)
+                else {
+                    continue;
+                };
+                (name, program)
+            }
+            super::payload::SlotSource::Launcher(name) => {
+                let activation = language
+                    .support()
+                    .configured_command_argv(worktree, cwd, &[name.to_owned()], config)
+                    .map_err(|_| refused())?
+                    .ok_or_else(refused)?;
+                // A program slot cannot encode an interpreter prefix or activation vars. Those
+                // require explicit recipe arguments/environment before admission, never edits
+                // to the expanded spec or silent loss of activation.
+                let [program] = activation.argv_prefix.as_slice() else {
+                    return Err(refused());
+                };
+                if !activation.vars.is_empty() || activation.path_prefix.is_some() {
+                    return Err(refused());
+                }
+                let program = PathBuf::from(program);
+                if !crate::assistance::launcher::absolute(&program)
+                    || !environment::readable(&program, &config.read_denies)
+                {
+                    return Err(refused());
+                }
+                (name, program)
+            }
+        };
+        programs.push((name.to_owned(), program));
+    }
     let mut roots = super::recipe::declared_roots(language.name());
-    roots.extend(super::recipe::environment_roots(language.name(), worktree));
+    roots.extend(programs.iter().map(|(_, program)| program.clone()));
+    // A path program can be vouched for by the same trusted language resolver in the actual
+    // cwd. An empty prefix preserves the requested executable; one exact prefix is also safe.
+    // Any other replacement is refused before adding its executable/bin roots.
+    if let Some(super::payload::Param::Path(program)) = effect.params.get(recipe.program) {
+        let name = program.to_str().ok_or_else(refused)?;
+        if let Some(activation) = language
+            .support()
+            .configured_command_argv(worktree, cwd, &[name.to_owned()], config)
+            .map_err(|_| refused())?
+        {
+            if !activation.argv_prefix.is_empty()
+                && activation.argv_prefix.as_slice() != [program.as_os_str().to_os_string()]
+            {
+                return Err(refused());
+            }
+            roots.push(program.clone());
+            roots.extend(activation.path_prefix);
+        }
+    }
+    roots.extend(super::recipe::environment_roots(
+        language.name(),
+        worktree,
+        config,
+    ));
+    // The trusted compiled support resolves current immutable launcher facts, never a root
+    // proposed by a module. Refused environments add no authority.
+    if config.provider.is_some() || config.checks.is_some() {
+        roots.extend(
+            language
+                .support()
+                .configured_environments(worktree, config)
+                .into_iter()
+                .filter(|environment| environment.missing_next_step.is_none())
+                .filter_map(|environment| environment.chosen.map(|candidate| candidate.path)),
+        );
+    }
     // The operator-declared programs of the launcher configuration (a probe's Node and package).
     roots.extend(configured.iter().map(|path| path.to_path_buf()));
     let developer_dirs = super::recipe::platform_developer_dirs();
@@ -964,14 +1137,14 @@ fn admitted_with(
     let admission = super::recipe::Admission {
         worktree,
         cache_dir: &scratch,
-        read_denies: &[],
+        read_denies: &config.read_denies,
         home: home.as_deref(),
         launcher_roots: &roots,
         developer_dirs: &developer_dirs,
         programs: &programs,
         timeout,
     };
-    super::recipe::expand(recipes, effect, &admission).map_err(|_| refused())
+    super::recipe::expand_at(recipes, effect, &admission, cwd).map_err(|_| refused())
 }
 
 /// The typed refusal of a module request outside the language's declared recipes.
@@ -993,26 +1166,49 @@ pub async fn format_stdin_command(
     worktree: &Path,
     project: &LanguageProject,
     file: &Path,
-) -> Routed<Option<StdinRun>> {
+    config: &ModuleConfig,
+) -> Routed<Result<Option<StdinRun>, LangError>> {
+    let (argv, cwd) = match language
+        .support()
+        .configured_format_stdin_command(worktree, project, file, config)
+    {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return Ok(Ok(None)),
+        Err(error) => return Ok(Err(error)),
+    };
+    let cwd = match crate::assistance::launcher::admit_path(&[worktree.to_path_buf()],&cwd) {
+        Ok(cwd) if cwd.is_dir() => cwd,
+        _ => return Ok(Err(LangError::Environment("formatter directory is unavailable or outside the admitted worktree; use native formatting".into()))),
+    };
     match module(language) {
         None => Ok(language
             .support()
-            .format_stdin_command(project, file)
-            .map(StdinRun::Argv)),
+            .configured_command_argv(worktree, &cwd, &argv, config)
+            .map(|environment| {
+                Some(StdinRun::Argv {
+                    cwd,
+                    argv,
+                    environment,
+                })
+            })),
         Some(host) => {
-            let effect: Option<EffectRequest> = host
+            let effect: super::payload::FormatPlanAnswer = host
                 .request(
                     language,
                     worktree,
                     Capability::FormatPlan,
                     encode(&FormatPlanRequest {
+                        config: config.clone(),
                         project: project.clone(),
                         file: file.to_path_buf(),
                     }),
                     Vec::new(),
                 )
                 .await?;
-            stdin_run(language, worktree, effect, &[])
+            match effect {
+                Ok(effect) => stdin_run(language, worktree, &cwd, effect, &[], config).map(Ok),
+                Err(error) => Ok(Err(error)),
+            }
         }
     }
 }
@@ -1025,19 +1221,31 @@ pub async fn syntax_probe_command(
     root: &Path,
     file: &Path,
     configured: Option<&ProbePrograms>,
-) -> Routed<Option<StdinRun>> {
+    config: &ModuleConfig,
+) -> Routed<Result<Option<StdinRun>, LangError>> {
     match module(language) {
         None => Ok(language
             .support()
             .syntax_probe_command(project, root, file, configured)
-            .map(StdinRun::Argv)),
+            .map(|argv| {
+                let environment = language
+                    .support()
+                    .configured_command_argv(worktree, root, &argv, config)?;
+                Ok(StdinRun::Argv {
+                    cwd: root.to_path_buf(),
+                    argv,
+                    environment,
+                })
+            })
+            .transpose()),
         Some(host) => {
-            let effect: Option<EffectRequest> = host
+            let effect: super::payload::FormatPlanAnswer = host
                 .request(
                     language,
                     worktree,
                     Capability::Syntax,
                     encode(&SyntaxQuery::ProbePlan {
+                        config: config.clone(),
                         project: Box::new(project.clone()),
                         root: root.to_path_buf(),
                         file: file.to_path_buf(),
@@ -1046,15 +1254,155 @@ pub async fn syntax_probe_command(
                     Vec::new(),
                 )
                 .await?;
+            let effect = match effect {
+                Ok(effect) => effect,
+                Err(error) => return Ok(Err(error)),
+            };
             stdin_run(
                 language,
                 worktree,
+                root,
                 effect,
                 &configured
                     .iter()
                     .flat_map(|tools| [tools.program.as_path(), tools.module.as_path()])
                     .collect::<Vec<_>>(),
+                config,
             )
+            .map(Ok)
+        }
+    }
+}
+
+/// `LanguageSupport::source_outline_probe_command`; nonempty anchors select source context.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "existing admitted probe contract plus public anchors"
+)]
+pub async fn source_outline_probe_command(
+    language: Language,
+    worktree: &Path,
+    project: &LanguageProject,
+    root: &Path,
+    file: &Path,
+    configured: Option<&ProbePrograms>,
+    config: &ModuleConfig,
+    anchors: &[u32],
+) -> Routed<Result<Option<StdinRun>, LangError>> {
+    match module(language) {
+        None => Ok(language
+            .support()
+            .source_outline_probe_command(project, root, file, configured, anchors)
+            .map(|argv| {
+                let environment = language
+                    .support()
+                    .configured_command_argv(worktree, root, &argv, config)?;
+                Ok(StdinRun::Argv {
+                    cwd: root.to_path_buf(),
+                    argv,
+                    environment,
+                })
+            })
+            .transpose()),
+        Some(host) => {
+            let effect: super::payload::FormatPlanAnswer = host
+                .request(
+                    language,
+                    worktree,
+                    Capability::Syntax,
+                    encode(&SyntaxQuery::OutlineProbePlan {
+                        anchors: anchors.to_vec(),
+                        config: config.clone(),
+                        project: Box::new(project.clone()),
+                        root: root.to_path_buf(),
+                        file: file.to_path_buf(),
+                        configured: configured.cloned(),
+                    }),
+                    Vec::new(),
+                )
+                .await?;
+            let effect = match effect {
+                Ok(effect) => effect,
+                Err(error) => return Ok(Err(error)),
+            };
+            stdin_run(
+                language,
+                worktree,
+                root,
+                effect,
+                &configured
+                    .iter()
+                    .flat_map(|tools| [tools.program.as_path(), tools.module.as_path()])
+                    .collect::<Vec<_>>(),
+                config,
+            )
+            .map(Ok)
+        }
+    }
+}
+
+/// Validates syntax-probe output without weakening the semantic provider's resolution policy.
+pub async fn source_outline_probe_result(
+    language: Language,
+    worktree: &Path,
+    path: &Path,
+    text: &str,
+    output: &str,
+) -> Routed<Option<Outline>> {
+    if output.len() > 256 * 1024 {
+        return Ok(None);
+    }
+    match module(language) {
+        None => Ok(language
+            .support()
+            .source_outline_probe_result(path, text, output)),
+        Some(host) => {
+            let (source, attachments) = source(path, text);
+            host.request(
+                language,
+                worktree,
+                Capability::Syntax,
+                encode(&SyntaxQuery::OutlineProbeResult {
+                    source,
+                    output: output.into(),
+                }),
+                attachments,
+            )
+            .await
+        }
+    }
+}
+
+/// Validates a bounded context selection through the owning language module.
+pub async fn source_context_probe_result(
+    language: Language,
+    worktree: &Path,
+    path: &Path,
+    text: &str,
+    output: &str,
+    anchors: &[u32],
+) -> Routed<Option<Vec<crate::lang::LineRange>>> {
+    if output.len() > 256 * 1024 || anchors.is_empty() || anchors.len() > 32 {
+        return Ok(None);
+    }
+    match module(language) {
+        None => Ok(language
+            .support()
+            .source_context_probe_result(path, text, output, anchors)),
+        Some(host) => {
+            let (source, attachments) = source(path, text);
+            host.request(
+                language,
+                worktree,
+                Capability::Syntax,
+                encode(&SyntaxQuery::ContextProbeResult {
+                    source,
+                    output: output.into(),
+                    anchors: anchors.to_vec(),
+                }),
+                attachments,
+            )
+            .await
         }
     }
 }
@@ -1183,8 +1531,8 @@ mod tests {
     }
 
     /// A module-planned test run may name only a declared recipe of class `test`, and a
-    /// formatter or probe only an interactive one: anything else is refused before expansion, and
-    /// before a missing tool could be reported for it.
+    /// formatter or probe only an interactive one. A path program also requires a trusted
+    /// activation that leaves the program unchanged or prefixes it with itself.
     #[test]
     fn effects_are_admitted_only_from_their_own_class() {
         use super::super::payload::{
@@ -1209,7 +1557,8 @@ mod tests {
                 assets: &[],
             }
         }
-        static RECIPES: [EffectRecipe; 4] = [
+        /// Routes test and interactive fixtures through their distinct admission contracts.
+        static RECIPES: [EffectRecipe; 7] = [
             recipe("fmt", RunClass::Interactive),
             EffectRecipe {
                 executables: &[ExecutableSlot {
@@ -1225,6 +1574,44 @@ mod tests {
                     source: SlotSource::HomeTool("agent-ide-no-such-tool"),
                 }],
                 ..recipe("absent", RunClass::Test)
+            },
+            EffectRecipe {
+                paths: &[crate::modules::payload::PathRule {
+                    param: "authority_root",
+                    roles: &[crate::modules::payload::PathRole::WorktreeRoot],
+                    existing_only: false,
+                    read_root: true,
+                }],
+                executables: &[ExecutableSlot {
+                    name: "tool",
+                    source: SlotSource::Launcher("node"),
+                }],
+                ..recipe("configured-node", RunClass::Interactive)
+            },
+            EffectRecipe {
+                executables: &[ExecutableSlot {
+                    name: "tool",
+                    source: SlotSource::Launcher("node"),
+                }],
+                ..recipe("configured-node-test", RunClass::Test)
+            },
+            EffectRecipe {
+                id: "configured-interpreter",
+                program: "interpreter",
+                args: &[],
+                env: &[],
+                paths: &[crate::modules::payload::PathRule {
+                    param: "interpreter",
+                    roles: &[crate::modules::payload::PathRole::LauncherRoot],
+                    existing_only: false,
+                    read_root: false,
+                }],
+                executables: &[],
+                stdin: Stdin::Null,
+                class: RunClass::Interactive,
+                timeout_ceiling_ms: 1000,
+                capture_bytes: 1024,
+                assets: &[],
             },
         ];
         static DECLARED: [(&str, &[EffectRecipe]); 1] = [("gamma", &RECIPES)];
@@ -1259,6 +1646,238 @@ mod tests {
                 second
             )
             .is_ok()
+        );
+        // A real conflicting ambient Node cannot substitute for a configured launcher slot.
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = crate::scratch::ScratchDir::new("configured-slot");
+        let ambient = scratch.join("ambient");
+        let configured = scratch.join("configured");
+        std::fs::create_dir_all(&ambient).unwrap();
+        std::fs::create_dir_all(&configured).unwrap();
+        for (path, body) in [
+            (
+                ambient.join("node"),
+                "#!/bin/sh\nprintf ran > ambient-ran\nprintf ambient\n",
+            ),
+            (
+                configured.join("node"),
+                "#!/bin/sh\nprintf '%s' \"$PWD\" > cwd-observed\nprintf configured\n",
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        /// Restores exact process PATH even if a synchronous serialized assertion unwinds.
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            /// Restores the process-local fixture setting after all child commands have reaped.
+            fn drop(&mut self) {
+                // SAFETY: this synchronous test runs under the required serialized gate; the
+                // guard outlives every child and restores the exact original OsString.
+                unsafe {
+                    match self.0.take() {
+                        Some(path) => std::env::set_var("PATH", path),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+        let _restore = RestorePath(std::env::var_os("PATH"));
+        // SAFETY: the required core gate serializes tests; no async work or live child spans
+        // this mutation, and RestorePath runs before the owning scratch fixture is removed.
+        unsafe {
+            std::env::set_var("PATH", &ambient);
+        }
+        assert_eq!(
+            crate::execution::job::executable_on("node", &scratch, &tool_path()),
+            Some(ambient.join("node"))
+        );
+        let context = ModuleConfig {
+            worktree: Some(scratch.to_path_buf()),
+            checks: Some(serde_json::json!({"node":configured.join("node")})),
+            ..Default::default()
+        };
+        for (id, class) in [
+            ("configured-node", RunClass::Interactive),
+            ("configured-node-test", RunClass::Test),
+        ] {
+            let spec = admitted_with(
+                gamma,
+                (&scratch, &scratch),
+                &request(id),
+                class,
+                second,
+                &[],
+                &context,
+            )
+            .unwrap();
+            assert_eq!(spec.program, configured.join("node"));
+            let output = std::process::Command::new(&spec.program)
+                .args(&spec.args)
+                .current_dir(&spec.cwd)
+                .env_clear()
+                .envs(spec.env)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"configured");
+            assert!(!scratch.join("ambient-ran").exists());
+        }
+        assert!(
+            admitted_with(
+                gamma,
+                (&scratch, &scratch),
+                &request("configured-node"),
+                RunClass::Interactive,
+                second,
+                &[],
+                &ModuleConfig::default()
+            )
+            .is_err(),
+            "missing launcher binding must not use ambient Node"
+        );
+        let mut denied = context;
+        let nested = scratch.join("member");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut target = request("configured-node");
+        target
+            .params
+            .insert("authority_root".into(), Param::Path(scratch.to_path_buf()));
+        let nested_spec = admitted_with(
+            gamma,
+            (&scratch, &nested),
+            &target,
+            RunClass::Interactive,
+            second,
+            &[],
+            &denied,
+        )
+        .unwrap();
+        assert_eq!(nested_spec.cwd, nested);
+        assert!(
+            nested_spec.read_roots.contains(&scratch.to_path_buf()),
+            "child cwd must not replace worktree path authority"
+        );
+        let output = std::process::Command::new(&nested_spec.program)
+            .current_dir(&nested_spec.cwd)
+            .env_clear()
+            .envs(nested_spec.env)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(nested.join("cwd-observed")).unwrap(),
+            nested.to_string_lossy()
+        );
+        assert!(
+            admitted_with(
+                gamma,
+                (&scratch, scratch.parent().unwrap()),
+                &target,
+                RunClass::Interactive,
+                second,
+                &[],
+                &denied
+            )
+            .is_err(),
+            "child cwd cannot escape the original worktree"
+        );
+        denied
+            .read_denies
+            .push(crate::execution::seatbelt::ReadDeny::Path(
+                configured.join("node"),
+            ));
+        assert!(
+            admitted_with(
+                gamma,
+                (&scratch, &scratch),
+                &request("configured-node"),
+                RunClass::Interactive,
+                second,
+                &[],
+                &denied
+            )
+            .is_err()
+        );
+
+        let worktree = scratch.join("fixture-worktree");
+        let selected = scratch.join("fixture-runtime/bin/program");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        std::fs::write(&selected, "fixture interpreter").unwrap();
+        let path_request = EffectRequest {
+            recipe: "configured-interpreter".to_owned(),
+            params: [("interpreter".to_owned(), Param::Path(selected.clone()))].into(),
+        };
+        let config_for = |path: &Path, prefix: &str| ModuleConfig {
+            worktree: Some(worktree.clone()),
+            checks: Some(serde_json::json!({
+                "interpreter": path.display().to_string(),
+                "interpreter_prefix": prefix,
+            })),
+            ..ModuleConfig::default()
+        };
+        for prefix in ["unchanged", "identity"] {
+            let spec = admitted_with(
+                gamma,
+                (&worktree, &worktree),
+                &path_request,
+                RunClass::Interactive,
+                second,
+                &[],
+                &config_for(&selected, prefix),
+            )
+            .unwrap();
+            assert_eq!(spec.program, selected);
+        }
+        assert!(
+            admitted_with(
+                gamma,
+                (&worktree, &worktree),
+                &path_request,
+                RunClass::Interactive,
+                second,
+                &[],
+                &config_for(&selected, "substitute"),
+            )
+            .is_err(),
+            "a different interpreter prefix is refused"
+        );
+        assert!(
+            admitted_with(
+                gamma,
+                (&worktree, &worktree),
+                &path_request,
+                RunClass::Interactive,
+                second,
+                &[],
+                &ModuleConfig {
+                    checks: Some(serde_json::json!({
+                        "interpreter": scratch.join("other-program").display().to_string(),
+                        "interpreter_prefix": "unchanged",
+                    })),
+                    ..ModuleConfig::default()
+                },
+            )
+            .is_err(),
+            "an unrelated configured interpreter cannot grant the selected path"
+        );
+        let denied_path = ModuleConfig {
+            read_denies: vec![crate::execution::seatbelt::ReadDeny::Path(selected.clone())],
+            ..config_for(&selected, "unchanged")
+        };
+        assert!(
+            admitted_with(
+                gamma,
+                (&worktree, &worktree),
+                &path_request,
+                RunClass::Interactive,
+                second,
+                &[],
+                &denied_path,
+            )
+            .is_err(),
+            "read denies still override the identity-preserving activation"
         );
     }
 

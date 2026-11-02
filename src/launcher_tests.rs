@@ -21,6 +21,23 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     let target = json!({"attachment":"private-attachment","candidate":"/private/tmp/worktree","git":executable,"codex":executable,"providers":[],"profiles":[],"allow_disabled_host":true});
     let config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target.clone()]});
     let loaded = LauncherConfig::parse(config.to_string().as_bytes()).unwrap();
+    assert!(loaded.bridge().is_none());
+    let mut bridged = config.clone();
+    bridged["bridge"] = json!({"registration_socket":"/private/service/adapter.sock", "core_socket":"/private/service/core.sock", "credential_file":"/private/service/producer.token"});
+    assert!(
+        LauncherConfig::parse(bridged.to_string().as_bytes())
+            .unwrap()
+            .bridge()
+            .is_some()
+    );
+    bridged["bridge"]["inline_secret"] = json!("refused");
+    assert!(LauncherConfig::parse(bridged.to_string().as_bytes()).is_err());
+    bridged["bridge"]
+        .as_object_mut()
+        .unwrap()
+        .remove("inline_secret");
+    bridged["bridge"]["core_socket"] = json!("relative.sock");
+    assert!(LauncherConfig::parse(bridged.to_string().as_bytes()).is_err());
     assert_eq!(
         loaded.target("private-attachment").unwrap().candidate,
         PathBuf::from("/private/tmp/worktree")
@@ -73,8 +90,15 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     let mut python_config = json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[python_target.clone()]});
     let unbound: ProviderLaunch =
         serde_json::from_value(python_config["targets"][0]["providers"][3].clone()).unwrap();
-    python_config["targets"][0]["providers"][3]["typescript"]["codex_macos_evidence"] =
-        json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
+    if cfg!(target_os = "linux") {
+        python_config["targets"][0]["providers"][3]["typescript"]["codex_macos_evidence"] =
+            json!(null);
+        python_config["targets"][0]["providers"][3]["typescript"]["linux_operator_bundle"] =
+            json!(unbound.expected_typescript_linux_operator_bundle().unwrap());
+    } else {
+        python_config["targets"][0]["providers"][3]["typescript"]["codex_macos_evidence"] =
+            json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
+    }
     assert!(LauncherConfig::parse(python_config.to_string().as_bytes()).is_ok());
     let loaded = LauncherConfig::parse(python_config.to_string().as_bytes()).unwrap();
     // The retired `gopls_defaults` entry (second in the file) is dropped before validation.
@@ -91,15 +115,22 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
         ["gopls_defaults"]
     );
     let typescript = &loaded.target("private-attachment").unwrap().providers[2];
-    assert!(typescript.typescript_codex_accepted());
-    assert!(!typescript.typescript_claude_accepted());
-    let accepted_claude = typescript
-        .expected_typescript_claude_macos_evidence()
-        .unwrap();
-    python_config["targets"][0]["providers"][3]["typescript"]["claude_macos_evidence"] =
-        json!(accepted_claude);
-    let loaded = LauncherConfig::parse(python_config.to_string().as_bytes()).unwrap();
-    assert!(loaded.target("private-attachment").unwrap().providers[2].typescript_claude_accepted());
+    if cfg!(target_os = "linux") {
+        assert!(!typescript.typescript_codex_accepted());
+        assert!(!typescript.typescript_claude_accepted());
+    } else {
+        assert!(typescript.typescript_codex_accepted());
+        assert!(!typescript.typescript_claude_accepted());
+        let accepted_claude = typescript
+            .expected_typescript_claude_macos_evidence()
+            .unwrap();
+        python_config["targets"][0]["providers"][3]["typescript"]["claude_macos_evidence"] =
+            json!(accepted_claude);
+        let loaded = LauncherConfig::parse(python_config.to_string().as_bytes()).unwrap();
+        assert!(
+            loaded.target("private-attachment").unwrap().providers[2].typescript_claude_accepted()
+        );
+    }
     let mut invented_claude = python_config.clone();
     invented_claude["targets"][0]["providers"][3]["typescript"]["claude_macos_evidence"] =
         json!("invented");
@@ -107,6 +138,7 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     for field in [
         "toolchain",
         "node.identity",
+        "node.blake3",
         "executable.identity",
         "executable.blake3",
         "typescript.typescript_version",
@@ -119,6 +151,7 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
         match field {
             "toolchain" => provider["toolchain"] = json!("24.4.1"),
             "node.identity" => provider["node"]["identity"] = json!("24.4.1"),
+            "node.blake3" => provider["node"]["blake3"] = json!("a".repeat(64)),
             "executable.identity" => provider["executable"]["identity"] = json!("6.0.1"),
             "executable.blake3" => provider["executable"]["blake3"] = json!("e".repeat(64)),
             "typescript.typescript_version" => {

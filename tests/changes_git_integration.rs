@@ -19,7 +19,7 @@ use std::{
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
 };
-use support::{GIT, GitFixture, Runner, authority_for, collect};
+use support::{GitFixture, Runner, authority_for, collect, git_program};
 
 /// Adapts the shared process runner with one Workspace-certified current source observation.
 struct CurrentRunner {
@@ -125,7 +125,7 @@ async fn content_queries_must_not_execute_repository_clean_filters() {
             );
         }
     }
-    let output = std::process::Command::new(GIT)
+    let output = std::process::Command::new(git_program())
         .arg("--version")
         .output()
         .unwrap();
@@ -167,7 +167,7 @@ async fn raw_modes_paths_and_separate_conflicts_survive() {
     .unwrap();
     let object = fixture.git(["rev-parse", "HEAD:conflict.txt"]);
     let oid = std::str::from_utf8(&object.stdout).unwrap().trim();
-    let mut child = Command::new(GIT)
+    let mut child = Command::new(git_program())
         .env_clear()
         .arg("-C")
         .arg(&fixture.root)
@@ -360,9 +360,13 @@ fn snapshot_intents_own_private_file_cleanup() {
         &authority_for(&fixture),
         DiffMode::Head,
     );
-    let intent =
-        SnapshotIntent::compare(scope.clone(), std::path::Path::new(GIT), b"left", b"right")
-            .unwrap();
+    let intent = SnapshotIntent::compare(
+        scope.clone(),
+        std::path::Path::new(git_program()),
+        b"left",
+        b"right",
+    )
+    .unwrap();
     let dir = intent.snapshot_directory().unwrap().to_path_buf();
     let pending = intent.clone();
     drop(intent);
@@ -372,7 +376,7 @@ fn snapshot_intents_own_private_file_cleanup() {
     assert!(
         SnapshotIntent::compare(
             scope,
-            std::path::Path::new(GIT),
+            std::path::Path::new(git_program()),
             &vec![0; MAX_SNAPSHOT_BLOB_BYTES + 1],
             b""
         )
@@ -392,8 +396,13 @@ fn snapshot_directory_honors_host_temp_writer() {
         &authority_for(&fixture),
         DiffMode::Head,
     );
-    let intent =
-        SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"left", b"right").unwrap();
+    let intent = SnapshotIntent::compare(
+        scope,
+        std::path::Path::new(git_program()),
+        b"left",
+        b"right",
+    )
+    .unwrap();
     let dir = intent.snapshot_directory().unwrap().to_path_buf();
     let expected_parent = fs::canonicalize(&custom_temp).expect("fixture temp dir exists");
     assert_eq!(
@@ -444,8 +453,13 @@ async fn incomplete_execution_never_becomes_snapshot_evidence() {
         &authority_for(&fixture),
         DiffMode::Head,
     );
-    let intent =
-        SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"old\n", b"new\n").unwrap();
+    let intent = SnapshotIntent::compare(
+        scope,
+        std::path::Path::new(git_program()),
+        b"old\n",
+        b"new\n",
+    )
+    .unwrap();
     let dir = intent.snapshot_directory().unwrap().to_owned();
     let result = Runner::default().run(intent.clone()).await.unwrap();
     assert_eq!(result.status().code(), Some(1));
@@ -486,7 +500,7 @@ async fn metadata_brackets_detect_head_and_untracked_changes() {
             let oid = if alternate_next { &alternate } else { &initial };
             alternate_next = !alternate_next;
             assert!(
-                Command::new(GIT)
+                Command::new(git_program())
                     .env_clear()
                     .arg("-C")
                     .arg(&root)
@@ -618,7 +632,7 @@ async fn source_digest_revision_and_sequence_are_correlated() {
     };
     let snapshot = collect_snapshot(
         &authority,
-        Path::new(GIT),
+        Path::new(git_program()),
         DiffMode::Unstaged,
         1,
         "snapshot-operation",
@@ -642,7 +656,7 @@ async fn source_digest_revision_and_sequence_are_correlated() {
     assert!(matches!(
         collect_snapshot(
             &authority,
-            Path::new(GIT),
+            Path::new(git_program()),
             DiffMode::Unstaged,
             1,
             "snapshot-operation",
@@ -856,7 +870,7 @@ async fn conflicts_retain_actual_stage_modes_and_objects() {
     let base = std::str::from_utf8(&base.stdout).unwrap().trim();
     let theirs = fixture.git(["rev-parse", ":staged.txt"]);
     let theirs = std::str::from_utf8(&theirs.stdout).unwrap().trim();
-    let mut child = Command::new(GIT)
+    let mut child = Command::new(git_program())
         .env_clear()
         .arg("-C")
         .arg(&fixture.root)
@@ -947,7 +961,7 @@ async fn untracked_rewrite_during_capture_is_best_effort() {
     };
     let snapshot = collect_snapshot(
         &authority,
-        Path::new(GIT),
+        Path::new(git_program()),
         DiffMode::Head,
         1,
         "volatile-capture",
@@ -1034,7 +1048,7 @@ async fn plain_diff_fallback_parses_real_hunks_without_exact_capture() {
     );
     let authority = authority_for(&fixture);
     let scope = GitScope::from_authority(&authority, DiffMode::Head);
-    let intent = SnapshotIntent::plain_diff(scope.clone(), Path::new(GIT)).unwrap();
+    let intent = SnapshotIntent::plain_diff(scope.clone(), Path::new(git_program())).unwrap();
     let mut runner = Runner::default();
     let evidence = runner.run(intent.clone()).await.unwrap();
     let stdout = intent.accept(evidence).unwrap();
@@ -1051,6 +1065,17 @@ async fn plain_diff_fallback_parses_real_hunks_without_exact_capture() {
         result.untracked().is_empty(),
         "plain diff names no untracked paths"
     );
+    // The default incremental diff drops the hunks the caller already holds, by fingerprint,
+    // and says how many; a fingerprint nobody holds drops nothing.
+    let held = result.selected_hunks()[0].fingerprint();
+    let unchanged = result
+        .clone()
+        .without_seen_hunks(|fingerprint| fingerprint == held);
+    assert!(unchanged.selected_hunks().is_empty());
+    assert_eq!(unchanged.unchanged_hunks(), 1);
+    let fresh = result.without_seen_hunks(|_| false);
+    assert_eq!(fresh.selected_hunks().len(), 1);
+    assert_eq!(fresh.unchanged_hunks(), 0);
 }
 
 /// A changed file whose name Git C-quotes in the `diff --git` header (a tab, a non-ASCII byte), or
@@ -1076,7 +1101,7 @@ async fn plain_diff_fallback_counts_files_git_quotes() {
     }
     let authority = authority_for(&fixture);
     let scope = GitScope::from_authority(&authority, DiffMode::Head);
-    let intent = SnapshotIntent::plain_diff(scope.clone(), Path::new(GIT)).unwrap();
+    let intent = SnapshotIntent::plain_diff(scope.clone(), Path::new(git_program())).unwrap();
     let mut runner = Runner::default();
     let evidence = runner.run(intent.clone()).await.unwrap();
     let stdout = intent.accept(evidence).unwrap();
@@ -1144,7 +1169,7 @@ async fn plain_diff_fallback_refuses_over_the_aggregate_path_ceiling() {
         confine_plain_diff_paths(&scope, &paths),
         Err(GitError::EvidenceTooLarge)
     );
-    let intent = SnapshotIntent::plain_diff(scope.clone(), Path::new(GIT)).unwrap();
+    let intent = SnapshotIntent::plain_diff(scope.clone(), Path::new(git_program())).unwrap();
     let mut runner = Runner::default();
     let evidence = runner.run(intent.clone()).await.unwrap();
     let stdout = intent.accept(evidence).unwrap();
@@ -1226,7 +1251,8 @@ async fn foreign_reap_identity_cannot_release_scratch() {
     let intent = SnapshotIntent::compare(scope.clone(), &wrapper, b"a\n", b"b\n").unwrap();
     let directory = intent.snapshot_directory().unwrap().to_owned();
     let (mut child, mut admissions) = support::launch_intent(&intent, &wrapper, 4096).unwrap();
-    let other = SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"a\n", b"b\n").unwrap();
+    let other = SnapshotIntent::compare(scope, std::path::Path::new(git_program()), b"a\n", b"b\n")
+        .unwrap();
     let foreign = Runner::default().run(other).await.unwrap();
     assert_eq!(
         intent.acknowledge_reap(&foreign),
@@ -1255,7 +1281,8 @@ fn uncertain_issued_snapshot_drop_quarantines_files() {
         &authority_for(&fixture),
         DiffMode::Head,
     );
-    let intent = SnapshotIntent::compare(scope, std::path::Path::new(GIT), b"a", b"b").unwrap();
+    let intent =
+        SnapshotIntent::compare(scope, std::path::Path::new(git_program()), b"a", b"b").unwrap();
     let directory = intent.snapshot_directory().unwrap().to_owned();
     let _unused_command = intent.command().unwrap();
     drop(intent);
@@ -1682,7 +1709,7 @@ async fn skipped_tracked_symlink_is_rechecked_before_snapshot_completion() {
     assert_eq!(
         collect_snapshot(
             &authority_for(&fixture),
-            Path::new(GIT),
+            Path::new(git_program()),
             DiffMode::Unstaged,
             1,
             "symlink-mutation",
@@ -1812,8 +1839,9 @@ fn matching_index_debug_git(fixture: &GitFixture, path: &str, flags: u64, later:
         fixture,
         "forged-stat-git",
         &format!(
-            "case \" $* \" in *\" ls-files --debug \"*) exec /bin/cat {} ;; *) exec /usr/bin/git \"$@\" ;; esac",
-            debug.display(),
+            "case \" $* \" in *\" ls-files --debug \"*) exec /bin/cat {} ;; *) exec {} \"$@\" ;; esac",
+            support::shell_path(&debug),
+            support::shell_path(Path::new(git_program())),
         ),
     )
 }
@@ -1896,7 +1924,7 @@ async fn missing_index_is_a_bracketed_empty_index() {
     let root = fixture.root.clone();
     let mut runner = Runner {
         after_compare: Some(Box::new(move || {
-            let output = std::process::Command::new(GIT)
+            let output = std::process::Command::new(git_program())
                 .env_clear()
                 .arg("-C")
                 .arg(&root)
@@ -1922,7 +1950,7 @@ async fn missing_index_is_a_bracketed_empty_index() {
         after_compare: Some(Box::new(move || {
             if first {
                 first = false;
-                let output = std::process::Command::new(GIT)
+                let output = std::process::Command::new(git_program())
                     .env_clear()
                     .arg("-C")
                     .arg(&root)
@@ -2028,9 +2056,9 @@ async fn real_truncated_blob_evidence_is_not_complete() {
         &authority_for(&fixture),
         DiffMode::Head,
     );
-    let intent = SnapshotIntent::blob(scope, std::path::Path::new(GIT), &oid).unwrap();
+    let intent = SnapshotIntent::blob(scope, std::path::Path::new(git_program()), &oid).unwrap();
     let (child, mut admissions) =
-        support::launch_intent(&intent, std::path::Path::new(GIT), 128).unwrap();
+        support::launch_intent(&intent, std::path::Path::new(git_program()), 128).unwrap();
     let completed = child
         .reap(Duration::from_secs(2), Duration::from_secs(2))
         .await
@@ -2120,7 +2148,7 @@ async fn final_metadata_probes_require_second_path_proof() {
         assert_eq!(
             collect_snapshot(
                 &authority_for(&fixture),
-                Path::new(GIT),
+                Path::new(git_program()),
                 DiffMode::Head,
                 1,
                 "final-proof",
@@ -2165,7 +2193,7 @@ async fn final_attribute_proof_refusal_retries_with_forced_capture() {
     };
     let snapshot = collect_snapshot(
         &authority_for(&fixture),
-        Path::new(GIT),
+        Path::new(git_program()),
         DiffMode::Head,
         1,
         "final-attribute-proof",
@@ -2201,7 +2229,7 @@ async fn clean_tree_refuses_unproven_metadata_path() {
         assert_eq!(
             collect_snapshot(
                 &authority_for(&fixture),
-                Path::new(GIT),
+                Path::new(git_program()),
                 DiffMode::Head,
                 1,
                 "clean-proof",
@@ -2233,7 +2261,7 @@ async fn index_probe_refuses_an_unproven_index_path() {
     assert_eq!(
         collect_snapshot(
             &authority_for(&fixture),
-            Path::new(GIT),
+            Path::new(git_program()),
             DiffMode::Head,
             1,
             "index-proof",
@@ -2264,8 +2292,9 @@ async fn index_probe_refuses_a_symlinked_parent() {
         &fixture,
         "linked-index-git",
         &format!(
-            "case \" $* \" in *\" rev-parse --path-format=absolute --git-path index \"*) printf '%s\\n' '{}' ;; *) exec /usr/bin/git \"$@\" ;; esac",
-            fixture.root.join(".git/linked/index").display(),
+            "case \" $* \" in *\" rev-parse --path-format=absolute --git-path index \"*) printf '%s\\n' {} ;; *) exec {} \"$@\" ;; esac",
+            support::shell_path(&fixture.root.join(".git/linked/index")),
+            support::shell_path(Path::new(git_program())),
         ),
     );
     assert_eq!(
@@ -2324,7 +2353,7 @@ async fn refused_path_authorization_fails_the_capture_before_any_native_read() {
         };
         let result = collect_snapshot(
             &authority_for(&fixture),
-            Path::new(GIT),
+            Path::new(git_program()),
             mode,
             1,
             "snapshot-operation",
@@ -2432,7 +2461,7 @@ async fn mixed_path_authorization_discloses_only_proven_bytes() {
     };
     let result = collect_snapshot(
         &authority_for(&fixture),
-        Path::new(GIT),
+        Path::new(git_program()),
         DiffMode::Unstaged,
         1,
         "snapshot-operation",
@@ -2467,7 +2496,7 @@ async fn mixed_path_authorization_discloses_only_proven_bytes() {
     };
     let snapshot = collect_snapshot(
         &authority_for(&fixture),
-        Path::new(GIT),
+        Path::new(git_program()),
         DiffMode::Unstaged,
         1,
         "snapshot-operation",

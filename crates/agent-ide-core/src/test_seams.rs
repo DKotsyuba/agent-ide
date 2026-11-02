@@ -24,7 +24,7 @@ pub fn var(_name: &str) -> Option<String> {
 
 /// Resolves the shared runtime/key-hint parent without creating or scanning it.
 /// Feature-enabled tests may select one existing private absolute directory owned by this user;
-/// invalid selectors fail closed. Default and release builds always use canonical `/private/tmp`.
+/// invalid selectors fail closed. Otherwise the operator-selected rendezvous parent is used.
 pub fn shared_runtime_root() -> std::io::Result<std::path::PathBuf> {
     #[cfg(feature = "test-seams")]
     if let Some(selected) = var("AGENT_IDE_TEST_SHARED_RUNTIME_ROOT") {
@@ -41,5 +41,5 @@ pub fn shared_runtime_root() -> std::io::Result<std::path::PathBuf> {
         }
         return std::fs::canonicalize(path);
     }
-    std::fs::canonicalize("/private/tmp")
+    crate::hook_hints::configured_root()
 }

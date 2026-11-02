@@ -172,10 +172,15 @@ fn ci_workflow_runs_the_xtask_gate_and_supply_chain_job() {
             "missing CI requirement: {requirement}"
         );
     }
+    let checkouts = workflow.matches("uses: actions/checkout@").count();
+    assert!(
+        checkouts >= 3,
+        "all three CI jobs must check out the source"
+    );
     assert_eq!(
         workflow.matches("persist-credentials: false").count(),
-        2,
-        "both jobs must check out without persisting credentials"
+        checkouts,
+        "every checkout must avoid persisting credentials"
     );
     assert!(!workflow.contains("@v4"), "no unpinned action references");
     let release = include_str!("../.github/workflows/release.yml");
@@ -370,7 +375,7 @@ fn run_install_local(script: &Path, prefix: &Path) {
     );
 }
 
-/// Asserts the installed layout under `prefix` for `version`: the mode-0755 binary, the plugin
+/// Asserts the installed layout under `prefix` for `version`: the owner-executable launcher, the plugin
 /// bundle's five copied directories plus its two contract files, the baked absolute-path hook
 /// naming that exact binary, and the `current` symlink pointing at `version`.
 fn assert_install_layout(prefix: &Path, installed_bin: &Path, version: &str) {
@@ -379,8 +384,26 @@ fn assert_install_layout(prefix: &Path, installed_bin: &Path, version: &str) {
         .unwrap()
         .permissions()
         .mode()
-        & 0o777;
-    assert_eq!(bin_mode, 0o755, "installed binary must be mode 0755");
+        & 0o7777;
+    assert_eq!(
+        bin_mode & 0o500,
+        0o500,
+        "launcher must be owner-readable and executable"
+    );
+    assert_eq!(
+        bin_mode & !0o755,
+        0,
+        "launcher must not grant extra write or privilege bits"
+    );
+    let launched = Command::new(installed_bin)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(launched.status.success(), "installed launcher must run");
+    assert_eq!(
+        String::from_utf8_lossy(&launched.stdout).trim(),
+        format!("agent-ide {version}")
+    );
 
     let version_dir = prefix.join("share/agent-ide/plugin").join(version);
     for part in [
@@ -407,7 +430,16 @@ fn assert_install_layout(prefix: &Path, installed_bin: &Path, version: &str) {
         "generated hook is missing the baked absolute exec line: {hook_contents}"
     );
     let hook_mode = std::fs::metadata(&hook_path).unwrap().permissions().mode();
-    assert_ne!(hook_mode & 0o111, 0, "generated hook must be executable");
+    assert_eq!(
+        hook_mode & 0o500,
+        0o500,
+        "generated hook must be owner-readable and executable"
+    );
+    assert_eq!(
+        hook_mode & 0o7777 & !0o755,
+        0,
+        "generated hook must not grant extra write or privilege bits"
+    );
 
     let current_link = prefix.join("share/agent-ide/plugin/current");
     let target = std::fs::read_link(&current_link).unwrap();
@@ -442,9 +474,65 @@ fn install_local_installs_into_a_disposable_prefix() {
     run_install_local(&script, &prefix);
     assert_install_layout(&prefix, &installed_bin, version);
 
-    // Re-running for the same version must replace the version directory and binary cleanly.
+    // Re-running an identical release refreshes the managed launcher.
     run_install_local(&script, &prefix);
     assert_install_layout(&prefix, &installed_bin, version);
+    #[cfg(target_os = "linux")]
+    {
+        // Keep the installed bundle internally sealed but different from the checkout's bundle.
+        let release = prefix.join(".agent-ide/standalone/releases").join(version);
+        let readme = release.join("README.md");
+        let mut bytes = std::fs::read(&readme).unwrap();
+        bytes.extend_from_slice(b"\nprevious source build\n");
+        std::fs::write(&readme, &bytes).unwrap();
+        let sums_path = release.join("SHA256SUMS");
+        let sums = std::fs::read_to_string(&sums_path).unwrap();
+        let old_line = sums
+            .lines()
+            .find(|line| line.ends_with("  README.md"))
+            .unwrap();
+        let new_line = format!("{}  README.md", agent_ide::selfinstall::sha256_hex(&bytes));
+        let sealed_sums = sums.replacen(old_line, &new_line, 1);
+        std::fs::write(&sums_path, &sealed_sums).unwrap();
+        let launcher = std::fs::read(&installed_bin).unwrap();
+        let plugin = std::fs::read(
+            prefix
+                .join("share/agent-ide/plugin")
+                .join(version)
+                .join("skills/agent-ide/SKILL.md"),
+        )
+        .unwrap();
+        let current = std::fs::read_link(prefix.join(".agent-ide/standalone/current")).unwrap();
+        let output = Command::new(&script)
+            .arg("--no-build")
+            .arg("--prefix")
+            .arg(&prefix)
+            .env("AGENT_IDE_HOME", &prefix)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("complete process visibility is unavailable")
+        );
+        assert_eq!(std::fs::read(&readme).unwrap(), bytes);
+        assert_eq!(std::fs::read_to_string(&sums_path).unwrap(), sealed_sums);
+        assert_eq!(std::fs::read(&installed_bin).unwrap(), launcher);
+        assert_eq!(
+            std::fs::read(
+                prefix
+                    .join("share/agent-ide/plugin")
+                    .join(version)
+                    .join("skills/agent-ide/SKILL.md")
+            )
+            .unwrap(),
+            plugin
+        );
+        assert_eq!(
+            std::fs::read_link(prefix.join(".agent-ide/standalone/current")).unwrap(),
+            current
+        );
+    }
     let _ = std::fs::remove_dir_all(&prefix);
 
     // A foreign script at the launcher path is refused: no backup, no replacement.
@@ -458,6 +546,7 @@ fn install_local_installs_into_a_disposable_prefix() {
         .arg("--no-build")
         .arg("--prefix")
         .arg(&unowned_prefix)
+        .env("AGENT_IDE_HOME", &unowned_prefix)
         .output()
         .expect("scripts/install-local.sh must execute");
     assert!(
@@ -505,4 +594,118 @@ fn install_local_installs_into_a_disposable_prefix() {
         "the launcher must be the managed shim"
     );
     let _ = std::fs::remove_dir_all(&backup_prefix);
+}
+
+/// The bootstrap chooses the host archive and refuses a mismatched ELF or a changed archive
+/// before executing its payload, even when the download command reports success.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_bootstrap_rejects_wrong_architecture_and_checksum() {
+    let root = unique_install_prefix("linux-bootstrap");
+    let bin = root.join("bin");
+    let bundle = root.join("agent-ide-v1.2.3");
+    let payload = root.join("payload");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::create_dir_all(&payload).unwrap();
+    std::fs::write(bundle.join("COMPLETE"), "complete\n").unwrap();
+    let mut elf = [0_u8; 20];
+    elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    elf[16] = 3;
+    elf[18] = 183; // aarch64 archive disguised as x86_64
+    let executable = bundle.join("agent-ide");
+    std::fs::write(&executable, elf).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let asset = "agent-ide-v1.2.3-x86_64-unknown-linux-gnu.tar.gz";
+    assert!(
+        Command::new("tar")
+            .args(["-czf"])
+            .arg(payload.join(asset))
+            .args(["-C"])
+            .arg(&root)
+            .arg("agent-ide-v1.2.3")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let sum = Command::new("sha256sum")
+        .arg(payload.join(asset))
+        .output()
+        .unwrap();
+    let digest = String::from_utf8(sum.stdout).unwrap();
+    std::fs::write(
+        payload.join("SHA256SUMS"),
+        format!("{}  {asset}\n", digest.split_whitespace().next().unwrap()),
+    )
+    .unwrap();
+    for (name, script) in [
+        (
+            "uname",
+            "#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo x86_64;; esac\n",
+        ),
+        (
+            "gh",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$TRACE\"\nwhile [ \"$1\" != --dir ]; do shift; done\ncp \"$FIXTURE\"/* \"$2\"/\n",
+        ),
+        (
+            "sha256sum",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SHA_TRACE\"\nexec /usr/bin/sha256sum \"$@\"\n",
+        ),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let run = || {
+        Command::new("sh")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+            .args(["--version", "1.2.3"])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("TMPDIR", &root)
+            .env("FIXTURE", &payload)
+            .env("TRACE", root.join("trace"))
+            .env("SHA_TRACE", root.join("sha-trace"))
+            .env_remove("GITHUB_TOKEN")
+            .output()
+            .unwrap()
+    };
+    let result = run();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("does not match Linux architecture"));
+    assert_eq!(
+        std::fs::read_to_string(root.join("sha-trace"))
+            .unwrap()
+            .trim(),
+        "-c selected-sum"
+    );
+    assert!(
+        std::fs::read_to_string(root.join("trace"))
+            .unwrap()
+            .contains(asset)
+    );
+    std::fs::write(
+        payload.join("SHA256SUMS"),
+        format!("{}  {asset}\n", "0".repeat(64)),
+    )
+    .unwrap();
+    let result = run();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("does not match SHA256SUMS"));
+    // Duplicate entries cannot be interpreted as one valid checksum.
+    std::fs::write(
+        payload.join("SHA256SUMS"),
+        format!(
+            "{}  {asset}\n{}  {asset}\n",
+            digest.split_whitespace().next().unwrap(),
+            digest.split_whitespace().next().unwrap()
+        ),
+    )
+    .unwrap();
+    let result = run();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("does not match SHA256SUMS"));
+    std::fs::remove_dir_all(root).unwrap();
 }

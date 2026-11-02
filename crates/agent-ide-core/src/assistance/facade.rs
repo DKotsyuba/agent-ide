@@ -1,7 +1,8 @@
 //! Bounded MCP discovery, finite Application routing, and fail-open Assistance feedback.
 //!
-//! This module has no peer-domain implementation of its own. It validates the eleven logical tool
-//! inputs, carries trusted host transport context, and honestly reports an unavailable or
+//! This module has no peer-domain implementation of its own. It advertises eleven public tools and
+//! validates their inputs plus the private Context transport, carries trusted host context, and
+//! honestly reports an unavailable or
 //! incomplete result until Workspace, Intelligence, and Changes return their typed facts.
 
 use std::{
@@ -68,12 +69,14 @@ const MAX_BYTE_OFFSET: u64 = crate::workspace::observation::MAX_SOURCE_BYTES as 
 const MAX_ACTIVATION_ID_BYTES: usize = 128;
 const MAX_HOOK_BYTES: usize = 64 * 1024;
 
-/// Names the only logical MCP methods exposed by Assistance.
+/// Names Assistance operations, including the private legacy Context transport operation.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AssistanceTool {
     /// Creates or retries one bounded Workspace activation operation.
     Start,
-    /// Requests bounded context from Intelligence when that peer is available.
+    /// Prepares a task-focused source packet under current workspace authority.
+    Prepare,
+    /// Private engine operation reused by inspect diagnostics/problems; never a public MCP route.
     Context,
     /// Requests a bounded Changes diff when that peer is available.
     Diff,
@@ -93,13 +96,18 @@ pub enum AssistanceTool {
     Graph,
     /// Runs or inspects one explicitly requested project test job.
     Test,
+    /// Returns an on-demand project map: directories and files with sizes and the authors'
+    /// one-line descriptions, no source bodies.
+    Tree,
 }
 
 impl AssistanceTool {
-    /// Returns the stable MCP discovery name for this logical method.
+    /// Returns the public MCP name or private historical transport label for this operation.
+    /// Context's label is internal only; it is neither advertised nor registered as a public call.
     pub const fn mcp_name(self) -> &'static str {
         match self {
             Self::Start => "ide.start",
+            Self::Prepare => "ide.prepare",
             Self::Context => "ide.context",
             Self::Diff => "ide.diff",
             Self::Inspect => "ide.inspect",
@@ -110,19 +118,35 @@ impl AssistanceTool {
             Self::Symbol => "ide.symbol",
             Self::Graph => "ide.graph",
             Self::Test => "ide.test",
+            Self::Tree => "ide.tree",
         }
     }
 
-    /// Reports whether this call can change binding, worktree or run state, so a reply lost after
-    /// delivery must be reported as an unknown outcome rather than a call to simply repeat.
+    /// Reports whether this tool has any binding/worktree/run mutation operation. For a
+    /// validated concrete request use mutates_with, which excludes read-only test queries.
     pub const fn mutates(self) -> bool {
-        matches!(self, Self::Start | Self::Stop | Self::Edit | Self::Test)
+        matches!(
+            self,
+            Self::Start | Self::Prepare | Self::Stop | Self::Edit | Self::Test
+        )
+    }
+
+    /// Classifies a validated request for lost-reply handling. Test history/result/output queries
+    /// do not start work; execution and cancellation operations remain mutating. Callers
+    /// must validate first so conflicting execution/read selectors cannot hide a mutation.
+    pub fn mutates_with(self, parameters: &Value) -> bool {
+        self.mutates()
+            && !(self == Self::Test
+                && ["result", "status", "history", "detail_ref", "output"]
+                    .iter()
+                    .any(|field| parameters.get(*field).is_some()))
     }
 
     /// Returns the corresponding closed Application transport tag.
     const fn transport_method(self) -> AssistanceMethod {
         match self {
             Self::Start => AssistanceMethod::Start,
+            Self::Prepare => AssistanceMethod::Prepare,
             Self::Context => AssistanceMethod::Context,
             Self::Diff => AssistanceMethod::Diff,
             Self::Inspect => AssistanceMethod::Inspect,
@@ -133,6 +157,7 @@ impl AssistanceTool {
             Self::Symbol => AssistanceMethod::Symbol,
             Self::Graph => AssistanceMethod::Graph,
             Self::Test => AssistanceMethod::Test,
+            Self::Tree => AssistanceMethod::Tree,
         }
     }
 }
@@ -142,11 +167,19 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
     matches!(
         (tool, kind),
         (AssistanceTool::Start, ResultKind::Activation)
-            | (AssistanceTool::Context, ResultKind::Context)
+            | (
+                AssistanceTool::Context,
+                ResultKind::Context | ResultKind::Inspect
+            )
             | (AssistanceTool::Diff, ResultKind::Diff)
             | (AssistanceTool::Stop, ResultKind::Stop)
-            | (AssistanceTool::Outline, ResultKind::Outline)
+            | (
+                AssistanceTool::Outline | AssistanceTool::Tree,
+                ResultKind::Outline
+            )
             | (AssistanceTool::Read, ResultKind::Read)
+            | (AssistanceTool::Prepare, ResultKind::Prepare)
+            | (AssistanceTool::Edit, ResultKind::EditProgress)
             | (AssistanceTool::Symbol, ResultKind::Symbol)
             | (AssistanceTool::Graph, ResultKind::Graph)
             | (AssistanceTool::Test, ResultKind::Test)
@@ -158,7 +191,7 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
 pub struct ToolSchema {
     /// Logical method selected by the schema.
     pub tool: AssistanceTool,
-    /// MCP-visible stable tool name.
+    /// Stable public tool name or private Context transport label, excluded from public discovery.
     pub name: &'static str,
     /// JSON Schema object enforcing the bounded model-facing arguments.
     pub input_schema: Value,
@@ -212,8 +245,10 @@ fn describe_languages(description: &str) -> String {
         .replace("{manifests_tail}", &tail)
 }
 
-/// Returns exactly the eleven current Assistance schemas regardless of daemon availability.
-pub fn tool_schemas() -> [ToolSchema; 11] {
+/// Returns the public schemas and the private Context validation schema, independent of
+/// availability. Public router registration and catalog projection exclude Context, and the
+/// catalog also leaves out the retired Prepare route; stable indexes remain internal.
+pub fn tool_schemas() -> [ToolSchema; 13] {
     let mut environment_languages = checked_language_ids();
     environment_languages.sort_unstable();
     let example_language = environment_languages.first().copied().unwrap_or("language");
@@ -222,7 +257,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
         environment_languages.join("|")
     );
     let environment_description = format!(
-        "Pick the current environment per language, optionally per project root (`{example_language}:packages/alpha`). Value: a candidate the start card lists, or a path to one (relative to that root, or absolute), or `auto` to return to the default. Kept for this worktree until changed. Only languages whose card shows an environment line accept a choice."
+        "Per language, or `{example_language}:<root>`: a start-card candidate, a path or `auto`."
     );
     [
         schema(
@@ -230,9 +265,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES, "description": "Any stable id for this activation (e.g. the task name); repeating it returns the same activation. Optional: a start that names none derives a stable id from this session, so repeating it also returns the same activation."},
-                    "root": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Absolute working directory to activate; defaults to the host's project directory. Must lie below a configured allowed root."},
-                    "read_only": {"type": "boolean", "default": false, "description": "Start as a reader; the default is the one writer allowed per worktree."},
+                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES},
+                    "root": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Absolute; default: the host's project directory."},
+                    "read_only": {"type": "boolean", "default": false, "description": "Reader; default: the one writer."},
                     "environment": {"type": "object", "maxProperties": 8, "propertyNames": {"pattern": environment_pattern}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 1024}, "description": environment_description}
                 }
             }),
@@ -243,7 +278,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root; returns its source with diagnostics."},
-                    "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET, "description": "Continue a truncated source reply from this byte offset."},
+                    "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET, "description": "Zero-based UTF-8 semantic position, never a continuation cursor."},
                     "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."},
                     "kind": {"type": "string", "enum": ["problems"], "description": "`problems`: the project check results instead of a file."},
                     "language": {"type": "string", "enum": checked_language_ids(), "description": "With `problems`: limit to one language."},
@@ -255,15 +290,22 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Diff,
             json!({
                 "type": "object", "additionalProperties": false,
-                "properties": {"paths": {"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1,"maxLength":1024},"description":"Limit capture and hunk budgets to these worktree-relative files or directories; literal paths only, no absolute paths or .. segments."}, "mode": {"type":"string","enum":["head","staged","unstaged","task"],"default":"head","description":"`head`: everything not yet committed; `staged` / `unstaged`: only that part; `task`: everything changed since activation, including commits."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}, "provenance": {"type": "boolean", "default": false, "description": "Return the exact worktree/comparison identity header instead of the compact default; no hashes appear otherwise."}}
+                "properties": {"paths": {"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1,"maxLength":1024}}, "mode": {"type":"string","enum":["head","staged","unstaged","task"],"description":"Whole comparison: uncommitted, staged, unstaged or since activation."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "provenance": {"type": "boolean", "default": false}}
             }),
         ),
         schema(
             AssistanceTool::Inspect,
             json!({
-                "type": "object", "additionalProperties": false,
-                "required": ["detail_ref"],
-                "properties": {"detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}}
+                "type": "object", "additionalProperties": false, "minProperties": 1,
+                "properties": {
+                    "kind": {"type":"string", "enum":["problems", "diagnostics"], "description":"Exclusive query mode; omit for retained references."},
+                    "wait_s": {"type":"integer", "minimum":1, "maximum":30, "description":"Only with detail_ref(s): completion seconds."},
+                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Only with kind:diagnostics."},
+                    "language": {"type":"string", "enum":checked_language_ids(), "description":"Only with kind:problems; omit for diagnostics."},
+                    "offset": {"type":"integer", "minimum":0, "maximum":MAX_PROBLEM_OFFSET, "description":"Only with kind:problems; continue from next_offset."},
+                    "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES},
+                    "detail_refs": {"type": "array", "minItems": 1, "maxItems": super::outbox::MAX_DETAIL_REFS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}}
+                }
             }),
         ),
         schema(
@@ -271,7 +313,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES, "description": "Optional, accepted for symmetry with ide.start; stop always ends this session's activation."}
+                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES}
                 }
             }),
         ),
@@ -279,18 +321,26 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Edit,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["operation_id"],
                 "properties": {
-                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Any unique id for this edit; repeating it never applies the edit twice."},
-                    "op": {"type": "string", "enum": ["replace", "insert", "delete", "rename"], "default": "replace", "description": "Symbol operation. replace: new body for `symbol` (or for `path`+`lines`); insert: new symbol placed `where` relative to `symbol`; delete: remove `symbol` with its header; rename: rename `symbol` project-wide to `new_name`."},
-                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`."},
-                    "where": {"type": "string", "enum": ["before", "after", "first", "last"], "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor."},
-                    "new_name": {"type": "string", "minLength": 1, "maxLength": 128, "description": "For rename: the new identifier, applied project-wide."},
+                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Retry key; never applied twice."},
+                    "op": {"type": "string", "enum": ["replace", "insert", "delete", "rename"], "default": "replace"},
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES},
+                    "old": {"type": "string", "minLength": 1},
+                    "new": {"type": "string"},
+                    "old_string": {"type": "string", "minLength": 1, "description": "Alias of `old`."},
+                    "new_string": {"type": "string", "description": "Alias of `new`."},
+                    "file_path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Alias of `path`."},
+                    "add_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES},
+                    "remove_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES},
+                    "where": {"type": "string", "enum": ["before", "after", "first", "last"]},
+                    "new_name": {"type": "string", "minLength": 1, "maxLength": 128},
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
-                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
-                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines` and to replace an existing file with `path`+`content`, optional (but validated) with `symbol`. Omit it with `path`+`content` to create a new file."},
-                    "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."},
-                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once (add `within` to scope it) and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match)."}}
+                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"},
+                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Deprecated; omit."},
+                    "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES},
+                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "add_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "remove_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}}},
+                    "patch": {"type": "string", "minLength": 1, "maxLength": super::batch::MAX_EDIT_TEXT_BYTES, "description": "A Codex apply_patch body (Add File, Update File), applied atomically. Use it alone."},
+                    "files": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_EDIT_FILES, "items": {"type": "object", "additionalProperties": false, "required": ["path"], "properties": {"path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object"}}, "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES}, "create": {"type": "boolean"}}}, "description": "Up to 16 files; up to 32 changes each."}
                 }
             }),
         ),
@@ -298,10 +348,11 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Outline,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["path"],
                 "properties": {
-                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root."},
-                    "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol))*$", "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows."}
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "One file, or a directory listing."},
+                    "paths": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_OUTLINE_FILES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "description": "Up to 24 files."},
+                    "glob": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "`*`, `?`, `**`; up to 24 files."},
+                    "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region))*$", "description": "Comma list of kinds to keep; `region` adds @header, @imports."}
                 }
             }),
         ),
@@ -310,11 +361,14 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`; returns its body with the doc header."},
-                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root; alone it reads the whole file, with `lines` or `ranges` those lines."},
-                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "Inclusive 1-based line range such as `120-180`."},
-                    "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest; a bare file path reads the text of a file no IDE language reads."},
-                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."}
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Address `src/a.rs#Type/method`, a window `…:3-5`, a region `src/a.rs#@imports` or `path:line`; returns doc and body."},
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the worktree; use items for related files. Alone: whole file; lines/ranges: selected lines."},
+                    "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$", "description": "With `path`: `120-180`, `120-` (to the end) or `120`; an end past the file is clamped."},
+                    "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several addresses in one reply, request order; a failed one fails only itself."},
+                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "description": "Several line ranges of one source/text file in one reply."},
+                    "detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES},
+                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "offset":{"type":"integer","minimum":0,"description":"1-based first line."}, "limit":{"type":"integer","minimum":1,"description":"Line count; default 2000."}}}, "description": "Up to 32."},
+                    "force": {"type": "boolean", "default": false}
                 }
             }),
         ),
@@ -322,13 +376,15 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Symbol,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["symbol"],
                 "properties": {
-                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`, or a bare name to search the project."},
-                    "usages": {"type": "boolean", "default": true, "description": "Include usages (src/tests split, with source lines)."},
-                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "Callers to list, 0–3 (0 = none); use ide.graph for deeper trees."},
-                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "Callees to list, 0–3 (0 = none)."},
-                    "history": {"type": "boolean", "default": false, "description": "Include the last commits touching the definition (opt-in)."}
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Address or bare name."},
+                    "symbols": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_SYMBOL_ENTRIES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Up to 8."},
+                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Only with byte_offset."},
+                    "byte_offset": {"type":"integer", "minimum":0, "maximum":MAX_BYTE_OFFSET},
+                    "usages": {"type": "boolean", "default": true},
+                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "0–3; 0 omits."},
+                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "0–3; 0 omits."},
+                    "history": {"type": "boolean", "default": false, "description": "Last commits touching it."}
                 }
             }),
         ),
@@ -336,12 +392,13 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Graph,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["symbol"],
                 "properties": {
-                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Symbol path `file#Owner/name`, or a bare name to search the project."},
-                    "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers", "description":"`callers`: who calls it (blast radius); `callees`: what it calls; `both`."},
-                    "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2, "description":"Levels to expand; 2 is usually enough."},
-                    "tests": {"type":"boolean", "default":false, "description":"Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent."}
+                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Address or bare name."},
+                    "symbols": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_SYMBOL_ENTRIES, "items":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "description":"Up to 8."},
+                    "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers"},
+                    "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2},
+                    "tests": {"type":"boolean", "default":false},
+                    "detail_ref":{"type":"string","minLength":1,"maxLength":MAX_DETAIL_REF_BYTES}
                 }
             }),
         ),
@@ -350,19 +407,48 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Run the tests that reference this symbol (`file#Owner/name`)."},
-                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Run the tests in this file or directory."},
-                    "pattern": {"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES, "description":"Run tests whose name matches this substring (runner filter)."},
-                    "command": {"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_COMMAND_BYTES}, "description":"Explicit argv to run instead of the detected runner; all argument bytes together are limited to 16 KiB."},
-                    "cwd": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`."},
-                    "env": {"type":"object", "maxProperties":MAX_ENV_ENTRIES, "additionalProperties":{"type":"string", "maxLength":MAX_ENV_VALUE_BYTES}, "description":"Environment variables added to the inherited environment for this explicit command. Only with `command`; names are bounded environment identifiers."},
-                    "status": {"type":"integer", "minimum":1, "description":"Re-read run number N (from `tests #N`) instead of starting one."},
-                    "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped and reported as timed out."}
+                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES},
+                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES},
+                    "pattern": {"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES},
+                    "command": {"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_COMMAND_BYTES}, "description":"One argv (16 KiB total); may set cwd and env."},
+                    "cwd": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Worktree-relative."},
+                    "env": {"type":"object", "maxProperties":MAX_ENV_ENTRIES, "additionalProperties":{"type":"string", "maxLength":MAX_ENV_VALUE_BYTES}},
+                    "cancel": {"type":"integer", "minimum":1},
+                    "result": {"type":"integer", "minimum":1},
+                    "history": {"type":"boolean", "enum":[true]},
+                    "output": {"type":"string", "minLength":1, "maxLength":MAX_DETAIL_REF_BYTES, "description":"Restore retained /output/N after context loss; exclusive, read-only."},
+                    "detail_ref": {"type":"string", "minLength":1, "maxLength":MAX_DETAIL_REF_BYTES},
+                    "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped; at most 600."},
+                    "targets": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_TEST_TARGETS, "items":{"type":"object", "additionalProperties":false, "minProperties":1, "maxProperties":1, "properties":{"symbol":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "path":{"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES}, "pattern":{"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES}, "command":{"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_COMMAND_BYTES}}}}, "description":"Up to 8."}
                 }
             }),
         ),
+        schema(
+            AssistanceTool::Prepare,
+            json!({"type":"object","additionalProperties":false,"required":["task"],"properties":{
+                "task":{"type":"string","minLength":1,"maxLength":16384},
+                "token_budget":{"type":"integer","minimum":0,"description":"Deprecated; ignored."}
+            }}),
+        ),
+        schema(
+            AssistanceTool::Tree,
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "path":{"type":"string","minLength":1,"maxLength":MAX_RELATIVE_PATH_BYTES,"description":"Directory to zoom into; default: project root."},
+                "depth":{"type":"integer","minimum":1,"maximum":crate::lang::render::TREE_MAX_DEPTH,"description":"Levels; default 2 at root, 1 below."}
+            }}),
+        ),
     ]
 }
+
+/// Tool `_meta` key with which an MCP server declares how many characters of one result its
+/// host may show inline. Claude Code (2.1.296) skips its MCP output-token limit for a tool that
+/// declares it and persists a result to a file only above the declared size, capped at
+/// [`WHOLE_SOURCE_RESULT_CHARS`]; without it a result over 100 000 characters (or the
+/// 25 000-token MCP limit) reaches the model only as a saved-file notice.
+pub(crate) const WHOLE_SOURCE_RESULT_META: &str = "anthropic/maxResultSizeChars";
+/// Inline result size declared for Read, Prepare and Inspect: Claude Code's own ceiling for a
+/// declared result size, so a whole packet up to it is shown to the model unchanged.
+pub(crate) const WHOLE_SOURCE_RESULT_CHARS: u64 = 500_000;
 
 /// Maximum bytes of a symbol path argument.
 pub const MAX_SYMBOL_PATH_BYTES: usize = 1024;
@@ -438,11 +524,42 @@ fn range_list(
 ) -> Result<Option<Vec<String>>, ParameterError> {
     let list = string_list(object, field, max)?;
     if let Some(list) = &list
-        && list.iter().any(|range| parse_line_range(range).is_none())
+        && list.iter().any(|range| parse_read_range(range).is_none())
     {
         return Err(invalid_field(field, FieldRule::LineRange));
     }
     Ok(list)
+}
+
+/// A fresh `operation_id` for an edit call that named none: process id, wall-clock nanoseconds
+/// and a process-wide counter, so ids never repeat across calls or daemon restarts.
+fn generated_operation_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!(
+        "auto-{}-{nanos:x}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Parses a lenient read range: `N` (one line), `N-M` or `N-` (to the end of the file).
+///
+/// The end of an open range is `u32::MAX`; readers clamp every end to the file's last line, so a
+/// range past the end of a file is never a parse failure. `None` for any other shape, a zero
+/// start or an end before the start.
+pub(crate) fn parse_read_range(text: &str) -> Option<crate::lang::LineRange> {
+    let (start, end) = match text.split_once('-') {
+        None => (text, text),
+        Some((start, "")) => (start, "4294967295"),
+        Some(pair) => pair,
+    };
+    let start: u32 = start.parse().ok()?;
+    let end: u32 = end.parse().ok()?;
+    (start >= 1 && end >= start).then(|| crate::lang::LineRange::new(start, end))
 }
 
 /// Parses an inclusive 1-based `start-end` line range; `None` for any other shape.
@@ -479,20 +596,20 @@ pub enum ParameterError {
         /// The exact closed rule the field value violated.
         rule: FieldRule,
     },
-    /// `ide.context` named neither `path` nor `kind: "problems"`.
+    /// The private Context validator, reused by diagnostic inspection, lacks its target.
     ///
-    /// The published schema stays a plain object (providers such as GLM drop a tool whose schema
-    /// uses `allOf`/`if`/`else`), so this either-or rule lives here instead of in the schema.
+    /// Public schemas stay plain objects (some providers drop conditionals), so the target
+    /// requirement lives in validation rather than an `allOf`/`if`/`else` schema.
     ContextTarget,
     /// `ide.outline` requires a relative file or directory path.
     OutlineTarget,
-    /// `ide.read` needs exactly one of: `symbol`, `path` alone (the whole file), `path` with
-    /// `lines`, `path` with `ranges`, or `symbols`.
+    /// `ide.read` needs exactly one of: `items`, `symbol`, `path` alone (the whole file), `path`
+    /// with `lines`, `path` with `ranges`, or `symbols`.
     ReadTarget,
-    /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` and `source_ref` for a range
-    /// replace, or the full-file form `path` + `content` (with `source_ref` to replace an existing
-    /// file, without it only to create a missing one); the forms are exclusive, except a redundant
-    /// `path` naming the symbol's own file.
+    /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` for a range replace, or the
+    /// full-file form `path` + `content` (which creates a missing file or replaces the current
+    /// bytes of an existing one); the optional, deprecated `source_ref` is never required. The
+    /// forms are exclusive, except a redundant `path` naming the symbol's own file.
     EditTarget,
     /// `ide.edit` with `changes` needs `path` (one file) and no single-change form beside it.
     ChangesTarget,
@@ -538,14 +655,6 @@ pub enum FieldRule {
     Boolean,
     /// The value must be an inclusive 1-based range `start-end` with `start <= end`.
     LineRange,
-    /// The closed method cannot proceed without the `source_ref` of the read its lines came from.
-    RangeEditSourceRef,
-    /// Exact-text changes require a source observation from the file that contains the text.
-    OldTextSourceRef,
-    /// A full-file edit without `source_ref` named a file that already exists: it may only create
-    /// a missing one, so replacing needs the `source_ref` of a read of that file. The worker, not
-    /// the facade, applies this rule, since only it observes whether the path exists.
-    ReplaceSourceRef,
 }
 
 impl FieldRule {
@@ -583,18 +692,7 @@ impl FieldRule {
             ),
             Self::RequiresProblemsKind => "requires \"kind\":\"problems\"".to_string(),
             Self::Boolean => "must be true or false".to_string(),
-            Self::LineRange => "must be an inclusive 1-based range like 120-180".to_string(),
-            Self::RangeEditSourceRef => {
-                "is required for a line-range edit; re-read the lines (ide.read) and retry with \
-                 the new source_ref"
-                    .to_string()
-            }
-            Self::OldTextSourceRef => {
-                "is required for an old-text change; re-read this file with ide.read and retry with the new source_ref".to_string()
-            }
-            Self::ReplaceSourceRef => {
-                "is required to replace an existing file: read it first (ide.read)".to_string()
-            }
+            Self::LineRange => "must be a 1-based line range like 120-180".to_string(),
         }
     }
 }
@@ -602,12 +700,12 @@ impl FieldRule {
 impl ParameterError {
     /// Renders the single-line model-facing refusal naming exactly what to fix (T21B).
     ///
-    /// Only caller field names that passed `echoable_field` are echoed back, and no field value
-    /// is ever included, so the text stays safe and bounded under 256 bytes on one line.
+    /// Only caller field names that passed `echoable_field` are echoed back; field values never
+    /// enter this message. The shared renderer bounds its head and adds exactly one repair.
     pub fn message(&self, tool: AssistanceTool) -> String {
         match self {
             Self::InvalidObject => format!(
-                "invalid bounded parameters: arguments must be a JSON object under {} bytes",
+                "Arguments must be a JSON object under {} bytes.",
                 parameter_limit(tool)
             ),
             Self::UnknownField(name) => {
@@ -615,45 +713,30 @@ impl ParameterError {
                     .as_ref()
                     .map(|name| format!(" \"{name}\""))
                     .unwrap_or_default();
-                let allowed = allowed_fields(tool).join(", ");
-                if allowed.is_empty() {
-                    format!("invalid bounded parameters: unknown field{named}")
-                } else {
-                    format!("invalid bounded parameters: unknown field{named}; allowed: {allowed}")
-                }
+                format!("Unknown argument{named}.")
             }
             Self::InvalidField { field, rule } => {
-                format!("invalid bounded parameters: \"{field}\" {}", rule.text())
+                format!("Argument \"{field}\" {}.", rule.text())
             }
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
             Self::OutlineTarget => OUTLINE_TARGET_MESSAGE.to_string(),
-            Self::ReadTarget => {
-                "ide.read needs one form: `symbol`, or `path` alone (the whole file), or `path` \
-                 with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
-                    .to_string()
-            }
-            Self::EditTarget => {
-                "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
-                 `source_ref` — not both"
-                    .to_string()
-            }
+            Self::ReadTarget => "ide.read needs exactly one supported read target.".to_string(),
+            Self::EditTarget => "ide.edit needs exactly one supported edit target.".to_string(),
             Self::ChangesTarget => {
-                "ide.edit takes one form: \"changes\" with \"path\", or one single-change form \
-                 — not both"
-                    .to_string()
+                "ide.edit cannot combine a changes list with a single-change form.".to_string()
             }
-            Self::TestTargetUnsupported(message) => format!(
-                "invalid bounded parameters: {message}; use ide.test with `pattern` or `command`"
-            ),
+            Self::TestTargetUnsupported(message) => {
+                format!("This test target is unsupported: {message}.")
+            }
         }
     }
 }
 
-/// Model-facing text for a context request that names neither a path nor the problems kind.
-const CONTEXT_TARGET_MESSAGE: &str =
-    "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\"";
+/// Model-facing target refusal from the private engine reused by file diagnostic inspection.
+const CONTEXT_TARGET_MESSAGE: &str = "ide.inspect diagnostics needs \"path\".";
 /// Model-facing text for an outline request without its required path.
-const OUTLINE_TARGET_MESSAGE: &str = "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)";
+const OUTLINE_TARGET_MESSAGE: &str =
+    "ide.outline needs \"path\" (a file or directory relative to the worktree root).";
 
 /// The closed request form of one call for the journal (QW-4): the names of the parameters the
 /// tool defines that the call carries, in the tool's own order, joined by `+` (for example
@@ -675,6 +758,7 @@ pub(crate) fn request_form(tool: AssistanceTool, parameters: &Value) -> String {
 fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
     match tool {
         AssistanceTool::Start => &["activation_id", "root", "read_only", "environment"],
+        AssistanceTool::Prepare => &["task", "token_budget"],
         AssistanceTool::Context => &[
             "path",
             "byte_offset",
@@ -683,8 +767,19 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "language",
             "offset",
         ],
-        AssistanceTool::Diff => &["mode", "detail_ref", "provenance", "paths"],
-        AssistanceTool::Inspect => &["detail_ref"],
+        // `since_last` is set by the normalization below (a call without `mode`) and read back by
+        // the daemon's own validation; it is never advertised.
+        AssistanceTool::Diff => &["mode", "detail_ref", "provenance", "paths", "since_last"],
+        AssistanceTool::Inspect => &[
+            "detail_ref",
+            "detail_refs",
+            "wait_ms",
+            "wait_s",
+            "kind",
+            "path",
+            "language",
+            "offset",
+        ],
         AssistanceTool::Stop => &["activation_id"],
         AssistanceTool::Edit => &[
             "operation_id",
@@ -697,19 +792,64 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "where",
             "new_name",
             "lines",
+            "files",
+            "patch",
         ],
-        AssistanceTool::Outline => &["path", "kinds"],
-        AssistanceTool::Read => &["symbol", "path", "lines", "symbols", "ranges"],
-        AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees", "history"],
-        AssistanceTool::Graph => &["symbol", "direction", "depth", "tests"],
+        AssistanceTool::Outline => &["path", "kinds", "paths", "glob"],
+        AssistanceTool::Tree => &["path", "depth"],
+        AssistanceTool::Read => &[
+            "symbol",
+            "path",
+            "lines",
+            "symbols",
+            "ranges",
+            "items",
+            "force",
+            "detail_ref",
+        ],
+        AssistanceTool::Symbol => &[
+            "symbol",
+            "usages",
+            "callers",
+            "callees",
+            "history",
+            "symbols",
+            "path",
+            "byte_offset",
+        ],
+        AssistanceTool::Graph => &[
+            "symbol",
+            "direction",
+            "depth",
+            "tests",
+            "symbols",
+            "detail_ref",
+        ],
         AssistanceTool::Test => &[
-            "symbol", "path", "pattern", "command", "cwd", "env", "status", "budget_s",
+            "symbol",
+            "path",
+            "pattern",
+            "command",
+            "cwd",
+            "env",
+            "status",
+            "cancel",
+            "result",
+            "history",
+            "output",
+            "detail_ref",
+            "budget_s",
+            "targets",
         ],
     }
 }
 
-/// Returns the hard argument-object byte limit for one logical tool.
+/// Returns the hard argument-object byte limit of one logical tool's non-batch forms; a batch
+/// form (`super::batch::batch_key`) is bounded by `super::batch::MAX_BATCH_PARAMETER_BYTES`.
 fn parameter_limit(tool: AssistanceTool) -> usize {
+    if tool == AssistanceTool::Prepare {
+        return 100 * 1024;
+    }
     match tool {
         AssistanceTool::Edit => crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES,
         AssistanceTool::Test => MAX_TEST_PARAMETERS_BYTES,
@@ -729,12 +869,12 @@ fn echoable_field(field: &str) -> Option<String> {
 }
 
 /// Builds one field-level rejection naming the violated closed rule.
-fn invalid_field(field: &'static str, rule: FieldRule) -> ParameterError {
+pub(super) fn invalid_field(field: &'static str, rule: FieldRule) -> ParameterError {
     ParameterError::InvalidField { field, rule }
 }
 
 /// Names the closed relative-path rule one already-bounded path string violated, if any.
-fn path_shape_rule(path: &str) -> Option<FieldRule> {
+pub(super) fn path_shape_rule(path: &str) -> Option<FieldRule> {
     if path.as_bytes().contains(&0) {
         Some(FieldRule::NoNul)
     } else if path.split('/').any(|part| part == "..") {
@@ -743,6 +883,19 @@ fn path_shape_rule(path: &str) -> Option<FieldRule> {
         Some(FieldRule::RelativePath)
     } else {
         None
+    }
+}
+
+/// Validates one already-bounded edit path before the worker checks canonical containment.
+///
+/// Relative paths retain the strict no-empty, dot or parent-component rules. Absolute paths
+/// may contain those native spellings, but never NUL; the worker resolves them beneath the
+/// active worktree before source observation, parent preparation or writes. No I/O occurs here.
+pub(super) fn edit_path_shape_rule(path: &str) -> Option<FieldRule> {
+    if std::path::Path::new(path).is_absolute() {
+        path.as_bytes().contains(&0).then_some(FieldRule::NoNul)
+    } else {
+        path_shape_rule(path)
     }
 }
 
@@ -767,17 +920,115 @@ impl ValidatedCall {
     }
 }
 
-/// Validates one closed logical tool payload and rejects identity or authority-shaped extra fields.
+/// Validates public model arguments, rejecting internal normalized fields before shared
+/// shape validation. Default diffs derive their incremental flag; explicit modes stay full.
 pub fn validate_call(
+    tool: AssistanceTool,
+    parameters: Value,
+) -> Result<ValidatedCall, ParameterError> {
+    if tool == AssistanceTool::Diff && parameters.get("since_last").is_some() {
+        return Err(ParameterError::UnknownField(Some("since_last".to_owned())));
+    }
+    validate_normalized_call(tool, parameters)
+}
+
+/// Validates the trusted front's normalized daemon payload with the same bounded shapes.
+/// Preserves the front-derived diff flag across daemon revalidation; this entry is not used
+/// for public model arguments. Raw internal callers without a mode receive the usual default.
+/// Absolute edit paths keep their original spelling for canonical containment by the worker;
+/// validation here grants no filesystem authority and does not relax non-edit path rules.
+pub(crate) fn validate_normalized_call(
     tool: AssistanceTool,
     mut parameters: Value,
 ) -> Result<ValidatedCall, ParameterError> {
-    let parameter_limit = parameter_limit(tool);
-    if serde_json::to_vec(&parameters)
-        .ok()
-        .is_none_or(|value| value.len() > parameter_limit)
+    if tool == AssistanceTool::Read {
+        normalize_read_ranges(&mut parameters)?;
+    }
+    // Result is the public domain name; status remains accepted for older clients.
+    if tool == AssistanceTool::Test
+        && let Some(object) = parameters.as_object_mut()
+        && let Some(result) = object.remove("result")
     {
-        return Err(ParameterError::InvalidObject);
+        if object.contains_key("status") {
+            return Err(invalid_field(
+                "result",
+                FieldRule::OneOf("not together with status"),
+            ));
+        }
+        object.insert("status".to_owned(), result);
+    }
+    // Public inspect queries have closed modes before reusing the private Context operation.
+    if tool == AssistanceTool::Inspect && parameters.get("kind").is_some() {
+        let object = parameters
+            .as_object()
+            .ok_or(ParameterError::InvalidObject)?;
+        if object.get("kind").and_then(Value::as_str) == Some("diagnostics") {
+            for field in ["language", "offset"] {
+                if object.contains_key(field) {
+                    return Err(invalid_field(field, FieldRule::RequiresProblemsKind));
+                }
+            }
+        }
+        if object.get("kind").and_then(Value::as_str) == Some("problems")
+            && object.contains_key("path")
+        {
+            return Err(invalid_field(
+                "path",
+                FieldRule::OneOf("used only with kind:diagnostics"),
+            ));
+        }
+        for field in ["detail_ref", "detail_refs", "wait_s", "wait_ms"] {
+            if object.contains_key(field) {
+                return Err(invalid_field(
+                    field,
+                    FieldRule::OneOf("used in the retained-reference form without kind"),
+                ));
+            }
+        }
+        let allowed: &[&str] = match object.get("kind").and_then(Value::as_str) {
+            Some("problems") => &["kind", "language", "offset"],
+            Some("diagnostics") => &["kind", "path"],
+            _ => {
+                return Err(invalid_field(
+                    "kind",
+                    FieldRule::OneOf("problems or diagnostics"),
+                ));
+            }
+        };
+        if let Some(field) = object
+            .keys()
+            .find(|field| !allowed.contains(&field.as_str()))
+        {
+            return Err(ParameterError::UnknownField(echoable_field(field)));
+        }
+    }
+    let batch_key = super::batch::batch_key(tool, &parameters);
+    let size = serde_json::to_vec(&parameters)
+        .ok()
+        .map(|value| value.len());
+    match (batch_key, size) {
+        (Some(key), Some(size)) if size > super::batch::MAX_BATCH_PARAMETER_BYTES => {
+            return Err(invalid_field(
+                key,
+                FieldRule::TooLong(super::batch::MAX_BATCH_PARAMETER_BYTES),
+            ));
+        }
+        (Some(_), Some(_)) => {}
+        (_, size) if size.is_none_or(|size| size > parameter_limit(tool)) => {
+            return Err(ParameterError::InvalidObject);
+        }
+        _ => {}
+    }
+    // `operation_id` is optional on every edit form: a call without one gets a fresh id, so it
+    // is never mistaken for a replay of another call.
+    if tool == AssistanceTool::Edit
+        && let Some(map) = parameters.as_object_mut()
+        && !map.contains_key("operation_id")
+    {
+        map.insert("operation_id".to_owned(), json!(generated_operation_id()));
+    }
+    if tool == AssistanceTool::Edit {
+        super::edit_forms::normalize(&mut parameters);
     }
     let object = parameters
         .as_object()
@@ -790,6 +1041,43 @@ pub fn validate_call(
         return Err(ParameterError::UnknownField(echoable_field(field)));
     }
     match tool {
+        AssistanceTool::Outline if object.contains_key("paths") || object.contains_key("glob") => {
+            super::batch::validate_outline(object)?;
+        }
+        AssistanceTool::Prepare => {
+            let task = required_string(object, "task", 16384)?;
+            if task.trim().is_empty() {
+                return Err(invalid_field("task", FieldRule::OneOf("nonempty task")));
+            }
+            // Accepted for compatibility only; the packet is never cut to a budget.
+            if object
+                .get("token_budget")
+                .is_some_and(|value| value.as_u64().is_none())
+            {
+                return Err(invalid_field(
+                    "token_budget",
+                    FieldRule::OneOf("nonnegative integer"),
+                ));
+            }
+        }
+        AssistanceTool::Tree => {
+            if object.contains_key("path") {
+                let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+                if let Some(rule) = path_shape_rule(path.strip_suffix('/').unwrap_or(path)) {
+                    return Err(invalid_field("path", rule));
+                }
+            }
+            if let Some(depth) = object.get("depth")
+                && !depth.as_u64().is_some_and(|depth| {
+                    (1..=crate::lang::render::TREE_MAX_DEPTH as u64).contains(&depth)
+                })
+            {
+                return Err(invalid_field(
+                    "depth",
+                    FieldRule::OneOf("an integer from 1 to 4"),
+                ));
+            }
+        }
         AssistanceTool::Outline => {
             if !object.contains_key("path") {
                 return Err(ParameterError::OutlineTarget);
@@ -803,9 +1091,9 @@ pub fn validate_call(
                 .get("kinds")
                 .and_then(Value::as_str)
                 .is_some_and(|kinds| {
-                    kinds
-                        .split(',')
-                        .any(|kind| crate::lang::SymbolKind::from_name(kind).is_none())
+                    kinds.split(',').any(|kind| {
+                        kind != "region" && crate::lang::SymbolKind::from_name(kind).is_none()
+                    })
                 })
             {
                 return Err(invalid_field(
@@ -814,7 +1102,25 @@ pub fn validate_call(
                 ));
             }
         }
+        AssistanceTool::Read | AssistanceTool::Graph if object.contains_key("detail_ref") => {
+            if object.len() != 1 {
+                return Err(invalid_field(
+                    "detail_ref",
+                    FieldRule::OneOf("alone, without a new selection"),
+                ));
+            }
+            required_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+        }
+        AssistanceTool::Read if object.contains_key("items") => {
+            super::batch::validate_read_items(object)?;
+        }
         AssistanceTool::Read => {
+            if object
+                .get("force")
+                .is_some_and(|value| value.as_bool().is_none())
+            {
+                return Err(invalid_field("force", FieldRule::OneOf("true or false")));
+            }
             optional_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
             optional_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
             optional_string(object, "lines", 32)?;
@@ -835,7 +1141,7 @@ pub fn validate_call(
                     if let Some(rule) = path_shape_rule(path) {
                         return Err(invalid_field("path", rule));
                     }
-                    if parse_line_range(object["lines"].as_str().unwrap_or_default()).is_none() {
+                    if parse_read_range(object["lines"].as_str().unwrap_or_default()).is_none() {
                         return Err(invalid_field("lines", FieldRule::LineRange));
                     }
                 }
@@ -852,6 +1158,41 @@ pub fn validate_call(
                     }
                 }
                 _ => return Err(ParameterError::ReadTarget),
+            }
+        }
+        AssistanceTool::Symbol | AssistanceTool::Graph if object.contains_key("symbols") => {
+            if object.contains_key("path") || object.contains_key("byte_offset") {
+                return Err(invalid_field(
+                    "target",
+                    FieldRule::OneOf("symbol, symbols, or path with byte_offset"),
+                ));
+            }
+            super::batch::validate_symbols(tool, object)?;
+        }
+        AssistanceTool::Symbol
+            if object.contains_key("path") || object.contains_key("byte_offset") =>
+        {
+            if object
+                .keys()
+                .any(|field| !matches!(field.as_str(), "path" | "byte_offset"))
+            {
+                return Err(invalid_field(
+                    "target",
+                    FieldRule::OneOf("path with byte_offset alone"),
+                ));
+            }
+            let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+            if let Some(rule) = path_shape_rule(path) {
+                return Err(invalid_field("path", rule));
+            }
+            if object
+                .get("byte_offset")
+                .is_none_or(|value| value.as_u64().is_none_or(|offset| offset > MAX_BYTE_OFFSET))
+            {
+                return Err(invalid_field(
+                    "byte_offset",
+                    FieldRule::NonNegativeInteger(MAX_BYTE_OFFSET),
+                ));
             }
         }
         AssistanceTool::Symbol => {
@@ -893,15 +1234,38 @@ pub fn validate_call(
                 return Err(invalid_field("tests", FieldRule::Boolean));
             }
         }
+        AssistanceTool::Test if object.contains_key("output") => {
+            let output = required_string(object, "output", MAX_DETAIL_REF_BYTES)?;
+            if output.as_bytes().contains(&0) {
+                return Err(invalid_field("output", FieldRule::NoNul));
+            }
+            if object.len() != 1 {
+                return Err(invalid_field("output", FieldRule::OneOf("used alone")));
+            }
+        }
+        AssistanceTool::Test if object.contains_key("targets") => {
+            super::batch::validate_test_targets(object)?;
+        }
         AssistanceTool::Test => {
-            let targets = ["symbol", "path", "pattern", "command", "status"]
-                .into_iter()
-                .filter(|field| object.contains_key(*field))
-                .count();
+            let targets = [
+                "symbol",
+                "path",
+                "pattern",
+                "command",
+                "status",
+                "cancel",
+                "history",
+                "detail_ref",
+            ]
+            .into_iter()
+            .filter(|field| object.contains_key(*field))
+            .count();
             if targets != 1 {
                 return Err(invalid_field(
                     "target",
-                    FieldRule::OneOf("exactly one of symbol, path, pattern, command, or status"),
+                    FieldRule::OneOf(
+                        "exactly one of symbol, path, pattern, command, result, history, cancel, or detail_ref",
+                    ),
                 ));
             }
             optional_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
@@ -920,6 +1284,24 @@ pub fn validate_call(
                 }
             }
             optional_string(object, "pattern", MAX_TEXT_BYTES)?;
+            optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+            if object
+                .get("history")
+                .is_some_and(|value| value.as_bool() != Some(true))
+            {
+                return Err(invalid_field("history", FieldRule::OneOf("true")));
+            }
+            if (object.contains_key("history")
+                || object.contains_key("status")
+                || object.contains_key("cancel")
+                || object.contains_key("detail_ref"))
+                && object.contains_key("budget_s")
+            {
+                return Err(invalid_field(
+                    "budget_s",
+                    FieldRule::OneOf("only with a new run"),
+                ));
+            }
             if object.contains_key("cwd") || object.contains_key("env") {
                 if !object.contains_key("command") {
                     return Err(invalid_field("cwd", FieldRule::OneOf("only with command")));
@@ -989,6 +1371,15 @@ pub fn validate_call(
                         FieldRule::OneOf("argv strings without NUL totaling at most 16384 bytes"),
                     ));
                 }
+            }
+            if object
+                .get("cancel")
+                .is_some_and(|value| value.as_u64().is_none_or(|id| id == 0))
+            {
+                return Err(invalid_field(
+                    "cancel",
+                    FieldRule::NonNegativeInteger(u64::MAX),
+                ));
             }
             if object
                 .get("status")
@@ -1159,13 +1550,96 @@ pub fn validate_call(
             {
                 return Err(invalid_field("provenance", FieldRule::Boolean));
             }
+            if object
+                .get("since_last")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(invalid_field("since_last", FieldRule::Boolean));
+            }
         }
 
+        AssistanceTool::Inspect if object.contains_key("kind") => {
+            // Reuse the private query validator without changing the receiving public tool:
+            // replies, retained selections and pushed job subjects continue to say ide.inspect.
+            validate_normalized_call(fold_inspect_problems(tool, &parameters), parameters.clone())?;
+        }
         AssistanceTool::Inspect => {
-            required_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+            // OUTBOX-r3 §8.5: one reference or up to eight in order, each with an optional bounded
+            // wait; naming neither is refused because no session fact list exists to read.
+            optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+            if let Some(wait) = object.get("wait_s") {
+                if wait.as_u64().is_none_or(|wait| !(1..=30).contains(&wait)) {
+                    return Err(invalid_field(
+                        "wait_s",
+                        FieldRule::IntegerRange { min: 1, max: 30 },
+                    ));
+                }
+                if object.contains_key("wait_ms") {
+                    return Err(invalid_field(
+                        "wait_s",
+                        FieldRule::OneOf("not together with wait_ms"),
+                    ));
+                }
+            }
+            if !object.contains_key("detail_ref") && !object.contains_key("detail_refs") {
+                return Err(invalid_field("detail_ref", FieldRule::Required));
+            }
+            if let Some(references) =
+                string_list(object, "detail_refs", super::outbox::MAX_DETAIL_REFS)?
+            {
+                if object.contains_key("detail_ref") {
+                    return Err(invalid_field(
+                        "detail_refs",
+                        FieldRule::OneOf("not together with detail_ref"),
+                    ));
+                }
+                if references.iter().any(|reference| {
+                    reference.len() > MAX_DETAIL_REF_BYTES
+                        || reference.chars().any(char::is_control)
+                }) {
+                    return Err(invalid_field(
+                        "detail_refs",
+                        FieldRule::TooLong(MAX_DETAIL_REF_BYTES),
+                    ));
+                }
+            }
+            if object.get("wait_ms").is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|wait| wait > super::outbox::MAX_WAIT_MS)
+            }) {
+                return Err(invalid_field(
+                    "wait_ms",
+                    FieldRule::NonNegativeInteger(super::outbox::MAX_WAIT_MS),
+                ));
+            }
         }
         AssistanceTool::Stop => {
             optional_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
+        }
+        AssistanceTool::Edit if object.contains_key("patch") => {
+            // A Codex `apply_patch` body travels alone beside `operation_id`; its grammar is
+            // checked by the worker, which owns the refusal text.
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "operation_id" | "patch"))
+            {
+                return Err(invalid_field(
+                    "patch",
+                    FieldRule::OneOf("used only with \"operation_id\""),
+                ));
+            }
+            let patch = required_string(object, "patch", super::batch::MAX_EDIT_TEXT_BYTES)?;
+            if patch.len() > super::batch::MAX_EDIT_TEXT_BYTES {
+                return Err(invalid_field(
+                    "patch",
+                    FieldRule::TooLong(super::batch::MAX_EDIT_TEXT_BYTES),
+                ));
+            }
+            required_string(object, "operation_id", 128)?;
+        }
+        AssistanceTool::Edit if object.contains_key("files") => {
+            super::batch::validate_edit_files(object)?;
         }
         AssistanceTool::Edit if object.contains_key("changes") => {
             required_string(object, "operation_id", 128)?;
@@ -1175,7 +1649,7 @@ pub fn validate_call(
                 }
             }
             let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
-            if let Some(rule) = path_shape_rule(path) {
+            if let Some(rule) = edit_path_shape_rule(path) {
                 return Err(invalid_field("path", rule));
             }
             let changes = object["changes"]
@@ -1187,15 +1661,21 @@ pub fn validate_call(
                         FieldRule::OneOf("an array of 1 to 32 change objects"),
                     )
                 })?;
-            // Line numbers and exact text are only meaningful for the bytes the caller read, so
-            // any `lines` or `old` entry makes the call name the observation it came from.
-            let mut needs_source = false;
             for entry in changes {
                 let entry = entry.as_object().ok_or_else(|| {
                     invalid_field("changes", FieldRule::OneOf("an array of change objects"))
                 })?;
                 let allowed = [
-                    "lines", "symbol", "op", "where", "content", "old", "new", "within",
+                    "lines",
+                    "symbol",
+                    "op",
+                    "where",
+                    "content",
+                    "old",
+                    "new",
+                    "within",
+                    "add_import",
+                    "remove_import",
                 ];
                 if let Some(field) = entry
                     .keys()
@@ -1203,7 +1683,7 @@ pub fn validate_call(
                 {
                     return Err(ParameterError::UnknownField(echoable_field(field)));
                 }
-                let addresses = ["lines", "symbol", "old"]
+                let addresses = ["lines", "symbol", "old", "add_import", "remove_import"]
                     .into_iter()
                     .filter(|field| entry.contains_key(*field))
                     .count();
@@ -1211,19 +1691,36 @@ pub fn validate_call(
                     return Err(invalid_field(
                         "changes",
                         FieldRule::OneOf(
-                            "each entry addressed by exactly one of \"lines\", \"symbol\" or \
-                             \"old\"",
+                            "each entry addressed by exactly one of \"lines\", \"symbol\", \
+                             \"old\", \"add_import\" or \"remove_import\"",
                         ),
                     ));
                 }
-                if entry.contains_key("lines") {
+                if let Some(field) = ["add_import", "remove_import"]
+                    .into_iter()
+                    .find(|field| entry.contains_key(*field))
+                {
+                    // One import statement as written; a second form key beside it is a mix.
+                    let statement = entry_string(entry, field)?;
+                    if statement.contains('\n') || statement.len() > MAX_SYMBOL_PATH_BYTES {
+                        return Err(invalid_field(
+                            "changes",
+                            FieldRule::OneOf("an import statement on one line"),
+                        ));
+                    }
+                    if entry.len() != 1 {
+                        return Err(invalid_field(
+                            "changes",
+                            FieldRule::OneOf("an import entry with no other key"),
+                        ));
+                    }
+                } else if entry.contains_key("lines") {
                     if parse_line_range(entry_string(entry, "lines")?).is_none() {
                         return Err(invalid_field(
                             "changes",
                             FieldRule::OneOf("entry \"lines\" like 12-20"),
                         ));
                     }
-                    needs_source = true;
                     // The content may be empty: empty replaces the range with nothing, which
                     // deletes those lines.
                     if !entry.get("content").is_some_and(Value::is_string) {
@@ -1259,7 +1756,10 @@ pub fn validate_call(
                     }
                     match op {
                         "replace" => {
-                            entry_string(entry, "content")?;
+                            // Empty content deletes the unit or the window (E2).
+                            if !entry.get("content").is_some_and(Value::is_string) {
+                                return Err(invalid_field("content", FieldRule::String));
+                            }
                         }
                         "insert" => {
                             entry_string(entry, "content")?;
@@ -1283,7 +1783,6 @@ pub fn validate_call(
                     }
                 } else {
                     entry_string(entry, "old")?;
-                    needs_source = true;
                     if !entry
                         .get("new")
                         .is_some_and(|value| value.as_str().is_some())
@@ -1309,21 +1808,9 @@ pub fn validate_call(
                     }
                 }
             }
-            if needs_source {
-                // Line numbers and exact text name the read they came from; the refusal teaches
-                // the re-read the way the single line-range form's does.
-                if !object.contains_key("source_ref") {
-                    let rule = if changes.iter().any(|entry| entry.get("old").is_some()) {
-                        FieldRule::OldTextSourceRef
-                    } else {
-                        FieldRule::RangeEditSourceRef
-                    };
-                    return Err(invalid_field("source_ref", rule));
-                }
-                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
-            } else {
-                optional_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
-            }
+            // Without `source_ref` every address resolves against the bytes current at
+            // processing time.
+            optional_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
         }
         AssistanceTool::Edit if object.contains_key("symbol") || object.contains_key("lines") => {
             required_string(object, "operation_id", 128)?;
@@ -1359,18 +1846,12 @@ pub fn validate_call(
                     return Err(ParameterError::EditTarget);
                 }
                 let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
-                if let Some(rule) = path_shape_rule(path) {
+                if let Some(rule) = edit_path_shape_rule(path) {
                     return Err(invalid_field("path", rule));
                 }
                 if parse_line_range(required_string(object, "lines", 32)?).is_none() {
                     return Err(invalid_field("lines", FieldRule::LineRange));
                 }
-                // Line numbers are only meaningful for the exact content the caller read, so the
-                // range form always names the observation it came from.
-                if !object.contains_key("source_ref") {
-                    return Err(invalid_field("source_ref", FieldRule::RangeEditSourceRef));
-                }
-                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
             }
             match op {
                 "replace" | "insert" => {
@@ -1415,17 +1896,29 @@ pub fn validate_call(
                     FieldRule::TooLong(MAX_EDIT_ARGUMENT_CONTENT_BYTES),
                 ));
             }
-            // Without `source_ref` the call may only create a file that does not exist yet: the
-            // worker observes the path itself and refuses an existing file. The placeholder only
-            // runs the request's own validation here (the worker supplies the real reference) and
-            // is dropped from the forwarded parameters below.
+            // Without `source_ref` the call writes the whole file: the worker observes the path
+            // itself, creating a missing file or replacing the current bytes of an existing one.
+            // The placeholder only runs the request's own validation here (the worker supplies the
+            // real reference) and is dropped from the forwarded parameters below.
             let source_ref = object
                 .contains_key("source_ref")
                 .then(|| required_string(object, "source_ref", MAX_DETAIL_REF_BYTES))
                 .transpose()?;
+            if let Some(rule) = edit_path_shape_rule(path) {
+                return Err(invalid_field("path", rule));
+            }
+            let original_path = path.to_owned();
+            // Changes accepts only resolved relative paths. Its constructor checks the remaining
+            // fields here; an absolute target retains its exact spelling for the worker's shared
+            // canonical containment check before the real Changes request is constructed.
+            let validation_path = if std::path::Path::new(path).is_absolute() {
+                "edit-target"
+            } else {
+                path
+            };
             let request = crate::changes::edit::EditRequest::new(
                 operation_id,
-                path,
+                validation_path,
                 source_ref.unwrap_or("create"),
                 object
                     .get("content")
@@ -1447,6 +1940,7 @@ pub fn validate_call(
             let creates = source_ref.is_none();
             parameters =
                 serde_json::to_value(request).map_err(|_| ParameterError::InvalidObject)?;
+            parameters["path"] = Value::String(original_path);
             if creates {
                 parameters
                     .as_object_mut()
@@ -1457,10 +1951,94 @@ pub fn validate_call(
     }
     if tool == AssistanceTool::Diff {
         let object = parameters.as_object_mut().expect("validated object");
+        // A diff that names no `mode` answers only what changed since the activation's previous
+        // diff (`since_last`, set here and never accepted from the model); naming a mode, even
+        // `head`, answers the whole diff.
+        if !object.contains_key("mode") && !object.contains_key("detail_ref") {
+            object.insert("since_last".to_owned(), json!(true));
+        }
         object.entry("mode").or_insert(json!("head"));
         object.entry("provenance").or_insert(json!(false));
     }
     Ok(ValidatedCall { tool, parameters })
+}
+
+/// Converts native-style offset/count operands into the existing closed range form without I/O.
+/// Offset0 aliases line1; absent count is2000. Conflicts, invalid integers and overflow refuse.
+fn normalize_read_ranges(parameters: &mut Value) -> Result<(), ParameterError> {
+    let normalize = |object: &mut Map<String, Value>| -> Result<(), ParameterError> {
+        if !object.contains_key("offset") && !object.contains_key("limit") {
+            return Ok(());
+        }
+        if !object.contains_key("path")
+            || ["symbol", "symbols", "ranges", "lines", "items"]
+                .iter()
+                .any(|key| object.contains_key(*key))
+        {
+            return Err(invalid_field(
+                "offset",
+                FieldRule::OneOf("with path only; use offset/limit or lines, never both"),
+            ));
+        }
+        let start = match object.get("offset") {
+            None => 1,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n <= u32::MAX as u64)
+                .ok_or_else(|| {
+                    invalid_field(
+                        "offset",
+                        FieldRule::IntegerRange {
+                            min: 0,
+                            max: u32::MAX as u64,
+                        },
+                    )
+                })?
+                .max(1),
+        };
+        let count = match object.get("limit") {
+            None => 2000,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n > 0 && *n <= u32::MAX as u64)
+                .ok_or_else(|| {
+                    invalid_field(
+                        "limit",
+                        FieldRule::IntegerRange {
+                            min: 1,
+                            max: u32::MAX as u64,
+                        },
+                    )
+                })?,
+        };
+        let end = start
+            .checked_add(count - 1)
+            .filter(|n| *n <= u32::MAX as u64)
+            .ok_or_else(|| {
+                invalid_field(
+                    "limit",
+                    FieldRule::IntegerRange {
+                        min: 1,
+                        max: u32::MAX as u64,
+                    },
+                )
+            })?;
+        object.remove("offset");
+        object.remove("limit");
+        object.insert("lines".into(), json!(format!("{start}-{end}")));
+        Ok(())
+    };
+    if let Some(object) = parameters.as_object_mut() {
+        normalize(object)?;
+        if let Some(items) = object.get_mut("items").and_then(Value::as_array_mut) {
+            for item in items {
+                if let Some(item) = item.as_object_mut() {
+                    normalize(item)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reads one required bounded nonempty string from one `changes` entry, refusing on the entry
@@ -1664,36 +2242,40 @@ impl AssistanceFacade {
     }
 
     /// [`Self::dispatch_at`], also returning the private actor tag a current managed Claude
-    /// daemon attaches to start replies, identity answers and `recovery_needed` refusals;
-    /// `Some(None)` is an identity answer that names no actor.
+    /// daemon attaches to start replies, identity answers and `recovery_needed` refusals, plus
+    /// the optional accepted-or-unknown Bridge publication result of a restart-loss notice.
+    /// `Some(None)` is an identity answer that names no actor; the handoff result never claims
+    /// model observation.
     pub async fn dispatch_at_tagged(
         &self,
         runtime_dir: &Path,
         host: &TrustedTransport,
         tool: AssistanceTool,
         parameters: Value,
-    ) -> (FacadeOutcome, Option<Option<String>>) {
+    ) -> (FacadeOutcome, Option<Option<String>>, Option<bool>) {
         let Ok(call) = validate_call(tool, parameters) else {
-            return (FacadeOutcome::InvalidParameters, None);
+            return (FacadeOutcome::InvalidParameters, None, None);
         };
         self.dispatch_validated(runtime_dir, host, call).await
     }
 
     /// Shared tail of [`Self::dispatch`] and [`Self::dispatch_at`] once parameters are validated.
+    /// Returns the closed facade outcome, an optional managed-Claude actor wrapper, and the
+    /// restart-loss Bridge publication result when the daemon supplied one.
     async fn dispatch_validated(
         &self,
         runtime_dir: &Path,
         host: &TrustedTransport,
         call: ValidatedCall,
-    ) -> (FacadeOutcome, Option<Option<String>>) {
+    ) -> (FacadeOutcome, Option<Option<String>>, Option<bool>) {
         let tool = call.tool();
         // The method envelope has the daemon's own method-payload bound, so the front's private
         // host metadata never takes room from bounded model arguments.
         let Some(parameters) = OpaqueJson::from_value(
-            &json!({"parameters":call.parameters(),"host_meta":host.host_meta}),
+            &method_envelope(tool, call.parameters(), host.host_meta.as_ref()),
             crate::app::MAX_ASSISTANCE_JSON_BYTES,
         ) else {
-            return (FacadeOutcome::InvalidParameters, None);
+            return (FacadeOutcome::InvalidParameters, None, None);
         };
         let Some(request) = MethodDispatch::new(
             host.request_id.clone(),
@@ -1702,9 +2284,10 @@ impl AssistanceFacade {
             call.tool().transport_method(),
             parameters,
         ) else {
-            return (FacadeOutcome::Unavailable, None);
+            return (FacadeOutcome::Unavailable, None, None);
         };
         let mut tag = None;
+        let mut lost_handoff = None;
         let outcome = match dispatch_method_if_running(runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
             MethodDispatchTransportResult::TimedOut => {
@@ -1713,9 +2296,16 @@ impl AssistanceFacade {
             }
             MethodDispatchTransportResult::Busy => FacadeOutcome::Busy,
             MethodDispatchTransportResult::Restarting => FacadeOutcome::Restarting,
+            MethodDispatchTransportResult::OutcomeUnknown
+                if tool == AssistanceTool::Test && !tool.mutates_with(call.parameters()) =>
+            {
+                FacadeOutcome::Incomplete
+            }
             MethodDispatchTransportResult::OutcomeUnknown => FacadeOutcome::OutcomeUnknown,
             // A read-only call that timed out after delivery changed nothing worth checking.
-            MethodDispatchTransportResult::WrittenTimedOut if tool.mutates() => {
+            MethodDispatchTransportResult::WrittenTimedOut
+                if tool.mutates_with(call.parameters()) =>
+            {
                 journal_transport_timeout(tool, "reply");
                 FacadeOutcome::OutcomeUnknown
             }
@@ -1747,26 +2337,83 @@ impl AssistanceFacade {
                         | PeerReply::Error { .. }
                         | PeerReply::InvalidParameters { .. }),
                         status,
-                    )) => FacadeOutcome::Reply(Box::new(reply), status),
-                    Some((reply @ PeerReply::Edit { .. }, status))
-                        if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) =>
-                    {
+                        handoff,
+                    )) => {
+                        lost_handoff = handoff;
                         FacadeOutcome::Reply(Box::new(reply), status)
                     }
-                    Some((reply @ PeerReply::Complete { kind, .. }, status))
+                    Some((
+                        reply @ (PeerReply::Edit { .. } | PeerReply::EditBatch { .. }),
+                        status,
+                        handoff,
+                    )) if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) => {
+                        lost_handoff = handoff;
+                        FacadeOutcome::Reply(Box::new(reply), status)
+                    }
+                    Some((reply @ PeerReply::Complete { kind, .. }, status, handoff))
                         if tool == AssistanceTool::Inspect
                             || tool_accepts_result_kind(tool, kind) =>
                     {
+                        lost_handoff = handoff;
                         FacadeOutcome::Reply(Box::new(reply), status)
                     }
                     // An undecodable reply to a delivered mutation cannot prove it did not apply.
-                    _ if tool.mutates() => FacadeOutcome::OutcomeUnknown,
+                    _ if tool.mutates_with(call.parameters()) => FacadeOutcome::OutcomeUnknown,
                     _ => FacadeOutcome::Incomplete,
                 }
             }
         };
-        (outcome, tag)
+        (outcome, tag, lost_handoff)
     }
+}
+
+/// Builds one method envelope: the validated model `parameters` and the trusted `host_meta`, to
+/// which a call whose reply may carry whole source adds
+/// [`crate::app::transport::WHOLE_SOURCE_META`], so the daemon knows this front decodes it.
+/// Absent host metadata stays absent; the envelope keeps exactly its two historical keys.
+fn method_envelope(tool: AssistanceTool, parameters: &Value, host_meta: Option<&Value>) -> Value {
+    let mut host_meta = host_meta.cloned();
+    if tool.transport_method().delivers_source()
+        && let Some(Value::Object(meta)) = host_meta.as_mut()
+    {
+        meta.insert(
+            crate::app::transport::WHOLE_SOURCE_META.into(),
+            Value::Bool(true),
+        );
+    }
+    json!({"parameters":parameters,"host_meta":host_meta})
+}
+
+/// Read, Prepare and Inspect envelopes announce whole-source decoding; other tools' envelopes and
+/// absent host metadata are unchanged, and every envelope keeps exactly its two keys.
+#[test]
+fn whole_source_tools_announce_the_front_capability() {
+    let meta = json!({"claudecode/toolUseId":"call"});
+    for tool in [
+        AssistanceTool::Read,
+        AssistanceTool::Prepare,
+        AssistanceTool::Inspect,
+    ] {
+        let envelope = method_envelope(tool, &json!({}), Some(&meta));
+        assert_eq!(envelope.as_object().unwrap().len(), 2);
+        assert_eq!(
+            envelope["host_meta"][crate::app::transport::WHOLE_SOURCE_META],
+            json!(true)
+        );
+        assert_eq!(envelope["host_meta"]["claudecode/toolUseId"], "call");
+    }
+    for tool in [
+        AssistanceTool::Context,
+        AssistanceTool::Edit,
+        AssistanceTool::Start,
+    ] {
+        let envelope = method_envelope(tool, &json!({}), Some(&meta));
+        assert_eq!(envelope["host_meta"], meta);
+    }
+    assert_eq!(
+        method_envelope(AssistanceTool::Read, &json!({}), None),
+        json!({"parameters":{},"host_meta":null})
+    );
 }
 
 /// Reports whether a delivered call's outcome is the kind a wedged daemon produces: a transport
@@ -1800,7 +2447,12 @@ fn journal_transport_timeout(tool: AssistanceTool, phase: &str) {
 }
 
 /// The answer to an `ide.stop` that was not sent because its actor could not be identified.
-const STOP_UNIDENTIFIED: &str = "error: stop_unidentified: the IDE could not identify this ide.stop's session, so nothing was stopped; repeat ide.stop, or continue with native tools";
+pub(crate) const STOP_UNIDENTIFIED: &str = "The IDE could not identify this stop's session; nothing was stopped.\nRepair: Repeat ide.stop.";
+
+/// The refusal for a reply whose final carrier cannot fit the response ceiling and has no
+/// receipt to degrade to; a head and one Repair line like every other refusal.
+pub(crate) const REPLY_LIMIT_REFUSAL: &str =
+    "The IDE result exceeds the reply limit.\nRepair: Continue with native tools.";
 
 /// What one stop's identity query established (see `StdioFacade::identify_actor`).
 enum StopIdentity {
@@ -1890,6 +2542,7 @@ pub async fn submit_hook_event(
             HookPhase::PostFailure => "post_failure",
             HookPhase::PermissionDenied => "permission_denied",
             HookPhase::PostBatch => "post_batch",
+            HookPhase::Compaction => "compaction",
         },
         "actor_id": event.actor_id(),
         "call_id": event.optional_call_id(),
@@ -1938,7 +2591,7 @@ pub async fn submit_hook_event(
 /// Encodes one bounded post-hook delta in the model-context schema required by its explicit host.
 ///
 /// Pre-hooks, empty/oversized text, invalid JSON serialization, and a `PermissionDenied` outcome
-/// all produce no output. Both current host contracts use `hookSpecificOutput`, but the event name
+/// all produce no output; a compaction event renders nothing. Both current host contracts use `hookSpecificOutput`, but the event name
 /// is selected from the validated host event rather than copied from arbitrary input.
 pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
     if text.is_empty() || text.len() > MAX_FEEDBACK_BYTES {
@@ -1950,6 +2603,7 @@ pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
         HookPhase::PostFailure => "PostToolUseFailure",
         HookPhase::PermissionDenied => return None,
         HookPhase::PostBatch => "PostToolBatch",
+        HookPhase::Compaction => return None,
     };
     serde_json::to_string(&json!({
         "hookSpecificOutput": {
@@ -2038,15 +2692,15 @@ impl FeedbackDelta {
         })
     }
 
-    /// Renders the model-facing fact, next action and freshness without exposing internal evidence provenance.
+    /// Renders the model-facing fact, its next action and its freshness qualifier on one line,
+    /// then the continuation call when a detail reference exists, without exposing internal
+    /// evidence provenance.
     pub fn render(&self) -> String {
-        let mut rendered = format!(
-            "Fact: {}\nNext: {}\nFreshness: {}",
-            self.fact, self.next_action, self.freshness
-        );
+        let mut rendered = format!("{} {} ({})", self.fact, self.next_action, self.freshness);
         if let Some(detail_ref) = &self.detail_ref {
-            rendered.push_str("\nDetail: ");
-            rendered.push_str(detail_ref);
+            rendered.push_str(&format!(
+                "\nide.inspect {{\"detail_ref\":\"{detail_ref}\"}}"
+            ));
         }
         rendered
     }
@@ -2336,6 +2990,9 @@ struct ManagedConnection {
     /// Each actor's last admitted start parameters on a current managed Claude daemon, keyed by
     /// the daemon's private actor tag, oldest first, at most [`MAX_REMEMBERED_ACTORS`].
     remembered: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    /// Requested work each remembered actor was relayed without its result (OUTBOX-r3 §10),
+    /// reported to the new daemon when the actor is re-activated after a replacement.
+    unresolved: Arc<super::unresolved::Unresolved>,
     /// Set once the bounded memory above evicted an actor that may still be active: from then on
     /// the session may hold actors it no longer remembers, so no actor is assumed gone.
     // ponytail: sticky for the rest of the session once more than 32 actors have been remembered
@@ -2373,6 +3030,7 @@ impl ManagedConnection {
             candidate: Arc::new(Mutex::new(None)),
             last_activation: Arc::new(Mutex::new(None)),
             remembered: Arc::new(std::sync::Mutex::new(Vec::new())),
+            unresolved: Arc::default(),
             memory_overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifecycle: Arc::new(Mutex::new(())),
             recovery_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2443,6 +3101,7 @@ impl ManagedConnection {
 
     /// Forgets one actor's remembered start.
     fn forget(&self, tag: &str) {
+        self.unresolved.forget(tag);
         self.remembered
             .lock()
             .expect("remembered starts mutex")
@@ -2641,7 +3300,7 @@ fn codex_route_identity(meta: &Map<String, Value>) -> Option<CodexRouteIdentity>
     CodexRouteIdentity::new(root_session, actor).ok()
 }
 
-/// Hosts the static eleven-tool rmcp surface even when no trusted host attachment exists.
+/// Hosts the static eleven-tool public rmcp surface even without a trusted host attachment.
 #[derive(Clone)]
 pub struct StdioFacade {
     /// Connect-only Application endpoint and finite deadline.
@@ -2657,6 +3316,11 @@ pub struct StdioFacade {
     /// Only the managed Codex constructor sets this. Publication never activates anything and is
     /// skipped entirely when the trusted request metadata lacks a root session or actor.
     publisher: Option<SharedCodexPublisher>,
+    /// Optional protected Bridge registration client; no workspace authority is delegated.
+    bridge: Option<Arc<super::bridge::BridgeClient>>,
+    /// Which per-host catalog and paragraph answer discovery. Both have eleven public tools; only
+    /// patch advertisement differs. Private Context validation remains outside the rmcp router.
+    catalog_host: CatalogHost,
     /// Generated static tool router; independent of daemon availability.
     router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
@@ -2669,6 +3333,8 @@ impl StdioFacade {
             attachment: None,
             reconnect: None,
             publisher: None,
+            bridge: None,
+            catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         }
     }
@@ -2684,6 +3350,8 @@ impl StdioFacade {
             attachment: None,
             reconnect: None,
             publisher: None,
+            bridge: None,
+            catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         }
     }
@@ -2699,6 +3367,8 @@ impl StdioFacade {
             attachment: Some(attachment),
             reconnect: None,
             publisher: None,
+            bridge: None,
+            catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         })
     }
@@ -2719,6 +3389,8 @@ impl StdioFacade {
             attachment: None,
             reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
             publisher: Some(publisher),
+            bridge: None,
+            catalog_host: CatalogHost::Codex,
             router: Self::described_tool_router(),
         })
     }
@@ -2738,6 +3410,8 @@ impl StdioFacade {
             attachment: None,
             reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
             publisher: None,
+            bridge: None,
+            catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         })
     }
@@ -2768,8 +3442,30 @@ impl StdioFacade {
                 note,
             )),
             publisher: None,
+            bridge: None,
+            catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         })
+    }
+
+    /// Selects the per-host catalog this facade advertises (export and tests; the managed Codex
+    /// constructor already selects [`CatalogHost::Codex`]).
+    pub fn with_catalog_host(mut self, host: CatalogHost) -> Self {
+        self.catalog_host = host;
+        self
+    }
+
+    /// Reads an optional protected Bridge deployment once at trusted managed startup.
+    /// Direct delivery needs no frontend registration. Historical empty-store deployments read
+    /// credentials here; invalid/unavailable credentials disable only that path, with no socket probe.
+    pub fn with_bridge_configuration(
+        mut self,
+        config: Option<&super::bridge::BridgeConfig>,
+    ) -> Self {
+        self.bridge = config
+            .filter(|config| config.native_stores.is_empty())
+            .and_then(super::bridge::BridgeConfig::open);
+        self
     }
 
     /// Gives this managed facade the authority to force-replace a wedged daemon through `evict`
@@ -2845,6 +3541,12 @@ impl StdioFacade {
             return None;
         }
         host.host_meta = Some(selected);
+        if self.catalog_host == CatalogHost::Codex
+            && let Some(route) = context.meta.get(super::bridge::ROUTE_META)
+            && let Some(Value::Object(meta)) = host.host_meta.as_mut()
+        {
+            meta.insert(super::bridge::ROUTE_META.into(), route.clone());
+        }
         Some(host)
     }
 
@@ -3080,7 +3782,7 @@ impl StdioFacade {
         // Managed Codex only: publish this process's route before the first dispatch of every
         // valid call. Idempotent, so retried calls after publication failure still publish.
         self.publish_codex_route(&context.meta).await;
-        let (outcome, tag) = self
+        let (outcome, tag, _) = self
             .facade
             .dispatch_at_tagged(runtime_dir, &host, tool, parameters.clone())
             .await;
@@ -3117,7 +3819,7 @@ impl StdioFacade {
         };
         // The repeat belongs to the actor just restored: a pre now owned by anyone else refuses.
         self.announce(&mut host, Some(&actor), Some(&actor));
-        let (outcome, tag) = self
+        let (outcome, tag, _) = self
             .facade
             .dispatch_at_tagged(runtime_dir, &host, tool, parameters.clone())
             .await;
@@ -3212,7 +3914,10 @@ impl StdioFacade {
     }
 
     /// Re-runs one remembered start through the ordinary `ide.start` path with the trusted
-    /// `claudecode/reactivation` host marker (T15B restart recovery); reports success.
+    /// `claudecode/reactivation` host marker (T15B restart recovery); reports activation success.
+    /// Unresolved subjects accompany every attempt and are forgotten only when the reply says
+    /// Bridge accepted custody or the publication outcome is uncertain. A definite no-effect
+    /// refusal keeps them for a later eligible restart.
     ///
     /// The daemon admits the root by the same `allowed_roots` rule as any start. `marker` names
     /// the real call whose genuine pending pre-hook lends its actor (`true`: any pre delivered
@@ -3253,10 +3958,21 @@ impl StdioFacade {
             if let Some(expected) = expected {
                 meta["claudecode/actor"] = json!(expected);
             }
+            // OUTBOX-r4 §10: what this actor was relayed unresolved before the replacement; the
+            // new daemon attempts one `lost-after-restart` Bridge publication and privately
+            // reports accepted-or-unknown custody. Older daemons ignore it, so the front retains it.
+            let lost = self
+                .reconnect
+                .as_ref()
+                .map(|reconnect| reconnect.unresolved.subjects(expected.unwrap_or_default()))
+                .unwrap_or_default();
+            if !lost.is_empty() {
+                meta["claudecode/lost"] = json!(lost);
+            }
             host.host_meta = Some(meta);
-            let FacadeOutcome::Reply(reply, _) = self
+            let (FacadeOutcome::Reply(reply, _), _, lost_handoff) = self
                 .facade
-                .dispatch_at(
+                .dispatch_at_tagged(
                     runtime_dir,
                     &host,
                     AssistanceTool::Start,
@@ -3271,7 +3987,14 @@ impl StdioFacade {
                 PeerReply::Complete {
                     kind: ResultKind::Activation,
                     ..
-                } => return true,
+                } => {
+                    if (lost.is_empty() || lost_handoff == Some(true))
+                        && let Some(reconnect) = &self.reconnect
+                    {
+                        reconnect.unresolved.forget(expected.unwrap_or_default());
+                    }
+                    return true;
+                }
                 // Still activating, or its pre-hook not there yet: one more bounded attempt.
                 PeerReply::Pending { .. }
                 | PeerReply::Unavailable {
@@ -3320,7 +4043,7 @@ impl StdioFacade {
             .await
         {
             // Only the exact identity answer names an actor; anything else proves nothing.
-            (FacadeOutcome::Reply(reply, _), Some(Some(tag)))
+            (FacadeOutcome::Reply(reply, _), Some(Some(tag)), _)
                 if matches!(
                     reply.as_ref(),
                     PeerReply::Unavailable {
@@ -3331,7 +4054,7 @@ impl StdioFacade {
             {
                 StopIdentity::Actor(tag)
             }
-            (FacadeOutcome::Reply(reply, _), None)
+            (FacadeOutcome::Reply(reply, _), None, _)
                 if matches!(
                     reply.as_ref(),
                     PeerReply::Unavailable {
@@ -3342,7 +4065,7 @@ impl StdioFacade {
             {
                 StopIdentity::Unsupported
             }
-            (outcome, _) => StopIdentity::Refused(outcome),
+            (outcome, _, _) => StopIdentity::Refused(outcome),
         }
     }
 
@@ -3377,6 +4100,7 @@ impl StdioFacade {
     async fn forget_remembered_activation(&self) {
         if let Some(reconnect) = &self.reconnect {
             *reconnect.last_activation.lock().await = None;
+            reconnect.unresolved.forget("");
             reconnect.mark_activated();
         }
     }
@@ -3475,7 +4199,7 @@ impl StdioFacade {
         &self,
         tool: AssistanceTool,
         parameters: Value,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let stage_parameters = parameters.clone();
         let call_started = std::time::Instant::now();
@@ -3502,11 +4226,37 @@ impl StdioFacade {
                 call_started.elapsed(),
                 &front_context,
             );
-            return CallToolResult::error(vec![ContentBlock::text(error.message(tool))]);
+            return render_reply(
+                PeerReply::InvalidParameters {
+                    message: error.message(tool),
+                },
+                content::Envelope::TextOnly,
+            );
         }
+        // Always discard any incoming similarly named extension. Only this trusted front
+        // can add a current same-call registration after model argument validation.
+        context.meta.remove(super::bridge::ROUTE_META);
+        if self.catalog_host == CatalogHost::Codex
+            && host_kind == Some(HostKind::Codex)
+            && matches!(tool, AssistanceTool::Test | AssistanceTool::Edit)
+            && tool.mutates_with(&parameters)
+            && let Some(client) = &self.bridge
+            && let Some(route) = client.register(&context.meta).await
+        {
+            context.meta.insert(
+                super::bridge::ROUTE_META.into(),
+                json!({
+                    "route_key": route.route_key, "actor": route.actor, "call": route.call,
+                }),
+            );
+        }
+        // harness-reply-v1 R1: every host, recognized or not, receives the compact text block
+        // alone; a host shows `structuredContent` in place of it when present, so none is sent.
+        // Only the test seam (`content::reply_envelope`) keeps the typed copy as a test oracle,
+        // and never for Claude.
         let envelope = match parse_host_kind(&context.meta) {
             Ok(HostKind::Claude) => content::Envelope::TextOnly,
-            _ => content::Envelope::WithStructured,
+            _ => content::reply_envelope(),
         };
         // Starts and stops are ordered with actor recovery and lease recovery, so a delayed
         // start reply can never re-remember an actor after its own stop.
@@ -3686,6 +4436,18 @@ impl StdioFacade {
         if tool == AssistanceTool::Stop && expected.is_none() && may_have_applied {
             self.forget_remembered_activation().await;
         }
+        // OUTBOX-r3 §10: remember what this reply leaves owed and forget what it resolves.
+        if tool != AssistanceTool::Stop
+            && let Some(reconnect) = &self.reconnect
+            && let FacadeOutcome::Reply(reply, _) = &outcome
+        {
+            reconnect.unresolved.observe(
+                tag.as_deref().unwrap_or_default(),
+                tool,
+                &stage_parameters,
+                reply,
+            );
+        }
         crate::telemetry::adapters::log_front_outcome(
             tool,
             &outcome,
@@ -3728,9 +4490,6 @@ impl StdioFacade {
                     note,
                 );
             }
-            FacadeOutcome::InvalidParameters => {
-                "invalid bounded parameters; inspect the tool schema"
-            }
             FacadeOutcome::MissingHostMetadata => {
                 // A caller whose `_meta` names no supported host contract can never correlate an
                 // invocation (the ZCode auto-mode case): name that closed cause rather than the
@@ -3742,47 +4501,61 @@ impl StdioFacade {
                     };
                     return render_reply_with_status(reply, None, envelope);
                 }
-                "Assistance host metadata or attachment is unavailable; continue with native tools"
+                transport_refusal(&FacadeOutcome::MissingHostMetadata, tool)
             }
-            FacadeOutcome::Unavailable => {
-                "Assistance daemon transport is unavailable; continue with native tools"
-            }
-            FacadeOutcome::TimedOut => {
-                "Assistance daemon transport timed out; continue with native tools"
-            }
-            // The daemon refused the call before running it, so even a mutation applied nothing.
-            FacadeOutcome::Busy => {
-                "error: busy: the IDE is serving too many calls at once and did not run this one, so nothing was applied; repeat this call in a moment"
-            }
-            // The daemon refused the call before running it (and a managed client already tried
-            // the replacement once), so even a mutation applied nothing.
-            FacadeOutcome::Restarting => {
-                "error: restarting: the IDE restarted after an internal fault and did not run this call, so nothing was applied; repeat this call"
-            }
-            // Never resent: the daemon may have executed the call, and a resend could only repeat
-            // a change or be refused for its already consumed pre-hook.
-            FacadeOutcome::OutcomeUnknown => match tool {
-                AssistanceTool::Edit => {
-                    "error: outcome_unknown: ide.edit may have reached the IDE and applied; verify with ide.diff before another edit"
-                }
-                AssistanceTool::Test => {
-                    "error: outcome_unknown: ide.test may have reached the IDE and started; check ide.inspect or ide.test status before another run"
-                }
-                AssistanceTool::Start | AssistanceTool::Stop => {
-                    "error: outcome_unknown: this call may have reached the IDE and applied; call ide.start to see the current binding before continuing"
-                }
-                _ => {
-                    "error: outcome_unknown: this call may have reached the IDE but its reply was lost; repeat this call"
-                }
-            },
-            FacadeOutcome::ReestablishFailed => {
-                "Assistance daemon exited; re-establish failed; continue with native tools"
-            }
-            FacadeOutcome::Incomplete => {
-                "typed Assistance peer result is unavailable; continue with native tools"
-            }
+            other => transport_refusal(&other, tool),
         };
         CallToolResult::error(vec![ContentBlock::text(message)])
+    }
+}
+
+/// The model-facing refusal of one transport-level failure, as a head, one `Repair:` line and
+/// nothing else (harness-reply-v1 R5).
+///
+/// Covers every outcome that never reached a typed peer reply: invalid arguments, a missing host
+/// attachment, an unavailable or timed-out connection, a `busy`/`restarting` daemon (the call did
+/// not run, so even a mutation applied nothing), a call whose reply was lost (never resent, so the
+/// text names the check to make for `tool` instead of a replay), a failed reconnect and an
+/// incomplete reply. [`FacadeOutcome::Reply`] carries a typed reply rendered elsewhere; it maps to
+/// the incomplete-result refusal so the function stays total. The returned text is static.
+pub(crate) fn transport_refusal(outcome: &FacadeOutcome, tool: AssistanceTool) -> &'static str {
+    match outcome {
+        FacadeOutcome::InvalidParameters => {
+            "These arguments do not match the tool schema.\nRepair: Correct the arguments and repeat this call."
+        }
+        FacadeOutcome::MissingHostMetadata => {
+            "The IDE host attachment is unavailable.\nRepair: Continue with native tools."
+        }
+        FacadeOutcome::Unavailable => {
+            "The IDE connection is unavailable.\nRepair: Continue with native tools."
+        }
+        FacadeOutcome::TimedOut => {
+            "The IDE connection timed out.\nRepair: Continue with native tools."
+        }
+        FacadeOutcome::Busy => {
+            "The IDE is serving too many calls; this call did not run and nothing was applied.\nRepair: Repeat this call."
+        }
+        FacadeOutcome::Restarting => {
+            "The IDE restarted after an internal fault; this call did not run and nothing was applied.\nRepair: Repeat this call."
+        }
+        FacadeOutcome::OutcomeUnknown => match tool {
+            AssistanceTool::Edit => {
+                "This edit may have applied; its outcome is unknown.\nRepair: Verify with ide.diff before another edit."
+            }
+            AssistanceTool::Test => {
+                "This test may have started; its outcome is unknown.\nRepair: Review ide.test {\"history\":true} before starting another run."
+            }
+            AssistanceTool::Start | AssistanceTool::Stop => {
+                "This activation change may have applied; its outcome is unknown.\nRepair: Call ide.start to see the current binding."
+            }
+            _ => "This call may have run, but its reply was lost.\nRepair: Repeat this call.",
+        },
+        FacadeOutcome::ReestablishFailed => {
+            "The IDE exited and could not reconnect.\nRepair: Continue with native tools."
+        }
+        FacadeOutcome::Incomplete | FacadeOutcome::Reply(..) => {
+            "The IDE's result is unavailable.\nRepair: Continue with native tools."
+        }
     }
 }
 
@@ -3793,10 +4566,12 @@ impl StdioFacade {
 /// passed [`content::fits`] without shrinking, so the facade never re-cuts an accepted whole hunk.
 ///
 /// `envelope` selects whether the final carrier also duplicates the typed reply as
-/// `structuredContent` (T14B): the Claude host hands that field straight to its model in place of
-/// `content`, defeating the compact renderer, so its calls render with [`content::Envelope::TextOnly`].
-/// Every other caller — Codex, and `worker::Shared::mark_feedback_inline_delivered` tracing the
-/// exact final carrier a live caller would receive — keeps [`content::Envelope::WithStructured`].
+/// `structuredContent`. Production callers of every host (Claude, Codex, unrecognized) pass
+/// [`content::Envelope::TextOnly`] (harness-reply-v1 R1): a host that receives `structuredContent`
+/// shows it in place of `content`, defeating the compact renderer. Only a `test-seams` build
+/// with `AGENT_IDE_TEST_STRUCTURED_REPLIES=1` ([`content::reply_envelope`]) selects
+/// [`content::Envelope::WithStructured`] for non-Claude hosts as the product tests' oracle;
+/// `worker::Shared::mark_feedback_inline_delivered` traces the final text-only carrier.
 ///
 /// `pub(super)` so `worker::Shared::mark_feedback_inline_delivered` can call it directly instead of
 /// re-approximating the fitting boundary.
@@ -3827,28 +4602,24 @@ pub(super) fn render_reply_with_status(
             },
         );
         receipt.map_or_else(
-            || {
-                CallToolResult::error(vec![ContentBlock::text(
-                    "Assistance result exceeds the bounded envelope; continue with native tools",
-                )])
-            },
+            || CallToolResult::error(vec![ContentBlock::text(REPLY_LIMIT_REFUSAL)]),
             content::PresentationReceipt::degraded,
         )
     })
 }
 
 /// Stable text for [`render_reply_after_reconnect`]'s added `retry` field (T08B).
-const RECONNECT_RETRY_HINT: &str = "daemon restarted; repeat this call once";
+const RECONNECT_RETRY_HINT: &str = "daemon restarted; repeat this call";
 /// Recovery when a non-Start call reaches a replacement with no actor binding.
-const RECONNECT_START_HINT: &str =
-    "daemon restarted; call ide.start first, then repeat this call with fresh references";
+const RECONNECT_START_HINT: &str = "daemon restarted; call ide.start in this project";
 /// Recovery after this session re-rooted to the requested root (T15B): the re-rooted call's own
 /// pre-hook ran before the new rendezvous existed, so the next call pairs normally.
-const REROOT_RETRY_HINT: &str = "session re-rooted to the requested root; repeat this call once";
+const REROOT_RETRY_HINT: &str = "session re-rooted to the requested root; repeat this call";
 /// Recovery after this session re-rooted on a missing pre-hook alone (T15B): a repeat pairs when
 /// the session truly moved, and a root-less start returns it to the host's project directory when
 /// the one lost pre-hook left it there.
-const REROOT_LATE_PRE_HINT: &str = "session re-rooted to the requested root; repeat this call once, or call ide.start without root";
+const REROOT_LATE_PRE_HINT: &str =
+    "session re-rooted to the requested root; call ide.start without root";
 
 /// A provider refusal's derived stage names the requested file's extension only, never its path,
 /// and every other failure keeps the plain `<tool>:<reason>` default.
@@ -3936,14 +4707,33 @@ fn render_reply_after_reconnect(
     with_retry_hint(rendered, hint)
 }
 
-/// Appends one stable recovery hint to a rendered result: a `retry` field beside the structured
-/// copy and the same sentence at the end of the compact text.
+/// Carries one stable recovery hint in the structured retry field and compact text. A typed
+/// refusal's existing Repair line is replaced within its 120-byte ceiling; quoted source data
+/// stays unchanged, so reconnect recovery never adds a second alternative repair.
 fn with_retry_hint(mut rendered: CallToolResult, hint: &str) -> CallToolResult {
     if let Some(Value::Object(fields)) = rendered.structured_content.as_mut() {
         fields.insert("retry".to_owned(), Value::String(hint.to_owned()));
     }
     if let Some(ContentBlock::Text(text)) = rendered.content.first_mut() {
-        text.text = format!("{}; retry: {hint}", text.text);
+        if text.text.lines().any(|line| line.starts_with("Repair: ")) {
+            let repair = format!(
+                "Repair: {}",
+                super::reply::bounded_utf8_prefix(&content::display_safe(hint), 112)
+            );
+            text.text = text
+                .text
+                .split_inclusive('\n')
+                .map(|line| {
+                    if line.starts_with("Repair: ") {
+                        format!("{repair}{}", if line.ends_with('\n') { "\n" } else { "" })
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect();
+        } else {
+            text.text = format!("{}; retry: {hint}", text.text);
+        }
     }
     rendered
 }
@@ -4011,11 +4801,23 @@ pub(crate) fn staged_detail(
     stage
 }
 
-/// Appends the explicit replaced-reference note to one rendered result, when due.
+/// Gives an InvalidDetail refusal its explicit restart reason without adding another recovery
+/// action or extending its Repair line. Only the known refusal head changes; carried status
+/// and the existing bounded repair remain intact.
 fn note_replaced_references(mut rendered: CallToolResult, note: bool) -> CallToolResult {
-    if note && let Some(ContentBlock::Text(text)) = rendered.content.first_mut() {
-        text.text
-            .push_str(" (issued before the IDE restarted; re-read)");
+    if note
+        && let Some(ContentBlock::Text(text)) = rendered.content.first_mut()
+        && let Some((head, tail)) = text.text.split_once("\nRepair: ")
+    {
+        let status = head.rsplit_once('\n').map_or("", |(status, _)| status);
+        text.text = format!(
+            "{}This result reference was issued before the IDE restarted.\nRepair: {tail}",
+            if status.is_empty() {
+                String::new()
+            } else {
+                format!("{status}\n")
+            }
+        );
     }
     rendered
 }
@@ -4327,7 +5129,7 @@ fn inline_complete_kinds_keep_structured_content() {
         };
         assert!(tool_accepts_result_kind(tool, kind));
         let encoded = reply.encode().unwrap();
-        let (decoded, _) = PeerReply::decode_delivered(encoded.as_str()).unwrap();
+        let (decoded, _, _) = PeerReply::decode_delivered(encoded.as_str()).unwrap();
         let rendered = render_reply(decoded, content::Envelope::WithStructured);
         assert_eq!(
             rendered.structured_content.unwrap()["kind"],
@@ -4403,7 +5205,7 @@ fn oversized_edit_replies_keep_outcome_operation_id_and_no_replay() {
             .starts_with("edit: outcome_unknown; path src/lib.rs; operation_id operation-9")
     );
     assert!(text.text.contains("do not replay this operation"));
-    assert_ne!(unknown.is_error, Some(true));
+    assert_eq!(unknown.is_error, Some(true));
 
     // A read that cannot be presented keeps the historical generic bounded-envelope error: it
     // carries no effect whose outcome must survive, and shrinking owner text cannot rescue it.
@@ -4423,7 +5225,7 @@ fn oversized_edit_replies_keep_outcome_operation_id_and_no_replay() {
     };
     assert_eq!(
         text.text,
-        "Assistance result exceeds the bounded envelope; continue with native tools"
+        "The IDE result exceeds the reply limit.\nRepair: Continue with native tools."
     );
     assert_eq!(read.is_error, Some(true));
 }
@@ -4539,20 +5341,32 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
     };
     assert!(text.text.contains(REROOT_LATE_PRE_HINT), "{}", text.text);
     assert!(
-        text.text.contains("or call ide.start without root"),
+        text.text.contains(
+            "Repair: session re-rooted to the requested root; call ide.start without root"
+        ),
         "{}",
         text.text
     );
 }
 
 impl StdioFacade {
-    /// Builds the eleven-tool router with the language-derived description phrases filled in
-    /// from the registered languages (see [`describe_languages`]).
-    fn described_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+    /// Builds the eleven-tool public router with the language-derived description phrases filled in
+    /// from the registered languages (see [`describe_languages`]), and the whole-source result
+    /// annotation on the tools whose replies carry source of any size
+    /// ([`WHOLE_SOURCE_RESULT_META`]).
+    pub(super) fn described_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         let mut router = Self::tool_router();
         for route in router.map.values_mut() {
             if let Some(description) = route.attr.description.as_mut() {
                 *description = std::borrow::Cow::Owned(describe_languages(description));
+            }
+            if ["ide.read", "ide.prepare", "ide.inspect"].contains(&route.attr.name.as_ref()) {
+                let mut meta = serde_json::Map::new();
+                meta.insert(
+                    WHOLE_SOURCE_RESULT_META.into(),
+                    json!(WHOLE_SOURCE_RESULT_CHARS),
+                );
+                route.attr.meta = Some(rmcp::model::MetaObject(meta));
             }
         }
         router
@@ -4561,10 +5375,19 @@ impl StdioFacade {
 
 #[tool_router]
 impl StdioFacade {
-    /// Activate Agent IDE for this project — once per task, before any other ide.* call. Returns
-    /// a project card: languages with sizes, the build/check/test/lint commands, layout by
-    /// directory, entry points and docs. Use it to orient instead of reading README, {manifests_head}
-    /// {manifests_tail}. Then use ide.outline / ide.symbol instead of native file reads.
+    /// Task source packet in one call, selected source whole; operator-configured models. If pending, one ide.inspect of its detail_ref waits for it. Check gaps.
+    #[tool(name = "ide.prepare", input_schema = tool_schemas()[11].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true))]
+    async fn prepare(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Prepare, parameters, context)
+            .await
+    }
+
+    /// Activate once per task; returns project card and batch call forms.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn start(
@@ -4575,24 +5398,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Start, parameters, context).await
     }
 
-    /// Bounded source with current diagnostics for one `path`, or with `kind: "problems"` the
-    /// project's latest check results (errors and warnings by file, paged). Use `problems` to
-    /// see what is broken right now instead of running the build yourself; use `path` before or
-    /// after editing a file natively.
-    #[tool(name = "ide.context", input_schema = tool_schemas()[1].input_schema.as_object().expect("tool schema is an object").clone(),
-        annotations(read_only_hint = true, open_world_hint = false))]
-    async fn context(
-        &self,
-        Parameters(parameters): Parameters<Value>,
-        context: RequestContext<RoleServer>,
-    ) -> CallToolResult {
-        self.call(AssistanceTool::Context, parameters, context)
-            .await
-    }
-
-    /// Diff of what this task changed in the working tree (`head`, `staged`, `unstaged` or `task`),
-    /// paged. Review it before finishing or handing off, instead of running `git diff` in a
-    /// shell.
+    /// Batch paths; paged changes since last diff. mode: whole comparison; provenance:true adds identity.
     #[tool(name = "ide.diff", input_schema = tool_schemas()[2].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn diff(
@@ -4603,11 +5409,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Diff, parameters, context).await
     }
 
-    /// Skeleton of a file (every symbol with signature, doc line and line numbers, members
-    /// indented, tests collapsed) or of a directory (files with line counts and first doc line).
-    /// A fraction of the cost of reading the file — use it before any native read of a source
-    /// file longer than a screen. Answers inline on a warm language server; a cold one answers
-    /// `pending` — poll ide.inspect.
+    /// Batch paths/glob: symbol and region addresses, signatures and docs, no bodies.
     #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn outline(
@@ -4619,9 +5421,18 @@ impl StdioFacade {
             .await
     }
 
-    /// Body of one symbol (`file#Owner/name`) or an explicit line range, numbered, with its doc
-    /// header. The precise replacement for reading a whole file when you already know what you
-    /// need; its `source_ref` is what a full-file ide.edit is based on.
+    /// Project map: call first in an unfamiliar repo. One call lists directories and files with sizes and the authors' one-line purpose, replacing rounds of ls/find/rg. No source bodies; path zooms in.
+    #[tool(name = "ide.tree", input_schema = tool_schemas()[12].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = true, open_world_hint = false))]
+    async fn tree(
+        &self,
+        Parameters(parameters): Parameters<Value>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        self.call(AssistanceTool::Tree, parameters, context).await
+    }
+
+    /// Batch items: {symbol} or {path, offset, limit}. Addresses: file#Type/f, #@imports, path:line, …:3-5. Current source, every item whole; unchanged acknowledged, force:true resends.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn read(
@@ -4632,11 +5443,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Read, parameters, context).await
     }
 
-    /// Symbol card for `file#Owner/name` or a bare name: resolved signature, doc, definition
-    /// location, usages split src/tests with the source line, callers and callees as full symbol
-    /// paths, and with `history: true` the last commits touching the definition. Language-server
-    /// accurate — replaces grep for usages and reading files to find callers. A bare name with
-    /// several matches returns the candidate paths.
+    /// Batch symbols: definition, docs, usages, immediate neighbors; deeper chains: ide.graph. path+byte_offset resolves a UTF-8 use-site.
     #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn symbol(
@@ -4647,10 +5454,8 @@ impl StdioFacade {
         self.call(AssistanceTool::Symbol, parameters, context).await
     }
 
-    /// Bounded call graph around one symbol: callers, callees or both, depth 1–3, at most 60
-    /// nodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into `+N tests` per parent (set `tests: true` to list them). Use
-    /// it to see the blast radius before changing a function or to trace how a call reaches a
-    /// symbol, instead of chained greps.
+    /// Call trees for a batch of symbols: callers (impact), callees (dependencies) or both; depth 2
+    /// usually suffices (1–3); tests:true expands test nodes.
     #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn graph(
@@ -4661,14 +5466,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Graph, parameters, context).await
     }
 
-    /// Run tests selected by `symbol` (the tests that reference it), by `path`, by name
-    /// `pattern`, or an explicit `command`; one background run per worktree under `budget_s`.
-    /// Explicit commands may set a worktree-relative `cwd` and bounded inherited-environment
-    /// overrides through `env`; their argv is limited to 16 KiB in total.
-    /// Returns the pass/fail line with an exact rerun command; full output is paged through
-    /// ide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless of how
-    /// the runner was launched; otherwise the result includes the exit code and bounded output
-    /// tail. Use it instead of running the test command in a shell: bounded selection and output.
+    /// Batch up to 8 targets at project root; budget_s bounds runtime. Read result:N/history:true, cancel:N, or output:"<ref>/output/N".
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false))]
     async fn test(
@@ -4679,9 +5477,7 @@ impl StdioFacade {
         self.call(AssistanceTool::Test, parameters, context).await
     }
 
-    /// Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or
-    /// the next page of a long result (outline, symbol, graph, diff, test output). Poll every
-    /// few seconds while it stays pending.
+    /// Batch detail_refs or one detail_ref; kind:diagnostics+path or kind:problems. No check run; unknown is not clean.
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -4693,8 +5489,7 @@ impl StdioFacade {
             .await
     }
 
-    /// End this task's IDE session; edited files stay on disk. Lists up to eight test runs started
-    /// in this binding whose results were never collected. Call once when done or before handing off.
+    /// End activation once, at task end; keeps edits, lists retained tests and running commands.
     #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn stop(
@@ -4705,11 +5500,9 @@ impl StdioFacade {
         self.call(AssistanceTool::Stop, parameters, context).await
     }
 
-    /// Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is
-    /// project-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a
-    /// `source_ref`. Formats the result with the project formatter, runs the project check
-    /// ({project_checks}) and returns this file's errors and warnings in the reply.
-    /// Prefer it over native edit/write for source: no line matching, no separate check step.
+    /// Atomic `files` batches (all-or-none), symbol/line/text/import edits, rename or host patch.
+    /// Long edits return `edit_progress` with stage, requested/committed paths, and `detail_ref`;
+    /// checks report separately.
     #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
     async fn edit(
@@ -4721,16 +5514,344 @@ impl StdioFacade {
     }
 }
 
-/// Connect-time instructions the host shows the model next to the tool list: the one-paragraph
-/// case for the IDE over native file tools, and the two rules every reply relies on.
-const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server-backed tools for source work. \
-Call ide.start once per task, then prefer the ide.* tools over native file tools for source: \
-ide.outline instead of reading a file, ide.symbol / ide.graph instead of grep for usages and \
-callers, ide.read for one symbol's body, ide.edit for changes (formatted and project-checked in \
-the same reply), ide.test to run exactly the tests that matter, ide.diff to review before \
-ide.stop. Symbols are addressed as `file#Owner/name`. A reply that says `pending` is not an \
-error: call ide.inspect with its detail_ref every few seconds until it completes. Native \
-read/edit tools remain available for non-source files and as a fallback.";
+/// Connect-time instructions Claude shows next to the tool list on every request: only a pointer.
+/// The workflow rules live once, in the shipped `agent-ide` skill, which Claude loads on demand.
+pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server tools (ide.*) for source work. The agent-ide skill holds their workflow rules; read it before the first ide.* call.";
+
+/// Codex connect-time rules for selective schema discovery, reuse, native verification and
+/// ordered lifecycle. The Codex skill supplies examples rather than another rule copy.
+pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE: discover needed exact names/schemas; never dump ALL_TOOLS. Batch compatible independent calls. Read known addresses, outline structure, symbol references; graph for needed chains. Reuse sufficient source/results/diffs; repeat or use native tools for a named gap/change/refusal. Required independent/broader checks remain valid. ide.diff is optional after reviewed Git diff; final diff precedes ide.stop. Bridge automatically delivers accepted async results: end the turn, keep task/session; never poll or finish/stop with owed work. One bounded ide.inspect wait_s (1..30) is recovery only. Try Repair once; fall back if unavailable. Verify uncertain writes before mutation.";
+
+/// Which per-host catalog `tools/list` and the connect-time instructions answer with.
+///
+/// Both catalogs expose the same eleven public names; the owner removed public `ide.context`.
+/// Its private transport remains reusable. Codex alone advertises native edit patches; legacy
+/// parameter compatibility such as `wait_ms` remains independent of public route removal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CatalogHost {
+    /// Claude, Claude-compatible launchers and an unmanaged `mcp`: eleven public tools.
+    #[default]
+    Claude,
+    /// Managed Codex: the same eleven public tools, with native edit patches advertised.
+    Codex,
+}
+
+impl CatalogHost {
+    /// Parses the `--host` export flag value: `claude` or `codex`; anything else is `None`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    /// Returns the connect-time instructions this host's model reads next to the tool list.
+    pub fn instructions(self) -> &'static str {
+        match self {
+            Self::Claude => SERVER_INSTRUCTIONS,
+            Self::Codex => SERVER_INSTRUCTIONS_CODEX,
+        }
+    }
+
+    /// Projects the full tool list onto this host's catalog.
+    ///
+    /// Every advertised schema is slimmed (`slim_schema`) and omits the legacy aliases and the
+    /// deprecated `source_ref` (the validator still accepts them), so the model reads only the
+    /// symbol-first forms. Both hosts exclude the private Context operation and advertise one
+    /// form per job: `ide.read` only `items`, `ide.test` only `targets` beside the single
+    /// `command`. Codex advertises only the native `patch` edit form (and optional operation_id)
+    /// with its own description, and reads by `lines`; Claude advertises `files` with fully typed
+    /// `changes` plus the single-symbol `op`/`symbol`/`new_name` form, and reads by
+    /// `offset`/`limit`. Each tool's description is its doc comment, rewritten here only for
+    /// Codex. Validators keep every unadvertised form. Projection clones schemas before trimming,
+    /// never mutating another host's catalog or the backend validation schema.
+    /// Both hosts let `ide.inspect` serve project problems and file diagnostics via the private
+    /// Context engine; the removed public route is never registered.
+    pub fn catalog(self, tools: Vec<rmcp::model::Tool>) -> Vec<rmcp::model::Tool> {
+        tools
+            .into_iter()
+            // Context is private; Prepare is retired from the catalog but stays routable.
+            .filter(|tool| !matches!(&*tool.name, "ide.context" | "ide.prepare"))
+            .map(|mut tool| {
+                // The whole-source result annotation is Claude Code's own contract; Codex ignores
+                // it, so its catalog does not carry the bytes.
+                if self == Self::Codex {
+                    tool.meta = None;
+                }
+                let mut schema = (*tool.input_schema).clone();
+                if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+                    for legacy in ["file_path", "old_string", "new_string", "source_ref"] {
+                        properties.remove(legacy);
+                    }
+                    if &*tool.name == "ide.read" {
+                        properties.retain(|key, _| matches!(key.as_str(), "items" | "force" | "detail_ref"));
+                        if let Some(Value::Object(fields)) = properties
+                            .get_mut("items")
+                            .and_then(|items| items.get_mut("items"))
+                            .and_then(|item| item.get_mut("properties"))
+                        {
+                            if self == Self::Codex { fields.remove("offset"); fields.remove("limit"); }
+                            else { fields.remove("lines"); }
+                        }
+                        if self == Self::Codex {
+                            tool.description = tool.description.as_deref().map(|description| {
+                                description.replace("{path, offset, limit}", "{path, lines:\"1-80\"}").into()
+                            });
+                        }
+                    }
+                    if &*tool.name == "ide.test" {
+                        for target_form in ["symbol", "path", "pattern"] {
+                            properties.remove(target_form);
+                        }
+                    }
+                    if self == Self::Codex && &*tool.name == "ide.edit" {
+                        properties.retain(|key, _| matches!(key.as_str(), "operation_id" | "patch"));
+                        tool.description = Some("Atomic multi-file edit: batch production and test changes in one apply_patch `patch` (*** Begin Patch, *** Add File or *** Update File, *** End Patch); delete and move are unsupported. Absolute file headers inside the worktree are accepted; outside paths refuse. At the inline wait limit the reply is edit_progress: requested and committed files, stage and detail_ref; the project check reports separately.".into());
+                    }
+                    if self == Self::Claude && &*tool.name == "ide.edit" {
+                        let change = properties.get("changes").and_then(|changes| changes.get("items")).cloned();
+                        properties.retain(|key, _| matches!(key.as_str(), "operation_id" | "files" | "op" | "symbol" | "new_name"));
+                        if let (Some(change), Some(Value::Object(file))) = (change, properties.get_mut("files").and_then(|files| files.get_mut("items")).and_then(|items| items.get_mut("properties"))) {
+                            file.insert("changes".into(), json!({"type": "array", "items": change}));
+                        }
+                    }
+                }
+                if self == Self::Codex && &*tool.name == "ide.edit" {
+                    schema.insert("required".to_owned(), json!(["patch"]));
+                }
+                let mut schema = Value::Object(schema);
+                slim_schema(&mut schema, false);
+                if let Value::Object(schema) = schema {
+                    tool.input_schema = std::sync::Arc::new(schema);
+                }
+                tool
+            })
+            .collect()
+    }
+}
+
+/// Native ranges normalize to legacy line selectors without changing single-read enrichment. Offset0/1
+/// select line1; selector conflicts and numeric overflow still refuse before source I/O.
+#[test]
+fn native_ranges_preserve_enriched_read_forms() {
+    let read =
+        |args| validate_call(AssistanceTool::Read, args).map(|call| call.parameters().clone());
+    assert_eq!(
+        read(json!({"path":"a.rs"})).unwrap(),
+        json!({"path":"a.rs"})
+    );
+    assert_eq!(
+        read(json!({"symbol":"a.rs#f"})).unwrap(),
+        json!({"symbol":"a.rs#f"})
+    );
+    assert_eq!(
+        read(json!({"path":"a.rs","offset":0,"limit":2,"force":true})).unwrap(),
+        json!({"path":"a.rs","lines":"1-2","force":true})
+    );
+    assert_eq!(
+        read(json!({"items":[{"path":"a.rs","offset":2,"limit":2}]})).unwrap(),
+        json!({"items":[{"path":"a.rs","lines":"2-3"}]})
+    );
+    for invalid in [
+        json!({"path":"a.rs","offset":-1}),
+        json!({"path":"a.rs","limit":0}),
+        json!({"path":"a.rs","offset":4294967295_u64,"limit":2}),
+        json!({"path":"a.rs","lines":"1-2","offset":1}),
+    ] {
+        assert!(read(invalid).is_err());
+    }
+}
+
+/// The public test domain exposes read-only result/history/output queries without launching a
+/// new process, and Codex sees one unambiguous native patch form. Legacy status remains valid.
+#[test]
+fn test_api_queries_and_codex_patch_projection_are_unambiguous() {
+    let result = validate_call(AssistanceTool::Test, json!({"result":3})).unwrap();
+    assert_eq!(result.parameters()["status"], 3);
+    for read in [
+        json!({"result":3}),
+        json!({"status":3}),
+        json!({"history":true}),
+        json!({"detail_ref":"test-output"}),
+        json!({"output":"test-ref/output/1"}),
+    ] {
+        let call = validate_call(AssistanceTool::Test, read).unwrap();
+        assert!(!call.tool().mutates_with(call.parameters()));
+    }
+    assert!(
+        validate_call(
+            AssistanceTool::Test,
+            json!({"targets":[{"command":["cargo","check"]},{"command":["cargo","test"]}]})
+        )
+        .is_ok()
+    );
+    assert!(validate_call(AssistanceTool::Test, json!({"targets":[{"command":[]}]})).is_err());
+    let cancellation = validate_call(AssistanceTool::Test, json!({"cancel":1})).unwrap();
+    assert!(cancellation.tool().mutates_with(cancellation.parameters()));
+    let start = validate_call(AssistanceTool::Test, json!({"targets":[{"pattern":"x"}]})).unwrap();
+    assert!(start.tool().mutates_with(start.parameters()));
+    assert!(validate_call(AssistanceTool::Test, json!({"history":true})).is_ok());
+    assert!(validate_call(AssistanceTool::Test, json!({"detail_ref":"test-output"})).is_ok());
+    for invalid in [
+        json!({"cancel":0}),
+        json!({"cancel":1,"budget_s":2}),
+        json!({"cancel":1,"history":true}),
+        json!({"targets":[{"pattern":"x"}],"cancel":1}),
+        json!({"history":false}),
+        json!({"targets":[{"pattern":"x"}],"history":true}),
+        json!({"targets":[{"pattern":"x"}],"detail_ref":"test-output"}),
+        json!({"targets":[{"pattern":"x"}],"result":1}),
+        json!({"history":true,"command":["true"]}),
+        json!({"result":0}),
+        json!({"result":1,"status":1}),
+        json!({"result":1,"budget_s":1}),
+        json!({"detail_ref":""}),
+        json!({"output":""}),
+        json!({"output":"x".repeat(MAX_DETAIL_REF_BYTES + 1)}),
+        json!({"output":1}),
+        json!({"output":"test-ref/output/1","force":true}),
+    ] {
+        assert!(
+            validate_call(AssistanceTool::Test, invalid.clone()).is_err(),
+            "{invalid}"
+        );
+    }
+    let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
+    for selector in [
+        "symbol",
+        "path",
+        "pattern",
+        "command",
+        "targets",
+        "result",
+        "status",
+        "history",
+        "cancel",
+        "detail_ref",
+        "budget_s",
+        "cwd",
+        "env",
+    ] {
+        let mut invalid = json!({"output":"test-ref/output/1"});
+        invalid[selector] = json!(1);
+        assert!(
+            validate_call(AssistanceTool::Test, invalid).is_err(),
+            "{selector}"
+        );
+    }
+    assert!(
+        validate_call(
+            AssistanceTool::Test,
+            json!({"output":format!("x{}", char::from(0))})
+        )
+        .is_err()
+    );
+    let edit = |host: CatalogHost| {
+        host.catalog(facade.router.list_all())
+            .into_iter()
+            .find(|tool| tool.name == "ide.edit")
+            .unwrap()
+    };
+    let codex = edit(CatalogHost::Codex);
+    for host in [CatalogHost::Claude, CatalogHost::Codex] {
+        let test = host
+            .catalog(facade.router.list_all())
+            .into_iter()
+            .find(|tool| tool.name == "ide.test")
+            .unwrap();
+        assert_eq!(test.input_schema["properties"]["output"]["type"], "string");
+    }
+    assert_eq!(codex.input_schema["required"], json!(["patch"]));
+    assert_eq!(
+        codex.input_schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["operation_id", "patch"]
+    );
+    assert!(
+        edit(CatalogHost::Claude).input_schema["properties"]
+            .get("files")
+            .is_some()
+    );
+    assert!(
+        edit(CatalogHost::Claude).input_schema["properties"]
+            .get("patch")
+            .is_none()
+    );
+}
+
+/// Public and daemon validation preserve the exclusive output selector verbatim and classify
+/// it as a query, so lost-reply handling cannot replay or invent a test execution.
+#[test]
+fn explicit_test_output_selector_survives_normalization_without_mutation() {
+    let parameters = json!({"output":"test-ref/output/1"});
+    let public = validate_call(AssistanceTool::Test, parameters.clone()).unwrap();
+    let daemon = validate_normalized_call(public.tool(), public.parameters().clone()).unwrap();
+    assert_eq!(daemon.parameters(), &parameters);
+    assert!(!daemon.tool().mutates_with(daemon.parameters()));
+}
+
+/// Removes the bound keywords (`minLength`, `maxLength`, `minItems`, `maxItems`, `minimum`,
+/// `maximum`, `minProperties`, `maxProperties`, `pattern`, `propertyNames`), a boolean
+/// `default: false` and, below the root (`nested`), the closed-object marker
+/// `additionalProperties: false` from a schema node and everything below it.
+///
+/// The advertised schema only guides the model; the facade's own validator enforces every bound
+/// and refuses unknown fields on arrival, so listing them again costs tokens on every request
+/// for no gain (the descriptions state the few ranges a caller must choose within, such as
+/// `0–3`). The root stays closed, so a host still sees that a tool takes only its listed
+/// fields; a typed `additionalProperties` (an open map's value schema) stays everywhere. Walks
+/// only schema nodes (`properties` values, `items`, `additionalProperties`), so a property that is
+/// itself called `pattern` survives.
+fn slim_schema(schema: &mut Value, nested: bool) {
+    let Value::Object(node) = schema else {
+        return;
+    };
+    for keyword in [
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minimum",
+        "maximum",
+        "minProperties",
+        "maxProperties",
+        "pattern",
+        "propertyNames",
+    ] {
+        node.remove(keyword);
+    }
+    if node.get("default") == Some(&Value::Bool(false)) {
+        node.remove("default");
+    }
+    if nested && node.get("additionalProperties") == Some(&Value::Bool(false)) {
+        node.remove("additionalProperties");
+    }
+    if let Some(Value::Object(properties)) = node.get_mut("properties") {
+        properties.remove("source_ref");
+        properties
+            .values_mut()
+            .for_each(|property| slim_schema(property, true));
+    }
+    for child in ["items", "additionalProperties"] {
+        if let Some(child) = node.get_mut(child) {
+            slim_schema(child, true);
+        }
+    }
+}
+
+/// Selects private Context validation for inspect problems/diagnostics; dispatch keeps Inspect.
+/// The caller closes inspect modes before this translation; other calls pass through unchanged.
+fn fold_inspect_problems(tool: AssistanceTool, parameters: &Value) -> AssistanceTool {
+    match (tool, parameters.get("kind")) {
+        (AssistanceTool::Inspect, Some(_)) => AssistanceTool::Context,
+        _ => tool,
+    }
+}
 
 /// Ensures diagnostics hide both launch attachments and populated host metadata in either format.
 #[test]
@@ -4742,6 +5863,320 @@ fn debug_redacts_trusted_transport_and_host_metadata() {
         assert!(
             !rendered.contains(secret) && !rendered.contains("private_json"),
             "private host Debug leaked"
+        );
+    }
+}
+
+/// Advertised guidance allows one bounded retained-result wait and still forbids idle polling.
+/// The old millisecond parameter stays private compatibility; public waits use seconds.
+#[test]
+fn advertised_text_never_teaches_waiting() {
+    let mut advertised = SERVER_INSTRUCTIONS.to_owned();
+    let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
+    for tool in facade.router.list_all() {
+        advertised.push_str(&serde_json::to_string(&tool).unwrap());
+    }
+    for banned in ["wait_ms", "nothing else to do", "poll every", "poll until"] {
+        assert!(
+            !advertised.contains(banned),
+            "advertised text names {banned}"
+        );
+    }
+    assert!(
+        validate_call(
+            AssistanceTool::Inspect,
+            json!({"detail_ref": "a", "wait_ms": 5})
+        )
+        .is_ok()
+    );
+    assert!(advertised.contains("wait_s"));
+    for wait in [
+        json!(0),
+        json!(31),
+        json!(-1),
+        json!(1.5),
+        json!("1"),
+        json!(true),
+    ] {
+        assert!(
+            validate_call(
+                AssistanceTool::Inspect,
+                json!({"detail_ref":"a", "wait_s":wait})
+            )
+            .is_err()
+        );
+    }
+    for wait in [1, 30] {
+        assert!(
+            validate_call(
+                AssistanceTool::Inspect,
+                json!({"detail_ref":"a", "wait_s":wait})
+            )
+            .is_ok()
+        );
+    }
+}
+
+/// The advertised catalog stays inside its byte budgets: the server paragraph under 700 bytes,
+/// every tool description under 600 bytes, every property description under 160 bytes
+/// (harness-reply-v1 section 3), and the per-host catalog totals of E-005 M-038 — the Claude total
+/// raised by 200 B for the whole-source result annotation on Read, Prepare and Inspect, without
+/// which Claude Code shows a result over 100 000 characters only as a saved-file notice. These are
+/// export-byte regression limits only. Token/context acceptance requires actual assembled-host
+/// catalog plus skill measurements; the historical 9,069-token prompt delta is not a byte scale.
+#[test]
+fn catalog_stays_within_the_budgets() {
+    for (host, paragraph, total_limit) in [
+        (CatalogHost::Claude, SERVER_INSTRUCTIONS, 8_200),
+        (CatalogHost::Codex, SERVER_INSTRUCTIONS_CODEX, 7_500),
+    ] {
+        assert!(
+            paragraph.len() <= 700,
+            "{host:?} paragraph {}",
+            paragraph.len()
+        );
+        let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
+        let mut total = 0;
+        for tool in host.catalog(facade.router.list_all()) {
+            let description = tool.description.as_deref().unwrap_or_default().len();
+            assert!(
+                description <= 600,
+                "{host:?} {} description {description} B",
+                tool.name
+            );
+            let properties = tool.input_schema["properties"].as_object().unwrap();
+            for (name, property) in properties {
+                let text = property["description"].as_str().unwrap_or_default().len();
+                assert!(
+                    text <= 160,
+                    "{host:?} {}.{name} description {text} B",
+                    tool.name
+                );
+            }
+            total += serde_json::to_string(&tool).unwrap().len();
+        }
+        assert!(total <= total_limit, "{host:?} catalog {total} B");
+    }
+}
+
+/// Both public catalogs have eleven tools including graph, with no context route. Inspect modes
+/// reuse the private Context engine; positional Symbol targets cannot mix with address batches.
+/// Only Codex advertises native patches; compatibility validation accepts them on both hosts.
+#[test]
+fn per_host_catalogs_differ_only_by_the_declared_subset() {
+    let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
+    let names = |host: CatalogHost| {
+        host.catalog(facade.router.list_all())
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(CatalogHost::Claude).len(), 11);
+    let codex = names(CatalogHost::Codex);
+    assert_eq!(names(CatalogHost::Claude), codex);
+    assert_eq!(codex.len(), 11, "{codex:?}");
+    assert!(!codex.iter().any(|name| name == "ide.context"));
+    assert!(codex.iter().any(|name| name == "ide.graph"));
+    let inspect = CatalogHost::Codex
+        .catalog(facade.router.list_all())
+        .into_iter()
+        .find(|tool| tool.name == "ide.inspect")
+        .unwrap();
+    for property in [
+        "kind",
+        "path",
+        "language",
+        "offset",
+        "detail_ref",
+        "detail_refs",
+    ] {
+        assert!(
+            inspect.input_schema["properties"].get(property).is_some(),
+            "{property}"
+        );
+    }
+    assert!(
+        CatalogHost::Claude
+            .instructions()
+            .contains("agent-ide skill")
+    );
+    for rule in [
+        "exact names/schemas",
+        "wait_s",
+        "independent/broader",
+        "final diff precedes ide.stop",
+        "automatically",
+        "owed work",
+    ] {
+        assert!(CatalogHost::Codex.instructions().contains(rule), "{rule}");
+    }
+    assert_eq!(CatalogHost::parse("codex"), Some(CatalogHost::Codex));
+    assert_eq!(CatalogHost::parse("zcode"), None);
+    assert!(validate_call(AssistanceTool::Graph, json!({"symbol": "a#b"})).is_ok());
+    assert!(
+        validate_call(
+            AssistanceTool::Symbol,
+            json!({"path":"a.rs","byte_offset":0})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Inspect,
+            json!({"kind":"diagnostics","path":"a.rs"})
+        )
+        .is_ok()
+    );
+    for arguments in [
+        json!({"path":"a.rs"}),
+        json!({"byte_offset":0}),
+        json!({"path":"a.rs","byte_offset":0,"symbol":"f"}),
+        json!({"path":"a.rs","byte_offset":0,"symbols":["f"]}),
+    ] {
+        assert!(validate_call(AssistanceTool::Symbol, arguments).is_err());
+    }
+    for arguments in [
+        json!({"kind":"unknown","path":"a.rs"}),
+        json!({"kind":"diagnostics"}),
+        json!({"kind":"problems","path":"a.rs"}),
+        json!({"kind":"diagnostics","path":"a.rs","language":"alpha"}),
+        json!({"kind":"diagnostics","path":"a.rs","detail_ref":"x"}),
+    ] {
+        assert!(validate_call(AssistanceTool::Inspect, arguments).is_err());
+    }
+    for host in [CatalogHost::Claude, CatalogHost::Codex] {
+        let catalog = host.catalog(facade.router.list_all());
+        let symbol = catalog
+            .iter()
+            .find(|tool| tool.name == "ide.symbol")
+            .unwrap();
+        let graph = catalog
+            .iter()
+            .find(|tool| tool.name == "ide.graph")
+            .unwrap();
+        assert!(
+            symbol
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("immediate neighbors")
+        );
+        assert!(
+            graph
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("batch of symbols")
+        );
+        assert!(graph.description.as_deref().unwrap().contains("depth 2"));
+        for property in ["callers", "callees"] {
+            let description = symbol.input_schema["properties"][property]["description"]
+                .as_str()
+                .unwrap();
+            assert!(description.contains("0–3"));
+        }
+        assert!(
+            symbol
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("deeper chains: ide.graph")
+        );
+        // Workflow rules live once, in the skill (Claude) or the server text (Codex); tool
+        // descriptions only describe their call.
+        for tool in host.catalog(facade.router.list_all()) {
+            let text = serde_json::to_string(&tool).unwrap().to_lowercase();
+            for rule in ["poll", "bridge", "end the turn", "idle", "reread"] {
+                assert!(!text.contains(rule), "{host:?} {} states {rule}", tool.name);
+            }
+        }
+        let edit = host
+            .catalog(facade.router.list_all())
+            .into_iter()
+            .find(|tool| tool.name == "ide.edit")
+            .unwrap();
+        assert_eq!(
+            edit.input_schema["properties"].get("patch").is_some(),
+            host == CatalogHost::Codex,
+            "{host:?} native patch advertisement"
+        );
+        for teaching in ["`patch`", "apply_patch"] {
+            assert_eq!(
+                edit.description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(teaching),
+                host == CatalogHost::Codex,
+                "{host:?} native patch teaching: {teaching}"
+            );
+        }
+    }
+    assert!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"patch":"*** Begin Patch\n*** Add File: a.rs\n+fn f() {}\n*** End Patch"})
+        )
+        .is_ok(),
+        "unadvertised native patches remain accepted for compatibility"
+    );
+    assert_eq!(
+        fold_inspect_problems(AssistanceTool::Inspect, &json!({"kind": "problems"})),
+        AssistanceTool::Context
+    );
+    assert_eq!(
+        fold_inspect_problems(AssistanceTool::Inspect, &json!({"detail_ref": "x"})),
+        AssistanceTool::Inspect
+    );
+}
+
+/// Inspect mode restrictions are advertised and a known problem-only field names its required mode.
+#[test]
+fn inspect_mode_restrictions_are_explicit_in_catalog_and_refusal() {
+    let inspect = tool_schemas()
+        .into_iter()
+        .find(|tool| tool.tool == AssistanceTool::Inspect)
+        .unwrap();
+    for field in ["language", "offset"] {
+        let description = inspect.input_schema["properties"][field]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(description.contains("problems"), "{field}: {description}");
+    }
+    let error = validate_call(
+        AssistanceTool::Inspect,
+        json!({"kind":"diagnostics","path":"a.rs","language":"other"}),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.message(AssistanceTool::Inspect),
+        "Argument \"language\" requires \"kind\":\"problems\"."
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Inspect,
+            json!({"kind":"diagnostics","path":"a.rs"})
+        )
+        .is_ok()
+    );
+    for (arguments, expected) in [
+        (json!({"kind":"problems","path":"a.rs"}), "kind:diagnostics"),
+        (
+            json!({"kind":"diagnostics","path":"a.rs","offset":0}),
+            "problems",
+        ),
+        (
+            json!({"kind":"diagnostics","path":"a.rs","wait_s":1}),
+            "without kind",
+        ),
+        (
+            json!({"kind":"diagnostics","path":"a.rs","invented":true}),
+            "Unknown argument",
+        ),
+    ] {
+        let error = validate_call(AssistanceTool::Inspect, arguments).unwrap_err();
+        assert!(
+            error.message(AssistanceTool::Inspect).contains(expected),
+            "{error:?}"
         );
     }
 }
@@ -4777,10 +6212,11 @@ impl rmcp::ServerHandler for StdioFacade {
             rmcp::model::Implementation::new("agent-ide", env!("CARGO_PKG_VERSION"))
                 .with_title("Agent IDE"),
         )
-        .with_instructions(SERVER_INSTRUCTIONS)
+        .with_instructions(self.catalog_host.instructions())
     }
 
-    /// Serves the static eleven-tool catalog, with private cache hints for modern requests only.
+    /// Serves the static eleven-tool public catalogs for both hosts, with private
+    /// cache hints for modern requests only.
     ///
     /// The catalog is static per binary, but a short private TTL keeps a client from holding
     /// stale schemas across an upgrade; `ttlMs` and `cacheScope` stay absent for legacy sessions
@@ -4791,7 +6227,8 @@ impl rmcp::ServerHandler for StdioFacade {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        let mut result = ListToolsResult::with_all_items(self.router.list_all());
+        let mut result =
+            ListToolsResult::with_all_items(self.catalog_host.catalog(self.router.list_all()));
         if modern_request(&context) {
             result = result
                 .with_ttl_ms(TOOLS_LIST_TTL_MS)
@@ -4813,26 +6250,31 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Start,
-            "invalid bounded parameters: unknown field \"actor_id\"; allowed: activation_id, root, read_only, environment"
+            "Unknown argument \"actor_id\"."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Stop, json!({"authority":1}))
                 .unwrap_err(),
             AssistanceTool::Stop,
-            "invalid bounded parameters: unknown field \"authority\"; allowed: activation_id"
+            "Unknown argument \"authority\"."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"../escape":1})).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: unknown field; allowed: path, byte_offset, detail_ref, kind, language, offset"
+            "Unknown argument."
                 .to_string(),
         ),
         (
-            validate_call(AssistanceTool::Inspect, json!({})).unwrap_err(),
+            validate_call(
+                AssistanceTool::Inspect,
+                json!({"detail_ref":"a","detail_refs":["b"]}),
+            )
+            .unwrap_err(),
             AssistanceTool::Inspect,
-            "invalid bounded parameters: \"detail_ref\" is required".to_string(),
+            "Argument \"detail_refs\" must be not together with detail_ref."
+                .to_string(),
         ),
         (
             validate_call(
@@ -4841,40 +6283,40 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"path\" must be a path relative to the worktree root, not absolute"
+            "Argument \"path\" must be a path relative to the worktree root, not absolute."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"path": "../secrets"})).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"path\" must not contain \"..\"".to_string(),
+            "Argument \"path\" must not contain \"..\".".to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, oversized).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: arguments must be a JSON object under 4096 bytes"
+            "Arguments must be a JSON object under 4096 bytes."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"path": "a".repeat(1025)})).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"path\" is longer than 1024 bytes".to_string(),
+            "Argument \"path\" is longer than 1024 bytes.".to_string(),
         ),
         (
             validate_call(AssistanceTool::Start, json!({"activation_id": ""})).unwrap_err(),
             AssistanceTool::Start,
-            "invalid bounded parameters: \"activation_id\" must be a non-empty string".to_string(),
+            "Argument \"activation_id\" must be a non-empty string.".to_string(),
         ),
         (
             validate_call(AssistanceTool::Start, json!({"activation_id": 7})).unwrap_err(),
             AssistanceTool::Start,
-            "invalid bounded parameters: \"activation_id\" must be a non-empty string".to_string(),
+            "Argument \"activation_id\" must be a non-empty string.".to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"kind":"problems","offset":-1}))
                 .unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"offset\" must be a non-negative integer up to 4294967295"
+            "Argument \"offset\" must be a non-negative integer up to 4294967295."
                 .to_string(),
         ),
         (
@@ -4884,7 +6326,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"byte_offset\" must be a non-negative integer up to 1048576"
+            "Argument \"byte_offset\" must be a non-negative integer up to 1048576."
                 .to_string(),
         ),
         (
@@ -4895,19 +6337,19 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             .unwrap_err(),
             AssistanceTool::Context,
             format!(
-                "invalid bounded parameters: \"language\" must be {}",
+                "Argument \"language\" must be {}.",
                 checked_language_alternatives()
             ),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"path":"a.rs","offset":5})).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"offset\" requires \"kind\":\"problems\"".to_string(),
+            "Argument \"offset\" requires \"kind\":\"problems\".".to_string(),
         ),
         (
             validate_call(AssistanceTool::Diff, json!({"mode":"all"})).unwrap_err(),
             AssistanceTool::Diff,
-            "invalid bounded parameters: \"mode\" must be \"head\", \"staged\", \"unstaged\", or \"task\""
+            "Argument \"mode\" must be \"head\", \"staged\", \"unstaged\", or \"task\"."
                 .to_string(),
         ),
         (
@@ -4917,7 +6359,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "invalid bounded parameters: \"content\" must be a string".to_string(),
+            "Argument \"content\" must be a string.".to_string(),
         ),
         (
             validate_call(
@@ -4927,49 +6369,29 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             .unwrap_err(),
             AssistanceTool::Edit,
             format!(
-                "invalid bounded parameters: \"content\" is longer than {MAX_EDIT_ARGUMENT_CONTENT_BYTES} bytes"
+                "Argument \"content\" is longer than {MAX_EDIT_ARGUMENT_CONTENT_BYTES} bytes."
             ),
         ),
         (
             validate_call(
                 AssistanceTool::Edit,
-                json!({"operation_id":"o","path":"/abs/a.rs","source_ref":"s","content":""}),
+                json!({"operation_id":"o","path":"a//a.rs","source_ref":"s","content":""}),
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "invalid bounded parameters: \"path\" must be a path relative to the worktree root, not absolute"
+            "Argument \"path\" must be a path relative to the worktree root, not absolute."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({})).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\""
+            "ide.inspect diagnostics needs \"path\"."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Outline, json!({})).unwrap_err(),
             AssistanceTool::Outline,
-            "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)".to_string(),
-        ),
-        (
-            validate_call(
-                AssistanceTool::Edit,
-                json!({"operation_id":"o","path":"a.rs","lines":"1-2","content":"x"}),
-            )
-            .unwrap_err(),
-            AssistanceTool::Edit,
-            "invalid bounded parameters: \"source_ref\" is required for a line-range edit; \
-             re-read the lines (ide.read) and retry with the new source_ref"
-                .to_string(),
-        ),
-        (
-            validate_call(
-                AssistanceTool::Edit,
-                json!({"operation_id":"o","path":"a.rs","changes":[{"old":"x","new":"y"}]}),
-            )
-            .unwrap_err(),
-            AssistanceTool::Edit,
-            "invalid bounded parameters: \"source_ref\" is required for an old-text change; re-read this file with ide.read and retry with the new source_ref".to_string(),
+            "ide.outline needs \"path\" (a file or directory relative to the worktree root).".to_string(),
         ),
         (
             validate_call(
@@ -4978,8 +6400,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Read,
-            "ide.read needs one form: `symbol`, or `path` alone (the whole file), or `path` \
-             with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
+            "ide.read needs exactly one supported read target."
                 .to_string(),
         ),
         (
@@ -4989,8 +6410,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "ide.edit takes one form: \"changes\" with \"path\", or one single-change form \
-             — not both"
+            "ide.edit cannot combine a changes list with a single-change form."
                 .to_string(),
         ),
         (
@@ -5000,20 +6420,19 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
-             `source_ref` — not both"
+            "ide.edit needs exactly one supported edit target."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Graph, json!({"symbol":"f","depth":0})).unwrap_err(),
             AssistanceTool::Graph,
-            "invalid bounded parameters: \"depth\" must be an integer from 1 to 3".to_owned(),
+            "Argument \"depth\" must be an integer from 1 to 3.".to_owned(),
         ),
         (
             validate_call(AssistanceTool::Test, json!({"symbol":"a.rs#f","budget_s":0}))
                 .unwrap_err(),
             AssistanceTool::Test,
-            "invalid bounded parameters: \"budget_s\" must be an integer from 1 to 600"
+            "Argument \"budget_s\" must be an integer from 1 to 600."
                 .to_owned(),
         ),
     ]
@@ -5123,15 +6542,9 @@ fn edit_changes_shape_matrix() {
         )
         .is_ok()
     );
-    // A lines entry without source_ref is refused on the source_ref rule.
-    assert_eq!(
-        batch(false, json!([{"lines":"3-4","content":"x"}])).unwrap_err(),
-        invalid_field("source_ref", FieldRule::RangeEditSourceRef)
-    );
-    assert_eq!(
-        batch(false, json!([{"old":"a","new":"b"}])).unwrap_err(),
-        invalid_field("source_ref", FieldRule::OldTextSourceRef)
-    );
+    // Lines and old entries need no source_ref: the current bytes are the base.
+    assert!(batch(false, json!([{"lines":"3-4","content":"x"}])).is_ok());
+    assert!(batch(false, json!([{"old":"a","new":"b"}])).is_ok());
     // No address, two addresses, a bad op, a bad where, a missing payload.
     assert!(batch(true, json!([{"content":"x"}])).is_err());
     assert!(batch(true, json!([{"lines":"1-2","old":"a","new":"b"}])).is_err());
@@ -5224,7 +6637,8 @@ fn read_symbols_and_ranges_validate() {
 
 /// The full-file form without `source_ref` validates as a creation request whose forwarded
 /// parameters carry no reference (the worker observes the path itself); with one it stays the
-/// canonical replace request, and path/content rules still hold for both.
+/// canonical replace request, and path/content rules still hold for both. Absolute spellings
+/// are shape-valid here; the worker's current worktree authority enforces containment.
 #[test]
 fn full_file_edit_without_source_ref_is_a_creation_request() {
     let created = validate_call(
@@ -5242,13 +6656,12 @@ fn full_file_edit_without_source_ref_is_a_creation_request() {
     )
     .unwrap();
     assert_eq!(replaced.parameters()["source_ref"], "s");
-    assert!(
-        validate_call(
-            AssistanceTool::Edit,
-            json!({"operation_id":"o","path":"/abs.rs","content":"x"})
-        )
-        .is_err()
-    );
+    let absolute = validate_call(
+        AssistanceTool::Edit,
+        json!({"operation_id":"o","path":"/abs.rs","content":"x"}),
+    )
+    .unwrap();
+    assert_eq!(absolute.parameters()["path"], "/abs.rs");
     assert!(
         validate_call(
             AssistanceTool::Edit,
@@ -5256,15 +6669,35 @@ fn full_file_edit_without_source_ref_is_a_creation_request() {
         )
         .is_err()
     );
-    assert_eq!(
-        ParameterError::InvalidField {
-            field: "source_ref",
-            rule: FieldRule::ReplaceSourceRef,
-        }
-        .message(AssistanceTool::Edit),
-        "invalid bounded parameters: \"source_ref\" is required to replace an existing file: \
-         read it first (ide.read)"
+    // A whole-file replacement needs no source_ref either, and an edit without operation_id
+    // gets a distinct generated one.
+    let first = validate_call(AssistanceTool::Edit, json!({"path":"a.rs","content":"x"})).unwrap();
+    let second = validate_call(AssistanceTool::Edit, json!({"path":"a.rs","content":"x"})).unwrap();
+    assert_ne!(
+        first.parameters()["operation_id"],
+        second.parameters()["operation_id"]
     );
+}
+
+/// Public callers cannot inject the normalized diff flag, and daemon revalidation keeps the
+/// front's default/full decision without letting explicit modes become incremental.
+#[test]
+fn diff_mode_is_derived_at_public_ingress_and_preserved_for_the_daemon() {
+    for mode in ["head", "unstaged", "staged", "task"] {
+        assert!(
+            validate_call(AssistanceTool::Diff, json!({"mode":mode,"since_last":true})).is_err()
+        );
+        let full = validate_call(AssistanceTool::Diff, json!({"mode":mode})).unwrap();
+        assert_ne!(full.parameters()["since_last"], true);
+        let daemon =
+            validate_normalized_call(AssistanceTool::Diff, full.parameters().clone()).unwrap();
+        assert_ne!(daemon.parameters()["since_last"], true);
+    }
+    let incremental = validate_call(AssistanceTool::Diff, json!({})).unwrap();
+    assert_eq!(incremental.parameters()["since_last"], true);
+    let daemon =
+        validate_normalized_call(AssistanceTool::Diff, incremental.parameters().clone()).unwrap();
+    assert_eq!(daemon.parameters()["since_last"], true);
 }
 
 /// Start accepts only absolute, normalized optional working-directory roots.
@@ -5294,6 +6727,80 @@ fn start_root_must_be_absolute_and_normalized() {
             rule: FieldRule::Boolean,
         }
     );
+}
+
+/// Every edit form defers absolute dot/parent/repeated-slash spellings to the worker's shared
+/// containment guard while relative paths and NUL keep their strict boundary refusals. Legacy
+/// line/symbol requests retain their existing canonical changes form, including the raw path.
+#[test]
+fn edit_absolute_native_shapes_reach_containment_in_every_form() {
+    for path in ["/repo/src/./a.rs", "/repo/src/../a.rs", "//repo//a.rs"] {
+        let calls = [
+            (
+                json!({"operation_id":"shape","path":path,"content":"new"}),
+                None,
+            ),
+            (
+                json!({"operation_id":"shape","path":path,"source_ref":"ref","content":"new"}),
+                None,
+            ),
+            (
+                json!({"operation_id":"shape","path":path,"lines":"1-1","content":"new"}),
+                Some(
+                    json!({"operation_id":"shape","path":path,"changes":[{"lines":"1-1","content":"new"}]}),
+                ),
+            ),
+            (
+                json!({"operation_id":"shape","path":path,"changes":[{"old":"old","new":"new"}]}),
+                None,
+            ),
+            (
+                json!({"operation_id":"shape","files":[{"path":path,"content":"new"}]}),
+                None,
+            ),
+            (
+                json!({"operation_id":"shape","symbol":format!("{path}#first"),"content":"new"}),
+                Some(
+                    json!({"operation_id":"shape","path":path,"changes":[{"symbol":format!("{path}#first"),"content":"new"}]}),
+                ),
+            ),
+            (
+                json!({"operation_id":"shape","path":path,"changes":[{"symbol":format!("{path}#first"),"content":"new"}]}),
+                None,
+            ),
+            (
+                json!({"operation_id":"shape","path":path,"changes":[{"old":"old","new":"new","within":format!("{path}#first")}]}),
+                None,
+            ),
+        ];
+        for (parameters, normalized) in calls {
+            let call = validate_call(AssistanceTool::Edit, parameters.clone())
+                .unwrap_or_else(|error| panic!("{parameters}: {error:?}"));
+            assert_eq!(
+                call.parameters(),
+                normalized.as_ref().unwrap_or(&parameters)
+            );
+        }
+    }
+    for path in [
+        "src/./a.rs",
+        "src/../a.rs",
+        "src//a.rs",
+        "src/a\0.rs",
+        "/repo/a\0.rs",
+    ] {
+        for parameters in [
+            json!({"operation_id":"shape","path":path,"content":"new"}),
+            json!({"operation_id":"shape","path":path,"lines":"1-1","content":"new"}),
+            json!({"operation_id":"shape","path":path,"changes":[{"old":"old","new":"new"}]}),
+            json!({"operation_id":"shape","files":[{"path":path,"content":"new"}]}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, parameters).is_err(),
+                "{path:?}"
+            );
+        }
+    }
 }
 
 /// The quoted alternatives the `problems` language refusal lists: every registered checked
@@ -5355,7 +6862,7 @@ fn absolute_context_path_refusal_names_the_relative_path_rule() {
     .message(AssistanceTool::Context);
     assert_eq!(
         message,
-        "invalid bounded parameters: \"path\" must be a path relative to the worktree root, not absolute"
+        "Argument \"path\" must be a path relative to the worktree root, not absolute."
     );
 }
 
@@ -5425,18 +6932,14 @@ mod managed_claude_front_tests {
     }
 
     impl ScriptedDaemon {
-        /// Binds the scripted daemon at `runtime/<bound>`.
+        /// Binds `bound` in a short private directory that fits Unix socket pathname limits.
         fn new(bound: &str) -> Self {
             use std::os::unix::fs::DirBuilderExt;
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let runtime = std::env::temp_dir().join(format!(
-                "ide-front-{}-{}-{}",
+                "f-{}-{}",
                 std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             std::fs::DirBuilder::new()
                 .mode(0o700)
@@ -5635,14 +7138,19 @@ mod managed_claude_front_tests {
                 // An older daemon and several actors: nothing is guessed or sent.
                 (_, true) => {
                     assert!(
-                        !sent && text.starts_with("error: stop_unidentified"),
+                        !sent && text.starts_with("The IDE could not identify this stop's session"),
                         "{text}"
                     );
                     assert_eq!(reconnect.remembered_tags(None).len(), 2);
                 }
                 // Any other refusal is not proof of an older daemon: nothing sent, memory kept.
                 _ => {
-                    assert!(!sent && text.contains("(hooks_not_delivered)"), "{text}");
+                    assert!(
+                        !sent
+                            && text
+                                == "The IDE received no host event for this session.\nRepair: Call ide.start in this project.",
+                        "{text}"
+                    );
                     assert_eq!(reconnect.remembered_tags(None).len(), 1);
                 }
             }
@@ -5674,7 +7182,7 @@ mod managed_claude_front_tests {
         };
         let (text, sent) = tokio::join!(claude_call(front, "ide.stop", json!({})), peer);
         assert!(
-            !sent && text.starts_with("error: stop_unidentified"),
+            !sent && text.starts_with("The IDE could not identify this stop's session"),
             "{text}"
         );
         assert_eq!(reconnect.remembered_tags(None), vec![tag]);
@@ -5717,7 +7225,10 @@ mod managed_claude_front_tests {
             ),
             peer
         );
-        assert!(text.contains("(never_activated)"), "{text}");
+        assert!(
+            text == "This session has no IDE activation yet.\nRepair: Call ide.start in this project.",
+            "{text}"
+        );
     }
 
     /// After a replacement a call announces the remembered tags; on `recovery_needed` the front
@@ -5786,6 +7297,74 @@ mod managed_claude_front_tests {
         assert!(text.contains("pub fn value()"), "{text}");
     }
 
+    /// Re-activation retains unresolved subjects through definite Bridge no-effect and clears
+    /// them only after accepted or uncertain custody.
+    #[tokio::test]
+    async fn restart_loss_is_forgotten_only_after_bridge_handoff() {
+        let daemon = ScriptedDaemon::new("agent-ide.sock");
+        let front = daemon.front(Arc::new(|| Box::pin(async { None })));
+        let reconnect = front.reconnect.clone().unwrap();
+        let tag = "d".repeat(64);
+        reconnect.unresolved.observe(
+            &tag,
+            AssistanceTool::Read,
+            &json!({"path":"src/lib.rs"}),
+            &PeerReply::Pending {
+                detail_ref: "read-before-restart".to_owned(),
+            },
+        );
+        let activation = PeerReply::Complete {
+            kind: ResultKind::Activation,
+            text: "activated".into(),
+            detail_ref: None,
+            truncated: false,
+            continuation: false,
+        };
+        let peer = async {
+            for handed_off in [false, true] {
+                let (stream, request) = daemon.request().await.unwrap();
+                assert_eq!(request["dispatch_method"], "start");
+                assert_eq!(
+                    request["params_json"]["host_meta"]["claudecode/lost"],
+                    json!(["ide.read src/lib.rs"])
+                );
+                answer(
+                    stream,
+                    &request,
+                    json!({
+                        "lost_handoff": handed_off,
+                        "reply": serde_json::to_value(&activation).unwrap()
+                    }),
+                )
+                .await;
+            }
+        };
+        let client = async {
+            for (handed_off, expected) in [
+                (false, vec!["ide.read src/lib.rs".to_owned()]),
+                (true, Vec::new()),
+            ] {
+                assert!(
+                    front
+                        .reactivate(
+                            &daemon.runtime,
+                            "old",
+                            json!({"activation_id":"restored"}),
+                            json!("real-call"),
+                            Some(&tag),
+                        )
+                        .await
+                );
+                assert_eq!(
+                    reconnect.unresolved.subjects(&tag),
+                    expected,
+                    "{handed_off}"
+                );
+            }
+        };
+        tokio::join!(client, peer);
+    }
+
     /// The anonymous 0.10.2 slot is re-activated before an ordinary call by naming that very
     /// call, never with an expected actor, and the call follows once.
     #[tokio::test]
@@ -5832,7 +7411,10 @@ mod managed_claude_front_tests {
             ),
             peer
         );
-        assert!(text.contains("host_binding"), "{text}");
+        assert_eq!(
+            text,
+            "This session has no IDE activation yet.\nRepair: Call ide.start in this project."
+        );
     }
 
     /// F-02: against an older daemon that identifies no actor, the single remembered activation
@@ -5889,7 +7471,8 @@ mod managed_claude_front_tests {
             );
             assert_eq!(*asked.lock().unwrap(), [remembered], "{text}");
             assert_eq!(
-                text.contains("other_repository: bound to /repo, asked /other"),
+                text.starts_with("Other agents still use the bound repository; nothing moved.")
+                    && text.contains("Bound repository: /repo; requested root: /other"),
                 remembered,
                 "{text}"
             );
@@ -6092,7 +7675,100 @@ mod managed_claude_front_tests {
             claude_call(front, "ide.start", json!({"activation_id":"x"})),
             peer
         );
-        assert!(text.starts_with("error: outcome_unknown"), "{text}");
+        assert!(
+            text.starts_with("This activation change may have applied; its outcome is unknown."),
+            "{text}"
+        );
         assert!(!reconnect.activated_before().await);
+    }
+
+    /// The lenient read range grammar: one line, a closed range and an open range parse; zero,
+    /// reversed and malformed ranges do not. Edits keep the strict grammar.
+    #[test]
+    fn read_ranges_accept_one_line_closed_and_open_forms() {
+        let range = |text: &str| parse_read_range(text).map(|r| (r.start, r.end));
+        assert_eq!(range("7"), Some((7, 7)));
+        assert_eq!(range("7-9"), Some((7, 9)));
+        assert_eq!(range("7-"), Some((7, u32::MAX)));
+        for bad in ["", "0", "0-3", "9-7", "-3", "a-b", "1-2-3"] {
+            assert_eq!(range(bad), None, "{bad}");
+        }
+        assert!(parse_line_range("7").is_none() && parse_line_range("7-").is_none());
+    }
+
+    /// The address-shaped edit forms E1-E8 validate; their closed shape errors refuse.
+    #[test]
+    fn address_edit_forms_validate() {
+        for call in [
+            json!({"symbol":"a.rs#F:2-3","content":"x"}),
+            json!({"symbol":"a.rs#F:2","content":""}),
+            json!({"symbol":"a.rs#F","old":"x","new":"y"}),
+            json!({"symbol":"a.rs#F:2-3","old":"x","new":"y"}),
+            json!({"path":"a.rs","old":"x","new":"y"}),
+            json!({"file_path":"a.rs","old_string":"x","new_string":""}),
+            json!({"symbol":"a.rs#@imports","op":"insert","where":"after","content":"use x;"}),
+            json!({"symbol":"a.rs#@header","content":"// h"}),
+            json!({"symbol":"a.rs#F:2-3","op":"delete"}),
+            json!({"path":"a.rs","add_import":"use std::fmt;"}),
+            json!({"path":"a.rs","remove_import":"use std::fmt;"}),
+            json!({"path":"a.rs","changes":[{"symbol":"a.rs#F","old":"x","new":"y"},{"add_import":"use x;"}]}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, call.clone()).is_ok(),
+                "{call}"
+            );
+        }
+        for call in [
+            json!({"path":"a.rs","add_import":"use a;\nuse b;"}),
+            json!({"path":"a.rs","old":"x"}),
+            json!({"path":"a.rs","old":"x","new":"y","content":"z"}),
+            json!({"symbol":"a.rs#F:2-3","old":"x","new":"y","content":"z"}),
+            json!({"path":"a.rs","add_import":"use a;","remove_import":"use b;"}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, call.clone()).is_err(),
+                "{call}"
+            );
+        }
+    }
+
+    /// The read forms accept windows, regions and `path:line` locations as symbol texts.
+    #[test]
+    fn read_accepts_windows_regions_and_locations() {
+        for call in [
+            json!({"symbol":"src/a.rs#Store/transcript:3-5"}),
+            json!({"symbol":"src/a.rs#@imports"}),
+            json!({"symbol":"/repo/src/a.rs:130"}),
+            json!({"symbols":["src/a.rs#@header","src/a.rs#Store/new:2","src/b.rs:88"]}),
+            json!({"items":[{"symbol":"src/a.rs#Store/transcript:10"},{"path":"docs/x.md","lines":"1-"}]}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Read, call.clone()).is_ok(),
+                "{call}"
+            );
+        }
+    }
+
+    /// `ide.edit {patch}` validates alone beside an optional `operation_id`; any other field beside
+    /// it, a non-string or an empty patch is refused, and the grammar is left to the worker.
+    #[test]
+    fn patch_edit_stands_alone() {
+        let ok = validate_call(
+            AssistanceTool::Edit,
+            json!({"patch":"*** Begin Patch\n*** End Patch"}),
+        )
+        .unwrap();
+        assert!(ok.parameters()["operation_id"].is_string());
+        for bad in [
+            json!({"patch":"x","path":"a.rs"}),
+            json!({"patch":"x","files":[]}),
+            json!({"patch":5}),
+            json!({"patch":""}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

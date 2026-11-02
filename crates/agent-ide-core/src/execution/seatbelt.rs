@@ -1,8 +1,8 @@
-//! Confined execution of project checks under the macOS Seatbelt sandbox.
+//! Confined execution of project checks under macOS Seatbelt or Linux bubblewrap/seccomp.
 //!
 //! This module is the single spawn path for the confined background checks of the v0.3
-//! problem-feed contract (EYES-r1 §3): every check process runs under `/usr/bin/sandbox-exec`
-//! with a freshly generated profile, in its own process group, with a bounded runtime and a
+//! problem-feed contract (EYES-r1 §3): each check uses a generated Seatbelt profile on macOS
+//! or private Linux namespaces with seccomp, in its own process group, with a bounded runtime and a
 //! bounded retained output. Timeout, cancellation, and post-exit sweeping kill and reap the
 //! whole group through its process id only; no pattern-based process matching exists here.
 
@@ -11,14 +11,16 @@ use std::{
     fmt, io,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "linux"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::{process::Command, task::JoinHandle};
 
 /// Absolute path of the macOS Seatbelt launcher used for every confined spawn.
+#[cfg(not(target_os = "linux"))]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// Time a group terminated with `SIGTERM` still has to exit before the runner escalates to
@@ -398,7 +400,12 @@ pub struct ConfinedOutput {
     pub truncated: bool,
 }
 
-/// Runs one check program under a generated Seatbelt profile in its own process group.
+/// Runs one check under the native confinement backend with bounded output and owned reaping.
+///
+/// On Linux, bubblewrap installs private namespaces and a socket-denying seccomp filter. Only
+/// declared roots are mounted; unsupported read exclusions or unavailable kernel facilities
+/// refuse the check. A private admission controller shares production's cancellation/reap path.
+/// The remaining profile-file details describe the macOS backend.
 ///
 /// The profile is written to a fresh `0600` private file and removed when the run ends,
 /// including on failure and cancellation. The child is spawned as
@@ -431,29 +438,61 @@ pub async fn run_confined(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> io::Result<ConfinedOutput> {
-    let profile = render_profile(policy)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let profile_path = write_profile(&profile)?;
-    let _profile_remover = ProfileFileRemover {
-        path: profile_path.clone(),
-    };
-
-    let mut command = Command::new(SANDBOX_EXEC);
-    command
-        .arg("-f")
-        .arg(&profile_path)
-        .arg(program)
-        .args(args)
-        .current_dir(cwd)
-        .env_clear()
-        .envs(
-            env.iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
+    #[cfg(target_os = "linux")]
+    {
+        // The standalone API uses the same owned-job reaper as production. In particular, a
+        // dropped caller cannot reap the leader before group signalling has finished.
+        let admission = std::sync::Arc::new(std::sync::Mutex::new(
+            super::AdmissionController::new(super::AdmissionLimits {
+                total_running: 1,
+                per_owner_running: 1,
+                per_owner_queued: 1,
+                total_queued: 1,
+                interactive_burst: 1,
+            })
+            .map_err(|error| io::Error::other(format!("{error:?}")))?,
+        ));
+        let owner = super::OwnerId::new("standalone-confined-check")
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        return run_admitted(
+            &admission,
+            owner,
+            program,
+            args,
+            cwd,
+            env,
+            Some(policy),
+            timeout,
+            max_output_bytes,
         )
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    run_prepared(command, timeout, max_output_bytes).await
+        .await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let profile = render_profile(policy)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let profile_path = write_profile(&profile)?;
+        let _profile_remover = ProfileFileRemover {
+            path: profile_path.clone(),
+        };
+
+        let mut command = Command::new(SANDBOX_EXEC);
+        command
+            .arg("-f")
+            .arg(&profile_path)
+            .arg(program)
+            .args(args)
+            .current_dir(cwd)
+            .env_clear()
+            .envs(
+                env.iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        run_prepared(command, timeout, max_output_bytes).await
+    }
 }
 
 /// [`run_confined`] (with a `policy`) or [`run_unconfined`] (without) as an Execution-owned job of
@@ -472,20 +511,33 @@ pub async fn run_admitted(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> io::Result<ConfinedOutput> {
+    #[cfg(not(target_os = "linux"))]
     let mut _profile_remover = None;
+    #[cfg(target_os = "linux")]
+    let mut linux_launch = None;
     let (launcher, argv) = match policy {
         Some(policy) => {
-            let profile = render_profile(policy)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            let profile_path = write_profile(&profile)?;
-            let mut argv = vec![
-                OsString::from("-f"),
-                profile_path.clone().into_os_string(),
-                program.as_os_str().to_owned(),
-            ];
-            argv.extend(args.iter().cloned());
-            _profile_remover = Some(ProfileFileRemover { path: profile_path });
-            (PathBuf::from(SANDBOX_EXEC), argv)
+            #[cfg(target_os = "linux")]
+            {
+                let launch = super::linux::prepare(program, args, cwd, policy)?;
+                let argv = launch.args.clone();
+                linux_launch = Some(launch);
+                (PathBuf::from(super::linux::BWRAP), argv)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let profile = render_profile(policy)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                let profile_path = write_profile(&profile)?;
+                let mut argv = vec![
+                    OsString::from("-f"),
+                    profile_path.clone().into_os_string(),
+                    program.as_os_str().to_owned(),
+                ];
+                argv.extend(args.iter().cloned());
+                _profile_remover = Some(ProfileFileRemover { path: profile_path });
+                (PathBuf::from(SANDBOX_EXEC), argv)
+            }
         }
         None => (program.to_path_buf(), args.to_vec()),
     };
@@ -499,6 +551,15 @@ pub async fn run_admitted(
             .collect(),
     )
     .map_err(|error| io::Error::new(io::ErrorKind::NotFound, format!("{error:?}")))?;
+    #[cfg(target_os = "linux")]
+    let command = {
+        let mut command = command;
+        if let Some(launch) = linux_launch {
+            command = command.with_private_stdin(launch.filter);
+            command.linux_mounts = launch.mounts;
+        }
+        command
+    };
     let output = super::job::run_job(
         admission,
         owner,
@@ -691,11 +752,13 @@ impl Drop for GroupKillGuard {
 }
 
 /// Removes the generated profile file when the run ends, including on failure and cancellation.
+#[cfg(not(target_os = "linux"))]
 struct ProfileFileRemover {
     /// Path of the private `0600` profile file this guard owns.
     path: PathBuf,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Drop for ProfileFileRemover {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -706,6 +769,7 @@ impl Drop for ProfileFileRemover {
 ///
 /// The name combines the process id with a process-local sequence number, so concurrent runs
 /// in one process and parallel runner processes never share a profile path.
+#[cfg(not(target_os = "linux"))]
 fn profile_path() -> PathBuf {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
@@ -724,7 +788,7 @@ fn profile_path() -> PathBuf {
 /// # Errors
 ///
 /// Propagates the filesystem error when the file cannot be created exclusively or written.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn write_profile(profile: &str) -> io::Result<PathBuf> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
 

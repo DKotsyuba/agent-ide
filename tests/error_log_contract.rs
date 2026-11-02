@@ -2,7 +2,7 @@
 //! `errors` reader finds what a daemon wrote, and that spawned processes never touch the real home.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,9 +21,13 @@ fn scratch(name: &str) -> PathBuf {
             std::process::id(),
             TEST_ID.fetch_add(1, Ordering::Relaxed)
         ));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     path
+}
+
+/// Places a unique runtime directly below task TMPDIR to stay within Unix socket path limits.
+fn short_runtime(name: &str) -> PathBuf {
+    fs::canonicalize(std::env::temp_dir()).unwrap().join(name)
 }
 
 /// The 16 hex repository key the reader derives from one canonical rendezvous key path.
@@ -61,26 +65,45 @@ fn git(dir: &Path, args: &[&str]) {
 
 /// Starts a daemon on `runtime` (created here), waits for its socket, and returns the child.
 fn start_daemon(runtime: &Path, configure: impl FnOnce(&mut Command)) -> std::process::Child {
-    fs::create_dir_all(runtime).unwrap();
-    fs::set_permissions(runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(
+            runtime.join("agent-ide.sock").as_os_str().as_bytes().len() <= 107,
+            "fixture Unix socket path exceeds Linux limit"
+        );
+    }
+    fs::DirBuilder::new().mode(0o700).create(runtime).unwrap();
     let mut command = agent_ide();
     command
         .args(["daemon", "--runtime-dir"])
         .arg(runtime)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     configure(&mut command);
     let mut child = command.spawn().unwrap();
     for _ in 0..400 {
         if std::os::unix::net::UnixStream::connect(runtime.join("agent-ide.sock")).is_ok() {
             return child;
         }
+        if child.try_wait().unwrap().is_some() {
+            let output = child.wait_with_output().unwrap();
+            let _ = fs::remove_dir_all(runtime);
+            panic!(
+                "daemon exited before binding: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
     let _ = child.kill();
-    child.wait().unwrap();
-    panic!("daemon did not bind its private socket");
+    let output = child.wait_with_output().unwrap();
+    let _ = fs::remove_dir_all(runtime);
+    panic!(
+        "daemon did not bind its private socket: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Stops a daemon with SIGTERM (a clean shutdown that logs `stopped`) and waits for it.
@@ -120,7 +143,7 @@ fn log_survives_daemon_restart_and_reader_finds_it_from_a_subdirectory() {
     fs::create_dir_all(repo.join("sub")).unwrap();
     // Not a git repository: the rendezvous key is the canonical directory itself.
     let key = key_of(&repo);
-    let runtime = base.join(format!("ai-r-{key}"));
+    let runtime = short_runtime(&format!("ai-r-{key}"));
     for _ in 0..2 {
         let child = start_daemon(&runtime, |command| {
             command
@@ -163,7 +186,7 @@ fn reader_resolves_worktrees_to_the_repository_log() {
     git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
     fs::create_dir_all(linked.join("deep/er")).unwrap();
     let key = key_of(&fs::canonicalize(main.join(".git")).unwrap());
-    let runtime = root.join(format!("ai-r-{key}"));
+    let runtime = short_runtime(&format!("ai-r-{key}"));
     for _ in 0..3 {
         terminate(start_daemon(&runtime, |command| {
             command.env(HOME_OVERRIDE_ENV, &home);
@@ -186,7 +209,7 @@ fn log_key_environment_names_the_log_directory_of_a_random_runtime() {
     let repo = fs::canonicalize(&base).unwrap().join("repo");
     fs::create_dir_all(&repo).unwrap();
     let key = key_of(&repo);
-    let runtime = base.join("ai-0123456789abcdef");
+    let runtime = short_runtime(&format!("ai-{key}"));
     terminate(start_daemon(&runtime, |command| {
         command
             .env(HOME_OVERRIDE_ENV, &home)
@@ -214,7 +237,7 @@ fn spawned_daemon_never_writes_under_the_real_home() {
     let real = passwd_home().expect("passwd home");
     assert_ne!(real, redirected, "tests must not run against the real home");
     let key = key_of(&fs::canonicalize(&base).unwrap());
-    let runtime = base.join(format!("ai-r-{key}"));
+    let runtime = short_runtime(&format!("ai-r-{key}"));
     terminate(start_daemon(&runtime, |_| {}));
     assert!(
         !real.join(".agent-ide/logs").join(&key).exists(),

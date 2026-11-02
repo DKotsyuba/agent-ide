@@ -81,9 +81,10 @@ const SNAPSHOT_SCRATCH_STEM: &str = "agent-ide-snapshot-";
 /// Process-local suffix that prevents accidental reuse of a scratch directory.
 static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
 
-/// Owns private files until all corresponding intents have been reaped or dropped.
+/// Owns private snapshots through tracked command settlement, or empty Workspace filename probes
+/// with no child. An unused owner removes its private tree on drop; uncertain command owners retain it.
 #[derive(Debug)]
-struct SnapshotDirectory {
+pub(in crate::workspace) struct SnapshotDirectory {
     /// ASCII absolute directory created exclusively with mode 0700 outside the worktree.
     path: PathBuf,
     /// Shared one-command lifecycle; unknown/cancelled owners quarantine instead of deleting files.
@@ -109,9 +110,17 @@ enum ScratchLifecycle {
 impl SnapshotDirectory {
     /// Creates a unique exclusive scratch directory; rejects repositories containing the temp root.
     fn new(scope: &GitScope) -> Result<Arc<Self>, GitError> {
+        Self::for_worktree(scope.worktree())
+    }
+
+    /// Reuses the private temporary owner for bounded Workspace filename probes with no child.
+    /// The canonical environment-selected temporary parent must be outside `worktree`; exclusive
+    /// 0700 creation is bounded to 16 collision attempts. Drop cleans this unused owner's tree.
+    pub(in crate::workspace) fn for_worktree(
+        worktree: &WorktreeRef,
+    ) -> Result<Arc<Self>, GitError> {
         let temp = fs::canonicalize(std::env::temp_dir()).map_err(|_| GitError::SnapshotIo)?;
-        let root =
-            fs::canonicalize(scope.worktree().worktree_path()).map_err(|_| GitError::SnapshotIo)?;
+        let root = fs::canonicalize(worktree.worktree_path()).map_err(|_| GitError::SnapshotIo)?;
         if temp.starts_with(&root) {
             return Err(GitError::SnapshotIo);
         }
@@ -133,6 +142,12 @@ impl SnapshotDirectory {
             }
         }
         Err(GitError::SnapshotIo)
+    }
+
+    /// Returns the owned private directory for descriptor-relative Workspace probes. Callers
+    /// must not transfer it to an untracked child or retain its path after dropping the owner.
+    pub(in crate::workspace) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Writes exactly one bounded side to an exclusive 0600 file; no repository paths enter names.

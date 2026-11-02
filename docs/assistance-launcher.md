@@ -5,6 +5,51 @@ that file once under a 64 KiB limit. Changes take effect only after restart. It 
 maintained by the trusted launcher/operator, separately from MCP arguments and hook data.
 A target path is never itself Workspace authority.
 
+An optional top-level `bridge` object selects a protected local Bridge deployment:
+
+```json
+{
+  "registration_socket": "/absolute/private-bridge/adapter.sock",
+  "core_socket": "/absolute/private-bridge/core.sock",
+  "credential_file": "/absolute/private-bridge/producer.token",
+  "native_stores": [{"harness":"codex","host":"local","store":"owned-codex"}]
+}
+```
+
+Paths must be normalized absolute paths with real owner-only current-user parents. The
+credential is a no-follow owner-only regular file, at most 16 KiB. Each process reads it
+once; there is no ambient credential discovery. SDK calls use the standalone client's finite
+five-second exchange baseline; Bridge owns the separate native handoff deadline after custody.
+`native_stores` accepts at most two unique harnesses (`codex`, `claude_code`), each with
+an explicit Bridge host/store namespace. The actor comes only from the independently
+validated IDE binding, never model arguments, cwd or parent-session guesses.
+
+A nonempty mapping selects Bridge-only delivery: IDE has no fallback carrier, wake or Stop hold.
+Graph always accepts a job, including cached results; tests return their run id without
+waiting for the child. Useful result/error bodies go to Bridge with Auto/KeepAll. Admission
+requires explicit direct-address, Auto, result-kind, size and delivery-scope capabilities.
+These capabilities are not a claim of an idle receiver's native wake support: that requires
+separate qualification for the actual executable/home/launch. Current Bridge stock Codex
+CLI queue acceptance does not prove passive model resumption. Do not enable a production
+cutover from a declared profile or custody receipt alone.
+
+Before possible SDK writes IDE commits immutable destination/body/sender-owner intent. Test
+facts deduplicate by run; independent graph jobs include their result reference. Unknown
+outcomes never create another send or carrier. Stop/displacement retires the boot/binding
+scope; restart retires only retained intents belonging to the same service/credential owner.
+A mismatched owner disables recovery instead of silently rehoming possible effects. Custody
+is not model observation and does not consume the saved domain result.
+
+Source-bearing bodies recheck current workspace/binding, no-follow source bytes and recorded
+path disclosure before publication; superseded results carry an explicit terminal outcome.
+Bridge does not grant IDE source access. Results describe the captured source revision, not
+an assurance that source will remain current until eventual receipt.
+
+Empty/omitted `native_stores` configures no Bridge delivery: IDE has no fallback carrier, so
+results of deferred work stay retained under their `detail_ref` and are read explicitly with
+`ide.inspect`.
+No global profile, installed service or operator grant is changed by building the candidate.
+
 The IDE's only path policy is the top-level `allowed_roots` list: `ide.start` admits its working
 directory (the optional `root` parameter, else the target `candidate`), the discovered Git
 worktree root and the Git common directory only when each lies below a configured root, and
@@ -76,6 +121,21 @@ The separate Claude cell accepts only
 `macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-claude-r3-2026-09-14:<bundle-digest>`.
 Its suffix is the same exact declared-bundle digest as the Codex record, while its distinct prefix records independent host acceptance. Every member is remeasured at startup
 and immediately before its one-shot child starts.
+On Linux, prepare local Node 24.4.0, TypeScript Language Server 6.0.0 and TypeScript 5.9.3
+first, then generate the provider object with their absolute paths:
+
+```sh
+agent-ide evidence typescript --node /opt/node/bin/node --bridge /opt/node/lib/node_modules/typescript-language-server/lib/cli.mjs --tsserver /opt/node/lib/node_modules/typescript/lib/tsserver.js
+```
+
+Add the printed JSON object to the target's `providers` array and run `agent-ide launcher check`
+on the resulting configuration before restarting the daemon. The helper reads the four closure
+members from the two package roots, checks their pinned digests and remeasures the bundle. It
+never runs Node or modifies configuration. Node's `24.4.0` label is operator-supplied contract
+information, not a version measured by this command; verify the installed Node separately.
+The Linux operator binding is not macOS host qualification; both macOS evidence fields remain
+null. A missing, changed or unsupported bundle is refused, and selected files must stay unchanged.
+
 `cache_namespace` is a bounded compatibility label, not a filesystem path or
 authority grant. Assistance combines it with the verified durable worktree and
 accepted provider identities to retain a private directory, then supplies only
@@ -92,7 +152,8 @@ unknown fields, invalid limits, relative paths, and malformed executable digests
 The fourth provider is the immutable `TypeScriptProviderBundleV1` in
 [TYPESCRIPT-r3](contracts/intelligence-v0.2.md). It accepts only an explicit accepted Node,
 bridge, TypeScript closure, and `tsserver.path`; it has no ambient npm/plugin/network discovery.
-Codex and Claude require their separate exact bundle-bound compiled release records. Claude runs
+On macOS, Codex and Claude require their separate exact bundle-bound compiled release records.
+Linux uses the operator binding described above. Claude runs
 the closed frame only through the daemon; a null Claude record keeps that host unavailable without affecting Codex. This is restart-only configuration and never enables a syntax
 server or automatic typing acquisition.
 
@@ -177,6 +238,35 @@ configuration is rejected on any malformed value.
   - A language subsection absent means that language is never checked and never appears in the
     `<agent-ide>` block.
 
+### Matching the project compiler and runtime
+
+A wrapper's inherited PATH does not select the background TypeScript compiler. Declare
+`project_checks.typescript.node` and `tsc_cli` explicitly; the latter should name the prepared
+project's own `node_modules/typescript/lib/tsc.js`, not an unrelated global installation.
+Both paths must be absolute and normalized. Run native checks from the same worktree with
+that Node and compiler, the same root tsconfig and the same dependency snapshot. Resolve
+package-manager shims before comparing the actual tools; a global version recorded in a
+manifest does not prove what a project-first PATH executes.
+
+The current confined adapter supports TypeScript5.9.3 and the semantic provider has its own
+separate release-qualified5.9.3 bundle. Pointing a check at6.x does not qualify that provider:
+an unsupported compiler is unavailable with an explicit version-mismatch cause, never a
+clean zero and never a silent fallback. Changing supported versions requires separate adapter
+and provider qualification. For a project requiring `^5.9.2`, a prepared5.9.3 dependency is
+compatible; a6.x seed from another checkout is not the same project environment.
+
+For reproducible launches, prepare dependencies from the intended project's lock or qualified
+snapshot; compare native/project/IDE compiler version and library bytes, the actual Node,
+working directory and configuration before admitting model work. Keep the selected identities
+in the run evidence. A mismatch must stop preparation rather than ask the agent to change
+project configuration to satisfy a different compiler.
+
+Checks rebuild a safe allowlisted environment and retain their read-only/no-network profile.
+They intentionally do not copy ambient credentials, writable HOME, arbitrary shell hooks,
+package-manager auto-installation or another process's complete environment. Explicit
+`ide.test command` has its own cwd/env; use the project's exact prepared command there.
+Matching semantic inputs does not mean removing confinement or inheriting every shell value.
+
 Every check process runs confined through one `sandbox-exec` profile: default-deny, no network,
 read-only access to the admitted worktree, reads limited to the declared toolchain directories and
 system paths, and write access only to the check's private cache directory and private temporary
@@ -205,7 +295,10 @@ Check caches live outside every runtime directory, under
 never collide; at daemon start, cache directories
 whose recorded worktree no longer exists are removed. A new worktree's Rust cache is cloned
 copy-on-write from the most recently completed sibling worktree of the same repository when
-possible.
+possible. A check process that exits nonzero leaves `last-failed-run.log` (mode `0600`) in its
+cache: program, arguments, the allowlisted environment, exit status and the whole captured
+stderr, replaced by the next failed run. It is an operator diagnostic; the agent's reply keeps
+only the bounded cause line.
 
 Lifecycle: the first MCP server that finds no live daemon spawns one shared per-repository daemon
 (runtime directory `/private/tmp/ai-r-<16 hex of the rendezvous key digest>`); later MCP servers of
@@ -216,6 +309,14 @@ serving calls, so a stale hint cannot send the first hook to an earlier daemon g
 Unresolved managed hooks stay silent to Claude and record a closed, path-free error-log detail.
 With zero open leases and no running check the daemon stops after `idle_timeout_s`, closes its
 socket, and removes its runtime directory; the caches remain.
+
+`AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT` can replace the default temporary parent for the shared runtime,
+key hints and manual or automatic hint collection. Supply the same existing absolute normalized
+directory to MCP servers, hooks and daemons. Invalid relative, traversing or unresolved overrides
+refuse runtime resolution and manual collection; automatic collection skips them without using
+the default parent. Unset or empty overrides retain `/private/tmp`. Keep the parent short enough
+for Unix socket paths. This operator setting does not change private child ownership, no-follow
+checks, identity fencing or locking.
 
 Scheduling: triggers are a successful `ide.start`, Claude post hooks for `Edit`, `Write`,
 `MultiEdit`, `NotebookEdit`, and `Bash`, and a completed `ide.edit`. A trigger that names the
@@ -239,3 +340,212 @@ checks add a bounded reason when the checker reported one (or say no reason was 
 `{"kind":"problems","language"?,"offset"?}` returns counts and up to 20 problems per call with
 `next_offset`. One `ProjectCheckCompleted` telemetry event (bucketed counts, no paths or messages)
 extends the TELEMETRY-r1 event scope.
+
+## Experimental Jev support pilot
+
+Build with `--features jev-pilot` to include the optional client. The same executable
+supports restart-only `jev_pilot.mode` values `off` (default) and `jev`. Existing
+checks and the ten public tools are unchanged. A malformed or incomplete helper
+section disables only the helper and records a fixed safe operator reason.
+
+```json
+"jev_pilot": {
+  "mode": "jev",
+  "route": "openrouter",
+  "base_url": "https://openrouter.ai/api",
+  "api_path": "alpha/decisions",
+  "model": "typesafe/jev-1.13",
+  "response_model": "typesafe/jev-1.13-20260917",
+  "input_usd_per_million": 0.042,
+  "task": "Review the changed behavior using observed project evidence.",
+  "credential_file": "/absolute/private/key-file",
+  "egress_allowed": true,
+  "initial_scope": ["src/example.ts"],
+  "trace_dir": "/absolute/private/existing-trace-directory"
+}
+```
+
+`mode` is the sole runtime assistance switch: `off` (default) or `jev`.
+Both modes use the same feature-enabled binary. Configuration is read at daemon
+startup; changing it requires a new daemon/session, never a rebuild.
+`base_url` plus relative `api_path` selects a compatible System One endpoint;
+`model` is sent verbatim and `response_model` (default: `model`) is checked exactly.
+`route` is only an optional accounting label, not a coded provider selection.
+For direct TypeSafe use base `https://api.typesafe.ai`, path `v1/systemone`,
+model and response model `jev-1.13.0`. Credentials remain in `credential_file`.
+No redirects, retries or provider fallback are enabled. Invalid configuration
+disables only assistance; OFF ignores endpoint/key configuration without I/O.
+An optional input tariff is an estimate; provider-reported `usage.cost` is separate.
+The key file must be canonical, regular, owned by the current user, inaccessible
+to group/world and at most 4096 bytes. The existing trace directory must be
+canonical, owner-only and private. OFF never opens a key, constructs HTTP or sends.
+The task is nonempty and at most 1024 UTF-8 bytes. Scope paths must be relative;
+only current writer authority can admit their bounded private source reads.
+Those reads never become main-agent source receipts.
+
+
+### Prepared early context
+
+An operator may set optional prepared_context_file inside the private trace_dir.
+This selects early handoff instead of post-edit inference. The packet producer
+runs separately; activation performs no HTTP and never opens the credential file.
+It accepts a canonical owner-only regular artifact up to 24 KiB with schema
+jev-prepared-context-v1, exact task/model, action bundle and confidence >= 0.5.
+
+The artifact contains evidence windows: path, full-file BLAKE3 version,
+source_bytes, UTF-8 start_byte/end_byte, literal text, and relation
+"observed_only; not proof of test coverage"; plus run_facts and gaps.
+At most four windows of 2048 bytes from files up to 64 KiB are accepted.
+The producer must use legitimate task/worktree/public-check facts, never the
+evaluator/reference or a known mutation list. Its provider trace and elapsed/token
+costs remain separate evidence. A packet does not prove the current actor ran a test.
+
+Writer activation re-observes each file through Workspace authority and checks
+hashes/ranges and the activation/native epoch. It retains source-backed context
+under a detail handle and returns a "Jev context ready" line. The existing Bridge
+job-ready path may hand it over; with no route, ide.inspect retrieves it normally.
+Publication and inspection re-prove every source. Private preparation creates
+neither main read-memory nor a full-file replacement base. OFF and read-only do
+not load the artifact. Invalid, stale, unsafe or over-budget input reports context
+unavailable while ordinary activation succeeds, without post-edit fallback.
+This mode introduces no autonomous tests, new tools, Bridge kind or sender.
+
+Without prepared early context, one real confirmed edit starts a 250 ms coalesced optional episode. Native changes
+qualify only after normal MCP authorization/reconciliation. The episode binds
+exact task, activation, binding generation, source versions and change epoch.
+Verified edit geometry supplies a bounded window around the actual changed byte;
+missing geometry is explicitly unavailable. The latest eight verified file spans
+are retained independently, so a multi-file edit cannot overwrite the changed
+file's geometry with another file's span. Scope alternatives remain selectable.
+Only previously observed or explicitly scoped files are read: at most eight unique
+files and 2 MiB aggregate bytes including freshness rereads, under the existing
+1 MiB per-file reader ceiling.
+Model state is at most 8 KiB; options at most twelve; ready graph borrowing is
+currently unavailable (zero graph requests). Source and relationship coverage is
+explicitly partial. No new provider warming or source index is introduced.
+
+At most two decisions, including test choice, run within five seconds of compute;
+each HTTP exchange has a 1.5-second total deadline. The helper may inspect, expand
+or reopen existing snapshots, suggest a next-natural-reply review, remain inactive,
+or choose one existing core-admitted test. The currently displayed window is not
+offered again; private scope changes require a subsequent decision and are omitted
+from the final choice. Surviving options preserve their local IDs and order.
+The run option names the actual observed
+test target; source-to-test relation is unverified. Without an admitted recipe no
+automatic test is offered. Choice confidence must be at least 0.5 and an independent
+usefulness Noul at least 0.8. A test uses existing admission, output/replay retention
+and canonical completion delivery, within min(recipe timeout, 30 seconds). Same-root
+busy is exclusion only; foreign output is never reused or cancelled. Explicit main
+tests cancel only their exact binding's optional work and wait for actual cleanup;
+a delay above two seconds is recorded as a violation. Stop/shutdown cancel and join
+owned optional work. Started results remain historical when source changes.
+
+Private JSONL records retain exact state, ordered options and requests without auth,
+bounded redacted responses, transport timing/status/bytes, reported usage, per-field
+token coverage and dated tariff estimates. Missing/interrupted usage and actual
+provider charges remain unknown. A durable exclusive task/worktree claim and a
+flushed pre-send pending record prevent restart replay from hiding attempted work.
+Changing the task text creates a new task identity. Trace files contain private
+project context and are not sent to the main agent or ordinary logs.
+
+## Task context (experimental)
+
+`ide.prepare {"task":"exact user task"}` prepares current source
+inside the active writer workspace. It does not execute tests or edit source, and it never
+builds or refreshes the index: it reads only the index the background indexer published.
+Without one it answers `prepare: not_ready` in the same call and names the cause. Index
+creation (by the background indexer) writes `.agent-ide/` and appends `/.agent-ide/` to
+`.gitignore`. Reader activations may prepare (a read-only call) but never start indexing. The `jev-pilot` build feature
+is required; existing IDE tools remain available when task context is disabled.
+
+The trusted launcher accepts a restart-only `task_context` object. Minimal offline setup:
+
+```json
+{"task_context":{"enabled":true,"models":{"embedding":null,"jev":null,"max_new_calls":0,"include_threshold":0.5}}}
+```
+
+Optional `models.embedding` uses `EmbeddingConfig`; optional `models.jev` uses `JevConfig`
+in `project/context`. Each route, model identity and private credential file is explicit.
+A null backend allocates no client and opens no credential. API egress requires the
+operator's `egress_allowed`; local embeddings accept literal loopback endpoints only.
+`max_new_calls` counts physical requests, including failed attempts, per preparation.
+Unknown or failed requests are journaled and never retried automatically.
+
+Background indexing is configured by `task_context.indexing` and is off by default:
+
+```json
+{"indexing":{"enabled":true,"max_new_calls":0,"max_input_bytes":0,"initial_allowed":false,"debounce_ms":750,"reconcile_ms":30000}}
+```
+
+One daemon thread indexes one active writer worktree at a time: after its `ide.start`, after a
+committed edit (debounced) and on a bounded periodic reconcile that also catches changes made
+outside the IDE. `max_new_calls` and `max_input_bytes` are totals for one activation, reduced
+by what each run actually sent; when they are spent, later runs still refresh local facts
+without any model call. A first full model indexing (nothing published yet in the configured
+embedding space) runs only with `initial_allowed`; until then each run prepares local facts
+only, the configured semantic index stays not ready (no lexical substitute) and the run records
+a free local estimate (fragments, input tokens, requests) that `ide.prepare` shows in its
+`not_ready` answer, so the operator can decide after seeing the cost. Without an embedding
+model (`models.embedding` null) the published index is the lexical one. Jev is never used for
+indexing. A failed run is not retried until the next `ide.start`. `ide.stop` and daemon
+shutdown cancel the running pass and wait for it.
+
+An optional operator-selected public check can ground preparation before retrieval:
+
+```json
+{"evidence":{"enabled":true,"target":{"files":["src/lib.rs"]},"budget_ms":30000}}
+```
+
+The setting belongs inside `task_context`; it is off when absent. A target is either
+`files` (1–64 worktree-relative paths) or `pattern` (a runner filter). The existing
+language test planner must support it. Only writer authority starts a check. Its result
+is collected within the same preparation; failed test locations and failure-block
+stack frames are source-validated investigation anchors, not instructions or proven defects.
+Unchanged-at-run and current source checks reject stale observations. The check has a
+maximum 280 s budget and leaves 10 s of the preparation deadline for retrieval; a preparation
+outliving the call's wait answers `pending` and settles through one `ide.inspect`, so set
+`limits.operation_ms` (at most 300 000) above the check budget for slow suites. An explicit
+agent test preempts only preparation-owned work. Missing/busy/unsupported checks are
+reported in notes and ordinary retrieval remains available; unavailable evidence is not
+a successful test. No additional model wakeup or public tool is introduced.
+
+Validated public failure files supplement the ranked retrieval quota rather than replacing
+its tail. The combined candidate set remains capped at 256 files; existing model-call,
+source-read and output limits still apply, with omissions and exhausted budgets disclosed.
+Before delivery, whole files or partial anchored test windows may be collected into complete test blocks using the
+existing language provider. Their imports, enclosing setup and referenced local helpers
+travel as one indivisible context bundle. Missing test ranges, unavailable providers or
+possible shared state with omitted sibling tests preserve the original selection; unresolved
+partial test context remains explicitly incomplete.
+The helper never cancels a provider startup midway; it may wait briefly for an already
+owned session and retry its outline once. This optional work does not prove task completeness.
+
+Operators may seed a fresh project from already paid vectors with
+`project_index ROOT MODELS_JSON --reuse-from SOURCE_ROOT`, before its daemon starts.
+This offline operation copies only vectors matching current payload hashes and the exact
+model space; it imports no source history, readiness state or delivery receipts. Follow
+with the normal indexing pass to revalidate and publish readiness. Its estimate lists
+remaining missing fragments; a fully reused index needs no document API calls.
+
+Model retrieval runs separately from the sequential worker; source revalidation and optional
+provider-backed test localization run on the normal worker. Stop cancels and joins owned work.
+Returned source is re-observed under current authority and refused if changed. The call waits
+up to 45 s and answers in one reply, never paged and never continued through `ide.inspect`:
+a status line (`complete`, `partial` or `needs_evidence`), the applicable `AGENTS.md`/`CLAUDE.md`
+rules and nearest manifests (each whole), numbered source per file
+with its line ranges, role and selection reasons (a partial file adds its header, imports and the
+signatures of declarations not shown), an explicit `omitted:` list and one usage line.
+Every selected source unit is delivered whole, required units first, then by rank; a
+localized test-context bundle arrives with all its supporting ranges. Rules, task-named files
+and manifests are delivered whole; a manifest already delivered whole as ranked source is not
+repeated. Nothing is omitted, cut or paged for reply size: the packet has no output ceiling,
+`token_budget` is ignored (with a note), and `omitted:` lists only selection gaps. A host that
+clips long tool output does so outside the IDE (Codex: raise `tool_output_token_limit`).
+`complete` means
+the retriever reported no gap, every required unit is complete and nothing was left out or
+cut. Delivered rows are remembered like a read of them; every delivered file keeps its
+observation as a freshness fence. A preparation not ready within its compute budget ends in a final `deadline` refusal
+and is cancelled; the call never leaves a pending state behind.
+Private indexing/model reads do not create main-agent read receipts. It is a shortlist, not
+proof that every affected file was found.
+Unsupported source languages remain path-only entries. No new release/install is implied.

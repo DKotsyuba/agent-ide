@@ -568,6 +568,7 @@ pub(crate) fn valid_relative_path(path: &Path) -> bool {
 
 /// Opens an absolute root by walking every raw component from `/` without following any symlink.
 /// Empty/dot/parent components and missing roots fail before any descendant source is inspected.
+/// On Linux, intermediate directories require search permission; the returned root is readable.
 pub(crate) fn open_root_directory(path: &Path) -> Result<File, ObservationError> {
     let raw = path.as_os_str().as_bytes();
     if raw.first() != Some(&b'/') || raw.contains(&0) {
@@ -581,26 +582,139 @@ pub(crate) fn open_root_directory(path: &Path) -> Result<File, ObservationError>
     {
         return Err(ObservationError::InvalidPath);
     }
+    open_directory_path(path)
+}
+
+/// Walks an absolute path without following symlinks, accepting lexical dot and parent components.
+/// Each parent component is opened in sequence, before any later `..` is resolved.
+pub(super) fn open_directory_path(path: &Path) -> Result<File, ObservationError> {
+    if !path.is_absolute() || path.as_os_str().as_bytes().contains(&0) {
+        return Err(ObservationError::InvalidPath);
+    }
+    let mut components = path.components().skip(1).peekable();
     // SAFETY: each successful descriptor is immediately owned by File and closed on replacement/drop.
-    let mut directory =
-        unsafe { File::from_raw_fd(open_directory(libc::AT_FDCWD, OsStr::new("/"))?) };
-    for component in tail
-        .split(|byte| *byte == b'/')
-        .filter(|part| !part.is_empty())
-    {
-        let fd = open_directory(directory.as_raw_fd(), OsStr::from_bytes(component)).map_err(
-            |error| {
-                if error == ObservationError::Missing {
-                    ObservationError::RootUnavailable
-                } else {
-                    error
-                }
-            },
-        )?;
+    let mut directory = unsafe {
+        File::from_raw_fd(open_root_component(
+            libc::AT_FDCWD,
+            OsStr::new("/"),
+            components.peek().is_none(),
+        )?)
+    };
+    while let Some(component) = components.next() {
+        let fd = open_root_component(
+            directory.as_raw_fd(),
+            component.as_os_str(),
+            components.peek().is_none(),
+        )
+        .map_err(|error| {
+            if error == ObservationError::Missing {
+                ObservationError::RootUnavailable
+            } else {
+                error
+            }
+        })?;
         // SAFETY: fd is a newly opened directory descriptor and File owns its lifetime.
         directory = unsafe { File::from_raw_fd(fd) };
     }
     Ok(directory)
+}
+
+/// Opens a no-follow root component, retaining read access for the final directory.
+fn open_root_component(
+    parent: libc::c_int,
+    component: &OsStr,
+    final_component: bool,
+) -> Result<libc::c_int, ObservationError> {
+    #[cfg(target_os = "linux")]
+    if !final_component {
+        return open_at(
+            parent,
+            component,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = final_component;
+    open_directory(parent, component)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    /// Restores fixture permissions even when an assertion fails.
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0.join("search"), fs::Permissions::from_mode(0o700));
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Checks search-only ancestors, readable final descriptors, and symlink rejection.
+    #[test]
+    fn linux_root_walk_accepts_search_only_ancestors_and_rejects_symlinks() {
+        let base = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "root-walk-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir(&base).unwrap();
+        let fixture = Fixture(base);
+        let search = fixture.0.join("search");
+        let root = search.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&search, fs::Permissions::from_mode(0o100)).unwrap();
+        let directory = open_root_directory(&root).unwrap();
+        // SAFETY: fcntl reads flags from the live owned descriptor without retaining it.
+        let flags = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_PATH, 0);
+        let parent_path = root.join("../root");
+        assert_eq!(
+            super::super::durable::real_directory(&parent_path)
+                .unwrap()
+                .0,
+            root
+        );
+        assert_eq!(
+            open_root_directory(&parent_path).unwrap_err(),
+            ObservationError::InvalidPath
+        );
+        fs::set_permissions(&search, fs::Permissions::from_mode(0o000)).unwrap();
+        // Privileged test users can bypass mode bits; only assert denial when the OS enforces them.
+        if File::open(&root).is_err() {
+            assert_eq!(
+                open_root_directory(&root).unwrap_err(),
+                ObservationError::Io
+            );
+            assert!(super::super::durable::real_directory(&parent_path).is_err());
+        }
+        fs::set_permissions(&search, fs::Permissions::from_mode(0o100)).unwrap();
+        symlink(&search, fixture.0.join("link")).unwrap();
+        assert_eq!(
+            open_root_directory(&fixture.0.join("link/root")).unwrap_err(),
+            ObservationError::SymlinkEscape
+        );
+        assert!(
+            super::super::durable::real_directory(&fixture.0.join("link/root/../root")).is_err()
+        );
+        symlink(&root, fixture.0.join("final-link")).unwrap();
+        assert_eq!(
+            open_root_directory(&fixture.0.join("final-link")).unwrap_err(),
+            ObservationError::SymlinkEscape
+        );
+    }
 }
 
 /// Fingerprints the opened directory's device, inode and creation timestamp, never its pathname.

@@ -25,3 +25,7 @@ Native editing remains available when this operation is inactive, unavailable, u
 ## Gates
 
 A substitute gate proves request fingerprinting, durable prepare/settle ordering, duplicate conflict, every no-effect outcome, and no replay after an unknown result. A real integration gate uses Application persistence plus Workspace descriptor operations to prove recovery after process interruption and native fallback remains usable. It does not prove an atomic multi-file transaction.
+
+## Multi-file receipts
+
+A multi-file edit (`ide.edit {files}`, [batch API v1](batch-api-v1.md) §7) is not atomic either; it is made resumable. Its durable receipt (`batch_edit_receipts_v1`, installed on first use) holds the digest of the caller's own arguments and, per file in request order, the path, the digest of the bytes it was validated against (none for a file to create), the digest of its candidate and a written mark; the operation settles once every file is written. Content is never stored. A retry with the same operation ID and request compares current bytes with these digests: a written or candidate-equal file is written earlier, a base-equal file is written after its recomputed candidate matches the recorded digest, and any other file stops the commit. A different request with the same ID is a conflicting duplicate. The one-file receipts are unchanged and do not take part.

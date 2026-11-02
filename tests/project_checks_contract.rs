@@ -86,6 +86,7 @@ fn rust_developer_dir(root: &Path) -> PathBuf {
 
 /// Creates and returns `<root>/xcode-developer`, a deterministic stand-in for an Xcode developer
 /// directory carrying a toolchain `clang`, sibling `clang++`, and the macOS platform SDK (T06B).
+#[cfg(target_os = "macos")]
 fn rust_xcode_developer_dir(root: &Path) -> PathBuf {
     let dir = root.join("xcode-developer");
     let bin_dir = dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin");
@@ -103,6 +104,9 @@ fn rust_xcode_developer_dir(root: &Path) -> PathBuf {
 /// `/Library/Developer/CommandLineTools`) that are only present when they exist on this real
 /// filesystem, mirroring [`RustChecker::cargo_check_spec`]'s own existence check.
 fn existing_literal_developer_roots() -> Vec<PathBuf> {
+    #[cfg(not(target_os = "macos"))]
+    return Vec::new();
+    #[cfg(target_os = "macos")]
     [
         PathBuf::from("/private/var/db/xcode_select_link"),
         PathBuf::from("/Library/Developer/CommandLineTools"),
@@ -180,46 +184,79 @@ fn rust_cargo_check_spec_matches_confined_contract() {
         .collect::<Vec<_>>()
     );
     assert_eq!(spec.cwd, request.worktree);
-    assert_eq!(
-        spec.env,
-        vec![
-            (
-                "PATH".to_owned(),
-                format!("{}/bin:/usr/bin:/bin", toolchain.display())
-            ),
-            (
-                "HOME".to_owned(),
-                rust_home().to_string_lossy().into_owned()
-            ),
-            (
-                "CARGO_HOME".to_owned(),
-                rust_home().join(".cargo").to_string_lossy().into_owned()
-            ),
-            (
-                "TMPDIR".to_owned(),
-                root.join("cache")
-                    .join("tmp")
-                    .to_string_lossy()
-                    .into_owned()
-            ),
-            (
-                "CARGO_TARGET_DIR".to_owned(),
-                root.join("cache")
-                    .join("target")
-                    .to_string_lossy()
-                    .into_owned()
-            ),
-            ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
-        ]
-    );
+    let expected_env = vec![
+        (
+            "PATH".to_owned(),
+            format!("{}/bin:/usr/bin:/bin", toolchain.display()),
+        ),
+        (
+            "HOME".to_owned(),
+            rust_home().to_string_lossy().into_owned(),
+        ),
+        (
+            "CARGO_HOME".to_owned(),
+            rust_home().join(".cargo").to_string_lossy().into_owned(),
+        ),
+        (
+            "TMPDIR".to_owned(),
+            root.join("cache")
+                .join("tmp")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "CARGO_TARGET_DIR".to_owned(),
+            root.join("cache")
+                .join("target")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ("CARGO_NET_OFFLINE".to_owned(), "true".to_owned()),
+        (
+            "RUSTC".to_owned(),
+            toolchain.join("bin/rustc").to_string_lossy().into_owned(),
+        ),
+        // A missing toolchain refuses as ToolMissing; no child ever installs one.
+        ("RUSTUP_AUTO_INSTALL".to_owned(), "0".to_owned()),
+    ];
+    #[cfg(target_os = "linux")]
+    let expected_env = {
+        use std::os::unix::fs::PermissionsExt;
+        let mut expected_env = expected_env;
+        let tool = |path: &str| {
+            let path = fs::canonicalize(path).ok()?;
+            let metadata = fs::metadata(&path).ok()?;
+            let text = path.to_str()?;
+            (metadata.is_file()
+                && metadata.permissions().mode() & 0o111 != 0
+                && !text.chars().any(char::is_whitespace))
+            .then(|| text.to_owned())
+        };
+        if let Some(cc) = tool("/usr/bin/cc") {
+            expected_env.push(("RUSTFLAGS".into(), format!("-Clinker={cc}")));
+            expected_env.push(("CC".into(), cc));
+            for (name, path) in [
+                ("CXX", "/usr/bin/c++"),
+                ("AR", "/usr/bin/ar"),
+                ("RANLIB", "/usr/bin/ranlib"),
+            ] {
+                if let Some(value) = tool(path) {
+                    expected_env.push((name.into(), value));
+                }
+            }
+        }
+        expected_env
+    };
+    assert_eq!(spec.env, expected_env);
     let mut expected_read_roots = vec![
         request.worktree.clone(),
         toolchain.clone(),
         rust_home().join(".cargo"),
         root.clone(),
         PathBuf::from("/private/etc"),
-        rust_developer_dir(&root),
     ];
+    #[cfg(target_os = "macos")]
+    expected_read_roots.push(rust_developer_dir(&root));
     expected_read_roots.extend(existing_literal_developer_roots());
     assert_eq!(spec.read_roots, expected_read_roots);
     assert_eq!(spec.write_roots, vec![root.join("cache")]);
@@ -305,8 +342,9 @@ fn rust_cargo_check_spec_falls_back_to_home_rustup() {
         rust_home().join(".cargo"),
         rust_home().join(".rustup"),
         PathBuf::from("/private/etc"),
-        rust_developer_dir(&root),
     ];
+    #[cfg(target_os = "macos")]
+    expected_read_roots.push(rust_developer_dir(&root));
     expected_read_roots.extend(existing_literal_developer_roots());
     assert_eq!(spec.read_roots, expected_read_roots);
     let _ = fs::remove_dir_all(&root);
@@ -389,8 +427,9 @@ fn rust_cargo_check_spec_without_ancestor_manifests_adds_nothing() {
         rust_home().join(".cargo"),
         root.clone(),
         PathBuf::from("/private/etc"),
-        rust_developer_dir(&root),
     ];
+    #[cfg(target_os = "macos")]
+    expected_read_roots.push(rust_developer_dir(&root));
     expected_read_roots.extend(existing_literal_developer_roots());
     assert_eq!(spec.read_roots, expected_read_roots);
     let _ = fs::remove_dir_all(&root);
@@ -818,6 +857,7 @@ async fn rust_check_failed_build_with_no_errors_is_fatal_not_ready() {
 
 /// Proves the confined spec's read roots include the configured developer directory override
 /// (T05B, EYES-r2 §3), so a build script's `cc` invocation can resolve through it.
+#[cfg(target_os = "macos")]
 #[test]
 fn rust_cargo_check_spec_includes_configured_developer_dir() {
     agent_ide::languages::install();
@@ -837,6 +877,31 @@ fn rust_cargo_check_spec_includes_configured_developer_dir() {
         spec.read_roots.contains(&developer_dir),
         "{:?}",
         spec.read_roots
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Linux does not grant an Apple developer directory or use its linker.
+#[cfg(target_os = "linux")]
+#[test]
+fn rust_cargo_check_spec_ignores_xcode_on_linux() {
+    agent_ide::languages::install();
+    let root = rust_scratch("linux-ignores-xcode");
+    let request = rust_request(&root, true);
+    let developer_dir = rust_developer_dir(&root);
+    let checker = RustChecker::new(
+        Arc::new(FakeRunner::default()),
+        rust_toolchain(&root, true),
+        None,
+        Duration::from_secs(300),
+        Some(developer_dir.clone()),
+    );
+    let spec = checker.cargo_check_spec(&request);
+    assert!(!spec.read_roots.contains(&developer_dir));
+    assert!(
+        spec.env
+            .iter()
+            .all(|(_, value)| !value.contains(&*developer_dir.to_string_lossy()))
     );
     let _ = fs::remove_dir_all(&root);
 }
@@ -869,6 +934,7 @@ fn rust_cargo_check_spec_ignores_nonexistent_developer_dir_override() {
 /// directory carries an Xcode toolchain clang: `CARGO_TARGET_<TRIPLE>_LINKER` derived from the
 /// toolchain directory name, `CC`, `CXX` and `SDKROOT` all point at the resolved Xcode paths, so
 /// a build script's link step never reaches the `/usr/bin/cc` `xcrun` shim.
+#[cfg(target_os = "macos")]
 #[test]
 fn rust_cargo_check_spec_sets_linker_env_when_xcode_clang_present() {
     agent_ide::languages::install();
@@ -915,6 +981,7 @@ fn rust_cargo_check_spec_sets_linker_env_when_xcode_clang_present() {
 
 /// Proves the confined spec falls back to `RUSTFLAGS=-Clinker=<clang>` (T06B) when a clang is
 /// found but the toolchain directory's own name carries no recognizable target triple.
+#[cfg(target_os = "macos")]
 #[test]
 fn rust_cargo_check_spec_falls_back_to_rustflags_when_triple_unknown() {
     agent_ide::languages::install();

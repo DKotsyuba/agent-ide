@@ -171,6 +171,17 @@ impl LanguageSupport for RustSupport {
         }
     }
 
+    /// Reuses the language lexer to keep raw strings, lifetimes and comments out of imports.
+    fn source_import_spans(&self, _file: &Path, source: &str) -> Option<Vec<LineRange>> {
+        let code: String = crate::module_graph::blanked_code(&source.chars().collect::<Vec<_>>())
+            .into_iter()
+            .collect();
+        Some(agent_ide_core::lang::regions::import_spans_from_code(
+            &code.lines().collect::<Vec<_>>(),
+            self.region_rules(),
+        ))
+    }
+
     /// Outline computed from the text alone (the `lexical` module parses it with `syn` and
     /// rebuilds rust-analyzer's document symbols, which this type's `normalize` then converts),
     /// so a cold rust-analyzer can still answer `ide.outline`, `ide.read` and symbol-addressed
@@ -214,6 +225,19 @@ impl LanguageSupport for RustSupport {
         })
     }
 
+    /// Rust regions: `//!` and `#![..]` header, `use`/`pub use`/`extern crate` imports,
+    /// `#[..]` attributes belong to the statement below, items end at `;` or `}`.
+    fn region_rules(&self) -> &'static agent_ide_core::lang::regions::RegionRules {
+        &agent_ide_core::lang::regions::RegionRules {
+            header_prefixes: &["#![", "#!"],
+            import_prefixes: &["use ", "extern crate "],
+            attribute_prefixes: &["#["],
+            visibility_prefix: true,
+            semicolon_imports: true,
+            ..agent_ide_core::lang::regions::GENERIC_RULES
+        }
+    }
+
     /// `.rs` files under a `tests` directory or named `*_test.rs`; nothing under `benches`.
     /// Expects a project-relative path: every component is examined.
     fn is_test_file(&self, file: &Path) -> bool {
@@ -244,6 +268,8 @@ impl LanguageSupport for RustSupport {
     ///   `tests/<name>/…` → `--test <name>`; `src/lib.rs` → `--lib`, `src/main.rs` → `--bins`,
     ///   `src/bin/<x>.rs` → `--bin <x>`, any other `src` file → its module path filter
     ///   (`src/a/b.rs` → `a::b::`, `mod.rs` dropped). Other files are [`LangError::Unsupported`].
+    /// * Files: [`LangError::Unsupported`]; the module's admitted `cargo test` recipes take one
+    ///   file target per run, so the caller runs the files one after another.
     /// * Pattern: `cargo test --workspace <pattern>`.
     ///
     /// Only the symbol form lists the tests it expects to cover.
@@ -335,6 +361,11 @@ impl LanguageSupport for RustSupport {
                     command,
                 })
             }
+            // The module's admitted `cargo test` recipes take one file target per run, so several
+            // files run one after another (the caller's fallback).
+            TestTarget::Files(_) => Err(LangError::Unsupported(
+                "cargo test runs one file target per invocation".to_owned(),
+            )),
             TestTarget::Pattern(pattern) => {
                 command.push(pattern.clone());
                 Ok(TestSelection {
@@ -345,15 +376,32 @@ impl LanguageSupport for RustSupport {
         }
     }
 
+    /// Supplies the native engine's concurrency option for generated test commands.
+    fn test_worker_setting(
+        &self,
+        argv: &[String],
+        workers: std::num::NonZeroU16,
+    ) -> Option<agent_ide_core::execution::test_workers::WorkerSetting> {
+        (argv.first().is_some_and(|word| word == "cargo")
+            && argv.get(1).is_some_and(|word| word == "test"))
+        .then(
+            || agent_ide_core::execution::test_workers::WorkerSetting::Environment {
+                name: "RUST_TEST_THREADS",
+                value: workers.to_string(),
+            },
+        )
+    }
+
     /// Parses libtest output (stdout, then stderr).
     ///
     /// Counts are the sum of every `test result:` summary; a target whose `running N tests`
     /// header has no summary (crash, signal, budget) contributes its `test … ok|FAILED|ignored`
     /// lines instead and makes the report `incomplete`, as does output with no summary at all
-    /// (e.g. a compile error). Failures follow the order of the `FAILED` lines; each takes its
-    /// location and message from the `---- <name> stdout ----` block: the first
-    /// `panicked at <file>:<line>:<col>:` line and up to four message lines after it (an
-    /// assertion's `left:`/`right:` values included) joined with ` | `, or else the block's first
+    /// (e.g. a compile error). Failures follow `FAILED` lines or the final `failures:` list.
+    /// Location and message come from a captured `---- <name> stdout ----` block or a matching
+    /// uncaptured thread panic in either stream: the first `panicked at <file>:<line>:<col>:`
+    /// line and up to four subsequent message lines joined with ` | `. An unrelated caught
+    /// thread panic never creates a failure. A captured block without a panic uses its first
     /// non-empty line. Only the post-1.73 panic format carries a location.
     fn parse_test_output(&self, stdout: &str, stderr: &str) -> TestReport {
         let text = format!("{stdout}\n{stderr}");
@@ -364,7 +412,34 @@ impl LanguageSupport for RustSupport {
         let mut failed_names = Vec::new();
         let mut blocks: HashMap<&str, Located> = HashMap::new();
         let mut block_order = Vec::new();
+        let mut failure_list = false;
         for (index, line) in lines.iter().enumerate() {
+            if *line == "failures:" {
+                failure_list = true;
+                continue;
+            }
+            if failure_list {
+                let name = line.trim();
+                if line.starts_with("    ") && !name.is_empty() {
+                    if !failed_names.iter().any(|failed| failed == name) {
+                        failed_names.push(name.to_owned());
+                    }
+                    continue;
+                }
+                if !name.is_empty() {
+                    failure_list = false;
+                }
+            }
+            if let Some(name) = line
+                .split_once("thread '")
+                .and_then(|(_, rest)| rest.split_once("' "))
+                .filter(|(_, rest)| rest.contains("panicked at "))
+                .map(|(name, _)| name)
+            {
+                blocks
+                    .entry(name)
+                    .or_insert_with(|| panic_of(&lines[index..]));
+            }
             if let Some(summary) = line.strip_prefix("test result: ") {
                 report.passed += count_before(summary, "passed");
                 report.failed += count_before(summary, "failed");
@@ -464,7 +539,24 @@ impl LanguageSupport for RustSupport {
         integration_test_bin(file)
     }
 
-    /// The first non-empty `//!` or `///` line of the leading comment block.
+    /// A crate's library root, then its binary root, then a module's own root file.
+    fn package_doc_files(&self) -> &'static [&'static str] {
+        &["src/lib.rs", "src/main.rs", "lib.rs", "mod.rs", "main.rs"]
+    }
+
+    /// Exact manifest consulted for package descriptions.
+    fn manifest_description_files(&self) -> &'static [&'static str] {
+        &["Cargo.toml"]
+    }
+
+    /// `[package] description` of `Cargo.toml` in `directory`.
+    fn manifest_description(&self, directory: &Path) -> Option<String> {
+        let text = std::fs::read_to_string(directory.join("Cargo.toml")).ok()?;
+        agent_ide_core::lang::toml_section_string(&text, "package", "description")
+    }
+
+    /// The first paragraph (consecutive non-empty lines) of the leading `//!` or `///` comment
+    /// block, joined with spaces.
     fn file_doc(&self, text: &str) -> Option<String> {
         let lines: Vec<_> = text.lines().collect();
 
@@ -483,9 +575,170 @@ impl LanguageSupport for RustSupport {
                 break;
             }
         }
-        docs.into_iter()
-            .find(|doc| !doc.is_empty())
-            .map(str::to_owned)
+        // The first paragraph: consecutive non-empty doc lines from the first one, so a sentence
+        // wrapped across lines is not cut at the line break.
+        let paragraph: Vec<&str> = docs
+            .into_iter()
+            .skip_while(|doc| doc.is_empty())
+            .take_while(|doc| !doc.is_empty())
+            .collect();
+        (!paragraph.is_empty()).then(|| paragraph.join(" "))
+    }
+
+    /// Plans a formatter from its target's effective Cargo project and edition. The returned
+    /// cwd lets rustfmt discover that project's configuration; tool/pin activation still occurs
+    /// before admission, with the original authoritative worktree and exact target preserved.
+    fn configured_format_stdin_command(
+        &self,
+        worktree: &Path,
+        project: &LanguageProject,
+        file: &Path,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Result<Option<(Vec<String>, PathBuf)>, LangError> {
+        if self.format_stdin_command(project, file).is_none() {
+            return Ok(None);
+        }
+        let target = if file.is_absolute() {
+            file.to_path_buf()
+        } else {
+            worktree.join(file)
+        };
+        let cwd = crate::environment::project_root(
+            worktree,
+            target.parent().unwrap_or(worktree),
+            &config.read_denies,
+        )
+        .map_err(LangError::Environment)?;
+        let mut project = project.clone();
+        if let Some(text) = crate::environment::manifest_text(worktree, &cwd, &config.read_denies)
+            .map_err(LangError::Environment)?
+            && let Some(edition) = toml_string(&text, "edition")
+        {
+            project.environment.retain(|(name, _)| name != "edition");
+            project.environment.push(("edition".into(), edition));
+        }
+        Ok(self
+            .format_stdin_command(&project, file)
+            .map(|argv| (argv, cwd)))
+    }
+
+    /// Guards native inputs before the existing detector. Its CI/task detector has no guarded
+    /// reader seam, so an extra-deny request returns no project facts rather than reading that
+    /// unsupported scope. Environment/check resolution remains independently guarded.
+    fn configured_detect(
+        &self,
+        root: &Path,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Option<LanguageProject> {
+        if !config.read_denies.is_empty() {
+            return None;
+        }
+        crate::environment::detectable(root, &[])
+            .then(|| self.detect(root))
+            .flatten()
+    }
+
+    /// Current configured environments come from the same guarded resolver as every child.
+    /// A refused projection has no usable candidate; ambient prepared variables are ignored.
+    fn configured_environments(
+        &self,
+        worktree: &Path,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Vec<agent_ide_core::lang::environment::ResolvedEnv> {
+        if !crate::environment::is_cargo_project(worktree) {
+            return Vec::new();
+        }
+        let resolved = match crate::environment::resolve(worktree, config) {
+            Ok((_, resolved)) => resolved,
+            Err(cause) => {
+                let mut resolved =
+                    crate::environment::environment(worktree, None, &config.read_denies);
+                resolved.missing_next_step = Some(cause);
+                resolved.identity.push_str(
+                    blake3::hash(serde_json::to_string(config).unwrap_or_default().as_bytes())
+                        .to_hex()
+                        .as_str(),
+                );
+                resolved
+            }
+        };
+        vec![resolved]
+    }
+
+    /// Activates the actual configured Rust tools, refusing incompatible projects before
+    /// admission. Explicit paths must name that same accepted tool; no PATH fallback occurs.
+    fn configured_command_env(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        program: &str,
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Result<
+        Option<agent_ide_core::lang::environment::CommandEnv>,
+        agent_ide_core::lang::LangError,
+    > {
+        use agent_ide_core::lang::{LangError, environment::CommandEnv};
+        let Some(name @ ("cargo" | "rustc" | "rustfmt")) = Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            return Ok(None);
+        };
+        let (tools, _) = crate::environment::resolve_at(worktree, cwd, config)
+            .map_err(LangError::Environment)?;
+        let executable = tools.dir.join("bin").join(name);
+        if Path::new(program).is_absolute() && Path::new(program) != executable
+            || (!Path::new(program).is_absolute() && program != name)
+        {
+            return Err(LangError::Environment("explicit Rust executable differs from the configured project environment; use native tools".into()));
+        }
+        if !agent_ide_core::lang::environment::readable(&executable, &config.read_denies) {
+            return Err(LangError::Environment(format!(
+                "configured {name} is missing or denied; use native tools"
+            )));
+        }
+        let mut vars = vec![
+            ("RUSTUP_AUTO_INSTALL".into(), "0".into()),
+            ("CARGO_NET_OFFLINE".into(), "true".into()),
+        ];
+        vars.push((
+            "RUSTUP_TOOLCHAIN".into(),
+            tools.dir.as_os_str().to_os_string(),
+        ));
+        vars.push(("RUSTC".into(), tools.dir.join("bin/rustc").into_os_string()));
+        if let Some(home) = tools.cargo_home {
+            vars.push(("CARGO_HOME".into(), home.into_os_string()));
+        }
+        Ok(Some(CommandEnv {
+            argv_prefix: vec![executable.into_os_string()],
+            path_prefix: Some(tools.dir.join("bin")),
+            vars,
+        }))
+    }
+
+    /// Uses the actual Cargo manifest selector before resolving a command. Unclaimed programs
+    /// keep their existing route; selected projects remain bounded by the admitted worktree.
+    fn configured_command_argv(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        argv: &[String],
+        config: &agent_ide_core::modules::contract::ModuleConfig,
+    ) -> Result<Option<agent_ide_core::lang::environment::CommandEnv>, LangError> {
+        let Some(program) = argv.first() else {
+            return Ok(None);
+        };
+        if !matches!(
+            Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("cargo" | "rustc" | "rustfmt")
+        ) {
+            return Ok(None);
+        }
+        let cwd =
+            crate::environment::command_directory(cwd, argv).map_err(LangError::Environment)?;
+        self.configured_command_env(worktree, &cwd, program, config)
     }
 
     /// `cargo` runs from the toolchain named by `AGENT_IDE_RUST_TOOLCHAIN_DIR` when that
@@ -500,6 +753,33 @@ impl LanguageSupport for RustSupport {
         let bin = PathBuf::from(std::env::var_os("AGENT_IDE_RUST_TOOLCHAIN_DIR")?).join("bin");
         let cargo = bin.join("cargo");
         cargo.is_file().then_some((cargo, bin))
+    }
+
+    /// Activates the already prepared Cargo toolchain for a bare Cargo request and disables
+    /// rustup installation for Rust-owned cargo/rustc/rustfmt commands, including explicit paths.
+    /// Explicit executable paths are preserved. Unknown programs are unclaimed; no manager or
+    /// installation runs and absent prepared tools retain the native missing-tool outcome.
+    fn command_env(
+        &self,
+        _worktree: &Path,
+        _cwd: &Path,
+        program: &str,
+    ) -> Option<agent_ide_core::lang::environment::CommandEnv> {
+        if !matches!(
+            Path::new(program).file_name()?.to_str()?,
+            "cargo" | "rustc" | "rustfmt"
+        ) {
+            return None;
+        }
+        let mut environment = agent_ide_core::lang::environment::CommandEnv {
+            vars: vec![("RUSTUP_AUTO_INSTALL".into(), "0".into())],
+            ..Default::default()
+        };
+        if let Some((executable, bin)) = self.test_toolchain(program) {
+            environment.argv_prefix = vec![executable.into_os_string()];
+            environment.path_prefix = Some(bin);
+        }
+        Some(environment)
     }
 }
 
@@ -643,14 +923,23 @@ fn convert(
     }
 }
 
-/// Extracts a field from its selected name through its type, retaining visibility before the name
-/// while excluding field attributes and comments from the signature.
+/// Extracts a field from its selected name through its type (`symbol`'s UTF-16 selection start to
+/// its range end on `lines`), retaining the visibility before the name while excluding field
+/// attributes, comments and whatever else shares the line from the signature.
+///
+/// The visibility is the text between the name and the nearest `{`, `,` or `]` before it on the
+/// name's line (the struct's opening brace, the previous field on the same line, or the field's
+/// last attribute), kept only when it starts with `pub`; so `pub struct S { a: u8, pub b: u8 }`
+/// gives `a: u8` and `pub b: u8`. `None` when a column falls inside a code point or past its
+/// line, and the caller then renders the field's declaration line instead.
 fn field_signature(lines: &[&str], symbol: &lsp::DocumentSymbol) -> Option<String> {
     let name_line = line_at(lines, symbol.selection_range.start.line + 1);
     let name_byte = utf16_column_byte(name_line, symbol.selection_range.start.character)?;
     let prefix = name_line.get(..name_byte)?;
-    let after_attributes = prefix.rsplit_once(']').map_or(prefix, |(_, suffix)| suffix);
-    let visibility = after_attributes.trim();
+    let own = prefix
+        .rsplit_once(['{', ',', ']'])
+        .map_or(prefix, |(_, suffix)| suffix);
+    let visibility = own.trim();
     let visibility = if visibility.starts_with("pub") {
         format!("{visibility} ")
     } else {
@@ -886,8 +1175,9 @@ fn count_before(summary: &str, label: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Location and message of one `---- name stdout ----` block's lines (see
-/// [`RustSupport::parse_test_output`]).
+/// Returns the first panic's location and at most four message lines from a captured block or
+/// uncaptured output suffix; no panic yields the first nonempty line without a location.
+/// The caller associates it only with a reported failing test (see [`RustSupport::parse_test_output`]).
 fn panic_of(block: &[&str]) -> Located {
     for (index, line) in block.iter().enumerate() {
         let Some((_, at)) = line.split_once("panicked at ") else {
@@ -936,18 +1226,32 @@ fn fill(commands: &mut ProjectCommands, slot: &str, argv: Vec<String>, source: C
 /// Toolchain named by `rust-toolchain.toml` (`channel = "…"`) or a legacy `rust-toolchain`
 /// file (TOML or a bare channel line); `None` when neither exists.
 fn toolchain(root: &Path) -> Option<String> {
-    ["rust-toolchain.toml", "rust-toolchain"]
-        .into_iter()
-        .find_map(|name| fs::read_to_string(root.join(name)).ok())
-        .and_then(|text| {
-            toml_string(&text, "channel").or_else(|| {
-                text.lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty() && !line.starts_with('#'))
-                    .filter(|line| !line.contains('='))
-                    .map(str::to_owned)
-            })
-        })
+    toolchain_pin(root).map(|(_, channel)| channel)
+}
+
+/// The declaring file's name (`rust-toolchain.toml` or `rust-toolchain`) and the toolchain
+/// channel it names: the TOML `channel` key, else the first non-comment line without `=`.
+/// The first readable file wins and only that file is parsed, exactly as [`toolchain`] always
+/// read it; `None` when neither file exists or the readable one names nothing.
+pub(crate) fn toolchain_pin(root: &Path) -> Option<(&'static str, String)> {
+    for (name, path) in [
+        ("rust-toolchain.toml", root.join("rust-toolchain.toml")),
+        ("rust-toolchain", root.join("rust-toolchain")),
+    ] {
+        if let Ok(text) = fs::read_to_string(path) {
+            return Some((
+                name,
+                toml_string(&text, "channel").or_else(|| {
+                    text.lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty() && !line.starts_with('#'))
+                        .filter(|line| !line.contains('='))
+                        .map(str::to_owned)
+                })?,
+            ));
+        }
+    }
+    None
 }
 
 /// Value of the first `key = "value"` line in a TOML text (any table), without parsing TOML.
@@ -1590,6 +1894,12 @@ mod tests {
             command(TestTarget::Pattern("lang::".into())),
             "cargo test --workspace lang::"
         );
+        let files =
+            |paths: &[&str]| TestTarget::Files(paths.iter().map(PathBuf::from).collect::<Vec<_>>());
+        assert!(matches!(
+            RustSupport.test_selection(&project(), &files(&["tests/lang.rs", "tests/cli.rs"])),
+            Err(LangError::Unsupported(_))
+        ));
         let integration = |file: &str, name: &str| TestId {
             file: PathBuf::from(file),
             name: name.to_owned(),
@@ -1657,6 +1967,39 @@ mod tests {
                 message: "assertion `left == right` failed | left: 1 | right: 2".to_owned(),
             }]
         );
+    }
+
+    /// Uncaptured panic output keeps the named failure, location and message in combined or
+    /// split streams; an unrelated caught helper panic never becomes another failed test.
+    #[test]
+    fn parses_nocapture_failure_without_a_stdout_block() {
+        let summary = "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let panic = "thread 'tests::bad' (12345) panicked at src/lib.rs:12:9:\nresult-economy failure message\n\n";
+        let combined = format!(
+            "running 2 tests\ntest tests::good ... ok\ntest tests::bad ... \n{panic}FAILED\n\nfailures:\n    tests::bad\n\n{summary}"
+        );
+        let stdout = format!(
+            "running 2 tests\ntest tests::good ... ok\ntest tests::bad ... FAILED\n\nfailures:\n    tests::bad\n\n{summary}"
+        );
+        let old_panic = panic.replace(" (12345)", "");
+        let stderr = format!(
+            "{old_panic}thread 'caught_helper' panicked at src/helper.rs:1:1:\nhandled helper panic\n\n"
+        );
+        for (stdout, stderr) in [(combined.as_str(), ""), (stdout.as_str(), stderr.as_str())] {
+            let report = RustSupport.parse_test_output(stdout, stderr);
+            assert_eq!(
+                (report.passed, report.failed, report.incomplete),
+                (1, 1, false)
+            );
+            assert_eq!(
+                report.failures,
+                vec![TestFailure {
+                    name: "tests::bad".to_owned(),
+                    location: Some((PathBuf::from("src/lib.rs"), 12)),
+                    message: "result-economy failure message".to_owned(),
+                }]
+            );
+        }
     }
 
     #[test]
@@ -1869,6 +2212,10 @@ mod tests {
         assert_eq!(
             RustSupport.file_doc("//! Rust docs\nfn a() {}"),
             Some("Rust docs".into())
+        );
+        assert_eq!(
+            RustSupport.file_doc("//! Managed units of the sole\n//! writer.\n//!\n//! Detail.\n"),
+            Some("Managed units of the sole writer.".into())
         );
     }
 

@@ -1206,6 +1206,15 @@ fn git_candidates(root: &Path) -> Option<Vec<(PathBuf, Option<Box<str>>)>> {
     Some(found)
 }
 
+/// Worktree-relative candidate files of `root` exactly as a sweep lists them: Git's tracked and
+/// untracked, not ignored, files in a Git worktree, else the bounded walk. Order is the listing's;
+/// no file is read.
+pub(crate) fn listed_files(root: &Path) -> Vec<PathBuf> {
+    git_candidates(root)
+        .map(|listed| listed.into_iter().map(|(path, _)| path).collect())
+        .unwrap_or_else(|| walk(root))
+}
+
 /// Raw path bytes, the index's sort key for files.
 fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()

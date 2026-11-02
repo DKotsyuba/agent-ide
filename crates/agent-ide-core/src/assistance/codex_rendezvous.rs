@@ -229,6 +229,8 @@ struct Publication {
     nonce: String,
     /// Record descriptor carrying the publisher's exclusive lock for the publisher's lifetime.
     record: File,
+    /// Pins the runtime inode for the normal publication lifetime; follows the record on drop.
+    _runtime_dir: File,
     /// Pinned, validated route directory the record was renamed into.
     route_dir: File,
 }
@@ -374,6 +376,7 @@ impl ManagedCodexPublisher {
             route,
             nonce,
             record,
+            _runtime_dir: runtime_dir,
             route_dir,
         });
         if !self.identities.contains(identity) {
@@ -464,12 +467,12 @@ fn write_locked_record(
     Ok(record)
 }
 
-/// Returns the production rendezvous root: `canonical("/private/tmp")/ai-c-<euid>`.
+/// Returns the production rendezvous root under the stable per-user platform parent.
 ///
-/// The fixed root never follows hook or MCP `TMPDIR` overrides. Returns [`None`] when the
-/// canonical temporary directory cannot be resolved; callers then simply do not publish.
+/// The parent never follows hook or MCP `TMPDIR` overrides. Returns [`None`] when it cannot be
+/// resolved; callers then simply do not publish.
 pub fn default_root() -> Option<PathBuf> {
-    let temporary = fs::canonicalize("/private/tmp").ok()?;
+    let temporary = crate::hook_hints::platform_root().ok()?;
     // SAFETY: `geteuid` merely reports the calling process's effective uid.
     Some(temporary.join(format!("ai-c-{}", unsafe { libc::geteuid() })))
 }
@@ -495,7 +498,9 @@ pub fn effective_root() -> Option<PathBuf> {
 /// Each candidate is opened `O_NOFOLLOW`, fstat-validated (regular file, owner, exact mode `0600`,
 /// `nlink == 1`, bounded size), probed for liveness — a record that can still be shared-locked has
 /// no publisher and is skipped — then fully parsed, identity-checked, and its runtime directory
-/// and owner-only daemon socket are re-verified through pinned descriptors before being returned.
+/// and owner-only daemon socket are re-verified through pinned descriptors before a final liveness
+/// probe. A concurrent or crashed publisher can make this point-in-time result stale during or
+/// immediately after discovery; a subsequent connection still has to establish its own authority.
 /// Zero or several live valid records, and any unsafe state, return [`None`] without ever
 /// repairing, deleting, or picking the newest record.
 ///
@@ -506,6 +511,15 @@ pub fn effective_root() -> Option<PathBuf> {
 /// so the lookup fits inside the hook's total deadline for everything this module itself creates;
 /// arbitrary hostile directory contents can only make discovery refuse the route, never block it.
 pub fn discover(root: &Path, identity: &CodexRouteIdentity) -> Option<HookTarget> {
+    discover_inner(root, identity, || {})
+}
+
+/// The callback marks the gap between runtime validation and the final liveness probe.
+fn discover_inner(
+    root: &Path,
+    identity: &CodexRouteIdentity,
+    mut after_runtime_validation: impl FnMut(),
+) -> Option<HookTarget> {
     let route = identity.digest();
     let root_dir = open_directory_at_path(root)?;
     if !is_owned_private_directory(&stat_descriptor(&root_dir)?) {
@@ -545,6 +559,14 @@ pub fn discover(root: &Path, identity: &CodexRouteIdentity) -> Option<HookTarget
         };
         if !validate_runtime(&parsed.runtime, parsed.device, parsed.inode).unwrap_or(false) {
             continue;
+        }
+        after_runtime_validation();
+        // A publisher may retire while validation is in progress; only a still-contended
+        // record is eligible. The returned target can still become stale after this instant.
+        match probe_record_lock(&record, libc::LOCK_SH | libc::LOCK_NB) {
+            LockProbe::Contended => {}
+            LockProbe::Unlocked => continue,
+            LockProbe::Failed => return None,
         }
         if target.is_some() {
             // Several live records on one route: silent no-match, never "newest wins".
@@ -651,8 +673,8 @@ fn probe_candidate(route_dir: &File, name: &str) -> CandidateProbe {
 /// The path must be absolute and already canonical, must open `O_NOFOLLOW|O_DIRECTORY` as a real
 /// `0700` effective-UID directory whose device/inode still match the record, and must contain the
 /// daemon socket as an owner-only Unix socket (exactly what the daemon sets right after bind). Any
-/// mismatch — including a runtime removed and recreated after publication — returns `false`, so a
-/// replacement runtime is never adopted through an old record.
+/// mismatch returns `false`. A normally live publication retains its runtime directory descriptor,
+/// preventing inode reuse; concurrent or crash teardown can make this observation stale.
 fn validate_runtime(runtime: &str, device: u64, inode: u64) -> Option<bool> {
     let path = PathBuf::from(runtime);
     if !path.is_absolute() || fs::canonicalize(&path).ok().as_deref() != Some(path.as_path()) {
@@ -660,10 +682,10 @@ fn validate_runtime(runtime: &str, device: u64, inode: u64) -> Option<bool> {
     }
     let directory = open_directory_at_path(&path)?;
     let status = stat_descriptor(&directory)?;
-    if !is_owned_private_directory(&status)
-        || status.st_dev as u64 != device
-        || status.st_ino != inode
-    {
+    // dev_t differs between macOS and Linux, while rendezvous records use u64.
+    #[allow(clippy::unnecessary_cast)]
+    let recorded_device = status.st_dev as u64;
+    if !is_owned_private_directory(&status) || recorded_device != device || status.st_ino != inode {
         return Some(false);
     }
     let socket = stat_at(&directory, SOCKET_NAME)?;
@@ -771,31 +793,36 @@ fn ensure_private_directory(path: &Path) -> Result<File, PublishError> {
 ///
 /// Intermediate components are validated only as "real directory, not a symlink" — they are
 /// system directories such as `/private/tmp`; the exact owner and mode rules belong to the
-/// rendezvous root and below, which callers check on the returned descriptor.
+/// rendezvous root and below, which callers check on the returned descriptor. On Linux the
+/// intermediate descriptors need search permission only; the final descriptor remains readable.
 fn open_directory_at_path(path: &Path) -> Option<File> {
     if !path.is_absolute() {
         return None;
     }
     let mut pinned: Option<File> = None;
-    for component in path.components() {
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let intermediate = components.peek().is_some();
         match component {
-            Component::RootDir => pinned = open_root_directory(),
+            Component::RootDir => pinned = open_root_directory(intermediate),
             Component::Prefix(_) | Component::CurDir | Component::ParentDir => return None,
-            Component::Normal(name) => pinned = open_directory_at_os(pinned.as_ref()?, name),
+            Component::Normal(name) => {
+                pinned = open_directory_at_os_with_mode(pinned.as_ref()?, name, intermediate)
+            }
         }
     }
     pinned
 }
 
 /// Opens the filesystem root `/`, the pinned start of every component-wise walk.
-fn open_root_directory() -> Option<File> {
+fn open_root_directory(intermediate: bool) -> Option<File> {
     let raw = CString::new("/").ok()?;
     // SAFETY: `raw` is a valid NUL-terminated path; the descriptor is owned from here on.
     let descriptor = unsafe {
         libc::openat(
             libc::AT_FDCWD,
             raw.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            directory_open_flags(intermediate),
         )
     };
     nonnegative_file(descriptor)
@@ -803,16 +830,37 @@ fn open_root_directory() -> Option<File> {
 
 /// Opens one directory component relative to a pinned parent descriptor, refusing symlinks.
 fn open_directory_at_os(parent: &File, name: &OsStr) -> Option<File> {
+    open_directory_at_os_with_mode(parent, name, false)
+}
+
+/// Opens a directory component, optionally using a Linux search-only descriptor for traversal.
+fn open_directory_at_os_with_mode(parent: &File, name: &OsStr, intermediate: bool) -> Option<File> {
     let raw = CString::new(name.as_bytes()).ok()?;
     // SAFETY: `raw` is valid for the call; the returned descriptor is owned from here on.
     let descriptor = unsafe {
         libc::openat(
             parent.as_raw_fd(),
             raw.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            directory_open_flags(intermediate),
         )
     };
     nonnegative_file(descriptor)
+}
+
+/// Selects no-follow directory flags, keeping final descriptors readable on every platform.
+fn directory_open_flags(intermediate: bool) -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    let access = if intermediate {
+        libc::O_PATH
+    } else {
+        libc::O_RDONLY
+    };
+    #[cfg(not(target_os = "linux"))]
+    let access = {
+        let _ = intermediate;
+        libc::O_RDONLY
+    };
+    access | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC
 }
 
 /// Opens one named directory component relative to a pinned parent descriptor.
@@ -1301,6 +1349,52 @@ mod tests {
         assert!(discover(&root, &fixture_identity("other")).is_none());
     }
 
+    /// Publishes and discovers through a search-only ancestor without weakening no-follow checks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_publish_and_discover_through_search_only_ancestor() {
+        /// Restores the owned fixture's mode before removing it, including on panic.
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.0.join("s"), fs::Permissions::from_mode(0o700));
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let area = TestArea::new("search-only");
+        let fixture = Fixture(area.base.clone());
+        let search = fixture.0.join("s");
+        let parent = search.join("p");
+        let runtime = parent.join("t");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = UnixListener::bind(runtime.join(SOCKET_NAME)).unwrap();
+        fs::set_permissions(runtime.join(SOCKET_NAME), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&search, fs::Permissions::from_mode(0o100)).unwrap();
+        let root = parent.join("r");
+        let identity = fixture_identity("search-only");
+        let mut publisher = ManagedCodexPublisher::new(root.clone(), runtime, fixture_attachment());
+        publisher.publish(&identity).unwrap();
+        assert!(discover(&root, &identity).is_some());
+        let final_directory = open_directory_at_path(&root).unwrap();
+        // SAFETY: fcntl reads flags from the live owned descriptor without retaining it.
+        let flags = unsafe { libc::fcntl(final_directory.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_PATH, 0);
+        fs::set_permissions(&search, fs::Permissions::from_mode(0o000)).unwrap();
+        // Privileged users can bypass mode bits; only assert denial when the OS enforces them.
+        if File::open(&parent).is_err() {
+            assert!(discover(&root, &identity).is_none());
+            assert!(open_directory_at_path(&parent).is_none());
+        }
+        fs::set_permissions(&search, fs::Permissions::from_mode(0o100)).unwrap();
+        std::os::unix::fs::symlink(&search, fixture.0.join("link")).unwrap();
+        assert!(open_directory_at_path(&fixture.0.join("link/p")).is_none());
+        assert!(discover(&fixture.0.join("link/p/r"), &identity).is_none());
+        drop(publisher);
+        drop(listener);
+    }
+
     #[test]
     fn dropped_publisher_unpublishes_its_record_and_keeps_the_route_directory() {
         let area = TestArea::new("drop");
@@ -1425,6 +1519,20 @@ mod tests {
             "device/inode mismatch rejects the replacement"
         );
         drop(publisher);
+    }
+
+    /// A publisher that retires during runtime validation must not leave a usable target.
+    #[test]
+    fn retiring_during_discovery_invalidates_the_candidate() {
+        let area = TestArea::new("retire-during-discovery");
+        let (mut publisher, _, identity) = publish_fixture(&area);
+        let mut reached = false;
+        let target = discover_inner(&area.root(), &identity, || {
+            reached = true;
+            publisher.unpublish_all();
+        });
+        assert!(reached, "runtime validation must reach the checkpoint");
+        assert!(target.is_none(), "a retired record cannot be returned");
     }
 
     #[test]
@@ -1905,9 +2013,10 @@ mod tests {
         let identity = fixture_identity("absent");
         assert!(discover(&area.root(), &identity).is_none());
         let root = default_root().expect("the production root resolves");
-        assert!(
-            root.to_string_lossy().starts_with("/private/tmp/ai-c-"),
-            "the production root is the fixed /private/tmp/ai-c-<euid> path"
+        assert_eq!(
+            root.parent(),
+            Some(crate::hook_hints::platform_root().unwrap().as_path()),
+            "the production root is under the stable platform parent"
         );
         let parent = root.parent().expect("the production root has a parent");
         assert!(

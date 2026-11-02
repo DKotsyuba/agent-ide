@@ -15,18 +15,38 @@
 //! `.python-version` is a version request only: a mismatch with the chosen environment becomes a
 //! warning and never switches it. Only files are read, under the host's read denies; no
 //! environment manager ever runs.
+//!
+//! A resolution's opaque [`ResolvedEnv::identity`] covers the native project inputs of the root
+//! (`native_inputs`: manifest, pin file, `requirements*.txt` and their local includes,
+//! lockfiles, the version request)
+//! besides the chosen environment itself, so a changed or recreated manifest, lock or config
+//! invalidates every consumer of the old answer — the card, the checks, the Pyright session,
+//! tests and formatting — through the same identity comparison. Linux also uses a bounded
+//! process-local registry of pinned filesystem objects to detect environment recreation.
+//! Interpreter metadata detects ordinary writes, but cannot prove every same-inode write
+//! within one filesystem timestamp tick. These fingerprints do not attest installed dependencies.
+//! Incomplete requirement-reference coverage produces a warning; requirements never request an
+//! interpreter version.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
-    os::unix::fs::MetadataExt,
+    io::Read,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
+    },
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
 
 use agent_ide_core::execution::seatbelt::ReadDeny;
 use agent_ide_core::lang::environment::{CommandEnv, EnvCandidate, EnvSource, ResolvedEnv};
+use agent_ide_core::modules::contract::ModuleConfig;
 
 use crate::checks::{
     PYPROJECT_FILE, PYRIGHT_CONFIG_FILE, allowed_file, read_config, read_pyproject_venv_keys,
@@ -255,32 +275,586 @@ fn settle(
     }
 }
 
-/// `ino.mtime` of `path` without following a final link, empty when it cannot be read.
+/// Inode and modification time without following a final link, plus Linux change time;
+/// empty when metadata cannot be read. Timestamps alone cannot guarantee a distinct stamp.
 fn stamp(path: &Path) -> String {
     fs::symlink_metadata(path)
         .map(|metadata| {
-            format!(
-                "{}.{}.{}",
-                metadata.ino(),
-                metadata.mtime(),
-                metadata.mtime_nsec()
-            )
+            #[cfg(target_os = "linux")]
+            {
+                format!(
+                    "{}.{}.{}.{}.{}",
+                    metadata.ino(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec()
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                format!(
+                    "{}.{}.{}",
+                    metadata.ino(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec()
+                )
+            }
         })
         .unwrap_or_default()
 }
 
-/// Opaque identity of a resolution: the chosen environment's path and version plus everything
-/// that changes when it is recreated in place (directory and interpreter inodes, the interpreter
-/// link's target, `pyvenv.cfg` stamp and content), or the missing cause. Why it won (`source`)
-/// is left out: selecting the current winner changes nothing a consumer depends on.
-fn identity(chosen: Option<&EnvCandidate>, missing: Option<&str>, denies: &[ReadDeny]) -> String {
+/// Linux environment generations retain at most 256 descriptors: old objects remain pinned
+/// until replacement or eviction, preventing inode reuse from hiding environment recreation.
+#[cfg(target_os = "linux")]
+mod linux_identity {
+    use super::*;
+    use std::sync::{
+        MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    const CAPACITY: usize = 128;
+    const MAX_OBSERVATIONS: usize = 16;
+    const RANDOM_UNAVAILABLE: &str = "cannot securely identify the Python environment; restore OS randomness and restart the IDE";
+    const GENERATION_EXHAUSTED: &str =
+        "cannot securely identify the Python environment; restart the IDE";
+
+    /// Pinned directory and regular interpreter identities; owning the files prevents inode reuse.
+    struct Evidence {
+        _directory: fs::File,
+        _interpreter: fs::File,
+        objects: [(u64, u64); 2],
+        interpreter_metadata: InterpreterMetadata,
+    }
+
+    /// Metadata from the pinned target detects ordinary in-place changes without read access.
+    /// Equal metadata cannot rule out same-size writes within one filesystem timestamp tick.
+    #[derive(PartialEq, Eq)]
+    struct InterpreterMetadata {
+        size: u64,
+        mode: u32,
+        modified: (i64, i64),
+        changed: (i64, i64),
+    }
+
+    /// A reusable generation and its pinned filesystem objects.
+    struct Entry {
+        evidence: Evidence,
+        generation: u64,
+    }
+
+    /// One mutex protects generations, eviction order and publication of pinned evidence.
+    #[derive(Default)]
+    struct State {
+        sequence: u64,
+        revision: u64,
+        entries: HashMap<PathBuf, Entry>,
+        order: VecDeque<PathBuf>,
+    }
+
+    impl State {
+        /// Allocates without wrapping; exhaustion refuses resolution instead of reusing a token.
+        fn next(&mut self) -> Result<u64, &'static str> {
+            self.sequence = self.sequence.checked_add(1).ok_or(GENERATION_EXHAUSTED)?;
+            Ok(self.sequence)
+        }
+
+        /// Removes all ownership and invalidates observations begun before this reset.
+        fn reset(&mut self) -> Result<(), &'static str> {
+            self.entries.clear();
+            self.order.clear();
+            self.revision = self.next()?;
+            Ok(())
+        }
+    }
+
+    /// Process-local nonce separates identities across module restarts; state owns all pins.
+    struct Registry {
+        nonce: String,
+        state: Mutex<State>,
+        observations: AtomicUsize,
+    }
+
+    /// Bounds temporary pins independently of cache publication; no state is synchronized
+    /// through this counter, so relaxed atomic admission and release suffice.
+    struct Observation<'a>(&'a AtomicUsize);
+
+    impl Drop for Observation<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Registry {
+        /// Initializes a registry only when a secure process nonce can be obtained.
+        fn new() -> Result<Self, &'static str> {
+            let mut nonce = [0_u8; 32];
+            let mut filled = 0;
+            while filled < nonce.len() {
+                // SAFETY: the remaining slice is writable for exactly the supplied length.
+                let count = unsafe {
+                    libc::getrandom(nonce[filled..].as_mut_ptr().cast(), nonce.len() - filled, 0)
+                };
+                if count > 0 {
+                    filled += count as usize;
+                } else if count < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                } else {
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open("/dev/urandom")
+                        .and_then(|mut file| file.read_exact(&mut nonce))
+                        .map_err(|_| RANDOM_UNAVAILABLE)?;
+                    break;
+                }
+            }
+            Ok(Self {
+                nonce: nonce.iter().map(|byte| format!("{byte:02x}")).collect(),
+                state: Mutex::new(State::default()),
+                observations: AtomicUsize::new(0),
+            })
+        }
+
+        /// Recovers poison only after dropping all cached evidence and advancing the revision.
+        fn lock(&self) -> Result<MutexGuard<'_, State>, &'static str> {
+            match self.state.lock() {
+                Ok(state) => Ok(state),
+                Err(poison) => {
+                    let mut state = poison.into_inner();
+                    state.reset()?;
+                    self.state.clear_poison();
+                    Ok(state)
+                }
+            }
+        }
+
+        /// Observes outside the mutex; intervening publication cannot be overwritten by stale
+        /// evidence. Matching concurrent observations share a generation, failures never do.
+        fn observe(&self, path: &Path, denies: &[ReadDeny]) -> Result<String, &'static str> {
+            let revision = self.lock()?.revision;
+            let admission = self
+                .observations
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    (count < MAX_OBSERVATIONS).then_some(count + 1)
+                })
+                .ok()
+                .map(|_| Observation(&self.observations));
+            let evidence = admission.as_ref().and_then(|_| evidence(path, denies));
+            self.publish(path, revision, evidence)
+        }
+
+        /// Commits matching evidence or assigns a unique unregistered token after a race.
+        fn publish(
+            &self,
+            path: &Path,
+            revision: u64,
+            evidence: Option<Evidence>,
+        ) -> Result<String, &'static str> {
+            let mut state = self.lock()?;
+            let generation = match evidence {
+                Some(evidence) => {
+                    if let Some(entry) = state.entries.get(path)
+                        && entry.evidence.objects == evidence.objects
+                        && entry.evidence.interpreter_metadata == evidence.interpreter_metadata
+                    {
+                        entry.generation
+                    } else {
+                        let generation = state.next()?;
+                        if state.revision == revision {
+                            if !state.entries.contains_key(path) {
+                                if state.entries.len() == CAPACITY
+                                    && let Some(oldest) = state.order.pop_front()
+                                {
+                                    state.entries.remove(&oldest);
+                                }
+                                state.order.push_back(path.to_path_buf());
+                            }
+                            state.entries.insert(
+                                path.to_path_buf(),
+                                Entry {
+                                    evidence,
+                                    generation,
+                                },
+                            );
+                            state.revision = generation;
+                        }
+                        generation
+                    }
+                }
+                None => {
+                    state.entries.remove(path);
+                    state.order.retain(|known| known != path);
+                    let generation = state.next()?;
+                    state.revision = generation;
+                    generation
+                }
+            };
+            Ok(format!("linux:{}:{generation}", self.nonce))
+        }
+    }
+
+    /// Opens an absolute path without following any symlink, requiring search permission only.
+    /// Every descriptor is O_PATH and closed by its owning File on all exits.
+    fn pin(path: &Path, directory: bool, denies: &[ReadDeny]) -> Option<fs::File> {
+        if !path.is_absolute() || denies.iter().any(|deny| deny.matches(path)) {
+            return None;
+        }
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open("/")
+            .ok()?;
+        let mut prefix = PathBuf::from("/");
+        let mut components = path.components().skip(1).peekable();
+        while let Some(component) = components.next() {
+            let std::path::Component::Normal(name) = component else {
+                return None;
+            };
+            prefix.push(name);
+            if denies.iter().any(|deny| deny.matches(&prefix)) {
+                return None;
+            }
+            let name = std::ffi::CString::new(name.as_bytes()).ok()?;
+            let is_directory = components.peek().is_some() || directory;
+            let flags = libc::O_PATH
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | if is_directory { libc::O_DIRECTORY } else { 0 };
+            // SAFETY: file owns the parent descriptor and name is a live NUL-terminated string.
+            let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return None;
+            }
+            // SAFETY: openat returned a new owned descriptor, transferred to exactly one File.
+            file = unsafe { fs::File::from_raw_fd(fd) };
+        }
+        let metadata = file.metadata().ok()?;
+        (if directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        })
+        .then_some(file)
+    }
+
+    /// Proves link targets under read denies before opening; empty policies permit canonical
+    /// aliases. Descriptor walks reject symlink changes after this proof, without a fallback.
+    fn evidence(path: &Path, denies: &[ReadDeny]) -> Option<Evidence> {
+        let python = python_of(path);
+        let (directory, target) = if denies.is_empty() {
+            (fs::canonicalize(path).ok()?, fs::canonicalize(python).ok()?)
+        } else {
+            (
+                path.to_path_buf(),
+                crate::checks::resolved_link_target(&python, denies)?,
+            )
+        };
+        let directory = pin(&directory, true, denies)?;
+        let interpreter = pin(&target, false, denies)?;
+        let directory_metadata = directory.metadata().ok()?;
+        let interpreter_metadata = interpreter.metadata().ok()?;
+        Some(Evidence {
+            objects: [
+                (directory_metadata.dev(), directory_metadata.ino()),
+                (interpreter_metadata.dev(), interpreter_metadata.ino()),
+            ],
+            interpreter_metadata: InterpreterMetadata {
+                size: interpreter_metadata.size(),
+                mode: interpreter_metadata.mode(),
+                modified: (
+                    interpreter_metadata.mtime(),
+                    interpreter_metadata.mtime_nsec(),
+                ),
+                changed: (
+                    interpreter_metadata.ctime(),
+                    interpreter_metadata.ctime_nsec(),
+                ),
+            },
+            _directory: directory,
+            _interpreter: interpreter,
+        })
+    }
+
+    /// Returns a stable bounded-cache generation, or refuses resolution when token uniqueness
+    /// cannot be established. Missing/denied evidence always receives a fresh generation.
+    pub(super) fn generation(path: &Path, denies: &[ReadDeny]) -> Result<String, &'static str> {
+        static REGISTRY: LazyLock<Result<Registry, &'static str>> = LazyLock::new(Registry::new);
+        REGISTRY
+            .as_ref()
+            .map_err(|error| *error)?
+            .observe(path, denies)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::{Arc, Barrier};
+
+        /// Owns a distinct fixture and removes it after the registry's pins have been dropped.
+        struct Fixture(PathBuf);
+
+        impl Fixture {
+            /// Creates one process-unique fixture under the configured test temporary directory.
+            fn new() -> Self {
+                static NEXT: AtomicUsize = AtomicUsize::new(0);
+                let root = std::env::temp_dir().join(format!(
+                    "python-pins-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir_all(&root).unwrap();
+                Self(root)
+            }
+
+            /// Creates an environment with a regular interpreter at an exact fixture path.
+            fn environment(&self, name: &str) -> PathBuf {
+                let path = self.0.join(name);
+                fs::create_dir_all(path.join("bin")).unwrap();
+                fs::write(python_of(&path), "python").unwrap();
+                path
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+
+        /// Repeated real deletion/recreation must invalidate without any test-owned old handle.
+        #[test]
+        fn rapid_recreation_never_reuses_a_generation() {
+            let fixture = Fixture::new();
+            let registry = Registry::new().unwrap();
+            let path = fixture.environment("venv");
+            let mut identities = HashSet::new();
+            for _ in 0..500 {
+                let identity = registry.observe(&path, &[]).unwrap();
+                assert_eq!(registry.observe(&path, &[]).unwrap(), identity);
+                assert!(identities.insert(identity));
+                fs::remove_dir_all(&path).unwrap();
+                fixture.environment("venv");
+            }
+        }
+
+        /// A stable interpreter symlink still invalidates when its regular target is replaced.
+        #[test]
+        fn unchanged_symlink_tracks_target_replacement() {
+            let fixture = Fixture::new();
+            let registry = Registry::new().unwrap();
+            let path = fixture.environment("venv");
+            let target = fixture.0.join("base-python");
+            fs::write(&target, "python").unwrap();
+            fs::remove_file(python_of(&path)).unwrap();
+            std::os::unix::fs::symlink(&target, python_of(&path)).unwrap();
+            let mut previous = registry.observe(&path, &[]).unwrap();
+            for _ in 0..64 {
+                fs::remove_file(&target).unwrap();
+                fs::write(&target, "python").unwrap();
+                let current = registry.observe(&path, &[]).unwrap();
+                assert_ne!(current, previous);
+                assert_eq!(registry.observe(&path, &[]).unwrap(), current);
+                previous = current;
+            }
+        }
+
+        /// A same-inode target overwrite behind a constant symlink invalidates its generation.
+        #[test]
+        fn unchanged_symlink_tracks_in_place_target_write() {
+            let fixture = Fixture::new();
+            let registry = Registry::new().unwrap();
+            let path = fixture.environment("venv");
+            let target = fixture.0.join("base-python");
+            fs::write(&target, "python").unwrap();
+            fs::remove_file(python_of(&path)).unwrap();
+            std::os::unix::fs::symlink(&target, python_of(&path)).unwrap();
+            let before_inode = fs::metadata(&target).unwrap().ino();
+            let previous = registry.observe(&path, &[]).unwrap();
+            fs::write(&target, "different python interpreter").unwrap();
+            assert_eq!(fs::metadata(&target).unwrap().ino(), before_inode);
+            let current = registry.observe(&path, &[]).unwrap();
+            assert_ne!(current, previous);
+            assert_eq!(registry.observe(&path, &[]).unwrap(), current);
+        }
+
+        /// An unchanged environment-directory symlink follows recreation of its actual target.
+        #[test]
+        fn unchanged_environment_symlink_tracks_directory_recreation() {
+            let fixture = Fixture::new();
+            let registry = Registry::new().unwrap();
+            let target = fixture.environment("actual-venv");
+            let alias = fixture.0.join(".venv");
+            std::os::unix::fs::symlink(&target, &alias).unwrap();
+            let previous = registry.observe(&alias, &[]).unwrap();
+            assert_eq!(registry.observe(&alias, &[]).unwrap(), previous);
+            fs::remove_dir_all(&target).unwrap();
+            fixture.environment("actual-venv");
+            let current = registry.observe(&alias, &[]).unwrap();
+            assert_ne!(current, previous);
+            assert_eq!(registry.observe(&alias, &[]).unwrap(), current);
+        }
+
+        /// Independent registries model module restarts and cannot share reusable tokens.
+        #[test]
+        fn independent_registries_have_distinct_nonces() {
+            let fixture = Fixture::new();
+            let first = Registry::new().unwrap();
+            let second = Registry::new().unwrap();
+            let path = fixture.environment("venv");
+            assert_ne!(first.nonce, second.nonce);
+            assert_ne!(
+                first.observe(&path, &[]).unwrap(),
+                second.observe(&path, &[]).unwrap()
+            );
+        }
+
+        /// Evicted objects cannot regain an old token even if their filesystem objects survive.
+        #[test]
+        fn eviction_changes_generation_and_bounds_pins() {
+            let fixture = Fixture::new();
+            let registry = Registry::new().unwrap();
+            let first = fixture.environment("first");
+            let previous = registry.observe(&first, &[]).unwrap();
+            for index in 0..CAPACITY {
+                registry
+                    .observe(&fixture.environment(&format!("env-{index}")), &[])
+                    .unwrap();
+            }
+            assert_eq!(registry.lock().unwrap().entries.len(), CAPACITY);
+            assert_ne!(registry.observe(&first, &[]).unwrap(), previous);
+            assert_eq!(registry.lock().unwrap().entries.len(), CAPACITY);
+        }
+
+        /// Barrier-started observations of one unchanged environment converge to one token.
+        #[test]
+        fn concurrent_observations_share_one_generation() {
+            let fixture = Fixture::new();
+            let registry = Arc::new(Registry::new().unwrap());
+            let path = fixture.environment("venv");
+            let barrier = Arc::new(Barrier::new(8));
+            let identities = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        let (registry, barrier, path) =
+                            (registry.clone(), barrier.clone(), path.clone());
+                        scope.spawn(move || {
+                            barrier.wait();
+                            registry.observe(&path, &[]).unwrap()
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .collect::<HashSet<_>>()
+            });
+            assert_eq!(identities.len(), 1);
+        }
+
+        /// Evidence captured before a newer publication never replaces that publication.
+        #[test]
+        fn stale_observation_cannot_restore_old_generation() {
+            let fixture = Fixture::new();
+            let registry = Registry::new().unwrap();
+            let path = fixture.environment("venv");
+            let old = registry.observe(&path, &[]).unwrap();
+            let revision = registry.lock().unwrap().revision;
+            let stale = evidence(&path, &[]).unwrap();
+            fs::remove_dir_all(&path).unwrap();
+            fixture.environment("venv");
+            let current = registry.observe(&path, &[]).unwrap();
+            let rejected = registry.publish(&path, revision, Some(stale)).unwrap();
+            assert_ne!(rejected, old);
+            assert_ne!(rejected, current);
+            assert_eq!(registry.observe(&path, &[]).unwrap(), current);
+        }
+
+        /// Denied targets and admission failures never reuse tokens, and recovery starts fresh.
+        #[test]
+        fn failed_evidence_invalidates_previous_pins() {
+            let fixture = Fixture::new();
+            let registry = Registry::new().unwrap();
+            let path = fixture.environment("venv");
+            let old = registry.observe(&path, &[]).unwrap();
+            let denied = [ReadDeny::Path(python_of(&path))];
+            let first = registry.observe(&path, &denied).unwrap();
+            assert_ne!(first, old);
+            assert_ne!(registry.observe(&path, &denied).unwrap(), first);
+            assert!(registry.lock().unwrap().entries.is_empty());
+            assert_ne!(registry.observe(&path, &[]).unwrap(), old);
+            let before_missing = registry.observe(&path, &[]).unwrap();
+            fs::remove_file(python_of(&path)).unwrap();
+            let missing = registry.observe(&path, &[]).unwrap();
+            assert_ne!(missing, before_missing);
+            assert_ne!(registry.observe(&path, &[]).unwrap(), missing);
+            fs::write(python_of(&path), "python").unwrap();
+            assert_ne!(registry.observe(&path, &[]).unwrap(), before_missing);
+            registry
+                .observations
+                .store(MAX_OBSERVATIONS, Ordering::Relaxed);
+            let overloaded = registry.observe(&path, &[]).unwrap();
+            assert_ne!(registry.observe(&path, &[]).unwrap(), overloaded);
+            registry.observations.store(0, Ordering::Relaxed);
+            assert_eq!(
+                registry.observe(&path, &[]).unwrap(),
+                registry.observe(&path, &[]).unwrap()
+            );
+        }
+
+        /// Poison discards cached ownership; exhausted counters refuse identity generation.
+        #[test]
+        fn poison_resets_pins_and_counter_never_wraps() {
+            let fixture = Fixture::new();
+            let registry = Registry::new().unwrap();
+            let path = fixture.environment("venv");
+            let old = registry.observe(&path, &[]).unwrap();
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let _guard = registry.state.lock().unwrap();
+                    panic!("test poison");
+                })
+                .is_err()
+            );
+            let current = registry.observe(&path, &[]).unwrap();
+            assert_ne!(current, old);
+            assert_eq!(registry.observe(&path, &[]).unwrap(), current);
+            registry.lock().unwrap().sequence = u64::MAX;
+            assert!(
+                registry
+                    .observe(&path, &[ReadDeny::Path(python_of(&path))])
+                    .is_err()
+            );
+        }
+    }
+}
+
+/// Opaque identity of a resolution: the chosen environment's path and version, Linux's pinned
+/// generation, directory/interpreter metadata, link target and config content. Includes native inputs
+/// (`native_inputs`) and, when nothing resolves, the missing cause. Why it won (`source`) is
+/// left out: selecting the current winner changes nothing a consumer depends on. Appends
+/// warnings for incomplete local requirement-reference coverage without changing selection.
+fn identity(
+    worktree: &Path,
+    root: &Path,
+    chosen: Option<&EnvCandidate>,
+    missing: Option<&str>,
+    denies: &[ReadDeny],
+    warnings: &mut Vec<String>,
+) -> Result<String, &'static str> {
+    // The native inputs belong to the root, not to the winner: a changed lock or config
+    // invalidates every consumer of this resolution, chosen or missing.
+    let native = native_inputs(worktree, root, denies, warnings);
     let Some(chosen) = chosen else {
-        return format!("missing|{}", missing.unwrap_or_default());
+        return Ok(format!("missing|{}|{native}", missing.unwrap_or_default()));
     };
     let python = python_of(&chosen.path);
     let config = chosen.path.join("pyvenv.cfg");
-    format!(
-        "{}|{:?}|{}|{}|{:?}|{}|{}",
+    let identity = format!(
+        "{}|{:?}|{}|{}|{:?}|{}|{}|{native}",
         chosen.path.display(),
         chosen.version,
         stamp(&chosen.path),
@@ -288,7 +862,447 @@ fn identity(chosen: Option<&EnvCandidate>, missing: Option<&str>, denies: &[Read
         fs::read_link(&python).ok(),
         stamp(&config),
         blake3::hash(read_config(&config, denies).unwrap_or_default().as_bytes())
-    )
+    );
+    #[cfg(target_os = "linux")]
+    return Ok(format!(
+        "{}|{identity}",
+        linux_identity::generation(&chosen.path, denies)?
+    ));
+    #[cfg(not(target_os = "linux"))]
+    Ok(identity)
+}
+
+/// Size of one chunk a native input is streamed through while being hashed: the identity costs
+/// this much memory per file, never the file's size.
+const NATIVE_INPUT_CHUNK: usize = 64 * 1024;
+
+/// Maximum distinct requirement/constraint files, references per file and queued references
+/// per resolution. Canonical visited identities prevent cycles from causing repeated reads.
+const REQUIREMENT_FILES: usize = 64;
+
+/// Maximum requirement content bytes per resolution, plus one EOF/budget probe byte; no
+/// over-budget prefix is hashed as complete. Fixed manifests and lockfiles retain their
+/// existing whole-content streaming.
+const REQUIREMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum physical requirement line length, excluding LF; longer lines are still fully
+/// hashed within the byte budget, but their reference coverage is explicitly unsupported.
+const REQUIREMENT_LINE: usize = 8 * 1024;
+
+/// Parses one physical requirement line into an optional local include path. Supports `-r`,
+/// `-c`, `--requirement`, `--constraint`, attached short arguments, `=` separators and one
+/// whole single/double-quoted path (spaces allowed), with an optional whitespace-led comment.
+/// Returns a static coverage reason for malformed references, continuations, expansion,
+/// escaped paths and URLs; never expands variables, fetches URLs or interprets package lines.
+fn requirement_reference(line: &str) -> Result<Option<&str>, &'static str> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    if line.ends_with('\\') {
+        return Err("line continuations are unsupported");
+    }
+    let options = ["--requirement", "--constraint", "-r", "-c"];
+    let argument = options
+        .into_iter()
+        .find_map(|option| line.strip_prefix(option).map(|argument| (option, argument)));
+    let Some((option, argument)) = argument else {
+        if line
+            .split_whitespace()
+            .take_while(|word| !word.starts_with('#'))
+            .any(|word| options.iter().any(|option| word.starts_with(*option)))
+        {
+            return Err("references must be standalone directives");
+        }
+        return Ok(None);
+    };
+    if option.starts_with("--") && !argument.is_empty() && !argument.starts_with(['=', ' ', '\t']) {
+        return Err("malformed local reference");
+    }
+    let argument = argument
+        .trim_start()
+        .strip_prefix('=')
+        .unwrap_or(argument.trim_start())
+        .trim_start();
+    let (path, tail) = if argument.starts_with(['\'', '"']) {
+        let quote = argument.as_bytes()[0] as char;
+        let rest = &argument[1..];
+        let end = rest.find(quote).ok_or("malformed local reference")?;
+        (&rest[..end], &rest[end + 1..])
+    } else {
+        let end = argument.find(char::is_whitespace).unwrap_or(argument.len());
+        (&argument[..end], &argument[end..])
+    };
+    if path.is_empty()
+        || path.starts_with('-')
+        || (!tail.is_empty()
+            && (!tail.starts_with(char::is_whitespace) || !tail.trim_start().starts_with('#')))
+    {
+        return Err("malformed local reference");
+    }
+    if path.contains(['$', '~', '%', '\\', ':', '\0', '\'', '"']) {
+        return Err("remote, expanded or escaped references are unsupported");
+    }
+    Ok(Some(path))
+}
+
+/// Resolves a requirement path inside the explicit worktree, checking lexical prefixes and
+/// the canonical target against read exclusions before opening content. Refuses every link
+/// below the worktree (including directory links), missing paths and lexical/resolved escapes;
+/// the authoritative worktree itself may have a canonical alias such as macOS `/var`.
+fn requirement_path(
+    worktree: &Path,
+    path: &Path,
+    denies: &[ReadDeny],
+) -> Result<PathBuf, &'static str> {
+    if denies
+        .iter()
+        .any(|deny| deny.matches(path) || deny.matches(worktree))
+    {
+        return Err("local reference excluded from reads");
+    }
+    let relative = path
+        .strip_prefix(worktree)
+        .map_err(|_| "local reference escapes worktree")?;
+    let mut checked = worktree.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => checked.push(name),
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir if checked != worktree => {
+                checked.pop();
+            }
+            _ => return Err("local reference escapes worktree"),
+        }
+        if denies.iter().any(|deny| deny.matches(&checked)) {
+            return Err("local reference excluded from reads");
+        }
+        let metadata =
+            fs::symlink_metadata(&checked).map_err(|_| "missing or unreadable local reference")?;
+        if metadata.file_type().is_symlink() {
+            return Err("symlinked local references are unsupported");
+        }
+    }
+    let canonical =
+        fs::canonicalize(&checked).map_err(|_| "missing or unreadable local reference")?;
+    let boundary = fs::canonicalize(worktree).map_err(|_| "unavailable worktree boundary")?;
+    if !canonical.starts_with(boundary) {
+        return Err("local reference escapes worktree");
+    }
+    if denies.iter().any(|deny| deny.matches(&canonical)) {
+        return Err("local reference excluded from reads");
+    }
+    Ok(canonical)
+}
+
+/// Opens an absolute, already-contained requirement path with `openat` and `O_NOFOLLOW`
+/// on every component, so a directory replaced by a symlink after validation cannot redirect
+/// the content read. Linux ancestors need search access only, not directory read access. Rejects non-normal components, I/O failures and non-regular final files;
+/// descriptors are owned by `File` and closed on every success/failure path. This mirrors the
+/// core source reader's descriptor walk, whose opener is private to that crate.
+fn open_requirement(path: &Path) -> Result<fs::File, &'static str> {
+    if !path.is_absolute() {
+        return Err("local reference escapes worktree");
+    }
+    let mut directory = fs::File::open("/").map_err(|_| "unavailable worktree boundary")?;
+    let mut components = path.components().skip(1).peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err("local reference escapes worktree");
+        };
+        let name =
+            std::ffi::CString::new(name.as_bytes()).map_err(|_| "malformed local reference")?;
+        let final_component = components.peek().is_none();
+        #[cfg(target_os = "linux")]
+        let access = if final_component {
+            libc::O_RDONLY
+        } else {
+            libc::O_PATH
+        };
+        #[cfg(not(target_os = "linux"))]
+        let access = libc::O_RDONLY;
+        let flags = access
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if final_component {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_DIRECTORY
+            };
+        // SAFETY: `directory` owns a live descriptor and `name` is NUL-terminated for the
+        // duration of this call. No pointer or borrowed descriptor escapes `openat`.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err("unreadable or symlinked local reference");
+        }
+        // SAFETY: successful openat returns a fresh owned descriptor; File takes exclusive
+        // ownership and closes it, including when this assignment drops the previous one.
+        directory = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    if !directory
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file())
+    {
+        return Err("local reference is not a regular file");
+    }
+    Ok(directory)
+}
+
+/// Streams a regular requirement file through a whole-content hash and bounded line parser.
+/// Decrements the shared byte budget, returns discovered relative/absolute references and
+/// records unsupported coverage reasons without including private line text. I/O or budget
+/// failures return no hash, so a prefix is never certified as complete; references and line
+/// storage are bounded independently. The caller has already checked containment and denies.
+fn hash_requirements(
+    path: &Path,
+    remaining: &mut usize,
+    reasons: &mut BTreeSet<&'static str>,
+) -> Result<(blake3::Hash, Vec<PathBuf>), &'static str> {
+    let mut file = open_requirement(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = vec![0u8; NATIVE_INPUT_CHUNK];
+    let mut line = Vec::new();
+    let mut references = Vec::new();
+    let mut oversized = false;
+    loop {
+        let window = chunk.len().min(remaining.saturating_add(1));
+        let read = file
+            .read(&mut chunk[..window])
+            .map_err(|_| "unreadable local reference")?;
+        if read > *remaining {
+            *remaining = 0;
+            return Err("requirement byte budget exceeded (8 MiB)");
+        }
+        *remaining -= read;
+        hasher.update(&chunk[..read]);
+        // A synthetic LF at EOF handles a final line with no terminator, without hashing it.
+        for byte in chunk[..read]
+            .iter()
+            .copied()
+            .chain((read == 0).then_some(b'\n'))
+        {
+            if byte == b'\n' {
+                if oversized {
+                    reasons.insert("requirement line exceeds 8 KiB");
+                } else {
+                    match std::str::from_utf8(&line) {
+                        Ok(line) => match requirement_reference(line) {
+                            Ok(Some(reference)) if references.len() < REQUIREMENT_FILES => {
+                                references.push(PathBuf::from(reference))
+                            }
+                            Ok(Some(_)) => {
+                                reasons.insert("requirement reference budget exceeded (64)");
+                            }
+                            Ok(None) => {}
+                            Err(reason) => {
+                                reasons.insert(reason);
+                            }
+                        },
+                        Err(_) => {
+                            reasons.insert("non-UTF-8 requirement lines are unsupported");
+                        }
+                    }
+                }
+                line.clear();
+                oversized = false;
+            } else if line.len() < REQUIREMENT_LINE {
+                line.push(byte);
+            } else {
+                oversized = true;
+            }
+        }
+        if read == 0 {
+            return Ok((hasher.finalize(), references));
+        }
+    }
+}
+
+/// Adds sorted root `requirements*.txt` and their local requirement/constraint closure to the
+/// native fingerprint. Processes at most 64 canonical files and 64 queued references using
+/// an iterative visited set, with an 8 MiB total read budget and 8 KiB physical lines.
+/// Unsupported, denied, missing and over-budget coverage appends one explicit warning;
+/// unreadable files contribute no content, preserving denied/absent input equivalence.
+/// `ponytail:` this is local reference discovery, not pip syntax; extend the documented subset
+/// only when needed, keeping unsupported scope visible and never installing dependencies.
+fn requirement_inputs(
+    worktree: &Path,
+    root: &Path,
+    denies: &[ReadDeny],
+    parts: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let mut reasons = BTreeSet::new();
+    let entries = requirement_path(worktree, root, denies)
+        .and_then(|_| fs::read_dir(root).map_err(|_| "unreadable requirement directory"));
+    let mut requirements: Vec<_> = match entries {
+        Ok(entries) => entries
+            .filter_map(|entry| match entry {
+                Ok(entry) => match entry.file_name().into_string() {
+                    Ok(name) => Some(name),
+                    Err(_) => {
+                        reasons.insert("non-UTF-8 requirement names are unsupported");
+                        None
+                    }
+                },
+                Err(_) => {
+                    reasons.insert("unreadable requirement directory entry");
+                    None
+                }
+            })
+            .filter(|name| name.starts_with("requirements") && name.ends_with(".txt"))
+            .take(REQUIREMENT_FILES + 1)
+            .collect(),
+        Err(reason) => {
+            reasons.insert(reason);
+            Vec::new()
+        }
+    };
+    if requirements.len() > REQUIREMENT_FILES {
+        reasons.insert("requirement file budget exceeded (64)");
+        requirements.clear();
+    }
+    requirements.sort();
+    let mut pending: VecDeque<_> = requirements
+        .into_iter()
+        .map(|name| root.join(name))
+        .collect();
+    let mut visited = HashSet::new();
+    let mut remaining = REQUIREMENT_BYTES;
+    while let Some(path) = pending.pop_front() {
+        let canonical = match requirement_path(worktree, &path, denies) {
+            Ok(path) => path,
+            Err(reason) => {
+                reasons.insert(reason);
+                continue;
+            }
+        };
+        if visited.contains(&canonical) {
+            continue;
+        }
+        if visited.len() == REQUIREMENT_FILES {
+            reasons.insert("requirement file budget exceeded (64)");
+            break;
+        }
+        visited.insert(canonical.clone());
+        match hash_requirements(&canonical, &mut remaining, &mut reasons) {
+            Ok((hash, references)) => {
+                parts.push(format!("{}={hash}", label(worktree, root, &path)));
+                for reference in references {
+                    if pending.len() == REQUIREMENT_FILES {
+                        reasons.insert("requirement reference budget exceeded (64)");
+                        break;
+                    }
+                    pending.push_back(path.parent().unwrap_or(root).join(reference));
+                }
+            }
+            Err(reason) => {
+                reasons.insert(reason);
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    if !reasons.is_empty() {
+        warnings.push(format!("Python requirements input coverage incomplete: {}; text fingerprints do not attest installed dependencies", reasons.into_iter().collect::<Vec<_>>().join("; ")));
+    }
+}
+
+/// The native project inputs of `root` whose content feeds the resolver identity, in fixed
+/// order: the manifest and pin files the resolver and `detect` already read (`pyproject.toml`,
+/// `pyrightconfig.json`, every root `requirements*.txt` sorted by name and its bounded local
+/// requirement/constraint closure), the dependency lockfiles (`uv.lock`, `poetry.lock`) and the version request
+/// (`.python-version`, the root's own, then the worktree's, in `version_request`'s lookup
+/// order, the worktree copy only when `root` differs from `worktree`).
+///
+/// Each entry contributes `<name>=<blake3 of the whole content>` — any changed byte, including
+/// deep inside a large lockfile, invalidates the resolution; a missing or host-denied fixed
+/// file contributes `<name>=-` — unreadable says nothing, exactly as `version_request`
+/// treats a denied `.python-version`. An enumerated `requirements*.txt` that says nothing
+/// contributes no entry at all, so an unreadable one fingerprints exactly like an absent one.
+/// Hashing streams the file in `NATIVE_INPUT_CHUNK` chunks through the same gated open
+/// `read_config` uses for fixed files — under denies, a denied or symlinked input is refused without being
+/// followed; without denies, links are followed as `read_config`'s plain read follows them —
+/// so no input is ever held in memory whole. Requirements use the stricter contained,
+/// link-free reader described by `requirement_inputs`, which also appends coverage warnings.
+fn native_inputs(
+    worktree: &Path,
+    root: &Path,
+    denies: &[ReadDeny],
+    warnings: &mut Vec<String>,
+) -> String {
+    /// One fingerprint entry: the whole-content hash, or `-` when the file says nothing.
+    fn entry(name: &str, path: &Path, denies: &[ReadDeny]) -> String {
+        match hash_config(path, denies) {
+            Some(hash) => format!("{name}={hash}"),
+            None => format!("{name}=-"),
+        }
+    }
+    let mut parts = Vec::new();
+    parts.push(entry("pyproject.toml", &root.join(PYPROJECT_FILE), denies));
+    parts.push(entry(
+        "pyrightconfig.json",
+        &root.join(PYRIGHT_CONFIG_FILE),
+        denies,
+    ));
+    requirement_inputs(worktree, root, denies, &mut parts, warnings);
+    parts.push(entry("uv.lock", &root.join("uv.lock"), denies));
+    parts.push(entry("poetry.lock", &root.join("poetry.lock"), denies));
+    parts.push(entry(
+        ".python-version",
+        &root.join(".python-version"),
+        denies,
+    ));
+    if root != worktree {
+        parts.push(entry(
+            "worktree/.python-version",
+            &worktree.join(".python-version"),
+            denies,
+        ));
+    }
+    blake3::hash(parts.join("\n").as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Whole-content BLAKE3 of a native input, hashed with bounded memory: the file is gated
+/// exactly like `read_config` gates a config — without denies a regular file is read as
+/// usual, under denies a denied or symlinked input is refused without being followed
+/// (`O_NOFOLLOW`) — then streamed in `NATIVE_INPUT_CHUNK` chunks straight into the hasher, so
+/// no input is ever held in memory whole. `None` when the file says nothing: missing, denied or
+/// otherwise unopenable. Any content, UTF-8 or not, is hashed as the bytes it is.
+///
+/// The gate mirrors `read_config`'s two branches (its `allowed_config` is private to
+/// `checks`); the denied-input equivalence is pinned by the `denied_native_inputs_say_nothing`
+/// test.
+fn hash_config(path: &Path, denies: &[ReadDeny]) -> Option<blake3::Hash> {
+    let mut file = if denies.is_empty() {
+        if !path.is_file() {
+            return None;
+        }
+        fs::File::open(path).ok()?
+    } else {
+        if denies.iter().any(|deny| deny.matches(path)) {
+            return None;
+        }
+        if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            return None;
+        }
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = vec![0u8; NATIVE_INPUT_CHUNK];
+    loop {
+        let read = file.read(&mut chunk).ok()?;
+        if read == 0 {
+            return Some(hasher.finalize());
+        }
+        hasher.update(&chunk[..read]);
+    }
 }
 
 /// One root's resolution, with whether a selection or pin governs it: an authoritative
@@ -305,6 +1319,8 @@ pub(crate) struct Resolution {
 
 /// Resolves the environment of the project `root` (absolute, inside `worktree`) with the agent's
 /// `selector`, per the module's precedence, reading every file under the host's `denies`.
+/// Incomplete requirement-reference coverage warns without overriding a pin, selection or
+/// discovered interpreter; requirements only contribute text fingerprints, never versions.
 pub(crate) fn resolve_with_denies(
     worktree: &Path,
     root: &Path,
@@ -317,7 +1333,7 @@ pub(crate) fn resolve_with_denies(
     let mut authoritative = true;
     let mut demanded = None;
     let paths = (worktree, root);
-    let (chosen, source, missing): Outcome = if [PYRIGHT_CONFIG_FILE, PYPROJECT_FILE]
+    let (mut chosen, mut source, mut missing): Outcome = if [PYRIGHT_CONFIG_FILE, PYPROJECT_FILE]
         .iter()
         .any(|name| denies.iter().any(|deny| deny.matches(&root.join(name))))
     {
@@ -380,7 +1396,20 @@ pub(crate) fn resolve_with_denies(
     {
         warnings.push(format!("≠ .python-version {request}"));
     }
-    let identity = identity(chosen.as_ref(), missing.as_deref(), denies);
+    let identity = identity(
+        worktree,
+        root,
+        chosen.as_ref(),
+        missing.as_deref(),
+        denies,
+        &mut warnings,
+    )
+    .unwrap_or_else(|cause| {
+        chosen = None;
+        source = None;
+        missing = Some(cause.to_owned());
+        format!("missing|{cause}")
+    });
     Resolution {
         env: ResolvedEnv {
             root: root
@@ -470,20 +1499,32 @@ pub(crate) fn for_path(worktree: &Path, path: &Path) -> Option<Resolution> {
         .or_else(|| governing(worktree))
 }
 
-/// The roots a run of `worktree`'s accepted environments reads: each chosen environment directory
-/// and its interpreter's canonical installation prefix (a base interpreter outside every static
-/// prefix, such as a user-home installation, included), exactly as the in-process check grants.
-pub fn accepted_roots(worktree: &Path) -> Vec<PathBuf> {
+/// The roots a run of `worktree`'s currently chosen Python environments reads: each selected
+/// interpreter's invocation prefix and the installation prefix the checker derives for that
+/// interpreter. Empty read-deny policies use filesystem canonicalization; nonempty policies use
+/// the checker's deny-safe link resolver. A missing or unprovable canonical target contributes no
+/// roots; the recipe's separately admitted environment root remains independent.
+pub fn accepted_roots(worktree: &Path, config: &ModuleConfig) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for env in environments(worktree, &[]) {
+    for env in environments(worktree, &config.read_denies) {
+        if env.missing_next_step.is_some() {
+            continue;
+        }
         let Some(interpreter) = interpreter(&env) else {
             continue;
         };
-        let canonical = fs::canonicalize(&interpreter).unwrap_or_else(|_| interpreter.clone());
+        let canonical = if config.read_denies.is_empty() {
+            fs::canonicalize(&interpreter).ok()
+        } else {
+            crate::checks::resolved_link_target(&interpreter, &config.read_denies)
+        };
+        let Some(canonical) = canonical else {
+            continue;
+        };
         for path in [&interpreter, &canonical] {
-            let prefix = path.parent().and_then(Path::parent).unwrap_or(path);
-            if !roots.iter().any(|root| root == prefix) {
-                roots.push(prefix.to_path_buf());
+            let prefix = crate::checks::grandparent_or_self(path);
+            if !roots.contains(&prefix) {
+                roots.push(prefix);
             }
         }
     }
@@ -653,6 +1694,24 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A search-only ancestor remains traversable, while a final symlink is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn requirement_open_traverses_search_only_directories_without_following_links() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = scratch("search-only");
+        put(&root, "private/requirements.txt", "package==1\n");
+        symlink("requirements.txt", root.join("private/link.txt")).unwrap();
+        fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o111)).unwrap();
+        let regular = open_requirement(&root.join("private/requirements.txt"));
+        let linked = open_requirement(&root.join("private/link.txt"));
+        fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(regular.is_ok(), "search-only ancestor must be traversable");
+        assert!(linked.is_err(), "final symlink must not be followed");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// Writes `text` to `root/relative`, creating parents.
@@ -1086,26 +2145,69 @@ mod tests {
         fs::remove_dir_all(&outside).unwrap();
     }
 
-    /// The accepted roots are the chosen environment and its interpreter's canonical installation
-    /// prefix, reached through the `bin/python` link even when it lies outside every static
-    /// prefix; a project without an environment accepts nothing.
+    /// Accepted roots follow only the chosen interpreter and honor the current read-deny policy.
     #[test]
     fn accepted_roots_follow_the_interpreter_link() {
         let root = scratch("accepted-roots");
-        let base = scratch("accepted-roots-base");
+        let base = fs::canonicalize(scratch("accepted-roots-base")).unwrap();
+        let base_alias = root.join("python-base-alias");
+        let unrelated = scratch("accepted-roots-unrelated");
         put(&base, "bin/python3.14", "");
+        put(&unrelated, "bin/python3.14", "");
+        std::os::unix::fs::symlink(&base, &base_alias).unwrap();
         put(&root, "pyproject.toml", "");
-        fs::create_dir_all(root.join(".venv/bin")).unwrap();
-        std::os::unix::fs::symlink(base.join("bin/python3.14"), root.join(".venv/bin/python"))
-            .unwrap();
+        for name in [".venv", ".venv-alt"] {
+            fs::create_dir_all(root.join(name).join("bin")).unwrap();
+            put(&root, &format!("{name}/pyvenv.cfg"), "version = 3.14.0\n");
+        }
+        std::os::unix::fs::symlink(
+            base_alias.join("bin/python3.14"),
+            root.join(".venv/bin/python"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            unrelated.join("bin/python3.14"),
+            root.join(".venv-alt/bin/python"),
+        )
+        .unwrap();
+        select(&root, "", ".venv");
+        let config = ModuleConfig::default();
         assert_eq!(
-            accepted_roots(&root),
-            vec![root.join(".venv"), fs::canonicalize(&base).unwrap()]
+            accepted_roots(&root, &config),
+            vec![root.join(".venv"), base.clone()]
         );
+        let denied = ModuleConfig {
+            read_denies: vec![ReadDeny::Path(base.clone())],
+            ..ModuleConfig::default()
+        };
+        // A nonempty deny policy keeps symlinked parents fail-closed, matching the checker.
+        assert!(accepted_roots(&root, &denied).is_empty());
+        let unrelated_deny = ModuleConfig {
+            read_denies: vec![ReadDeny::Path(fs::canonicalize(&unrelated).unwrap())],
+            ..ModuleConfig::default()
+        };
+        assert!(accepted_roots(&root, &unrelated_deny).is_empty());
+
+        fs::remove_file(root.join(".venv/bin/python")).unwrap();
+        std::os::unix::fs::symlink(
+            unrelated.join("bin/python3.14"),
+            root.join(".venv/bin/python"),
+        )
+        .unwrap();
+        let denied_changed_target = ModuleConfig {
+            read_denies: vec![ReadDeny::Path(fs::canonicalize(&unrelated).unwrap())],
+            ..ModuleConfig::default()
+        };
+        assert!(accepted_roots(&root, &denied_changed_target).is_empty());
+
         fs::remove_dir_all(root.join(".venv")).unwrap();
-        assert!(accepted_roots(&root).is_empty());
+        // The explicit selection is missing; a different discovered environment is not a fallback.
+        assert!(accepted_roots(&root, &config).is_empty());
+        fs::remove_dir_all(root.join(".venv-alt")).unwrap();
+        agent_ide_core::lang::environment::replace_selections(&root, crate::LANGUAGE, Vec::new());
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&base).unwrap();
+        fs::remove_dir_all(&unrelated).unwrap();
     }
 
     /// Explicit commands run activated in the environment of the deepest root holding `cwd`,
@@ -1185,7 +2287,8 @@ mod tests {
     /// Real Pyright: `.venv` lacks `stub_package`, `.venv-py314` provides it. Before the
     /// selection the project check reports the import unresolved; after selecting
     /// `.venv-py314` the same check resolves it. Needs `AGENT_IDE_PYRIGHT`, `AGENT_IDE_NODE` and
-    /// `AGENT_IDE_PYTHON` like the product tests.
+    /// `AGENT_IDE_PYTHON` like the product tests. Runs the public package `index.js` entry so its
+    /// bootstrap initializes the bundled typeshed root.
     #[tokio::test]
     #[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
     async fn real_pyright_check_follows_the_selected_environment() {
@@ -1197,25 +2300,12 @@ mod tests {
         let cli = pyright
             .parent()
             .and_then(Path::parent)
-            .map(|prefix| prefix.join("lib/node_modules/pyright/dist/pyright.js"))
+            .map(|prefix| prefix.join("lib/node_modules/pyright/index.js"))
             .map(|cli| fs::canonicalize(&cli).unwrap_or(cli))
             .unwrap();
         let root = fs::canonicalize(scratch("real-selection")).unwrap();
         put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
         put(&root, "src/app.py", "from stub_package import VALUE\n");
-        // Pyright 1.1.413 flags parts of the 3.14 standard library itself; ignore them so only the
-        // import under test counts. No `venv` key: this config pins nothing.
-        let prefix = fs::canonicalize(&python)
-            .unwrap()
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .to_path_buf();
-        put(
-            &root,
-            "pyrightconfig.json",
-            &serde_json::json!({ "ignore": [prefix] }).to_string(),
-        );
         for name in [".venv", ".venv-py314"] {
             let interpreter = root.join(name).join("bin/python");
             fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
@@ -1421,8 +2511,8 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Fix F: selecting the current winner keeps the identity; recreating the environment at
-    /// the same path changes it.
+    /// Selecting the current winner keeps the identity; deleting and recreating the chosen
+    /// environment changes it without any test-owned handle keeping the old directory alive.
     #[test]
     fn identity_ignores_source_and_tracks_recreation() {
         let root = scratch("identity");
@@ -1433,6 +2523,453 @@ mod tests {
         fs::remove_dir_all(root.join(".venv")).unwrap();
         venv(&root, ".venv", "");
         assert_ne!(resolve(&root, &root, None).identity, discovered);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The native project inputs feed the identity: changing, adding or removing exactly one
+    /// input — the manifest, either lockfile, the pin file, a requirements file or the version
+    /// request — invalidates the resolution even though the chosen environment itself is
+    /// byte-identical (a changed lock changes declared dependency inputs), so checks and
+    /// sessions must not ride on the old answer. Each mutation is compared against the identity
+    /// captured immediately before it, so only the named input can explain the change. A nested
+    /// root also covers its worktree-level version request.
+    #[test]
+    fn native_input_changes_change_the_identity() {
+        let root = scratch("native-identity");
+        put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        venv(&root, ".venv", "home = .\nversion = 3.12.7\n");
+        let id = || resolve(&root, &root, None).identity;
+        let before = id();
+        put(&root, "pyproject.toml", "[project]\nname = \"svc2\"\n");
+        assert_ne!(id(), before, "manifest content");
+
+        let before = id();
+        put(&root, "uv.lock", "lock v1\n");
+        assert_ne!(id(), before, "added lockfile");
+        let before = id();
+        put(&root, "uv.lock", "lock v2\n");
+        assert_ne!(id(), before, "lockfile content");
+        let before = id();
+        fs::remove_file(root.join("uv.lock")).unwrap();
+        assert_ne!(id(), before, "removed lockfile");
+
+        let before = id();
+        put(&root, "poetry.lock", "poetry v1\n");
+        assert_ne!(id(), before, "poetry lockfile");
+        let before = id();
+        fs::remove_file(root.join("poetry.lock")).unwrap();
+        assert_ne!(id(), before, "removed poetry lockfile");
+
+        // A pin file without venv keys pins nothing, so only its fingerprint can move.
+        let before = id();
+        put(&root, "pyrightconfig.json", "{\"extra\": true}\n");
+        assert_ne!(id(), before, "added pin file");
+        let before = id();
+        put(&root, "pyrightconfig.json", "{\"extra\": false}\n");
+        assert_ne!(id(), before, "pin file content");
+        let before = id();
+        fs::remove_file(root.join("pyrightconfig.json")).unwrap();
+        assert_ne!(id(), before, "removed pin file");
+
+        let before = id();
+        put(&root, "requirements-dev.txt", "pytest\n");
+        assert_ne!(id(), before, "requirements file");
+
+        let before = id();
+        put(&root, ".python-version", "3.13\n");
+        assert_ne!(id(), before, "version request");
+
+        // The worktree-level request of a nested root belongs to that root's identity too.
+        let nested = root.join("packages/svc");
+        put(&nested, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        put(&root, "packages/svc/app.py", "");
+        let nested_before = resolve(&root, &nested, None).identity;
+        put(&root, ".python-version", "3.12\n");
+        assert_ne!(
+            resolve(&root, &nested, None).identity,
+            nested_before,
+            "worktree-level version request"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A change deep inside a large lockfile invalidates the resolution: the fingerprint hashes
+    /// the whole content in bounded chunks, not a prefix, so a dependency changed past any
+    /// fixed window must not ride on the old answer. The two lockfiles are the same length and
+    /// differ in exactly one byte beyond 256 KiB.
+    #[test]
+    fn lockfile_tail_change_changes_the_identity() {
+        let root = scratch("native-lock-tail");
+        put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        venv(&root, ".venv", "");
+        let body = "a".repeat(256 * 1024);
+        put(&root, "uv.lock", &format!("{body}a\n"));
+        let before = resolve(&root, &root, None).identity;
+        put(&root, "uv.lock", &format!("{body}b\n"));
+        assert_ne!(
+            resolve(&root, &root, None).identity,
+            before,
+            "a changed tail byte is a changed lock"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The supported standalone include spellings preserve a whole quoted path with spaces;
+    /// remote/expanded/escaped paths, malformed quoting and combined directives stay explicit.
+    #[test]
+    fn requirement_reference_syntax_is_bounded_and_explicit() {
+        for line in [
+            "-r deps.in",
+            "-rdeps.in",
+            "-r=deps.in",
+            "--requirement deps.in",
+            "--requirement=deps.in",
+            "-c deps.in",
+            "-cdeps.in",
+            "-c=deps.in",
+            "--constraint deps.in",
+            "--constraint=deps.in",
+        ] {
+            assert_eq!(requirement_reference(line), Ok(Some("deps.in")), "{line}");
+        }
+        for line in [
+            "-r 'deps with spaces.in'",
+            "-c\"deps with spaces.in\" # comment",
+            "--requirement='deps with spaces.in'",
+            "--constraint=\"deps with spaces.in\"\t# comment",
+        ] {
+            assert_eq!(
+                requirement_reference(line),
+                Ok(Some("deps with spaces.in")),
+                "{line}"
+            );
+        }
+        for line in ["", "# -r ignored", "pkg==1 # -c ignored", "python==3.99"] {
+            assert_eq!(requirement_reference(line), Ok(None), "{line}");
+        }
+        for line in [
+            "-r",
+            "-c 'unclosed",
+            "-r \"bad\"tail",
+            "-r a -c b",
+            "--requirementfoo",
+            "--no-index -r a",
+            "-r https://example.invalid/a",
+            "-r file:///a",
+            "-r ${INPUT}",
+            "-c ~/private",
+            "-r path\\ with\\ spaces",
+            "-r a\\",
+        ] {
+            assert!(requirement_reference(line).is_err(), "{line}");
+        }
+    }
+
+    /// A constraint-only content change invalidates the shared identity, including a request
+    /// for a different Python package version, while the selected prepared interpreter,
+    /// source and version remain unchanged and no interpreter-version warning is invented.
+    #[test]
+    fn referenced_constraint_change_preserves_the_selected_environment() {
+        let root = scratch("constraint-identity");
+        put(&root, "requirements.txt", "-c constraints.txt\n");
+        put(&root, "constraints.txt", "python==3.99\n");
+        venv(&root, ".venv", "version = 3.14.0\n");
+        let before = resolve(&root, &root, Some(".venv"));
+        put(&root, "constraints.txt", "python==3.98\n");
+        let after = resolve(&root, &root, Some(".venv"));
+        assert_ne!(before.identity, after.identity);
+        assert_eq!(interpreter(&before), interpreter(&after));
+        assert_eq!(after.source, Some(EnvSource::Selected));
+        assert_eq!(after.chosen.unwrap().version.as_deref(), Some("3.14.0"));
+        assert!(before.warnings.is_empty());
+        assert!(after.warnings.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// References are relative to each containing file, may cross a nested project root
+    /// within the authoritative worktree, and deduplicate canonical aliases/cycles. Quoted
+    /// paths with spaces work through real file discovery, not just the line parser.
+    #[test]
+    fn nested_requirement_references_deduplicate_and_terminate_cycles() {
+        let root = scratch("requirement-cycle");
+        let project = root.join("svc");
+        put(
+            &project,
+            "requirements.txt",
+            "-r '../shared/dev deps.in'\n-r '../shared/./dev deps.in'\n",
+        );
+        put(
+            &root,
+            "shared/dev deps.in",
+            "--constraint='limits/base pins.txt'\n-r ../svc/requirements.txt\n",
+        );
+        put(
+            &root,
+            "shared/limits/base pins.txt",
+            "pkg==1\n-c '../dev deps.in'\n",
+        );
+        venv(&project, ".venv", "");
+        let before = resolve(&root, &project, None);
+        assert!(before.warnings.is_empty(), "{:?}", before.warnings);
+        let mut parts = Vec::new();
+        let mut warnings = Vec::new();
+        requirement_inputs(&root, &project, &[], &mut parts, &mut warnings);
+        assert_eq!(parts.len(), 3, "each canonical input is hashed once");
+        assert_eq!(resolve(&root, &project, None).identity, before.identity);
+        put(
+            &root,
+            "shared/limits/base pins.txt",
+            "pkg==2\n-c '../dev deps.in'\n",
+        );
+        let after = resolve(&root, &project, None);
+        assert_ne!(after.identity, before.identity);
+        assert_eq!(interpreter(&after), interpreter(&before));
+        assert!(after.warnings.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A same-length changed tail beyond 256 KiB in a referenced constraint is fully hashed;
+    /// the streaming result matches the full-content BLAKE3 and reference coverage is complete.
+    #[test]
+    fn referenced_constraint_tail_is_hashed_in_full() {
+        let root = fs::canonicalize(scratch("constraint-tail")).unwrap();
+        put(&root, "requirements.txt", "--constraint=deps/pins.txt\n");
+        venv(&root, ".venv", "");
+        let padding = "# padding\n".repeat(30_000);
+        let body = format!("{padding}pkg==1\n");
+        assert!(body.len() > 256 * 1024);
+        put(&root, "deps/pins.txt", &body);
+        let before = resolve(&root, &root, None);
+        let mut remaining = REQUIREMENT_BYTES;
+        let mut reasons = BTreeSet::new();
+        let (hash, references) =
+            hash_requirements(&root.join("deps/pins.txt"), &mut remaining, &mut reasons).unwrap();
+        assert_eq!(hash, blake3::hash(body.as_bytes()));
+        assert!(references.is_empty());
+        assert!(reasons.is_empty());
+        put(&root, "deps/pins.txt", &format!("{padding}pkg==2\n"));
+        let after = resolve(&root, &root, None);
+        assert_ne!(after.identity, before.identity);
+        assert!(after.warnings.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Denied lexical/resolved paths, lexical escapes and file/directory symlinks contribute
+    /// no foreign content. Mutating every hidden target leaves the entire resolution output
+    /// unchanged, while coverage reasons remain explicit and the prepared environment wins.
+    #[test]
+    fn excluded_and_escaping_requirement_contents_never_enter_the_resolution() {
+        let fixture = scratch("requirement-boundary");
+        let root = fixture.join("worktree");
+        venv(&root, ".venv", "");
+        put(
+            &root,
+            "requirements.txt",
+            "-c hidden/pins.txt\n-c ../foreign.txt\n-r link.txt\n-r linked/pins.txt\n",
+        );
+        put(&root, "hidden/pins.txt", "hidden==1\n");
+        put(&fixture, "foreign.txt", "foreign==1\n");
+        put(&fixture, "foreign/pins.txt", "foreign==1\n");
+        std::os::unix::fs::symlink(fixture.join("foreign.txt"), root.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(
+            fixture.join("foreign.txt"),
+            root.join("requirements-escape.txt"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(fixture.join("foreign"), root.join("linked")).unwrap();
+        let denies = [ReadDeny::Path(root.join("hidden"))];
+        let before = resolve_with_denies(&root, &root, None, &denies).env;
+        assert_eq!(chosen(&before), Some(".venv"));
+        let warnings = before.warnings.join(";");
+        assert!(warnings.contains("excluded from reads"));
+        assert!(warnings.contains("escapes worktree"));
+        assert!(warnings.contains("symlinked local references"));
+        put(&root, "hidden/pins.txt", "hidden==2\n");
+        put(&fixture, "foreign.txt", "foreign==2\n");
+        put(&fixture, "foreign/pins.txt", "foreign==2\n");
+        let after = resolve_with_denies(&root, &root, None, &denies).env;
+        assert_eq!(format!("{before:?}"), format!("{after:?}"));
+        // A canonical deny also applies when the authoritative worktree has a lexical alias.
+        let alias = fixture.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let resolved_deny = [ReadDeny::Path(
+            fs::canonicalize(root.join("hidden")).unwrap(),
+        )];
+        assert_eq!(
+            requirement_path(&alias, &alias.join("hidden/pins.txt"), &resolved_deny),
+            Err("local reference excluded from reads")
+        );
+        // Replacing an already-validated parent with a link still cannot redirect the open.
+        put(&root, "swap/pins.txt", "local==1\n");
+        let checked = requirement_path(&root, &root.join("swap/pins.txt"), &[]).unwrap();
+        fs::rename(root.join("swap"), root.join("retained")).unwrap();
+        std::os::unix::fs::symlink(fixture.join("foreign"), root.join("swap")).unwrap();
+        let mut remaining = REQUIREMENT_BYTES;
+        assert!(hash_requirements(&checked, &mut remaining, &mut BTreeSet::new()).is_err());
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    /// Missing, unsupported/remote/expanded and non-UTF-8 references are warnings rather than
+    /// falsely complete coverage; overlong lines are fully hashed but explicitly unparsed.
+    #[test]
+    fn unsupported_requirement_coverage_is_visible_without_changing_selection() {
+        let root = scratch("requirement-unsupported");
+        venv(&root, ".venv", "version = 3.14.0\n");
+        for text in [
+            "-r absent.in\n",
+            "-c https://example.invalid/pins\n",
+            "-r ${INPUT}\n",
+            "-r 'unclosed\n",
+            "-r a -c b\n",
+            "-r a\\\n b\n",
+        ] {
+            put(&root, "requirements.txt", text);
+            let env = resolve(&root, &root, Some(".venv"));
+            assert_eq!(chosen(&env), Some(".venv"));
+            assert_eq!(env.source, Some(EnvSource::Selected));
+            assert!(
+                env.warnings
+                    .iter()
+                    .any(|warning| warning.contains("coverage incomplete")),
+                "{text}"
+            );
+        }
+        fs::write(root.join("requirements.txt"), [0xff, b'\n']).unwrap();
+        assert!(resolve(&root, &root, None).warnings[0].contains("non-UTF-8"));
+        put(&root, "requirements.txt", &"a".repeat(REQUIREMENT_LINE + 1));
+        let before = resolve(&root, &root, None);
+        assert!(before.warnings[0].contains("line exceeds 8 KiB"));
+        put(
+            &root,
+            "requirements.txt",
+            &format!("{}b", "a".repeat(REQUIREMENT_LINE)),
+        );
+        assert_ne!(resolve(&root, &root, None).identity, before.identity);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// File/edge/byte bounds stop discovery deterministically and expose incomplete coverage.
+    /// The streaming reader returns no digest for an over-budget prefix, while an exact
+    /// byte-budget file succeeds, including its final physical line without LF.
+    #[test]
+    fn requirement_discovery_limits_are_explicit() {
+        let root = fs::canonicalize(scratch("requirement-limits")).unwrap();
+        venv(&root, ".venv", "");
+        put(&root, "requirements.txt", "-r deps/0.in\n");
+        for index in 0..REQUIREMENT_FILES {
+            put(
+                &root,
+                &format!("deps/{index}.in"),
+                &format!("-r {}.in\n", index + 1),
+            );
+        }
+        assert!(resolve(&root, &root, None).warnings[0].contains("file budget exceeded (64)"));
+        put(
+            &root,
+            "requirements.txt",
+            &"-r deps/0.in\n".repeat(REQUIREMENT_FILES + 1),
+        );
+        assert!(resolve(&root, &root, None).warnings[0].contains("reference budget exceeded (64)"));
+        for index in 0..REQUIREMENT_FILES {
+            put(&root, &format!("requirements-{index}.txt"), "pkg==1\n");
+        }
+        assert!(resolve(&root, &root, None).warnings[0].contains("file budget exceeded (64)"));
+        for index in 0..REQUIREMENT_FILES {
+            fs::remove_file(root.join(format!("requirements-{index}.txt"))).unwrap();
+        }
+        put(
+            &root,
+            "requirements.txt",
+            &"#\n".repeat(REQUIREMENT_BYTES / 2 + 1),
+        );
+        assert!(resolve(&root, &root, None).warnings[0].contains("byte budget exceeded (8 MiB)"));
+        put(&root, "small.in", "pkg==1");
+        let mut reasons = BTreeSet::new();
+        let mut remaining = 6;
+        assert_eq!(
+            hash_requirements(&root.join("small.in"), &mut remaining, &mut reasons)
+                .unwrap()
+                .0,
+            blake3::hash(b"pkg==1")
+        );
+        let mut remaining = 5;
+        assert_eq!(
+            hash_requirements(&root.join("small.in"), &mut remaining, &mut reasons),
+            Err("requirement byte budget exceeded (8 MiB)")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A host-denied native input is unreadable and says nothing: a fixed file's fingerprint
+    /// entry equals the file's absence, a dynamically enumerated `requirements*.txt` gets no
+    /// entry at all when denied (denied fingerprints exactly like absent), and the resolver's
+    /// existing refusal of denied manifest/pin files is intact through the new fingerprint path.
+    #[test]
+    fn denied_native_inputs_say_nothing() {
+        use agent_ide_core::execution::seatbelt::ReadDeny;
+        let root = scratch("native-denied");
+        put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        venv(&root, ".venv", "");
+        put(&root, "uv.lock", "lock v1\n");
+        put(&root, "requirements-dev.txt", "pytest\n");
+        let resolve = |denies: &[ReadDeny]| resolve_with_denies(&root, &root, None, denies).env;
+        // A denied lockfile contributes the same `-` entry as no lockfile at all.
+        let denied = [ReadDeny::Path(root.join("uv.lock"))];
+        let with_denied_lock = resolve(&denied).identity;
+        fs::remove_file(root.join("uv.lock")).unwrap();
+        assert_eq!(
+            resolve(&[]).identity,
+            with_denied_lock,
+            "a denied input is unreadable, not a different answer"
+        );
+        put(&root, "uv.lock", "lock v1\n");
+        assert_eq!(chosen(&resolve(&denied)), Some(".venv"));
+        // A denied enumerated requirements file is no entry, not a `-` entry: denied equals
+        // absent for the dynamic part of the fingerprint too.
+        let denied_requirements = [ReadDeny::Path(root.join("requirements-dev.txt"))];
+        let with_denied_requirements = resolve(&denied_requirements).identity;
+        fs::remove_file(root.join("requirements-dev.txt")).unwrap();
+        assert_eq!(
+            resolve(&[]).identity,
+            with_denied_requirements,
+            "a denied requirements file is unreadable, not a different answer"
+        );
+        put(&root, "requirements-dev.txt", "pytest\n");
+        // The existing refusal of a denied manifest is unchanged.
+        let denies = [ReadDeny::Path(root.join("pyproject.toml"))];
+        let refused = resolve(&denies);
+        assert_eq!(chosen(&refused), None);
+        assert!(
+            refused
+                .missing_next_step
+                .as_deref()
+                .is_some_and(|step| step.contains("excluded from reads by the host"))
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A native input that exists but is not UTF-8 text is still content: it is hashed as the
+    /// bytes it is, so its presence — and any change of it — invalidates the resolution. The
+    /// fingerprint is about the file, not about its readability as text.
+    #[test]
+    fn non_utf8_native_input_is_content() {
+        let root = scratch("native-non-utf8");
+        put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        venv(&root, ".venv", "");
+        let without_lock = resolve(&root, &root, None).identity;
+        fs::write(root.join("uv.lock"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let with_binary = resolve(&root, &root, None).identity;
+        assert_ne!(
+            with_binary, without_lock,
+            "existing content counts, whatever its encoding"
+        );
+        assert_eq!(chosen(&resolve(&root, &root, None)), Some(".venv"));
+        fs::write(root.join("uv.lock"), [0xff, 0xfe, 0x00, 0x02]).unwrap();
+        assert_ne!(
+            resolve(&root, &root, None).identity,
+            with_binary,
+            "a changed byte of binary content is a change"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

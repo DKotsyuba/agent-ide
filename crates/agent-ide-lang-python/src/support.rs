@@ -215,6 +215,22 @@ pub(crate) fn venv_directories(root: &Path) -> Vec<PathBuf> {
 /// means no checker was proven).
 pub(crate) const PY_AST_PROBE: &str = "import ast,sys\ntry:\n    ast.parse(sys.stdin.read())\nexcept SyntaxError as e:\n    print(f\"{e.lineno}: {e.msg}\")\n    sys.exit(1)";
 
+impl Python {
+    /// The pytest argument of one file target: a directory (`tests/`) selects the test files
+    /// inside it and passes through unchanged; a plain `.py` file must be one pytest would collect
+    /// by convention, or the module would be imported top-level as a test target, so any other
+    /// is [`LangError::Unsupported`].
+    fn test_file_argument(&self, file: &Path) -> Result<String, LangError> {
+        if file.extension().is_some_and(|extension| extension == "py") && !self.is_test_file(file) {
+            return Err(LangError::Unsupported(format!(
+                "no tests in {}",
+                file.display()
+            )));
+        }
+        Ok(file.display().to_string())
+    }
+}
+
 impl LanguageSupport for Python {
     /// Always the Python [`LANGUAGE`].
     fn language(&self) -> Language {
@@ -407,6 +423,28 @@ impl LanguageSupport for Python {
         })
     }
 
+    /// Reuses one bounded CST for operator imports and skeletons; no semantic edit fallback.
+    fn source_details(
+        &self,
+        file: &Path,
+        source: &str,
+        imports: bool,
+        outline: bool,
+    ) -> (Option<Vec<LineRange>>, Option<Outline>) {
+        crate::source_outline::details(file, source, imports, outline)
+    }
+
+    /// Collects module-level imports from the CST, excluding all literal contents.
+    fn source_import_spans(&self, _file: &Path, source: &str) -> Option<Vec<LineRange>> {
+        crate::source_outline::imports(source)
+    }
+
+    /// Computes a source-only syntax outline without starting Pyright or executing project code.
+    /// Syntax errors and resource limits return `None`; server-loading edit fallbacks stay disabled.
+    fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
+        crate::source_outline::outline(file, source)
+    }
+
     /// Header = decorators directly above `def`/`class` (multi-line decorator arguments
     /// included); the docstring stays inside the body and its first paragraph becomes `doc`.
     /// Names a function binds (parameters, locals, `except as` bindings, comprehension
@@ -517,6 +555,21 @@ impl LanguageSupport for Python {
             }
         }
     }
+    /// Python regions: `#` comments, module docstring header, `import`/`from` imports, decorators
+    /// bind to the statement below, indented lines continue a block, `if __name__` is `@main`.
+    fn region_rules(&self) -> &'static agent_ide_core::lang::regions::RegionRules {
+        &agent_ide_core::lang::regions::RegionRules {
+            line_comments: &["#"],
+            block_comment: None,
+            import_prefixes: &["import ", "from "],
+            attribute_prefixes: &["@"],
+            indentation_blocks: true,
+            main_marker: Some("if __name__"),
+            docstring_header: true,
+            ..agent_ide_core::lang::regions::GENERIC_RULES
+        }
+    }
+
     /// `test_*.py`, `*_test.py`, `conftest.py` and any `.py` file under a `tests` or `test` directory.
     fn is_test_file(&self, file: &Path) -> bool {
         let Some(name) = file.file_name().and_then(|name| name.to_str()) else {
@@ -539,7 +592,9 @@ impl LanguageSupport for Python {
     /// symbol no test references is [`LangError::Unsupported`]. A file target runs whole only
     /// when the file is one pytest would collect by convention (`test_*.py`, `*_test.py`,
     /// `conftest.py`, under `tests/` or `test/`); a directory target selects the test files
-    /// inside it; a non-test `.py` file is [`LangError::Unsupported`]. Patterns go to `-k`.
+    /// inside it; a non-test `.py` file is [`LangError::Unsupported`]. Several file targets
+    /// (`Files`) are one pytest invocation over all of them, each checked as a file target.
+    /// Patterns go to `-k`.
     fn test_selection(
         &self,
         project: &LanguageProject,
@@ -561,26 +616,41 @@ impl LanguageSupport for Python {
                 };
                 (tests, args)
             }
-            TestTarget::File(file) => {
-                // A directory (`tests/`) selects the test files inside it and passes through
-                // unchanged; a plain `.py` file must be one pytest would collect by convention,
-                // or the module would be imported top-level as a test target.
-                if file.extension().is_some_and(|extension| extension == "py")
-                    && !self.is_test_file(file)
-                {
-                    return Err(LangError::Unsupported(format!(
-                        "no tests in {}",
-                        file.display()
-                    )));
-                }
-                (Vec::new(), vec![file.display().to_string()])
-            }
+            TestTarget::File(file) => (Vec::new(), vec![self.test_file_argument(file)?]),
+            TestTarget::Files(files) => (
+                Vec::new(),
+                files
+                    .iter()
+                    .map(|file| self.test_file_argument(file))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
             TestTarget::Pattern(pattern) => (Vec::new(), vec!["-k".to_owned(), pattern.clone()]),
         };
         let mut command = in_environment(project, &["pytest"]).map_err(LangError::Unsupported)?;
         command.extend(args);
         command.extend(PYTEST_FLAGS.map(String::from));
         Ok(TestSelection { tests, command })
+    }
+
+    /// Supplies the native engine's concurrency option for generated test commands.
+    fn test_worker_setting(
+        &self,
+        argv: &[String],
+        workers: std::num::NonZeroU16,
+    ) -> Option<agent_ide_core::execution::test_workers::WorkerSetting> {
+        (argv.first().is_some_and(|word| word == "pytest")
+            || argv
+                .get(1..3)
+                .is_some_and(|words| words == ["-m", "pytest"])
+            || argv
+                .get(..3)
+                .is_some_and(|words| words == ["uv", "run", "pytest"]))
+        .then(
+            || agent_ide_core::execution::test_workers::WorkerSetting::EnvironmentOptions {
+                name: "PYTEST_ADDOPTS",
+                value: format!("-n {workers}"),
+            },
+        )
     }
 
     /// Reads the last `N passed, M failed, K skipped in 0.1s` summary (errors count as failed,
@@ -729,6 +799,22 @@ impl LanguageSupport for Python {
         program: &str,
     ) -> Option<agent_ide_core::lang::environment::CommandEnv> {
         crate::environment::command_env(worktree, cwd, program)
+    }
+
+    /// A package's `__init__.py`.
+    fn package_doc_files(&self) -> &'static [&'static str] {
+        &["__init__.py"]
+    }
+
+    /// Exact manifest consulted for package descriptions.
+    fn manifest_description_files(&self) -> &'static [&'static str] {
+        &["pyproject.toml"]
+    }
+
+    /// `[project] description` of `pyproject.toml` in `directory`.
+    fn manifest_description(&self, directory: &Path) -> Option<String> {
+        let text = std::fs::read_to_string(directory.join("pyproject.toml")).ok()?;
+        agent_ide_core::lang::toml_section_string(&text, "project", "description")
     }
 
     /// The module docstring's first line (or the line after an empty opening quote).
@@ -1904,6 +1990,28 @@ src/pkg/contract.py  (27 lines, python)
                 .command[..2],
             argv(&["pytest", "tests"])
         );
+        // Several file targets are one pytest invocation; a non-test file among them refuses.
+        let several = TestTarget::Files(vec![
+            PathBuf::from("tests/test_a.py"),
+            PathBuf::from("tests/unit"),
+        ]);
+        assert_eq!(
+            &Python
+                .test_selection(&project(&[]), &several)
+                .unwrap()
+                .command[..3],
+            argv(&["pytest", "tests/test_a.py", "tests/unit"])
+        );
+        assert!(matches!(
+            Python.test_selection(
+                &project(&[]),
+                &TestTarget::Files(vec![
+                    PathBuf::from("tests/test_a.py"),
+                    PathBuf::from("src/hypfactory/yaml_subset.py"),
+                ])
+            ),
+            Err(LangError::Unsupported(_))
+        ));
         assert!(Python.is_test_file(&PathBuf::from("test/helper.py")));
         assert!(!Python.is_test_file(&PathBuf::from("src/value.py")));
 

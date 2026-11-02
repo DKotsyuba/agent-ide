@@ -119,11 +119,19 @@ impl OpaqueJson {
     }
 }
 
+/// Private host-metadata key with which a front announces it decodes Read, Prepare and Inspect
+/// replies of any size (`AssistanceMethod::delivers_source`). A daemon refuses such a call from
+/// a front without it before executing anything; older daemons ignore the key, as they ignore
+/// every host-metadata key they do not read.
+pub const WHOLE_SOURCE_META: &str = "agent-ide/whole-source";
+
 /// Names the closed Assistance operations Application may route through wire v2 through v5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistanceMethod {
     /// Separate sanitized hook-observation ingress; never a generic event subscription.
     HookSubmit,
+    /// Task-context preparation with operator-configured optional model backends.
+    Prepare,
     /// Current v0.1 `ide.start` method dispatch.
     Start,
     /// Current v0.1 `ide.context` method dispatch.
@@ -146,6 +154,8 @@ pub enum AssistanceMethod {
     Graph,
     /// v0.4 `ide.test` explicit test run/status, wire version 4.
     Test,
+    /// `ide.tree` on-demand project map, wire version 5.
+    Tree,
 }
 
 impl AssistanceMethod {
@@ -154,14 +164,26 @@ impl AssistanceMethod {
         match self {
             Self::Edit | Self::Outline | Self::Read | Self::Symbol => 3,
             Self::Test => 4,
-            Self::Graph => 5,
+            Self::Graph | Self::Prepare | Self::Tree => 5,
             _ => 2,
         }
+    }
+
+    /// Whether this method's reply may carry requested source text that must reach the caller
+    /// whole (a front announces it can receive such replies with [`WHOLE_SOURCE_META`]): Read and Prepare, and Inspect, which hands over a retained Read result that did not
+    /// finish within the inline wait.
+    ///
+    /// These replies are bounded only by the length-prefixed frame format; every other method keeps
+    /// the fixed Assistance payload and frame caps. A non-source reply inside them is still held to
+    /// its own serialized bound when it is encoded and decoded.
+    pub(crate) fn delivers_source(self) -> bool {
+        matches!(self, Self::Read | Self::Prepare | Self::Inspect)
     }
 
     /// Parses only the method tag paired with its assigned wire version.
     pub(crate) fn from_dispatch_tag(value: &str, version: u64) -> Option<Self> {
         match value {
+            "prepare" if version == 5 => Some(Self::Prepare),
             "start" => Some(Self::Start),
             "context" => Some(Self::Context),
             "diff" => Some(Self::Diff),
@@ -173,6 +195,7 @@ impl AssistanceMethod {
             "symbol" if version == 3 => Some(Self::Symbol),
             "test" if version == 4 => Some(Self::Test),
             "graph" if version == 5 => Some(Self::Graph),
+            "tree" if version == 5 => Some(Self::Tree),
             _ => None,
         }
     }
@@ -249,6 +272,10 @@ pub struct MethodDispatch {
     opaque_attachment: String,
     method: AssistanceMethod,
     params_json: OpaqueJson,
+    /// Kernel-reported process id of the peer that sent this request on the daemon's socket
+    /// (the MCP front's process), set only by the daemon's accept path and never sent on the
+    /// wire. Liveness evidence for a stale-writer takeover, never identity or authority.
+    carrier: Option<u32>,
 }
 
 impl std::fmt::Debug for MethodDispatch {
@@ -280,7 +307,22 @@ impl MethodDispatch {
             opaque_attachment,
             method,
             params_json,
+            carrier: None,
         })
+    }
+
+    /// Returns this request with the kernel-reported peer process id `pid` of the connection it
+    /// arrived on (`None` when the platform could not report it). Only the daemon's accept path
+    /// calls this; a client never sets it.
+    pub fn with_carrier(mut self, pid: Option<u32>) -> Self {
+        self.carrier = pid;
+        self
+    }
+
+    /// Returns the peer process id the daemon observed for this request, if any (see
+    /// [`Self::with_carrier`]).
+    pub fn carrier(&self) -> Option<u32> {
+        self.carrier
     }
 
     /// Returns the client-supplied transport request ID for bounded reply correlation.
@@ -346,6 +388,14 @@ pub trait AssistanceDispatcher: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = super::observation::TelemetrySummary> + Send + '_>> {
         Box::pin(async { super::observation::TelemetrySummary::unavailable() })
     }
+    /// Notes that process `pid` opened a long-lived client lease on this daemon (an MCP front
+    /// attaching). Liveness evidence only; the default dispatcher ignores it.
+    fn carrier_opened(&self, _pid: u32) {}
+
+    /// Notes that a client lease of process `pid` reached EOF (the front exited or detached).
+    /// Liveness evidence only; the default dispatcher ignores it.
+    fn carrier_closed(&self, _pid: u32) {}
+
     /// Registers one host-selected Claude candidate on an existing repository daemon.
     /// The returned opaque attachment selects only this candidate; activation still proves Git
     /// identity and durable authority. Other dispatchers reject registration by default.

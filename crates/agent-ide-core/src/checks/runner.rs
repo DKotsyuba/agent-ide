@@ -2,7 +2,7 @@
 //!
 //! A checker describes one confined process as a [`RunSpec`] and hands it to a
 //! [`ConfinedRunner`]. The production runner wraps the Seatbelt launcher in
-//! `crate::execution::seatbelt`; tests use [`FakeRunner`] with scripted outputs so checker
+//! `crate::execution::seatbelt` (Seatbelt on macOS, bubblewrap/seccomp on Linux); tests use [`FakeRunner`] with scripted outputs so checker
 //! logic (argument building, parsing, state mapping) runs without `sandbox-exec`.
 
 use std::collections::VecDeque;
@@ -156,6 +156,7 @@ impl ConfinedRunner for AdmittedRunner {
 /// Whether this daemon has already seen the host refuse to apply our Seatbelt profile because
 /// the daemon itself is confined; remembered for the daemon's lifetime so no later check wastes
 /// a spawn on the doomed wrapper again.
+#[cfg(any(target_os = "macos", test))]
 static NESTED_SANDBOX_REFUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -168,6 +169,7 @@ static NESTED_SANDBOX_REFUSED: std::sync::atomic::AtomicBool =
 /// before `exec`. `sandbox_apply` anywhere later in stderr is the checker's own failure (a
 /// `build.rs` that itself invokes `sandbox-exec`, a workspace path containing the substring),
 /// so it stays the checker's to report.
+#[cfg(target_os = "macos")]
 fn nested_sandbox_refusal(output: &RunOutput) -> bool {
     output.status.is_some_and(|code| code != 0)
         && output.stdout.is_empty()
@@ -179,6 +181,7 @@ fn nested_sandbox_refusal(output: &RunOutput) -> bool {
 
 /// Production check runner: the Seatbelt profile of [`SeatbeltRunner`], with a one-time fallback
 /// for a daemon the host itself already confines.
+/// On Linux the native confined runner is always used and no unconfined fallback exists.
 ///
 /// Every run first tries the profiled wrapper. When the host refuses to apply a nested Seatbelt
 /// profile (`sandbox-exec: sandbox_apply: Operation not permitted`), the same check runs once
@@ -192,6 +195,7 @@ pub struct NestedSandboxFallbackRunner {
     /// The profile-applying runner tried first on every check.
     inner: Arc<dyn ConfinedRunner>,
     /// The runner of the unprofiled fallback; `None` runs it directly.
+    #[cfg(target_os = "macos")]
     fallback: Option<Arc<dyn ConfinedRunner>>,
 }
 
@@ -200,6 +204,7 @@ impl NestedSandboxFallbackRunner {
     pub fn new(inner: Arc<dyn ConfinedRunner>) -> Self {
         Self {
             inner,
+            #[cfg(target_os = "macos")]
             fallback: None,
         }
     }
@@ -212,6 +217,7 @@ impl NestedSandboxFallbackRunner {
                 admission: admission.clone(),
                 confine: true,
             }),
+            #[cfg(target_os = "macos")]
             fallback: Some(Arc::new(AdmittedRunner {
                 admission,
                 confine: false,
@@ -223,38 +229,46 @@ impl NestedSandboxFallbackRunner {
 impl ConfinedRunner for NestedSandboxFallbackRunner {
     fn run(&self, spec: RunSpec) -> BoxFuture<'_, io::Result<RunOutput>> {
         Box::pin(async move {
-            if !NESTED_SANDBOX_REFUSED.load(std::sync::atomic::Ordering::Acquire) {
-                match self.inner.run(spec.clone()).await {
-                    Ok(output) => {
-                        if !nested_sandbox_refusal(&output) {
-                            return Ok(output);
+            #[cfg(not(target_os = "macos"))]
+            {
+                self.inner.run(spec).await
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if !NESTED_SANDBOX_REFUSED.load(std::sync::atomic::Ordering::Acquire) {
+                    match self.inner.run(spec.clone()).await {
+                        Ok(output) => {
+                            if !nested_sandbox_refusal(&output) {
+                                return Ok(output);
+                            }
+                            NESTED_SANDBOX_REFUSED
+                                .store(true, std::sync::atomic::Ordering::Release);
                         }
-                        NESTED_SANDBOX_REFUSED.store(true, std::sync::atomic::Ordering::Release);
+                        // A spawn or profile failure is the checker's cause to report, not evidence
+                        // of a nested-sandbox refusal.
+                        Err(error) => return Err(error),
                     }
-                    // A spawn or profile failure is the checker's cause to report, not evidence
-                    // of a nested-sandbox refusal.
-                    Err(error) => return Err(error),
                 }
+                if let Some(fallback) = &self.fallback {
+                    return fallback.run(spec).await;
+                }
+                let output = crate::execution::seatbelt::run_unconfined(
+                    &spec.program,
+                    &spec.args,
+                    &spec.cwd,
+                    &spec.env,
+                    spec.timeout,
+                    spec.max_output_bytes,
+                )
+                .await?;
+                Ok(RunOutput {
+                    status: output.status,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                    timed_out: output.timed_out,
+                    truncated: output.truncated,
+                })
             }
-            if let Some(fallback) = &self.fallback {
-                return fallback.run(spec).await;
-            }
-            let output = crate::execution::seatbelt::run_unconfined(
-                &spec.program,
-                &spec.args,
-                &spec.cwd,
-                &spec.env,
-                spec.timeout,
-                spec.max_output_bytes,
-            )
-            .await?;
-            Ok(RunOutput {
-                status: output.status,
-                stdout: output.stdout,
-                stderr: output.stderr,
-                timed_out: output.timed_out,
-                truncated: output.truncated,
-            })
         })
     }
 }
@@ -321,6 +335,35 @@ impl ConfinedRunner for FakeRunner {
 mod tests {
     use super::*;
 
+    /// Linux never treats checker stderr as authority to retry without its confinement.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_wrapper_looking_failure_never_runs_unconfined() {
+        let fake = FakeRunner::new(vec![Ok(RunOutput {
+            status: Some(71),
+            stderr: b"sandbox-exec: sandbox_apply: Operation not permitted\n".to_vec(),
+            ..RunOutput::default()
+        })]);
+        let runner = NestedSandboxFallbackRunner::new(Arc::new(fake.clone()));
+        let output = runner
+            .run(RunSpec {
+                program: PathBuf::from("/bin/echo"),
+                args: vec!["must-not-run".into()],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                read_roots: vec![],
+                write_roots: vec![],
+                read_denies: vec![],
+                timeout: Duration::from_secs(2),
+                max_output_bytes: 1024,
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.status, Some(71));
+        assert!(output.stdout.is_empty());
+        assert_eq!(fake.specs().len(), 1);
+    }
+
     /// Serializes the tests that flip the daemon-lifetime nested-sandbox memory and resets it,
     /// so each starts from an unrefused daemon regardless of parallel test order.
     async fn isolated_fallback_state() -> tokio::sync::MutexGuard<'static, ()> {
@@ -335,6 +378,7 @@ mod tests {
     /// the remembered decision keeps every later check off the doomed wrapper. The fake runner
     /// holds exactly one scripted output, so a second profiled consult would fail loudly.
     #[tokio::test]
+    #[cfg(target_os = "macos")]
     async fn nested_sandbox_refusal_falls_back_once_and_is_remembered() {
         let _state = isolated_fallback_state().await;
         let fake = FakeRunner::new(vec![Ok(RunOutput {

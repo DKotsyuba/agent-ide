@@ -1,18 +1,40 @@
 # Agent IDE
 
-An explicitly activated coding companion for Codex and Claude Code on macOS arm64. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback. Linux remains explicitly `not_tested` and no Linux release artifact is published.
+An explicitly activated coding companion for Codex and Claude Code. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback. macOS arm64 is release-qualified; Linux x86_64 and aarch64 are local candidates, not qualified releases, and no Linux release artifact is published.
 
-Status (0.8.1): eleven MCP tools — `ide.start`, `ide.context`, `ide.outline`, `ide.read`,
-`ide.symbol`, `ide.graph`, `ide.edit`, `ide.test`, `ide.diff`, `ide.inspect`, `ide.stop` — over
+Current 0.10.9 development surface: eleven MCP tools — `ide.start`, `ide.outline`, `ide.read`,
+`ide.symbol`, `ide.graph`, `ide.tree`, `ide.edit`, `ide.test`, `ide.diff`, `ide.inspect`, `ide.stop` — over
 Rust, Python and TypeScript/JavaScript language servers, a language-free core with one crate per
 language, a cross-language name bridge (CSS selectors ↔ HTML/TSX class names), and plain
 directories without Git (every tool except the Git views; those answer "not a git repository").
-Every release
-passes five live macOS acceptance routes (product, direct Codex, direct Claude, agent-run to Claude,
+On Linux, Git-backed change snapshots require the launcher-selected Git to support
+`--no-lazy-fetch` (Git 2.45 or later); older Git is refused so a partial clone cannot fetch
+missing objects during a snapshot.
+On Linux, batch edits can compare new names directly on unencrypted ext2/ext3/ext4 directories
+without casefold, even when the temporary directory is on another filesystem. A casefold directory
+requires temporary space on the same filesystem with matching rules. Other or unverified
+filesystems refuse such a batch before writing rather than guessing name aliases.
+The macOS release gate requires five live acceptance routes (product, direct Codex, direct Claude, agent-run to Claude,
 agent-run to Codex). Go support was removed in 0.10.8; an old launcher entry for it is ignored with a doctor line.
 
 Tagged releases are built on GitHub Actions using an arm64 macOS runner and published
 with a SHA-256 checksum in GitHub Releases. See [docs/release.md](docs/release.md).
+
+## Agent workflow
+
+Collect related targets before making tool calls. Use bounded batches: outline paths/glob,
+symbol/graph symbols, read items, one multi-file edit (Codex patch / Claude files), test
+targets, aggregate diff paths and known inspect detail_refs. Do not issue one call per
+file, symbol or tiny hunk when the related set fits a batch. Split only for advertised
+limits or newly discovered work. Start/stop are once-only lifecycle calls per worktree.
+
+Read and plan the related changes together, apply them atomically, then run checks together.
+In Bridge mode, graph/test results arrive automatically for a qualified live host.
+Continue independent work or end the current turn; never poll, finish or stop while waiting.
+Reuse unchanged reads; force only for lost context or deliberate rereading. Native tools
+remain a fallback, and native Git diff is valid. See the shipped host skill and the
+[active tool contract](docs/contracts/tools-v0.4.md). Stock managed Codex
+CLI passive wake stays unqualified.
 
 ## Install
 
@@ -62,16 +84,19 @@ Build from source (also usable before publication):
 release_root="$(mktemp -d)"
 version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
 cargo build --locked --release --bin agent-ide
-scripts/package-release.sh target/release/agent-ide "v$version" "$release_root"
-tar -xzf "$release_root/agent-ide-v$version-aarch64-apple-darwin.tar.gz" -C "$release_root"
+archive="$(scripts/package-release.sh target/release/agent-ide "v$version" "$release_root")"
+cargo xtask package verify "$archive"
+tar -xzf "$archive" -C "$release_root"
 "$release_root/agent-ide-v$version/agent-ide" self-install --release "$release_root/agent-ide-v$version" --version "$version"
 ```
 
 `package-release.sh` writes only the tarball and its `SHA256SUMS`; the bundle directory exists
 once the tarball is extracted. Use a new version for changed source: the installer never
-overwrites an existing version with different bytes (source builds may pass `self-install
---replace` — `scripts/install-local.sh` does — to rebuild a same-version release). For a
-development install without a release bundle, use `scripts/install-local.sh`.
+overwrites an existing version with different bytes. On macOS a source build may pass
+`self-install --replace` when the release is not in use; `scripts/install-local.sh` does so.
+On Linux, replacing a different build of the same version is refused because global process
+absence cannot be proven. Use a new version for changed source; fresh and identical installs
+still work. For a development install without a release bundle, use `scripts/install-local.sh`.
 
 Restart agent-run after an install or update: it resolves
 `~/.local/share/agent-ide/plugin/current` once, when its service starts, so its runtimes
@@ -97,10 +122,12 @@ configuration, toolchains, install layout, plugin link, host hooks, daemons, rec
 and exits 2 when it reports errors. `agent-ide doctor --runtime-dir PATH` keeps querying a
 running repository daemon.
 
-The accepted language-server versions for 0.8.1 are rust-analyzer 1.98.1 (from the pinned
+The pinned language-server versions are rust-analyzer 1.98.1 (from the pinned
 Rust toolchain), pyright 1.1.413, typescript-language-server 6.0.0, TypeScript 5.9.3, and
-Node 24.4.0; the release workflow installs exactly these, and [docs/release.md](docs/release.md)
-lists them for the publication gate.
+Node 24.4.0; the macOS release workflow installs exactly these, and [docs/release.md](docs/release.md)
+lists them for the publication gate. Linux TypeScript setup can generate a measured provider fragment
+with `agent-ide evidence typescript --node ABS --bridge ABS --tsserver ABS`; see
+[launcher configuration](docs/assistance-launcher.md). This does not prove the Node version or qualify Linux.
 
 Runtime-neutral orchestrators can register one command for both hosts:
 
@@ -161,11 +188,15 @@ MCP and delegates to that exact installed binary's `claude-hook`. It never searc
 binary update cannot split MCP and hook versions. That argument-free mode finds the active project
 rendezvous from the hook payload's canonical `cwd` — resolved to the nearest ancestor holding the
 MCP-written key cache — never from an environment variable. The managed MCP requires the template's
-one target. It joins one deterministic shared per-repository runtime (`/private/tmp/ai-r-<hash>`,
+one target. It joins one deterministic shared per-repository runtime (`<parent>/ai-r-<hash>`,
 keyed by the canonical git common directory): the first MCP starts the daemon, a later MCP of the
 same repository adopts the healthy daemon, and an MCP exit never stops it.
 
-`agent-ide claude-rendezvous /absolute/path/to/project` prints the repository runtime directory without creating runtime state.
+The shared parent defaults to `/private/tmp` on macOS. On Linux it is `/run/user/<euid>` when
+private, otherwise the validated nonempty `XDG_RUNTIME_DIR`, otherwise the effective user home.
+An invalid specified XDG directory fails closed. `AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT` overrides
+the parent for MCP, hooks and daemon; use the same existing absolute normalized directory for each.
+`agent-ide claude-rendezvous /absolute/path/to/project` prints the runtime path without creating state.
 
 The separate launcher environment variable `AGENT_IDE_HOST_ATTACHMENT` enables
 connect-only routing when supported host request metadata is also present. It is an
@@ -180,31 +211,38 @@ Placeholder-only host examples are shipped for
 [Claude Code](docs/examples/claude-settings.json).
 
 The v0.3 project problem feed adds confined background checks for Rust (`cargo check --offline
---locked`) and Python (pyright) on macOS, a compact `<agent-ide>` error/warning block on Claude
+--locked`) and Python (pyright), a compact `<agent-ide>` error/warning block on Claude
 `PostToolUse` hooks (on managed Codex it rides native hooks and terminal replies at once,
-T29B), and `ide.context` with `{"kind":"problems"}`. Enable it only through the
+T29B), and `ide.inspect` with `{"kind":"problems"}`. Enable it only through the
 trusted launcher configuration (`AGENT_IDE_LAUNCHER_CONFIG`): declare normalized absolute
 `allowed_roots` plus a `project_checks` section naming the Rust toolchain and the Node/Pyright
 pair, as in the shipped fragment
 [docs/examples/launcher-eyes.json](docs/examples/launcher-eyes.json). Missing fields, empty
 roots, or an undeclared language keep the feed disabled and v0.2 behaviour unchanged. Each check
-runs under `sandbox-exec` with no network, a read-only worktree, reads limited to the declared
-toolchains (when the host already confines the daemon and refuses a nested profile, the check
-still runs, under the host's confinement only), and one private cache under
+runs with no network, a read-only worktree and reads limited to declared toolchains, plus one
+private cache under
 `$HOME/.agent-ide/checks/<repository>/<worktree>/<policy digest>/<language>`; the environment is rebuilt from an
-allowlist (`CARGO_NET_OFFLINE=true`, private `CARGO_TARGET_DIR` and temp). Runs are debounced,
+allowlist (`CARGO_NET_OFFLINE=true`, private `CARGO_TARGET_DIR` and temp). macOS uses
+`sandbox-exec`; when a host denies a nested profile, it may run under the host confinement alone.
+Linux requires `/usr/bin/bwrap` with `--bind-fd`, `--ro-bind-fd`, `--disable-userns` and
+`--assert-userns-disabled`, usable user/mount/network namespaces, seccomp, `openat2` and
+`close_range` with `CLOSE_RANGE_CLOEXEC` (Linux 5.11 or a backport). Unsupported read-deny
+exclusions or unavailable confinement make the check unavailable, with no unconfined Linux retry.
+Runs are debounced,
 bounded by `check_timeout_s`, and their process groups are killed on cancel or timeout. Unused
-check caches, telemetry stores and old installed releases are removed automatically; `agent-ide
-cache status` shows what would go and why, `agent-ide cache prune` applies it now
-([cache retention](docs/cache-retention.md)). See the
+check caches, telemetry stores and old installed releases are subject to automatic retention;
+`agent-ide cache status` shows its decisions and `agent-ide cache prune` applies safe removals.
+On Linux, cleanup of caches, releases, trash and Claude hints is paused because process visibility
+across PID namespaces is unknown, so disk use can grow beyond retention budgets. See
+[cache retention](docs/cache-retention.md), the
 [EYES-r2 contract](docs/contracts/eyes-v0.3.md), the
 [symbol-addressed tools v0.4 contract](docs/contracts/tools-v0.4.md), and the
 [launcher configuration](docs/assistance-launcher.md).
 
-Checks run in one shared per-repository daemon under `/private/tmp/ai-r-<hash>`, keyed by the
+Checks run in one shared per-repository daemon under `<parent>/ai-r-<hash>`, keyed by the
 canonical git common directory, so every worktree of one repository shares one daemon; later MCP
 servers adopt it and MCP exit never stops it. The MCP leaves the repository key for its hook in
-`/private/tmp/ai-k-<hash>`, so hooks never run `git`. With zero open sessions and no running
+`<parent>/ai-k-<hash>`, so hooks never run `git`. With zero open sessions and no running
 check the daemon stops after `idle_timeout_s` (default 300 seconds) and removes only its runtime
 directory; caches survive. Everything is fail-open: a missing service, toolchain, or feed never
 blocks native tools or turn completion.
@@ -219,10 +257,10 @@ when Git discovers a worktree, that worktree and its Git directory do too; other
 with `outside_allowed_roots`. No host sandbox is replayed and no sandbox profile is ever accepted
 or captured. The IDE also supports directories without Git; Git-only diff and history answers say
 no Git data is available.
-The offline installation helpers are `agent-ide evidence executable` and `agent-ide launcher check`.
+The offline installation helpers are `agent-ide evidence executable`, Linux `agent-ide evidence typescript`, and `agent-ide launcher check`.
 The bundled
-`skills/agent-ide` workflow directs coding agents through start, context, the
-supported `ide.edit` path when offered, refreshed context, diff, and stop.
+`skills/agent-ide` workflow directs coding agents through start, outline or a symbol card,
+reads and edits by address, graph call chains when needed, diff, and stop.
 Native host editing remains available when `ide.edit` is inactive, unavailable,
 unsupported, declined, or uncertain.
 
@@ -258,12 +296,12 @@ Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure it
 The v0.2 TypeScript increment supports Codex and Claude semantic Context for `.js`, `.jsx`, `.ts`,
 and `.tsx` on their separate accepted macOS release cells. Configure `typescript_defaults_v1` with
 the exact Node 24.4.0, TypeScript Language Server 6.0.0 bridge, TypeScript 5.9.3 `tsserver.js`,
-complete closure identities, the bundle-bound compiled Codex evidence ID, the separate Claude
-evidence ID when that host is enabled, and an ancestor `tsconfig.json` or `jsconfig.json` as
-documented in the [launcher contract](docs/assistance-launcher.md). That config must set
-`compilerOptions.types` to `[]` and `moduleResolution` to `node10`; JS/JSX also require
-`allowJs: true`. The top-level `files` array must contain the current document exactly once as a
-bounded normalized relative path; `include`, `exclude`, `outDir`, `declarationDir`, and dependency
-graphs are unsupported. Each operation is exclusive and one-shot; normal
+complete closure identities and, on macOS, the bundle-bound compiled Codex evidence ID and separate
+Claude evidence ID when that host is enabled. Linux uses a measured operator bundle binding instead
+of macOS evidence; this is not qualification. Supply an ancestor `tsconfig.json` or `jsconfig.json` as
+documented in the [launcher contract](docs/assistance-launcher.md). The project config must admit
+the document through bounded literal `files` or `include` entries and set the supported
+`compilerOptions.types` and `moduleResolution` values described there; JS/JSX also require
+`allowJs: true`. Wildcard includes and excludes are refused. Each operation is exclusive and one-shot; normal
 success requires graceful shutdown, protocol EOF, zero bridge exit, and direct-child reap without
 TERM/KILL. Claude runs the same profile through the daemon.

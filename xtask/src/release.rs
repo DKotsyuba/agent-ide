@@ -4,11 +4,11 @@
 //! `release prepare` performs the local version/CHANGELOG edits, `release manifest` writes the
 //! schema-shaped `release-manifest.json`, `release publish` stages a complete draft, verifies it
 //! and makes it visible, and `release wait` observes one exact tag/commit/run. Hashing, archiving
-//! and GitHub access go through `shasum`, `tar`/`gzip` and `gh`; nothing is reimplemented.
+//! and GitHub access go through the platform SHA-256 utility, `tar`/`gzip` and `gh`.
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::{Result, read, run, table_value, target_dir};
 
-/// The only qualified target; the archive name and the manifest bundle entry carry it.
+/// The qualified release target; local Linux packages do not change release qualification.
 const TARGET: &str = "aarch64-apple-darwin";
 /// The release manifest asset; it is listed in `SHA256SUMS` but never lists itself (PKG-02).
 const MANIFEST: &str = "release-manifest.json";
@@ -31,7 +31,7 @@ const INSTALLER: &str = "install.sh";
 /// Upper bound for a manifest read from a directory or a published release.
 const MANIFEST_MAX_BYTES: u64 = 16384;
 /// Checkout files copied verbatim into the bundle (paths are identical on both sides).
-const COPIED: [&str; 11] = [
+const COPIED: [&str; 13] = [
     "install.sh",
     "README.md",
     "docs/release.md",
@@ -43,11 +43,13 @@ const COPIED: [&str; 11] = [
     "hooks/claude-hook.sh",
     "skills/agent-ide/SKILL.md",
     "skills/agent-ide/agents/openai.yaml",
+    "skills/codex/agent-ide/SKILL.md",
+    "skills/codex/agent-ide/agents/openai.yaml",
 ];
 /// Bundle files that are made executable after copying.
 const EXECUTABLES: [&str; 3] = ["agent-ide", "install.sh", "hooks/claude-hook.sh"];
 /// The complete archive file set, bundle-relative and in byte order.
-const BUNDLE_FILES: [&str; 16] = [
+const BUNDLE_FILES: [&str; 18] = [
     ".agents/plugins/marketplace.json",
     ".claude-plugin/marketplace.json",
     ".claude-plugin/plugin.json",
@@ -64,6 +66,8 @@ const BUNDLE_FILES: [&str; 16] = [
     "metadata.json",
     "skills/agent-ide/SKILL.md",
     "skills/agent-ide/agents/openai.yaml",
+    "skills/codex/agent-ide/SKILL.md",
+    "skills/codex/agent-ide/agents/openai.yaml",
 ];
 /// The Codex marketplace catalog written into the bundle, byte for byte.
 const CODEX_MARKETPLACE: &str = "{\n  \"name\": \"agent-ide\",\n  \"interface\": {\"displayName\": \"Agent IDE\"},\n  \"plugins\": [\n    {\n      \"name\": \"agent-ide\",\n      \"source\": {\"source\": \"local\", \"path\": \"./\"}\n    }\n  ]\n}\n";
@@ -99,13 +103,28 @@ fn output(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Result<String>
     Ok(String::from_utf8(out.stdout)?)
 }
 
-/// The lowercase SHA-256 of one file, from `shasum -a 256`.
+/// Constructs the host SHA-256 command in its standard text-output mode.
+fn sha256_command() -> Command {
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("sha256sum")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut command = Command::new("shasum");
+        command.args(["-a", "256"]);
+        command
+    }
+}
+
+/// Computes one lowercase SHA-256 without changing the checksum manifest format.
 fn sha256(path: &Path) -> Result<String> {
-    let text = output(
-        "shasum",
-        &["-a", "256", path.to_str().ok_or("non-UTF-8 path")?],
-    )?;
-    let digest = text
+    let result = sha256_command().arg(path).output()?;
+    if !result.status.success() {
+        return Err("SHA-256 utility failed".into());
+    }
+    let output = String::from_utf8(result.stdout)?;
+    let digest = output
         .split_whitespace()
         .next()
         .unwrap_or_default()
@@ -113,7 +132,7 @@ fn sha256(path: &Path) -> Result<String> {
     if is_hex(&digest, 64) {
         Ok(digest)
     } else {
-        Err("shasum returned no digest".into())
+        Err("SHA-256 utility returned no digest".into())
     }
 }
 
@@ -159,6 +178,47 @@ fn asset_name(tag: &str) -> String {
     format!("agent-ide-{tag}-{TARGET}.tar.gz")
 }
 
+/// Identifies supported Linux executables from ELF class, byte order, ABI, type and machine.
+fn elf_target(header: &[u8]) -> Option<&'static str> {
+    if header.len() < 20
+        || &header[..7] != b"\x7fELF\x02\x01\x01"
+        || !matches!(header[7], 0 | 3)
+        || header[8] != 0
+        || !matches!(u16::from_le_bytes([header[16], header[17]]), 2 | 3)
+    {
+        return None;
+    }
+    match u16::from_le_bytes([header[18], header[19]]) {
+        62 => Some("x86_64-unknown-linux-gnu"),
+        183 => Some("aarch64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
+/// Derives the bundle target from the executable, refusing unknown formats or architectures.
+fn binary_target(binary: &Path) -> Result<&'static str> {
+    let mut header = [0; 20];
+    fs::File::open(binary)?.read_exact(&mut header)?;
+    if &header[..4] == b"\x7fELF" {
+        return elf_target(&header).ok_or_else(|| "unsupported ELF executable".into());
+    }
+    if output("file", &[binary.to_str().ok_or("non-UTF-8 path")?])?
+        .contains("Mach-O 64-bit executable arm64")
+    {
+        return Ok(TARGET);
+    }
+    Err("unsupported executable format or architecture".into())
+}
+
+fn host_target() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some(TARGET),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
 fn json_file(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
@@ -192,7 +252,8 @@ pub fn package(root: &Path, binary: &Path, tag: &str, output_dir: &Path) -> Resu
         }
     }
     let name = format!("agent-ide-{tag}");
-    let asset = asset_name(tag);
+    let target = binary_target(binary)?;
+    let asset = format!("agent-ide-{tag}-{target}.tar.gz");
     let tmp = TempDir::new("agent-ide-package")?;
     let bundle = tmp.0.join(&name);
     fs::create_dir_all(bundle.join(".agents/plugins"))?;
@@ -221,11 +282,12 @@ pub fn package(root: &Path, binary: &Path, tag: &str, output_dir: &Path) -> Resu
     collect_files(&bundle, &bundle, &mut files)?;
     files.retain(|f| Path::new(f).file_name().is_some_and(|n| n != "SHA256SUMS"));
     files.sort();
-    let mut shasum = Command::new("shasum");
-    shasum.current_dir(&bundle).args(["-a", "256"]).args(&files);
-    let sums = shasum.output()?;
+    let sums = sha256_command()
+        .current_dir(&bundle)
+        .args(&files)
+        .output()?;
     if !sums.status.success() {
-        return Err("shasum over the bundle failed".into());
+        return Err("SHA-256 utility over the bundle failed".into());
     }
     fs::write(bundle.join("SHA256SUMS"), sums.stdout)?;
     run(
@@ -312,7 +374,7 @@ fn read_sums(path: &Path) -> Result<BTreeMap<String, String>> {
     Ok(sums)
 }
 
-/// `shasum -c` semantics: every listed file exists and matches; returns the parsed list.
+/// Checks every listed file against its digest and returns the parsed list.
 fn check_sums(dir: &Path) -> Result<BTreeMap<String, String>> {
     let sums = read_sums(&dir.join("SHA256SUMS"))?;
     for (name, digest) in &sums {
@@ -325,7 +387,7 @@ fn check_sums(dir: &Path) -> Result<BTreeMap<String, String>> {
 
 /// Verifies one release archive: its directory's `SHA256SUMS`, the manifest binding when a
 /// `release-manifest.json` sits next to it, then everything the former release smoke test
-/// checked — exact file set, regular files only, Mach-O arm64 executable, versions, the seal,
+/// checked — exact file set, regular files only, host-matching executable, versions, the seal,
 /// marketplaces, the executable measurement, the Claude hook and a disposable self-install.
 pub fn verify(asset: &Path) -> Result<()> {
     let asset = fs::canonicalize(asset)?;
@@ -334,12 +396,23 @@ pub fn verify(asset: &Path) -> Result<()> {
         .and_then(|n| n.to_str())
         .ok_or("archive name missing")?
         .to_owned();
+    let target = [
+        TARGET,
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+    ]
+    .into_iter()
+    .find(|target| name.ends_with(&format!("-{target}.tar.gz")))
+    .ok_or("unexpected release archive target")?;
     let tag = name
         .strip_prefix("agent-ide-")
-        .and_then(|rest| rest.strip_suffix(&format!("-{TARGET}.tar.gz")))
+        .and_then(|rest| rest.strip_suffix(&format!("-{target}.tar.gz")))
         .filter(|tag| tag.strip_prefix('v').and_then(version_key).is_some())
         .ok_or("unexpected release archive name")?
         .to_owned();
+    if host_target() != Some(target) {
+        return Err("release archive does not match this host".into());
+    }
     let version = &tag[1..];
     let dir = asset.parent().ok_or("archive directory missing")?;
     if !check_sums(dir)?.contains_key(&name) {
@@ -385,10 +458,8 @@ pub fn verify(asset: &Path) -> Result<()> {
     }
     let bin = bundle.join("agent-ide");
     let bin_str = bin.to_str().ok_or("non-UTF-8 path")?;
-    if fs::metadata(&bin)?.permissions().mode() & 0o111 == 0
-        || !output("file", &[bin_str])?.contains("Mach-O 64-bit executable arm64")
-    {
-        return Err("packaged agent-ide is not a macOS arm64 executable".into());
+    if fs::metadata(&bin)?.permissions().mode() & 0o111 == 0 || binary_target(&bin)? != target {
+        return Err("packaged executable does not match archive target".into());
     }
     for file in [".codex-plugin/plugin.json", ".claude-plugin/plugin.json"] {
         if json_file(&bundle.join(file))?["version"] != version {
@@ -403,7 +474,7 @@ pub fn verify(asset: &Path) -> Result<()> {
     }
     check_sums(&bundle)?;
     if json_file(&bundle.join(".claude-plugin/marketplace.json"))?["plugins"]
-        != json!([{"name": "agent-ide", "source": "./", "description": "Agent IDE coding-companion skill and Claude lifecycle hooks.", "version": version}])
+        != json!([{"name": "agent-ide", "source": "./", "description": "Batch related source discovery, reads, atomic multi-file edits and checks; automatic Bridge completion.", "version": version}])
         || json_file(&bundle.join(".agents/plugins/marketplace.json"))?["plugins"]
             != json!([{"name": "agent-ide", "source": {"source": "local", "path": "./"}}])
     {
@@ -1308,7 +1379,47 @@ pub fn wait(gh: &Path, w: &Wait) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Linux package selection accepts only supported ELF64 executables and architectures.
+    #[test]
+    fn linux_elf_target_rejects_wrong_abi_and_machine() {
+        let mut header = [0_u8; 20];
+        header[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        header[16] = 3;
+        header[18] = 62;
+        assert_eq!(super::elf_target(&header), Some("x86_64-unknown-linux-gnu"));
+        header[18] = 183;
+        assert_eq!(
+            super::elf_target(&header),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        for (offset, value) in [(4, 1), (5, 2), (7, 9), (8, 1), (16, 1), (18, 40), (19, 1)] {
+            let mut invalid = header;
+            invalid[offset] = value;
+            assert_eq!(super::elf_target(&invalid), None, "header byte {offset}");
+        }
+        assert_eq!(super::elf_target(&header[..19]), None);
+    }
     use super::*;
+
+    /// Single-file and bundle hashing agree on the standard digest and exact manifest format.
+    #[test]
+    fn sha256_utility_produces_bundle_manifest_format() -> Result<()> {
+        let tmp = TempDir::new("agent-ide-sha256-test")?;
+        fs::write(tmp.0.join("fixture"), b"abc")?;
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(sha256(&tmp.0.join("fixture"))?, digest);
+        let result = sha256_command()
+            .current_dir(&tmp.0)
+            .arg("fixture")
+            .output()?;
+        assert!(result.status.success());
+        assert_eq!(
+            String::from_utf8(result.stdout)?,
+            format!("{digest}  fixture\n")
+        );
+        Ok(())
+    }
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const TAG: &str = "v0.7.0";

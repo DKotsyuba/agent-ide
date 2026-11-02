@@ -23,6 +23,17 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/ABSOLUTE/PATH/agent-ide' codex-hook --managed",
+            "timeout": 1
+          }
+        ]
+      }
     ]
   }
 }

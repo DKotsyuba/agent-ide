@@ -7,6 +7,8 @@
 //! every activation, check and test run holds shared, and never while a live `agent-ide` process
 //! that does not take leases exists. Installed releases (`standalone/releases/`) are removed when
 //! not current, not among the newest, old enough and not executed by any live process.
+//! Linux currently pauses destructive cleanup: its namespace-local procfs cannot prove that
+//! another PID namespace has no users of this shared state. Observation remains available.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -20,6 +22,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
 mod rustc;
 mod usage;
 use usage::{Sharing, Usage};
@@ -507,7 +511,8 @@ pub struct Totals {
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     /// Live `agent-ide` processes that do not take leases, or `None` when the process snapshot
-    /// failed; either non-empty or `None` pauses all check and telemetry removal.
+    /// failed or cannot cover every user of the shared state; either non-empty or `None` pauses
+    /// all check, telemetry and provider removal.
     pub legacy: Option<Vec<Process>>,
     /// Live development or test builds proven to take leases; they never pause removal.
     pub builds: Vec<Process>,
@@ -560,7 +565,7 @@ impl Report {
         }
         match &self.legacy {
             None => text.push_str(
-                "eviction of checks/telemetry paused: the process list could not be read\n",
+                "eviction of checks/telemetry/providers paused: complete process visibility is unavailable\n",
             ),
             Some(legacy) if !legacy.is_empty() => {
                 text.push_str(
@@ -675,6 +680,7 @@ pub type Process = (i32, Option<PathBuf>);
 /// Lists every live process of the effective user whose name starts with `agent-ide`, with its
 /// executable path; `None` when the list is unavailable, truncated, or a process could not be
 /// inspected for a reason other than having exited.
+#[cfg(target_os = "macos")]
 pub fn process_snapshot() -> Option<Vec<Process>> {
     let mut capacity = 1024usize;
     let pids = loop {
@@ -734,6 +740,31 @@ pub fn process_snapshot() -> Option<Vec<Process>> {
         }
     }
     Some(processes)
+}
+
+/// Lists visible Linux processes conservatively; an incomplete procfs scan returns `None`.
+///
+/// This is observational evidence only: an apparently complete procfs scan may omit users of
+/// the shared state in other PID namespaces. Use [`global_process_snapshot`] for cleanup.
+#[cfg(target_os = "linux")]
+pub fn process_snapshot() -> Option<Vec<Process>> {
+    linux::snapshot(Path::new("/proc"))
+}
+
+/// Lists processes only when their absence can protect shared state during destructive cleanup.
+///
+/// macOS retains its system-wide scan. Linux has no established proof that the current procfs
+/// covers every PID namespace using the per-user state, so it returns `None` even when the
+/// visible process scan succeeds. Callers must keep caches, releases and hints on `None`.
+pub fn global_process_snapshot() -> Option<Vec<Process>> {
+    #[cfg(target_os = "linux")]
+    {
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        process_snapshot()
+    }
 }
 
 /// Device and inode of a file, following symlinks.
@@ -915,18 +946,20 @@ impl Identity {
 /// Lists the live `agent-ide` processes that may publish Claude hook key hints without the
 /// directory lock, or `None` when the process list is unavailable; hint collection
 /// ([`crate::hook_hints::collect`]) must not apply while either is non-empty or `None`.
+/// `snapshot` must cover all users of the shared state; production callers use
+/// [`global_process_snapshot`], never the namespace-local Linux observation.
 pub fn hint_publishers_unsafe(snapshot: &dyn Fn() -> Option<Vec<Process>>) -> Option<Vec<Process>> {
     hint_publishers_unsafe_as(&Identity::current(&state_root()?), snapshot)
 }
 
 /// Returns the question hook key hint collection asks right before every removal: `true` only while
-/// a fresh process snapshot shows every live `agent-ide` to be this executable or a proven build.
-/// One proof cache serves all questions of a pass.
+/// a fresh global process snapshot shows every live `agent-ide` to be this executable or a proven
+/// build. Linux returns false until global visibility can be proved. One proof cache serves a pass.
 pub fn hint_publishers_safe() -> impl Fn() -> bool {
     let identity = state_root().map(|root| Identity::current(&root));
     move || {
         identity.as_ref().is_some_and(|identity| {
-            hint_publishers_unsafe_as(identity, &process_snapshot)
+            hint_publishers_unsafe_as(identity, &global_process_snapshot)
                 .is_some_and(|unsafe_publishers| unsafe_publishers.is_empty())
         })
     }
@@ -941,6 +974,7 @@ fn hint_publishers_unsafe_as(
 }
 
 /// When process `pid` started, or `None` when it cannot be inspected.
+#[cfg(target_os = "macos")]
 fn process_start(pid: i32) -> Option<SystemTime> {
     // SAFETY: `proc_bsdinfo` is plain data that `proc_pidinfo` fills up to its size.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -952,6 +986,12 @@ fn process_start(pid: i32) -> Option<SystemTime> {
         SystemTime::UNIX_EPOCH
             + Duration::new(info.pbi_start_tvsec, (info.pbi_start_tvusec as u32) * 1_000)
     })
+}
+
+/// Returns the conservative lower bound of a Linux process's start time.
+#[cfg(target_os = "linux")]
+fn process_start(pid: i32) -> Option<SystemTime> {
+    linux::start_time(Path::new("/proc"), pid)
 }
 
 /// Whether the stream contains the build proof `needle`; any read error means no.
@@ -1554,8 +1594,23 @@ fn lock_session(path: &Path, create: bool) -> Option<Option<File>> {
         Err(error) if !create && error.kind() == ErrorKind::NotFound => return Some(None),
         Err(_) => return None,
     };
-    (file.metadata().ok()?.is_file() && flock(&file, libc::LOCK_EX | libc::LOCK_NB))
-        .then_some(Some(file))
+    if !file.metadata().ok()?.is_file() || !flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
+        return None;
+    }
+    // On Linux flock and POSIX record locks are independent. An OFD lock also conflicts with
+    // POSIX locks and remains tied to this file description until this guard is dropped.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: zero is a valid initialization for the remaining fields of struct flock.
+        let mut record: libc::flock = unsafe { std::mem::zeroed() };
+        record.l_type = libc::F_WRLCK as _;
+        record.l_whence = libc::SEEK_SET as _;
+        // SAFETY: `file` is open and `record` is a valid initialized flock for this call.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &record) } == -1 {
+            return None;
+        }
+    }
+    Some(Some(file))
 }
 
 /// Creates the family trash directory and names a unique destination inside it.
@@ -1763,8 +1818,9 @@ fn sweep_releases(
 
 /// Runs one sweep (or, without `apply`, a dry run) over the state root `state_root`.
 ///
-/// Callers that apply should hold [`SweepLock`]. `snapshot` lists live `agent-ide` processes;
-/// the real one is [`process_snapshot`].
+/// Callers that apply should hold [`SweepLock`]. `snapshot` must list live `agent-ide` processes
+/// across every namespace using this state, or return `None`; production uses
+/// [`global_process_snapshot`]. Injected complete snapshots support isolated policy tests.
 pub fn sweep_with(
     state_root: &Path,
     apply: bool,
@@ -1880,9 +1936,15 @@ fn sweep_as(
     report
 }
 
-/// Runs one sweep or dry run with the real clock and process snapshot.
+/// Runs one sweep or dry run with the real clock and global process evidence.
+/// Linux reports unknown visibility and preserves all affected state, including trash.
 pub fn sweep(state_root: &Path, apply: bool) -> Report {
-    sweep_with(state_root, apply, SystemTime::now(), &process_snapshot)
+    sweep_with(
+        state_root,
+        apply,
+        SystemTime::now(),
+        &global_process_snapshot,
+    )
 }
 
 /// Exclusive hold of the machine-wide sweep lock; dropping it records the sweep as completed.
@@ -1922,8 +1984,8 @@ impl Drop for SweepLock {
 /// Applies the policy in a long-lived daemon: first after `FIRST_SWEEP_DELAY`, then every
 /// `SWEEP_INTERVAL`, each on a blocking thread and only when no daemon swept within
 /// `SWEEP_SPACING`. Removals are recorded in this process's error log. Runs until dropped.
-/// Shared hint collection uses the same feature-gated fixture root as publishers; default
-/// builds retain canonical `/private/tmp`, and an invalid test selector never falls back there.
+/// Hint collection uses the same configured Claude parent as writers; an invalid parent skips
+/// that collection and records a path-free failure without falling back to the legacy parent.
 pub async fn run_periodically() {
     let mut delay = FIRST_SWEEP_DELAY;
     loop {
@@ -1938,32 +2000,31 @@ pub async fn run_periodically() {
                 // The Claude hook key hints below the temporary root go with the same round, but
                 // only while no process that may publish one without the lock is alive.
                 use crate::errorlog::{Fields, Method, Outcome, record};
-                let (outcome, detail) = match hint_publishers_unsafe(&process_snapshot) {
-                    Some(unsafe_publishers) if unsafe_publishers.is_empty() => {
-                        match crate::test_seams::shared_runtime_root() {
-                            Ok(root) => {
-                                let hints = crate::hook_hints::collect(
-                                    &root,
-                                    true,
-                                    SystemTime::now(),
-                                    &hint_publishers_safe(),
-                                );
-                                (
-                                    Outcome::Completed,
-                                    format!("hook_key_hints removed={}", hints.stale),
-                                )
-                            }
-                            Err(_) => (
-                                Outcome::Skipped,
-                                "hook_key_hints paused=unavailable".to_owned(),
-                            ),
-                        }
+                let (outcome, detail) = match (
+                    crate::hook_hints::effective_root(),
+                    hint_publishers_unsafe(&global_process_snapshot),
+                ) {
+                    (Ok(tmp), Some(unsafe_publishers)) if unsafe_publishers.is_empty() => {
+                        let hints = crate::hook_hints::collect(
+                            &tmp,
+                            true,
+                            SystemTime::now(),
+                            &hint_publishers_safe(),
+                        );
+                        (
+                            Outcome::Completed,
+                            format!("hook_key_hints removed={}", hints.stale),
+                        )
                     }
-                    Some(unsafe_publishers) => (
+                    (Ok(_), Some(unsafe_publishers)) => (
                         Outcome::Skipped,
                         format!("hook_key_hints paused={}", unsafe_publishers.len()),
                     ),
-                    None => (Outcome::Skipped, "hook_key_hints paused=unknown".to_owned()),
+                    (Ok(_), None) => (Outcome::Skipped, "hook_key_hints paused=unknown".to_owned()),
+                    (Err(_), _) => (
+                        Outcome::Skipped,
+                        "hook_key_hints paused=invalid_root".to_owned(),
+                    ),
                 };
                 if outcome == Outcome::Skipped || detail != "hook_key_hints removed=0" {
                     record(

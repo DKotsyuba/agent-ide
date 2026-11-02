@@ -28,8 +28,56 @@ use tokio::{
     time::timeout,
 };
 
-/// Exact analyzer build observed from the selected toolchain and required in `initialize` replies.
+/// Existing macOS fixture identity, also used by the synthetic validation-only profile.
 const ANALYZER_VERSION: &str = "1.98.1 (48a229ce 2026-09-01)";
+
+/// Measures the explicitly selected Linux analyzer once; macOS retains its accepted identity.
+/// The initialize reply must match this independently obtained CLI version exactly.
+fn analyzer_version() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        VERSION.get_or_init(|| {
+            let output = std::process::Command::new(analyzer_bin())
+                .arg("--version")
+                .output()
+                .expect("the selected rust-analyzer must report its version");
+            assert!(output.status.success(), "rust-analyzer --version failed");
+            let version = String::from_utf8(output.stdout).expect("analyzer version must be UTF-8");
+            let version = version
+                .trim()
+                .strip_prefix("rust-analyzer ")
+                .expect("the selected executable must identify itself as rust-analyzer");
+            assert!(
+                version.starts_with("1.98.1 ("),
+                "the fixture requires the pinned analyzer"
+            );
+            version.to_owned()
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        ANALYZER_VERSION
+    }
+}
+
+/// Uses the operator-selected Linux toolchain name; macOS keeps the existing pinned contract.
+fn rustup_toolchain() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN")
+            .expect("set AGENT_IDE_RUST_TOOLCHAIN to the prepared Linux toolchain");
+        assert!(
+            !toolchain.is_empty(),
+            "the selected toolchain must be nonempty"
+        );
+        toolchain
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "1.98.1-aarch64-apple-darwin".into()
+    }
+}
 
 /// Builds one canonical worktree and matching Execution authority for an isolated profile test.
 fn worktree(path: &str, incarnation: u64) -> RustWorktree {
@@ -50,16 +98,32 @@ fn worktree(path: &str, incarnation: u64) -> RustWorktree {
 /// Returns the operator-verified absolute path of one binary inside the accepted rustup toolchain,
 /// honoring `AGENT_IDE_RUST_TOOLCHAIN_DIR` when the harness points at a non-default rustup home.
 fn toolchain_bin(tool: &str) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    let root = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+        .expect("set AGENT_IDE_RUST_TOOLCHAIN_DIR to the prepared Linux toolchain");
+    #[cfg(not(target_os = "linux"))]
     let root = std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
         .unwrap_or_else(|_| "/Users/pluto/.rustup/toolchains/1.98.1-aarch64-apple-darwin".into());
+    assert!(
+        Path::new(&root).is_absolute(),
+        "toolchain directory must be absolute"
+    );
     PathBuf::from(root).join("bin").join(tool)
 }
 
-/// Returns the operator-verified rust-analyzer path, with the local accepted binary as fallback.
+/// Returns the explicit Linux analyzer path, retaining the accepted local fallback only on macOS.
 fn analyzer_bin() -> PathBuf {
-    std::env::var("AGENT_IDE_RUST_ANALYZER")
+    #[cfg(target_os = "linux")]
+    let path = PathBuf::from(
+        std::env::var("AGENT_IDE_RUST_ANALYZER")
+            .expect("set AGENT_IDE_RUST_ANALYZER to the prepared Linux analyzer"),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let path = std::env::var("AGENT_IDE_RUST_ANALYZER")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/Users/pluto/.local/bin/rust-analyzer"))
+        .unwrap_or_else(|_| PathBuf::from("/Users/pluto/.local/bin/rust-analyzer"));
+    assert!(path.is_absolute(), "analyzer path must be absolute");
+    path
 }
 
 /// Builds the complete fixed Rust compatibility identity used by every exclusive request.
@@ -69,13 +133,13 @@ fn analyzer_bin() -> PathBuf {
 fn profile(cache_namespace: &Path) -> RustProfile {
     RustProfile::new(RustProfileIdentity {
         binary: analyzer_bin(),
-        rust_analyzer_version: format!("rust-analyzer {ANALYZER_VERSION}"),
+        rust_analyzer_version: format!("rust-analyzer {}", analyzer_version()),
         cargo: toolchain_bin("cargo"),
         cargo_home: None,
         cargo_version: "cargo 1.98.1".into(),
         rustc: toolchain_bin("rustc"),
         rustc_version: "rustc 1.98.1".into(),
-        rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
+        rustup_toolchain: rustup_toolchain(),
         configuration: "cache-priming-check-on-save-and-proc-macro-disabled-v1".into(),
         trust: "local-trusted-v1".into(),
         transport: "stdio-v1".into(),
@@ -86,8 +150,9 @@ fn profile(cache_namespace: &Path) -> RustProfile {
 
 /// Creates a private Cargo project and its profile-local writable cache directories.
 /// `item` returns the given Rust type and expression; returns the project root, its `src/lib.rs`
-/// URI, and the verified absolute cache namespace prepared under that same root. The successful
-/// caller removes the root, which also reclaims the namespace.
+/// URI and a verified absolute sibling cache namespace. Keeping Cargo and provider temporary
+/// writes outside the watched worktree avoids self-generated watcher activity delaying readiness.
+/// Successful callers remove both owned directories after proving child reaping.
 fn project(label: &str, result: &str, expression: &str) -> (PathBuf, String, PathBuf) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = std::env::temp_dir().join(format!(
@@ -96,7 +161,11 @@ fn project(label: &str, result: &str, expression: &str) -> (PathBuf, String, Pat
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(root.join("src")).unwrap();
-    let cache_namespace = root.join("rust-native-v1");
+    let cache_namespace = root.with_extension("rust-native-v1");
+    assert!(
+        !cache_namespace.starts_with(&root),
+        "provider cache must not be watched as project source"
+    );
     for directory in ["cargo", "target", "tmp"] {
         fs::create_dir_all(cache_namespace.join(directory)).unwrap();
     }
@@ -229,7 +298,7 @@ async fn semantic_session(
     if initialized
         .pointer("/result/serverInfo/version")
         .and_then(Value::as_str)
-        != Some(ANALYZER_VERSION)
+        != Some(analyzer_version())
     {
         return Err(io::Error::other(format!(
             "unexpected analyzer version: {initialized}"
@@ -428,13 +497,13 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
     let build_profile = |cache_namespace: &Path| {
         RustProfile::new(RustProfileIdentity {
             binary: analyzer.clone(),
-            rust_analyzer_version: format!("rust-analyzer {ANALYZER_VERSION}"),
+            rust_analyzer_version: format!("rust-analyzer {}", analyzer_version()),
             cargo: toolchain_bin("cargo"),
             cargo_home: None,
             cargo_version: "cargo 1.98.1".into(),
             rustc: toolchain_bin("rustc"),
             rustc_version: "rustc 1.98.1".into(),
-            rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
+            rustup_toolchain: rustup_toolchain(),
             configuration: "cache-priming-check-on-save-and-proc-macro-disabled-v1".into(),
             trust: "local-trusted-v1".into(),
             transport: "stdio-v1".into(),
@@ -544,7 +613,9 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
     );
     assert_ne!(first_cache_namespace, second_cache_namespace);
     fs::remove_dir_all(first_root).unwrap();
+    fs::remove_dir_all(first_cache_namespace).unwrap();
     fs::remove_dir_all(second_root).unwrap();
+    fs::remove_dir_all(second_cache_namespace).unwrap();
 }
 
 /// Exercises the accepted Rust settings/version/status barrier through the production Session API.
@@ -640,7 +711,7 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
     let (stdout, stdin) = child.pipes();
     let outcome=with_session(stdout,stdin,worktree.worktree().clone(),1,ViewGeneration {backend:view.generation(),configuration:1,toolchain:1,view:1},ProviderSettings::new(profile.clone()),SessionOptions{request_timeout:Duration::from_secs(40),lifetime:Duration::from_secs(70)},|mut session|async move{
         assert!(session.provider_readiness().is_ready());
-        assert_eq!(session.capabilities().server_info.as_ref().unwrap().version.as_deref(),Some(ANALYZER_VERSION));
+        assert_eq!(session.capabilities().server_info.as_ref().unwrap().version.as_deref(),Some(analyzer_version()));
         assert!(matches!(session.settings().downcast_ref::<RustProfile>(),Some(profile) if profile.configuration()=="cache-priming-check-on-save-and-proc-macro-disabled-v1"));
         let context=session.context(&observed,text.as_bytes(),ContextQuery::Symbol{byte_offset:text.rfind("answer").unwrap()}).await?;
         assert_eq!(context.mode,ContextMode::Semantic,"{context:?}");assert!(!context.definitions.unwrap().is_empty());
@@ -669,6 +740,7 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
         String::from_utf8_lossy(&reaped.stderr.bytes)
     );
     fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(cache_namespace).unwrap();
 }
 
 /// A relative cache namespace would resolve against the spawned child's working directory (the
