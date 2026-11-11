@@ -1269,7 +1269,11 @@ fn create_backup(
         return Err(());
     }
     connection
-        .backup(MAIN_DB, &backup_path, None)
+        .backup(
+            MAIN_DB,
+            &backup_path,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
         .map_err(|_| ())?;
     let mut file = File::open(&backup_path).map_err(|_| ())?;
     file.sync_all().map_err(|_| ())?;

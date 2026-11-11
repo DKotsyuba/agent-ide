@@ -31,7 +31,7 @@ use agent_ide::{
     selfinstall,
     telemetry::{Filter, Telemetry, TelemetryConfig},
 };
-use rmcp::{serve_server, transport::io::stdio};
+use rmcp::{serve_server, service::ServerInitializeError, transport::io::stdio};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
@@ -165,6 +165,8 @@ async fn main() -> ExitCode {
                     Ok(_) => ExitCode::SUCCESS,
                     Err(_) => fail(AppError::InvalidResponse),
                 },
+                // Stateless 2026-07-28 clients never send `initialize`; EOF before it is a clean close.
+                Err(ServerInitializeError::ConnectionClosed(_)) => ExitCode::SUCCESS,
                 Err(_) => fail(AppError::InvalidResponse),
             }
         }
@@ -3966,6 +3968,8 @@ async fn serve_managed_stdio(
                 () = &mut termination => (true, true),
             }
         }
+        // Stateless 2026-07-28 clients never send `initialize`; EOF before it is a clean close.
+        Some(Err(ServerInitializeError::ConnectionClosed(_))) => (true, false),
         Some(Err(_)) => (false, false),
         None => (true, true),
     };
