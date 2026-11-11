@@ -10,6 +10,9 @@ directories without Git (every tool except the Git views; those answer "not a gi
 On Linux, Git-backed change snapshots require the launcher-selected Git to support
 `--no-lazy-fetch` (Git 2.45 or later); older Git is refused so a partial clone cannot fetch
 missing objects during a snapshot.
+On Ubuntu, `sudo sh scripts/install-linux-deps.sh` adds the Git maintainers' PPA and installs
+APT's Git and `bubblewrap` candidates; it checks the upstream Git version and sandbox startup.
+After changing Git, remeasure its executable in any launcher that pins its digest.
 On Linux, batch edits can compare new names directly on unencrypted ext2/ext3/ext4 directories
 without casefold, even when the temporary directory is on another filesystem. A casefold directory
 requires temporary space on the same filesystem with matching rules. Other or unverified
